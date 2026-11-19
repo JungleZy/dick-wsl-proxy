@@ -166,9 +166,17 @@ class ConntrackTests(unittest.TestCase):
             kernel.parse_entry(encoded_entry(value, include_id=False))
 
     def test_malformed_and_duplicate_attributes_fail_closed(self):
-        for data in (b"\0", b"\x03\0\x01\0", b"\x08\0\x01\0", kernel.attribute(1, b"one") + kernel.attribute(1, b"two")):
+        for data in (
+            b"\0", struct.pack("=HH", 3, 1), struct.pack("=HH", 8, 1),
+            kernel.attribute(1, b"one") + kernel.attribute(1, b"two"),
+            kernel.attribute(1, b"x")[:-1],  # Missing the last padding byte.
+            kernel.attribute(1 | 0x4000, b"one") + kernel.attribute(1, b"two", nested=True),
+        ):
             with self.subTest(data=data), self.assertRaises(kernel.Failure):
                 kernel.attributes(data)
+        # A short, zero-valued CTA_ZONE is not proof of the default zone.
+        with self.assertRaises(kernel.Failure):
+            kernel.parse_entry(encoded_entry(entry()) + kernel.attribute(kernel.CTA_ZONE, b"\0"))
 
     def test_unproven_mark_tuple_zone_and_status_are_not_owned(self):
         p = plan()

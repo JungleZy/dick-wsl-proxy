@@ -565,34 +565,45 @@ CT_NEW, CT_GET, CT_DELETE = 0, 1, 2
 REQUEST, ACK, ROOT, MATCH = 1, 4, 0x100, 0x200
 DUMP_INTR = 0x10
 CTA_ORIG, CTA_REPLY, CTA_STATUS, CTA_MARK, CTA_ID, CTA_ZONE = 1, 2, 3, 8, 12, 18
+NLA_HEADER = struct.Struct("=HH")
 
 
 def attribute(kind, payload, nested=False):
     length = 4 + len(payload)
-    return struct.pack("=HH", length, kind | (NESTED if nested else 0)) + payload + b"\0" * (-length % 4)
+    return NLA_HEADER.pack(length, kind | (NESTED if nested else 0)) + payload + b"\0" * (-length % 4)
 
 
 def attributes(payload):
     result = {}
+    end = len(payload)
     offset = 0
-    while offset < len(payload):
-        require(len(payload) - offset >= 4, "short_netlink_attribute")
-        length, kind = struct.unpack_from("=HH", payload, offset)
-        require(4 <= length <= len(payload) - offset, "invalid_netlink_attribute_length")
+    # This loop runs for every attribute in every fresh dump. Keep the bounds
+    # checks inline, including the final check for missing alignment padding.
+    while offset < end:
+        remaining = end - offset
+        if remaining < 4:
+            raise Failure("short_netlink_attribute")
+        length, kind = NLA_HEADER.unpack_from(payload, offset)
+        if not 4 <= length <= remaining:
+            raise Failure("invalid_netlink_attribute_length")
         kind &= 0x3fff
-        require(kind not in result, "duplicate_netlink_attribute")
+        if kind in result:
+            raise Failure("duplicate_netlink_attribute")
         result[kind] = payload[offset + 4:offset + length]
         offset += (length + 3) & ~3
-    require(offset == len(payload), "truncated_netlink_attribute_padding")
+    if offset != end:
+        raise Failure("truncated_netlink_attribute_padding")
     return result
 
 
 def scalar(values, kind, width, default=None):
     if kind not in values:
-        require(default is not None, "missing_conntrack_attribute")
+        if default is None:
+            raise Failure("missing_conntrack_attribute")
         return default
     value = values[kind]
-    require(len(value) == width, "invalid_conntrack_scalar")
+    if len(value) != width:
+        raise Failure("invalid_conntrack_scalar")
     return int.from_bytes(value, "big")
 
 

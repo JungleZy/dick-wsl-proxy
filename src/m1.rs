@@ -210,7 +210,7 @@ impl Controller {
         }
         let script = concat!(
             "exec /usr/bin/python3 -I - <<'WPL_EXIT'\n",
-            include_str!("exit_probe.py"),
+            include_str!("probe/exit_probe.py"),
             "\nWPL_EXIT\n"
         );
         let raw =
