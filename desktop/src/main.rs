@@ -1,3 +1,4 @@
+//! 桌面二进制入口：Windows 进入 GPUI 应用，其他平台明确拒绝运行。
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 #[cfg(target_os = "windows")]
