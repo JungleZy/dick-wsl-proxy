@@ -265,6 +265,150 @@ class ConntrackTests(unittest.TestCase):
             self.assertFalse(kernel.owned(p, dns))
 
 
+class PreparedLookupTests(unittest.TestCase):
+    def test_ordered_mixed_protocol_queries_share_one_snapshot(self):
+        p = plan()
+        udp = entry()
+        tcp = entry(origin=1, identifier=2)
+        tcp["original"] = (6, *tcp["original"][1:])
+        tcp["reply"] = (6, *tcp["reply"][1:])
+        prepared = kernel.prepare_lookup(p)
+        peer = p["guest"] + ":45000"
+        self.assertEqual(
+            kernel.resolve_queries(prepared, [udp, tcp], [("tcp", peer), ("udp", peer), ("udp", p["guest"] + ":45001"), ("tcp", peer)]),
+            [p["origins"][1], p["origins"][0], None, p["origins"][1]],
+        )
+
+    def test_foreign_marks_and_cross_zone_candidates_remain_ambiguous(self):
+        p = plan()
+        prepared = kernel.prepare_lookup(p)
+        query = [("udp", p["guest"] + ":45000")]
+        for zone, tuple_zones in ((0, (0, 0)), (9, (0, 0)), (0, (7, 0)), (0, (0, 7))):
+            foreign = entry(identifier=2)
+            foreign.update(mark=0, zone=zone, tuple_zones=tuple_zones)
+            for values in ([foreign], [entry(), foreign], [foreign, entry()], [entry(), foreign, foreign]):
+                with self.subTest(zone=zone, tuple_zones=tuple_zones, values=values):
+                    self.assertEqual(kernel.resolve_queries(prepared, values, query), [None])
+
+    def test_every_cookie_row_is_validated_before_any_query_result(self):
+        p = plan()
+        prepared = kernel.prepare_lookup(p)
+        query = [("udp", p["guest"] + ":45000")]
+        for key, value in (("zone", 1), ("tuple_zones", (0, 1)), ("status", 0), ("id", True), ("original", None)):
+            unrelated = entry(origin=1, peer=45001, identifier=2)
+            unrelated[key] = value
+            with self.subTest(key=key), self.assertRaisesRegex(kernel.Failure, "instance_mark_has_unproven_mapping"):
+                kernel.resolve_queries(prepared, [entry(), unrelated], query)
+        for duplicate in (entry(peer=45001, identifier=2), entry(origin=1, identifier=2)):
+            with self.subTest(duplicate=duplicate), self.assertRaisesRegex(kernel.Failure, "duplicate_conntrack_mapping"):
+                kernel.resolve_queries(prepared, [entry(), duplicate], [("tcp", p["guest"] + ":45002")])
+
+    def test_reused_preparation_never_reuses_mapping_or_destination_cache(self):
+        p = comprehensive_plan()
+        prepared = kernel.prepare_lookup(p)
+        query = [("udp", p["guest"] + ":45000")]
+        first = comprehensive_entry()
+        second = comprehensive_entry("1.1.1.1", 53)
+        second["id"] += 1
+        with patch.object(kernel, "endpoint", wraps=kernel.endpoint) as parse:
+            self.assertEqual(kernel.resolve_queries(prepared, [first], query), ["93.184.216.34:443"])
+            self.assertEqual(kernel.resolve_queries(prepared, [second], query), ["1.1.1.1:53"])
+            self.assertEqual(kernel.resolve_queries(prepared, [], query), [None])
+            self.assertEqual(kernel.resolve_queries(prepared, [first], query), ["93.184.216.34:443"])
+        self.assertEqual(parse.call_count, 7)  # Four peers, three fresh destination proofs.
+        self.assertEqual(set(vars(prepared)), {"cookie", "guest", "ingress", "dns", "origins"})
+
+    def test_plan_and_query_validation_remain_strict(self):
+        p = plan()
+        invalid = copy.deepcopy(p)
+        invalid["cookie"] = True
+        with self.assertRaises(kernel.Failure):
+            kernel.prepare_lookup(invalid)
+        prepared = kernel.prepare_lookup(p)
+        for protocol, peer in (("UDP", p["guest"] + ":45000"), ("udp", "172.28.80.1:45000"), ("udp", p["guest"] + ":045000")):
+            with self.subTest(protocol=protocol, peer=peer), self.assertRaises(kernel.Failure):
+                kernel.resolve_queries(prepared, [entry()], [(protocol, peer)])
+
+    def test_duplicate_detection_and_destination_validation_are_linear(self):
+        class CountingTuple(tuple):
+            comparisons = 0
+            __hash__ = tuple.__hash__
+
+            def __eq__(self, other):
+                CountingTuple.comparisons += 1
+                return tuple.__eq__(self, other)
+
+        p = plan()
+        prepared = kernel.prepare_lookup(p)
+        values = []
+        for number in range(256):
+            value = entry(peer=45000 + number, identifier=number)
+            value["original"] = CountingTuple((17, p["guest"], 44000 + number, "172.28.80.1", 43772))
+            value["reply"] = CountingTuple(value["reply"])
+            values.append(value)
+        with patch.object(kernel, "endpoint", wraps=kernel.endpoint) as parse:
+            self.assertEqual(kernel.resolve_queries(prepared, values, [("udp", p["guest"] + ":45000")]), [p["origins"][0]])
+        self.assertEqual(parse.call_count, 2)  # One shared destination and one query peer.
+        self.assertLess(CountingTuple.comparisons, len(values) * 4)
+
+    def test_unrelated_foreign_rows_do_not_reparse_plan_or_destination(self):
+        p = plan()
+        prepared = kernel.prepare_lookup(p)
+        foreign = entry()
+        foreign.update(mark=0, original=None)
+        foreign["reply"] = (17, "192.0.2.1", 9999, p["guest"], 45000)
+        with patch.object(kernel, "endpoint", wraps=kernel.endpoint) as parse:
+            self.assertEqual(kernel.resolve_queries(prepared, [foreign] * 256, [("udp", p["guest"] + ":45000")]), [None])
+        parse.assert_called_once_with(p["guest"] + ":45000")
+
+    def test_tuple_attributes_are_decoded_once_and_ipv4_stays_canonical(self):
+        value = entry()
+        payload = encoded_entry(value)
+        with patch.object(kernel, "attributes", wraps=kernel.attributes) as parse:
+            self.assertEqual(kernel.parse_entry(payload), value)
+        self.assertEqual(parse.call_count, 7)
+        for source, destination in (("0.0.0.0", "255.255.255.255"), ("1.2.3.4", "192.0.2.255")):
+            original = (17, source, 1, destination, 65535)
+            self.assertEqual(kernel.parse_tuple(kernel.encode_tuple(original)), original)
+
+    def test_comprehensive_origin_checks_remain_exact_for_each_fresh_snapshot(self):
+        p = comprehensive_plan()
+        prepared = kernel.prepare_lookup(p)
+        query = [("udp", p["guest"] + ":45000")]
+        for destination, port in (("0.0.0.0", 443), ("127.0.0.1", 443), ("169.254.1.1", 443), ("224.0.0.1", 443), ("255.255.255.255", 443), ("::1", 443), ("1.1.1.1", 0), kernel.endpoint(p["ingress"])):
+            with self.subTest(destination=destination, port=port), self.assertRaisesRegex(kernel.Failure, "instance_mark_has_unproven_mapping"):
+                kernel.resolve_queries(prepared, [comprehensive_entry(destination, port)], query)
+
+    def test_ipv6_tuple_formatting_is_unchanged(self):
+        addresses = kernel.attribute(3, bytes.fromhex("00000000000000000000ffffc0000201"))
+        addresses += kernel.attribute(4, bytes.fromhex("20010db8000000000000000000000001"))
+        transport = kernel.attribute(1, b"\x11")
+        transport += kernel.attribute(2, struct.pack("!H", 44000))
+        transport += kernel.attribute(3, struct.pack("!H", 53))
+        payload = kernel.attribute(1, addresses, True) + kernel.attribute(2, transport, True)
+        self.assertEqual(kernel.parse_tuple(payload, ipv6=True), (17, "::ffff:c000:201", 44000, "2001:db8::1", 53))
+
+    def test_tuple_zone_attributes_are_not_hidden_by_parse_reuse(self):
+        value = entry()
+        payload = b"\x02\x00\x00\x00"
+        original = kernel.encode_tuple(value["original"])
+        original += kernel.attribute(3, struct.pack("!H", 7))
+        payload += kernel.attribute(kernel.CTA_ORIG, original, True)
+        payload += kernel.attribute(kernel.CTA_REPLY, kernel.encode_tuple(value["reply"]), True)
+        for kind, field in ((kernel.CTA_MARK, "mark"), (kernel.CTA_STATUS, "status"), (kernel.CTA_ID, "id")):
+            payload += kernel.attribute(kind, struct.pack("!I", value[field]))
+        parsed = kernel.parse_entry(payload)
+        self.assertEqual(parsed["tuple_zones"], (7, 0))
+        with self.assertRaisesRegex(kernel.Failure, "instance_mark_has_unproven_mapping"):
+            kernel.resolve_queries(kernel.prepare_lookup(plan()), [parsed], [("udp", plan()["guest"] + ":45000")])
+        duplicate = kernel.attribute(kernel.CTA_ORIG, original + kernel.attribute(3, b"\0\0"), True)
+        fields = kernel.attributes(payload[4:])
+        malformed = b"\x02\x00\x00\x00" + duplicate
+        malformed += b"".join(kernel.attribute(kind, data) for kind, data in fields.items() if kind != kernel.CTA_ORIG)
+        with self.assertRaisesRegex(kernel.Failure, "duplicate_netlink_attribute"):
+            kernel.parse_entry(malformed)
+
+
 class FirewallTests(unittest.TestCase):
     def test_restore_preserves_xtables_negation_token(self):
         with patch.object(kernel, "run") as run:
@@ -579,6 +723,17 @@ class GrantTests(unittest.TestCase):
 
     def filename(self, p=None):
         return os.path.join(self.directory, kernel.plan_digest(p or plan()) + ".json")
+
+    def test_precheck_window_uses_guest_clock_and_transit_does_not_renew_it(self):
+        req = request()
+        with patch.object(kernel, "guest_lock"), patch.object(kernel, "guard"), patch.object(kernel, "Conntrack"), patch.object(kernel, "firewall", return_value={}), patch.object(kernel, "inspect_mappings", return_value=[]), patch.object(kernel, "install_rules"):
+            window = kernel.execute(req)["grant_deadline"]
+        self.assertEqual(window, 1030)
+        self.clock.return_value = 1029
+        kernel.grant(req["plan"], "arm", window)
+        self.clock.return_value = 1030
+        with self.assertRaisesRegex(kernel.Failure, "expired"):
+            kernel.grant(req["plan"], "consume")
 
     def test_install_needs_exact_unexpired_once_only_ticket(self):
         p = plan()

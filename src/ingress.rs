@@ -1,28 +1,42 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc::Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use socket2::{Protocol, Type};
 
 use crate::m1::Plan;
-use crate::query_bridge::QueryBridge;
+use crate::query_bridge::Lookup;
+#[path = "metadata_lane.rs"]
+mod metadata_lane;
+use metadata_lane::{MetadataLane, Observation};
+
+#[path = "flow_stats.rs"]
+mod flow_stats;
+use flow_stats::{Flow, FlowStats};
+#[path = "metadata_timing.rs"]
+mod metadata_timing;
+use metadata_timing::MetadataTiming;
+#[path = "udp_admission.rs"]
+mod udp_admission;
+use udp_admission::{Retirement as UdpRetirement, UdpActivity};
+#[path = "udp_pump.rs"]
+mod udp_pump;
+use udp_pump::UdpPump;
 
 const MAX_TCP: usize = 64;
 const MAX_UDP: usize = 128;
 const ACCEPT_BATCH: usize = 16;
-const UDP_BATCH: usize = 4;
-const UDP_REPLY_BATCH: usize = 4;
+const UDP_BATCH: usize = 16;
 const MAX_DNS_UDP: usize = 8;
 const BUFFER_SIZE: usize = 16 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const HALF_CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
-const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ERROR_BYTES: usize = 512;
 
 /// Owns both exclusive ingress binds and every forwarding worker.
@@ -54,10 +68,10 @@ impl Ingress {
             .map_err(|e| format!("configure UDP ingress: {e}"))?;
         // Authenticate the transient metadata lane before handing duplicate binds
         // to the lease owner. A failed handshake must not leave a custody lease.
-        let bridge = QueryBridge::open(plan)?;
+        let shared = Arc::new(Shared::new());
+        let bridge = MetadataLane::start(plan, Arc::clone(&shared.stopping))?;
         crate::lease::reserve(plan, &tcp, &udp)?;
 
-        let shared = Arc::new(Shared::new());
         *lock(&shared.bridge) = Some(bridge);
         let worker_shared = Arc::clone(&shared);
         let plan = Arc::new(plan.clone());
@@ -121,12 +135,16 @@ impl Ingress {
 
     pub fn diagnostics(&self) -> serde_json::Value {
         let active_tcp = lock(&self.shared.active).len();
+        let (connections, traffic) = self.shared.flows.snapshot();
         serde_json::json!({
             "active_tcp": active_tcp,
             "healthy": self.health().is_ok(),
             "active_dns_udp": self.shared.dns_udp_active.load(Ordering::Acquire),
             "stopping": self.shared.is_stopping(),
             "counters": &*lock(&self.shared.counters),
+            "metadata_latency": lock(&self.shared.timing).snapshot(),
+            "connections": connections,
+            "traffic": traffic,
         })
     }
 }
@@ -186,27 +204,35 @@ struct HealthCounters {
     rejected_tcp: u64,
     rejected_udp: u64,
     dns_udp_capacity_rejections: u64,
+    udp_capacity_rejections: u64,
+    udp_quiet_reclaims: u64,
+    udp_idle_expirations: u64,
+    udp_idle_with_response_debt: u64,
     last_error: Option<String>,
 }
 
 struct Shared {
-    stopping: AtomicBool,
+    stopping: Arc<AtomicBool>,
     failure: Mutex<Option<String>>,
     active: Mutex<HashMap<SocketAddrV4, ActiveTcp>>,
-    bridge: Mutex<Option<QueryBridge>>,
+    bridge: Mutex<Option<MetadataLane>>,
     dns_udp_active: std::sync::atomic::AtomicUsize,
     counters: Mutex<HealthCounters>,
+    timing: Mutex<MetadataTiming>,
+    flows: Arc<FlowStats>,
 }
 
 impl Shared {
     fn new() -> Self {
         Self {
-            stopping: AtomicBool::new(false),
+            stopping: Arc::new(AtomicBool::new(false)),
             failure: Mutex::new(None),
             active: Mutex::new(HashMap::new()),
             bridge: Mutex::new(None),
             dns_udp_active: std::sync::atomic::AtomicUsize::new(0),
             counters: Mutex::new(HealthCounters::default()),
+            timing: Mutex::new(MetadataTiming::default()),
+            flows: Arc::new(FlowStats::new()),
         }
     }
 
@@ -296,6 +322,7 @@ impl Shared {
         Ok(Some(TcpRegistration {
             shared: Arc::clone(self),
             peer,
+            flow: self.flows.begin("tcp"),
         }))
     }
 }
@@ -303,6 +330,7 @@ impl Shared {
 struct TcpRegistration {
     shared: Arc<Shared>,
     peer: SocketAddrV4,
+    flow: Flow,
 }
 
 impl TcpRegistration {
@@ -364,42 +392,140 @@ impl Drop for TcpWorkers {
     }
 }
 
+struct PendingDestination {
+    started: Instant,
+    observation: Result<Receiver<Observation>, String>,
+}
+
 fn destination(
     plan: &Plan,
-    protocol: &str,
+    protocol: &'static str,
     peer: SocketAddrV4,
     shared: &Shared,
 ) -> Result<SocketAddrV4, String> {
-    if shared.is_stopping() || peer.ip() != &plan.guest || peer.port() == 0 {
-        return Err("unauthorized ingress peer or stopped ingress".into());
+    finish_destination(
+        plan,
+        protocol,
+        submit_destination(plan, protocol, peer, shared),
+        shared,
+    )
+}
+
+fn submit_destination(
+    plan: &Plan,
+    protocol: &'static str,
+    peer: SocketAddrV4,
+    shared: &Shared,
+) -> PendingDestination {
+    let started = Instant::now();
+    let observation = if shared.is_stopping() || peer.ip() != &plan.guest || peer.port() == 0 {
+        Err("unauthorized ingress peer or stopped ingress".into())
+    } else {
+        lock(&shared.bridge)
+            .as_ref()
+            .ok_or_else(|| "query_transport_closed: metadata bridge is closed".to_owned())
+            .and_then(|lane| lane.submit(Lookup { protocol, peer }))
+    };
+    PendingDestination {
+        started,
+        observation,
     }
-    let result = {
-        let mut bridge = lock(&shared.bridge);
-        // Workers queued behind another lookup must not start a new command
-        // after stop has begun.
-        if shared.is_stopping() {
-            return Err("ingress is stopping".into());
-        }
-        bridge
-            .as_mut()
-            .ok_or_else(|| "query_transport_closed: metadata bridge is closed".to_string())
-            .and_then(|bridge| bridge.query(protocol, peer))
-    }
-    .and_then(|origin| {
-        let ip = *origin.ip();
-        if shared.is_stopping()
-            || origin == plan.ingress
-            || origin.port() == 0
-            || ip.is_unspecified()
-            || ip.is_multicast()
-            || ip.is_broadcast()
-            || (plan.system_dns.is_none() && !plan.origins.contains(&origin))
-        {
-            Err("origin lookup is no longer authorized".into())
-        } else {
-            Ok(origin)
-        }
+}
+
+fn finish_destination(
+    plan: &Plan,
+    protocol: &str,
+    pending: PendingDestination,
+    shared: &Shared,
+) -> Result<SocketAddrV4, String> {
+    let observation = pending.observation.and_then(|rx| {
+        rx.recv()
+            .map_err(|_| "query_transport_dispatch_closed".to_owned())
     });
+    finish_observation(plan, protocol, pending.started, observation, shared)
+}
+
+struct DestinationGroup {
+    started: Instant,
+    observations: Result<std::vec::IntoIter<Observation>, String>,
+}
+
+impl DestinationGroup {
+    fn next(&mut self, plan: &Plan, shared: &Shared) -> Result<SocketAddrV4, String> {
+        let observation = match &mut self.observations {
+            Ok(observations) => observations
+                .next()
+                .ok_or_else(|| "query_transport_incomplete_group".to_owned()),
+            Err(error) => Err(error.clone()),
+        };
+        finish_observation(plan, "udp", self.started, observation, shared)
+    }
+}
+
+fn destination_group(plan: &Plan, keys: &[Lookup], shared: &Shared) -> DestinationGroup {
+    let started = Instant::now();
+    let receiver = if shared.is_stopping()
+        || keys
+            .iter()
+            .any(|key| key.peer.ip() != &plan.guest || key.peer.port() == 0)
+    {
+        Err("unauthorized ingress peer or stopped ingress".into())
+    } else {
+        lock(&shared.bridge)
+            .as_ref()
+            .ok_or_else(|| "query_transport_closed: metadata bridge is closed".to_owned())
+            .and_then(|lane| lane.submit_group(keys))
+    };
+    let observations = receiver
+        .and_then(|rx| {
+            rx.recv()
+                .map_err(|_| "query_transport_dispatch_closed".to_owned())
+        })
+        .and_then(|observations| {
+            if observations.len() == keys.len() {
+                Ok(observations.into_iter())
+            } else {
+                Err("query_transport_incomplete_group".to_owned())
+            }
+        });
+    DestinationGroup {
+        started,
+        observations,
+    }
+}
+
+fn finish_observation(
+    plan: &Plan,
+    protocol: &str,
+    started: Instant,
+    observation: Result<Observation, String>,
+    shared: &Shared,
+) -> Result<SocketAddrV4, String> {
+    let result = observation
+        .and_then(|obs| {
+            lock(&shared.timing).observe(
+                obs.started.saturating_duration_since(started),
+                obs.elapsed,
+                obs.batch,
+                obs.guest_us,
+            );
+            obs.origin
+        })
+        .and_then(|origin| {
+            let ip = *origin.ip();
+            if shared.is_stopping()
+                || origin == plan.ingress
+                || origin.port() == 0
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_broadcast()
+                || (plan.system_dns.is_none() && !plan.origins.contains(&origin))
+            {
+                Err("origin lookup is no longer authorized".into())
+            } else {
+                Ok(origin)
+            }
+        });
     shared.record_metadata(protocol, &result);
     result
 }
@@ -413,17 +539,17 @@ enum Route {
 
 // This runs only after the kernel metadata bridge has authorized the peer and
 // original endpoint. DNS aliases are never inferred from application payloads.
-fn route(
+fn route_details(
     plan: &Plan,
     runtime: Option<&crate::m2::Runtime>,
     protocol: &str,
     original: SocketAddrV4,
-) -> Result<Route, String> {
+) -> Result<(Route, &'static str), String> {
     let Some(runtime) = runtime else {
-        return Ok(Route::Direct(original));
+        return Ok((Route::Direct(original), "enumerated_origin"));
     };
     if plan.system_dns == Some(*original.ip()) && original.port() == 53 {
-        return Ok(Route::Dns);
+        return Ok((Route::Dns, "system_dns"));
     }
     if original.port() == 53 {
         return Err("alternate plaintext DNS destination rejected".into());
@@ -439,13 +565,24 @@ fn route(
     if actual == plan.ingress || runtime.policy.is_reserved_endpoint(actual) {
         return Err("reserved resolved business endpoint rejected".into());
     }
-    if alias.is_some() || runtime.policy.allows_ip(*actual.ip()) {
-        Ok(Route::Direct(actual))
+    if alias.is_some() {
+        Ok((Route::Direct(actual), "domain_alias"))
+    } else if runtime.policy.allows_ip(*actual.ip()) {
+        Ok((Route::Direct(actual), "ip_or_cidr"))
     } else if protocol == "tcp" {
-        Ok(Route::Chain)
+        Ok((Route::Chain, "default_chain"))
     } else {
         Err("non-whitelisted UDP rejected: two-hop UDP is unavailable".into())
     }
+}
+
+fn route(
+    plan: &Plan,
+    runtime: Option<&crate::m2::Runtime>,
+    protocol: &str,
+    original: SocketAddrV4,
+) -> Result<Route, String> {
+    route_details(plan, runtime, protocol, original).map(|(route, _)| route)
 }
 
 fn select_route(
@@ -453,9 +590,23 @@ fn select_route(
     runtime: Option<&crate::m2::Runtime>,
     protocol: &str,
     original: SocketAddrV4,
+    flow: &Flow,
     shared: &Shared,
 ) -> Result<Route, String> {
-    let result = route(plan, runtime, protocol, original);
+    let result = route_details(plan, runtime, protocol, original).map(|(route, reason)| {
+        flow.selected(
+            match route {
+                Route::Dns => "dns",
+                Route::Direct(_) => "direct",
+                Route::Chain => "chain",
+            },
+            reason,
+        );
+        route
+    });
+    if result.is_err() {
+        flow.failed();
+    }
     let mut counters = lock(&shared.counters);
     let counter = match (&result, protocol) {
         (Ok(Route::Dns), "tcp") => &mut counters.dns_tcp,
@@ -485,11 +636,12 @@ fn run(
         shared: Arc::clone(&shared),
         handles: Vec::with_capacity(MAX_DNS_UDP),
     };
-    let mut flows: HashMap<SocketAddrV4, UdpFlow> = HashMap::new();
-    // One reusable buffer holds every legal IPv4 UDP payload, including an empty
-    // datagram. UDP receive length zero is data, never an EOF indication.
-    let mut datagram = [0u8; 65_535];
+    let mut flows: BTreeMap<SocketAddrV4, UdpFlow> = BTreeMap::new();
+    let mut pump = UdpPump::new();
+    let mut pending = Vec::with_capacity(UDP_BATCH);
+    let mut keys = Vec::with_capacity(UDP_BATCH);
     while !shared.is_stopping() {
+        let mut made_progress = false;
         workers.reap()?;
         dns_workers.reap()?;
         for _ in 0..ACCEPT_BATCH {
@@ -497,7 +649,10 @@ fn run(
                 break;
             }
             let client = match listener.accept() {
-                Ok((client, _)) => client,
+                Ok((client, _)) => {
+                    made_progress = true;
+                    client
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) if transient(&error) => continue,
                 Err(error) => return Err(format!("TCP ingress accept failed: {error}")),
@@ -515,30 +670,51 @@ fn run(
             let plan = Arc::clone(&plan);
             let worker_shared = Arc::clone(&shared);
             let runtime = runtime.clone();
+            let spawn_failure = registration.flow.failure_marker();
             let worker = thread::Builder::new()
                 .name("m1-tcp".into())
                 .spawn(move || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         forward_tcp(&plan, client, &registration, runtime.as_deref())
                     }));
+                    if worker_shared.is_stopping() {
+                        registration.flow.stopped();
+                    }
                     match result {
-                        Ok(Err(error)) if !worker_shared.is_stopping() => {
-                            worker_shared.record_error("tcp", error);
+                        Ok(Err(error)) => {
+                            if !worker_shared.is_stopping() {
+                                registration.flow.failed();
+                                worker_shared.record_error("tcp", error);
+                            }
                         }
-                        Err(_) => worker_shared.fail("TCP forwarding worker panicked".into()),
+                        Err(_) => {
+                            registration.flow.failed();
+                            worker_shared.fail("TCP forwarding worker panicked".into());
+                        }
                         _ => {}
                     }
                 })
-                .map_err(|e| format!("start TCP forwarding worker: {e}"))?;
+                .map_err(|e| {
+                    spawn_failure.failed();
+                    format!("start TCP forwarding worker: {e}")
+                })?;
             workers.handles.push(worker);
         }
-        for _ in 0..UDP_BATCH {
+        keys.clear();
+        for (slot, buffer) in pump.buffers.iter_mut().enumerate() {
             if shared.is_stopping() {
                 break;
             }
-            let (size, peer) = match udp.recv_from(&mut datagram) {
-                Ok((size, SocketAddr::V4(peer))) if peer.ip() == &plan.guest => (size, peer),
-                Ok(_) => continue,
+            let (size, peer) = match udp.recv_from(buffer) {
+                Ok((size, SocketAddr::V4(peer)))
+                    if peer.ip() == &plan.guest && peer.port() != 0 =>
+                {
+                    (size, peer)
+                }
+                Ok(_) => {
+                    made_progress = true;
+                    continue;
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 // Windows can report ICMP from a guest that sent then closed its
                 // UDP socket on this unconnected listener's next receive.
@@ -549,61 +725,104 @@ fn run(
                 }
                 Err(error) => return Err(format!("UDP ingress receive failed: {error}")),
             };
-            let origin = match destination(&plan, "udp", peer, &shared) {
+            made_progress = true;
+            pending.push((slot, size, peer));
+            keys.push(Lookup {
+                protocol: "udp",
+                peer,
+            });
+        }
+        let mut observations =
+            (!pending.is_empty()).then(|| destination_group(&plan, &keys, &shared));
+        for (slot, size, peer) in pending.drain(..) {
+            let datagram = &pump.buffers[slot];
+            let origin = match observations
+                .as_mut()
+                .expect("received UDP group")
+                .next(&plan, &shared)
+            {
                 Ok(origin) => origin,
                 Err(error) => {
+                    if let Some(flow) = flows.remove(&peer) {
+                        flow.stats.stage("metadata");
+                        flow.stats.failed();
+                    } else {
+                        shared.flows.begin("udp").failed();
+                    }
                     shared.record_error("udp", error);
-                    flows.remove(&peer);
                     continue;
                 }
             };
-            let target = match select_route(&plan, runtime.as_deref(), "udp", origin, &shared) {
-                Ok(Route::Direct(target)) => target,
-                Ok(Route::Dns) => {
-                    flows.remove(&peer);
-                    let runtime = runtime.as_ref().expect("DNS route requires M2 runtime");
-                    if dns_workers.handles.len() >= MAX_DNS_UDP {
-                        let mut counters = lock(&shared.counters);
-                        counters.dns_udp_capacity_rejections =
-                            counters.dns_udp_capacity_rejections.saturating_add(1);
-                        counters.last_error = Some("UDP DNS worker capacity reached".into());
+            let mut new_stats = if flows.get(&peer).is_some_and(|flow| flow.origin == origin) {
+                None
+            } else {
+                flows.remove(&peer);
+                let stats = shared.flows.begin("udp");
+                stats.destination(origin);
+                Some(stats)
+            };
+            let stats = new_stats.as_ref().unwrap_or_else(|| &flows[&peer].stats);
+            stats.stage("policy");
+            let target =
+                match select_route(&plan, runtime.as_deref(), "udp", origin, stats, &shared) {
+                    Ok(Route::Direct(target)) => target,
+                    Ok(Route::Dns) => {
+                        stats.stage("dns");
+                        let runtime = runtime.as_ref().expect("DNS route requires M2 runtime");
+                        if dns_workers.handles.len() >= MAX_DNS_UDP {
+                            stats.failed();
+                            let mut counters = lock(&shared.counters);
+                            counters.dns_udp_capacity_rejections =
+                                counters.dns_udp_capacity_rejections.saturating_add(1);
+                            counters.last_error = Some("UDP DNS worker capacity reached".into());
+                            continue;
+                        }
+                        schedule_dns_udp(
+                            &plan,
+                            runtime,
+                            &udp,
+                            (origin, peer),
+                            &datagram[..size],
+                            new_stats.expect("DNS is never a retained direct UDP flow"),
+                            &mut dns_workers,
+                        )?;
                         continue;
                     }
-                    schedule_dns_udp(
-                        &plan,
-                        runtime,
-                        &udp,
-                        peer,
-                        origin,
-                        &datagram[..size],
-                        &mut dns_workers,
-                    )?;
-                    continue;
-                }
-                Ok(Route::Chain) => {
-                    // There is no authenticated two-hop UDP implementation.
-                    // Never reinterpret a missing UDP transport as direct access.
-                    flows.remove(&peer);
-                    shared.record_error("udp", "UDP chain transport unavailable".into());
-                    continue;
-                }
-                Err(error) => {
-                    flows.remove(&peer);
-                    shared.record_error("udp", error);
-                    continue;
-                }
-            };
+                    Ok(Route::Chain) => {
+                        // There is no authenticated two-hop UDP implementation.
+                        stats.failed();
+                        flows.remove(&peer);
+                        shared.record_error("udp", "UDP chain transport unavailable".into());
+                        continue;
+                    }
+                    Err(error) => {
+                        flows.remove(&peer);
+                        shared.record_error("udp", error);
+                        continue;
+                    }
+                };
             if flows
                 .get(&peer)
                 .is_some_and(|flow| flow.origin != origin || flow.target != target)
+                && let Some(previous) = flows.remove(&peer)
             {
-                flows.remove(&peer);
+                new_stats = Some(previous.stats);
             }
             if !flows.contains_key(&peer) {
-                if flows.len() >= MAX_UDP || shared.is_stopping() {
+                if shared.is_stopping() || !admit_udp(&mut flows, &shared, Instant::now()) {
+                    if let Some(stats) = &new_stats {
+                        if shared.is_stopping() {
+                            stats.stopped();
+                        } else {
+                            stats.stage("connect");
+                            stats.failed();
+                        }
+                    }
                     continue;
                 }
-                let flow = match UdpFlow::connect(origin, target) {
+                let stats = new_stats.expect("new UDP mapping has an accounting record");
+                stats.stage("connect");
+                let flow = match UdpFlow::connect(origin, target, stats) {
                     Ok(flow) => flow,
                     Err(error) => {
                         shared.record_error("udp", format!("create origin socket: {error}"));
@@ -618,65 +837,40 @@ fn run(
                 break;
             }
             let flow = flows.get_mut(&peer).expect("UDP flow was just selected");
+            flow.stats.stage("relay");
             match flow.socket.send(&datagram[..size]) {
-                Ok(sent) if sent == size => flow.touched = Instant::now(),
+                Ok(sent) if sent == size => {
+                    flow.stats.tx(sent);
+                    flow.activity.sent(Instant::now());
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 result => {
+                    flow.stats.failed();
                     shared.record_error("udp", format!("origin send failed: {result:?}"));
                     flows.remove(&peer);
                 }
             }
         }
-        flows.retain(|peer, flow| {
-            if shared.is_stopping() || flow.touched.elapsed() >= UDP_IDLE_TIMEOUT {
-                return false;
-            }
-            for _ in 0..UDP_REPLY_BATCH {
-                if shared.is_stopping() {
-                    return false;
-                }
-                let size = match flow.socket.recv(&mut datagram) {
-                    Ok(size) => size,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(error) => {
-                        shared.record_error("udp", format!("origin receive failed: {error}"));
-                        return false;
-                    }
-                };
-                match destination(&plan, "udp", *peer, &shared) {
-                    Ok(origin) if origin == flow.origin => {}
-                    Ok(_) => {
-                        shared.record_error("udp", "UDP mapping changed before reply".into());
-                        return false;
-                    }
-                    Err(error) => {
-                        shared.record_error("udp", error);
-                        return false;
-                    }
-                }
-                match route(&plan, runtime.as_deref(), "udp", flow.origin) {
-                    Ok(Route::Direct(target)) if target == flow.target => {}
-                    _ => {
-                        shared.record_error("udp", "UDP route expired before reply".into());
-                        return false;
-                    }
-                }
-                if shared.is_stopping() {
-                    return false;
-                }
-                match udp.send_to(&datagram[..size], *peer) {
-                    Ok(sent) if sent == size => flow.touched = Instant::now(),
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                    result => {
-                        shared.record_error("udp", format!("guest send failed: {result:?}"));
-                        return false;
-                    }
-                }
-            }
-            true
-        });
-        thread::sleep(POLL_INTERVAL);
+        made_progress |= pump.collect(&mut flows, &shared);
+        if !pump.is_empty() {
+            keys.clear();
+            keys.extend(pump.keys());
+            let observations = destination_group(&plan, &keys, &shared);
+            pump.forward(
+                &plan,
+                runtime.as_deref(),
+                &udp,
+                &mut flows,
+                observations,
+                &shared,
+            );
+        }
+        if !made_progress && !shared.is_stopping() {
+            udp_pump::wait(&listener, &udp, &mut flows, &shared)?;
+        }
+    }
+    for flow in flows.values() {
+        flow.stats.stopped();
     }
     Ok(())
 }
@@ -696,20 +890,23 @@ fn schedule_dns_udp(
     plan: &Arc<Plan>,
     runtime: &Arc<crate::m2::Runtime>,
     udp: &UdpSocket,
-    peer: SocketAddrV4,
-    original: SocketAddrV4,
+    (original, peer): (SocketAddrV4, SocketAddrV4),
     request: &[u8],
+    stats: Flow,
     workers: &mut TcpWorkers,
 ) -> Result<(), String> {
-    let socket = udp
-        .try_clone()
-        .map_err(|_| "retain DNS UDP reply socket".to_string())?;
+    let socket = udp.try_clone().map_err(|_| {
+        stats.failed();
+        "retain DNS UDP reply socket".to_string()
+    })?;
     let plan = Arc::clone(plan);
     let runtime = Arc::clone(runtime);
     let request = request.to_vec();
     let shared = Arc::clone(&workers.shared);
     shared.dns_udp_active.fetch_add(1, Ordering::AcqRel);
     let slot = DnsUdpSlot(Arc::clone(&shared));
+    stats.tx(request.len());
+    let spawn_failure = stats.failure_marker();
     let worker = thread::Builder::new()
         .name("m2-dns-udp".into())
         .spawn(move || {
@@ -722,6 +919,7 @@ fn schedule_dns_udp(
                     .dns
                     .answer(&request)
                     .map_err(|_| "managed UDP DNS answer failed".to_string())?;
+                stats.stage("metadata");
                 if destination(&plan, "udp", peer, &shared)? != original
                     || route(&plan, Some(&runtime), "udp", original)? != Route::Dns
                 {
@@ -730,18 +928,26 @@ fn schedule_dns_udp(
                 if shared.is_stopping() {
                     return Ok(());
                 }
+                stats.stage("dns");
                 match socket.send_to(&answer, peer) {
-                    Ok(size) if size == answer.len() => Ok(()),
+                    Ok(size) if size == answer.len() => {
+                        stats.rx(size);
+                        Ok(())
+                    }
                     _ => Err("managed UDP DNS reply failed".into()),
                 }
             })();
-            if let Err(error) = result
-                && !shared.is_stopping()
-            {
+            if shared.is_stopping() {
+                stats.stopped();
+            } else if let Err(error) = result {
+                stats.failed();
                 shared.record_error("udp", error);
             }
         })
-        .map_err(|_| "start managed UDP DNS worker".to_string())?;
+        .map_err(|_| {
+            spawn_failure.failed();
+            "start managed UDP DNS worker".to_string()
+        })?;
     workers.handles.push(worker);
     Ok(())
 }
@@ -785,6 +991,10 @@ fn serve_dns_tcp(
     client
         .set_write_timeout(Some(CONNECT_TIMEOUT))
         .map_err(|_| "configure TCP DNS write deadline".to_string())?;
+    let mut client = Metered {
+        inner: &mut client,
+        flow: &registration.flow,
+    };
     let mut request = Vec::new();
     while !shared.is_stopping() {
         if !read_dns_query(&mut client, &mut request)? {
@@ -815,24 +1025,118 @@ fn serve_dns_tcp(
     Ok(())
 }
 
+fn record_udp_retirement(flow: &UdpFlow, reason: UdpRetirement, shared: &Shared) {
+    let mut counters = lock(&shared.counters);
+    match reason {
+        UdpRetirement::Idle => {
+            counters.udp_idle_expirations = counters.udp_idle_expirations.saturating_add(1);
+            if flow.activity.has_response_debt() {
+                counters.udp_idle_with_response_debt =
+                    counters.udp_idle_with_response_debt.saturating_add(1);
+            }
+        }
+        UdpRetirement::Quiet => {
+            counters.udp_quiet_reclaims = counters.udp_quiet_reclaims.saturating_add(1);
+        }
+    }
+}
+
+fn admit_udp(flows: &mut BTreeMap<SocketAddrV4, UdpFlow>, shared: &Shared, now: Instant) -> bool {
+    if flows.len() < MAX_UDP {
+        return true;
+    }
+    // At most MAX_UDP entries are inspected, without probing receive queues or
+    // allocating a candidate list. Endpoint order breaks timestamp ties so the
+    // victim is deterministic even when multiple flows have the same activity.
+    let victim = flows
+        .iter()
+        .filter_map(|(peer, flow)| {
+            flow.activity
+                .reclaimable(now)
+                .map(|reason| (reason.priority(), flow.activity.touched(), *peer, reason))
+        })
+        .min_by_key(|(priority, touched, peer, _)| (*priority, *touched, *peer));
+    if let Some((_, _, peer, reason)) = victim {
+        let flow = flows.remove(&peer).expect("UDP admission victim exists");
+        record_udp_retirement(&flow, reason, shared);
+        // Dropping both socket and its accounting owner precedes replacement;
+        // never retarget a socket that could still receive an old-origin reply.
+        drop(flow);
+        return true;
+    }
+    {
+        let mut counters = lock(&shared.counters);
+        counters.udp_capacity_rejections = counters.udp_capacity_rejections.saturating_add(1);
+    }
+    shared.record_error("udp", "UDP flow capacity reached: all mappings busy".into());
+    false
+}
+
 struct UdpFlow {
+    generation: u64,
     origin: SocketAddrV4,
     target: SocketAddrV4,
     socket: UdpSocket,
-    touched: Instant,
+    activity: UdpActivity,
+    stats: Flow,
 }
 
 impl UdpFlow {
-    fn connect(origin: SocketAddrV4, target: SocketAddrV4) -> io::Result<Self> {
-        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-        socket.set_nonblocking(true)?;
-        socket.connect(target)?;
+    fn connect(origin: SocketAddrV4, target: SocketAddrV4, stats: Flow) -> io::Result<Self> {
+        let result: io::Result<UdpSocket> = (|| {
+            let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+            socket.set_nonblocking(true)?;
+            socket.connect(target)?;
+            Ok(socket)
+        })();
+        if result.is_err() {
+            stats.failed();
+        }
+        let socket = result?;
+        stats.stage("relay");
         Ok(Self {
+            generation: next_udp_generation(),
             origin,
             target,
             socket,
-            touched: Instant::now(),
+            activity: UdpActivity::new(Instant::now()),
+            stats,
         })
+    }
+}
+
+fn next_udp_generation() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        value.checked_add(1)
+    })
+    .expect("UDP flow generation exhausted")
+}
+
+/// DNS terminates locally; count actual reads/writes, including partial framing,
+/// without retaining the DNS question or changing frame handling.
+struct Metered<'a, T> {
+    inner: &'a mut T,
+    flow: &'a Flow,
+}
+
+impl<T: Read> Read for Metered<'_, T> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let size = self.inner.read(buffer)?;
+        self.flow.tx(size);
+        Ok(size)
+    }
+}
+
+impl<T: Write> Write for Metered<'_, T> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let size = self.inner.write(buffer)?;
+        self.flow.rx(size);
+        Ok(size)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -843,9 +1147,12 @@ fn forward_tcp(
     runtime: Option<&crate::m2::Runtime>,
 ) -> Result<(), String> {
     let shared = &registration.shared;
+    let flow = &registration.flow;
     let origin = destination(plan, "tcp", registration.peer, shared)?;
-    let selected = select_route(plan, runtime, "tcp", origin, shared)?;
+    flow.destination(origin);
+    let selected = select_route(plan, runtime, "tcp", origin, flow, shared)?;
     if selected == Route::Dns {
+        flow.stage("dns");
         return serve_dns_tcp(
             plan,
             runtime.expect("DNS route requires M2 runtime"),
@@ -857,6 +1164,7 @@ fn forward_tcp(
     if shared.is_stopping() {
         return Ok(());
     }
+    flow.stage("connect");
     let upstream = match selected {
         Route::Direct(target) => {
             TcpStream::connect_timeout(&SocketAddr::V4(target), CONNECT_TIMEOUT)
@@ -870,13 +1178,15 @@ fn forward_tcp(
         Route::Dns => unreachable!("DNS handled internally"),
     };
     registration.attach_origin(&upstream)?;
+    flow.stage("metadata");
     if client.peer_addr().ok() != Some(SocketAddr::V4(registration.peer))
         || destination(plan, "tcp", registration.peer, shared)? != origin
         || route(plan, runtime, "tcp", origin)? != selected
     {
         return Err("TCP mapping changed while connecting to origin".into());
     }
-    relay(client, upstream, shared).map_err(|e| format!("relay: {e}"))
+    flow.stage("relay");
+    relay(client, upstream, shared, flow).map_err(|e| format!("relay: {e}"))
 }
 
 fn transient(error: &io::Error) -> bool {
@@ -905,7 +1215,13 @@ impl Pipe {
         }
     }
 
-    fn pump(&mut self, source: &mut TcpStream, target: &mut TcpStream) -> io::Result<bool> {
+    fn pump(
+        &mut self,
+        source: &mut TcpStream,
+        target: &mut TcpStream,
+        flow: &Flow,
+        upload: bool,
+    ) -> io::Result<bool> {
         let mut progressed = false;
         if self.start == self.end && !self.eof {
             match source.read(&mut self.buffer) {
@@ -928,6 +1244,11 @@ impl Pipe {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                 Ok(size) => {
                     self.start += size;
+                    if upload {
+                        flow.tx(size);
+                    } else {
+                        flow.rx(size);
+                    }
                     progressed = true;
                 }
                 Err(error)
@@ -947,7 +1268,12 @@ impl Pipe {
     }
 }
 
-fn relay(mut client: TcpStream, mut upstream: TcpStream, shared: &Shared) -> io::Result<()> {
+fn relay(
+    mut client: TcpStream,
+    mut upstream: TcpStream,
+    shared: &Shared,
+    flow: &Flow,
+) -> io::Result<()> {
     client.set_nonblocking(true)?;
     upstream.set_nonblocking(true)?;
     let mut request = Pipe::new();
@@ -955,11 +1281,11 @@ fn relay(mut client: TcpStream, mut upstream: TcpStream, shared: &Shared) -> io:
     let mut touched = Instant::now();
     let mut half_closed = None;
     while !shared.is_stopping() {
-        let mut progressed = request.pump(&mut client, &mut upstream)?;
+        let mut progressed = request.pump(&mut client, &mut upstream, flow, true)?;
         if shared.is_stopping() {
             break;
         }
-        progressed |= response.pump(&mut upstream, &mut client)?;
+        progressed |= response.pump(&mut upstream, &mut client, flow, false)?;
         if request.shutdown && response.shutdown {
             return Ok(());
         }
@@ -1013,7 +1339,15 @@ mod tests {
         let (upstream, mut origin) = tcp_pair();
         let shared = Arc::new(Shared::new());
         let relay_shared = Arc::clone(&shared);
-        let worker = thread::spawn(move || relay(ingress, upstream, &relay_shared));
+        let flow = shared.flows.begin("tcp");
+        let destination = match upstream.peer_addr().unwrap() {
+            SocketAddr::V4(address) => address,
+            _ => unreachable!(),
+        };
+        flow.destination(destination);
+        flow.selected("direct", "enumerated_origin");
+        flow.stage("relay");
+        let worker = thread::spawn(move || relay(ingress, upstream, &relay_shared, &flow));
 
         // The server speaks first, while the client's write half remains open.
         origin.write_all(b"greeting").unwrap();
@@ -1032,6 +1366,76 @@ mod tests {
         client.read_to_end(&mut response).unwrap();
         assert_eq!(response, b"after client EOF");
         worker.join().unwrap().unwrap();
+        let ingress = Ingress {
+            shared,
+            worker: None,
+        };
+        let diagnostics = ingress.diagnostics();
+        let traffic = &diagnostics["traffic"];
+        assert_eq!(traffic["tx_bytes"], request.len() as u64);
+        assert_eq!(traffic["rx_bytes"], 24);
+        let row = &diagnostics["connections"]["recent"][0];
+        assert_eq!(row["destination"], destination.to_string());
+        assert_eq!(row["route"], "direct");
+        assert_eq!(row["status"], "completed");
+        assert_eq!(row["tx_bytes"], request.len() as u64);
+        assert_eq!(row["rx_bytes"], 24);
+        assert!(
+            diagnostics["connections"]["active"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn dns_metering_counts_partial_transport_without_retaining_questions() {
+        struct ShortWriter {
+            written: usize,
+        }
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.written == 3 {
+                    return Err(io::ErrorKind::BrokenPipe.into());
+                }
+                let size = bytes.len().min(3 - self.written);
+                self.written += size;
+                Ok(size)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let shared = Arc::new(Shared::new());
+        let flow = shared.flows.begin("tcp");
+        flow.destination("192.0.2.53:53".parse().unwrap());
+        flow.selected("dns", "system_dns");
+        flow.stage("dns");
+        let mut input = io::Cursor::new([0, 12, 1]);
+        let mut metered = Metered {
+            inner: &mut input,
+            flow: &flow,
+        };
+        assert!(read_dns_query(&mut metered, &mut Vec::new()).is_err());
+        let mut output = ShortWriter { written: 0 };
+        let mut metered = Metered {
+            inner: &mut output,
+            flow: &flow,
+        };
+        assert!(metered.write_all(&[1; 5]).is_err());
+        flow.failed();
+        drop(flow);
+        let ingress = Ingress {
+            shared,
+            worker: None,
+        };
+        let diagnostics = ingress.diagnostics();
+        assert_eq!(diagnostics["traffic"]["tx_bytes"], 3);
+        assert_eq!(diagnostics["traffic"]["rx_bytes"], 3);
+        assert_eq!(
+            diagnostics["connections"]["recent"][0]["failure_stage"],
+            "dns"
+        );
     }
 
     #[test]
@@ -1046,10 +1450,8 @@ mod tests {
         let registration = shared.register(peer, &ingress).unwrap().unwrap();
         registration.attach_origin(&upstream).unwrap();
         let relay_shared = Arc::clone(&shared);
-        let worker = thread::spawn(move || {
-            let _registration = registration;
-            relay(ingress, upstream, &relay_shared)
-        });
+        let worker =
+            thread::spawn(move || relay(ingress, upstream, &relay_shared, &registration.flow));
         shared.request_stop();
         // Repeated stops do not re-register or detach anything.
         shared.request_stop();
@@ -1072,6 +1474,164 @@ mod tests {
         assert!(shared.register(peer, &ingress).unwrap().is_none());
     }
 
+    fn udp_table_peer(index: usize) -> SocketAddrV4 {
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 20_000 + index as u16)
+    }
+
+    fn full_udp_table(
+        shared: &Shared,
+        now: Instant,
+        answered: bool,
+    ) -> (UdpSocket, BTreeMap<SocketAddrV4, UdpFlow>) {
+        let origin = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        origin
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let SocketAddr::V4(address) = origin.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let mut flows = BTreeMap::new();
+        for index in 0..MAX_UDP {
+            let stats = shared.flows.begin("udp");
+            stats.destination(address);
+            stats.selected("direct", "enumerated_origin");
+            let mut flow = UdpFlow::connect(address, address, stats).unwrap();
+            for _ in 0..if answered { 2 } else { 1 } {
+                assert_eq!(flow.socket.send(b"x").unwrap(), 1);
+                flow.stats.tx(1);
+                flow.activity.sent(now);
+                let mut byte = [0];
+                let (size, source) = origin.recv_from(&mut byte).unwrap();
+                assert_eq!(size, 1);
+                if answered {
+                    origin.send_to(&byte, source).unwrap();
+                    flow.socket.set_nonblocking(false).unwrap();
+                    flow.socket
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    assert_eq!(flow.socket.recv(&mut byte).unwrap(), 1);
+                    flow.socket.set_nonblocking(true).unwrap();
+                    flow.stats.rx(1);
+                    flow.activity.replied(now);
+                }
+            }
+            flows.insert(udp_table_peer(index), flow);
+        }
+        (origin, flows)
+    }
+
+    #[test]
+    fn udp_full_table_reclaims_completed_reused_lru_without_touching_inflight() {
+        let shared = Shared::new();
+        let now = Instant::now();
+        let (origin, mut flows) = full_udp_table(&shared, now, true);
+        // The oldest socket is reused again and becomes genuinely busy. The
+        // next two have identical activity, so endpoint order breaks the tie.
+        let busy = flows.get_mut(&udp_table_peer(0)).unwrap();
+        assert_eq!(busy.socket.send(b"busy").unwrap(), 4);
+        busy.stats.tx(4);
+        busy.activity.sent(now);
+        let mut packet = [0; 8];
+        assert_eq!(origin.recv_from(&mut packet).unwrap().0, 4);
+        for index in 3..MAX_UDP {
+            let flow = flows.get_mut(&udp_table_peer(index)).unwrap();
+            flow.activity.sent(now + Duration::from_millis(1));
+            flow.activity.replied(now + Duration::from_millis(1));
+        }
+        assert!(admit_udp(&mut flows, &shared, now + Duration::from_secs(1)));
+        assert_eq!(flows.len(), MAX_UDP - 1);
+        assert!(flows.contains_key(&udp_table_peer(0)));
+        assert!(!flows.contains_key(&udp_table_peer(1)));
+        assert!(flows.contains_key(&udp_table_peer(2)));
+        let replacement_peer = udp_table_peer(MAX_UDP);
+        let SocketAddr::V4(address) = origin.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let mut replacement =
+            UdpFlow::connect(address, address, shared.flows.begin("udp")).unwrap();
+        assert_eq!(replacement.socket.send(b"new").unwrap(), 3);
+        replacement.stats.tx(3);
+        replacement.activity.sent(now + Duration::from_secs(1));
+        assert_eq!(origin.recv_from(&mut packet).unwrap().0, 3);
+        flows.insert(replacement_peer, replacement);
+        assert_eq!(flows.len(), MAX_UDP);
+        assert!(admit_udp(&mut flows, &shared, now + Duration::from_secs(1)));
+        assert!(flows.contains_key(&replacement_peer));
+        assert!(flows.contains_key(&udp_table_peer(0)));
+        assert!(!flows.contains_key(&udp_table_peer(2)));
+        let counters = lock(&shared.counters);
+        assert_eq!(counters.udp_quiet_reclaims, 2);
+        assert_eq!(counters.udp_capacity_rejections, 0);
+        assert_eq!(counters.udp_failures, 0);
+    }
+
+    #[test]
+    fn udp_full_table_rejects_when_every_real_exchange_is_unanswered() {
+        let shared = Shared::new();
+        let now = Instant::now();
+        let (_origin, mut flows) = full_udp_table(&shared, now, false);
+        let mut byte = [0];
+        for flow in flows.values() {
+            assert_eq!(
+                flow.socket.recv(&mut byte).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+        // Empty receive queues must not turn the 128 in-flight sends into
+        // eviction candidates. No extra socket or accounting owner is retained.
+        assert!(!admit_udp(
+            &mut flows,
+            &shared,
+            now + Duration::from_secs(1)
+        ));
+        assert_eq!(flows.len(), MAX_UDP);
+        let counters = lock(&shared.counters);
+        assert_eq!(counters.udp_capacity_rejections, 1);
+        assert_eq!(counters.udp_quiet_reclaims, 0);
+        assert_eq!(counters.udp_idle_expirations, 0);
+        assert_eq!(counters.udp_failures, 1);
+        assert_eq!(
+            counters.last_error.as_deref(),
+            Some("UDP flow capacity reached: all mappings busy")
+        );
+    }
+
+    #[test]
+    fn udp_pressure_prefers_long_idle_unanswered_flow_and_accounts_once() {
+        let shared = Shared::new();
+        let now = Instant::now();
+        let (_origin, mut flows) = full_udp_table(&shared, now, true);
+        let idle_peer = udp_table_peer(7);
+        flows.get_mut(&idle_peer).unwrap().activity.sent(now);
+        for (peer, flow) in &mut flows {
+            if *peer != idle_peer {
+                flow.activity.sent(now + Duration::from_secs(2));
+                flow.activity.replied(now + Duration::from_secs(2));
+            }
+        }
+        assert!(admit_udp(
+            &mut flows,
+            &shared,
+            now + Duration::from_secs(31)
+        ));
+        assert!(!flows.contains_key(&idle_peer));
+        assert_eq!(flows.len(), MAX_UDP - 1);
+        // Admission below capacity does not shorten anyone's ordinary lease.
+        assert!(admit_udp(
+            &mut flows,
+            &shared,
+            now + Duration::from_secs(31)
+        ));
+        assert_eq!(flows.len(), MAX_UDP - 1);
+        let counters = lock(&shared.counters);
+        assert_eq!(counters.udp_idle_expirations, 1);
+        assert_eq!(counters.udp_idle_with_response_debt, 1);
+        assert_eq!(counters.udp_quiet_reclaims, 0);
+        // Response debt is observational, not an application timeout: legitimate
+        // fire-and-forget UDP does not become a transport failure at idle expiry.
+        assert_eq!(counters.udp_failures, 0);
+    }
+
     #[test]
     fn udp_flow_keeps_source_for_multiple_and_empty_datagrams() {
         let origin = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -1082,7 +1642,8 @@ mod tests {
             SocketAddr::V4(address) => address,
             _ => unreachable!(),
         };
-        let flow = UdpFlow::connect(address, address).unwrap();
+        let stats = Arc::new(FlowStats::new());
+        let flow = UdpFlow::connect(address, address, stats.begin("udp")).unwrap();
         let mut source = None;
         let mut buffer = [0; 32];
         for message in [b"first".as_slice(), b"".as_slice(), b"third".as_slice()] {
@@ -1139,6 +1700,38 @@ mod tests {
         assert_eq!(counters.metadata_successes, 0);
         assert!(!shared.is_stopping());
         assert!(lock(&shared.failure).is_none());
+        drop(counters);
+
+        let origin = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let SocketAddr::V4(target) = origin.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let mut flow =
+            UdpFlow::connect(plan.origins[0], target, shared.flows.begin("udp")).unwrap();
+        let now = Instant::now();
+        flow.activity.sent(now);
+        for _ in 0..2 {
+            let mut observations = destination_group(
+                &plan,
+                &[Lookup {
+                    protocol: "udp",
+                    peer,
+                }],
+                &shared,
+            );
+            let error = observations.next(&plan, &shared).unwrap_err();
+            assert!(error.starts_with("query_transport_closed:"));
+            // Failed authorization never clears response debt or permits early
+            // pressure reclaim; the production loop also drops this mapping.
+            assert_eq!(
+                flow.activity.reclaimable(now + Duration::from_secs(1)),
+                None
+            );
+        }
+        let counters = lock(&shared.counters);
+        assert_eq!(counters.metadata_queries, 4);
+        assert_eq!(counters.metadata_transport_failures, 4);
+        assert_eq!(counters.metadata_successes, 0);
     }
 
     #[test]

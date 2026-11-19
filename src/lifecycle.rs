@@ -122,9 +122,9 @@ impl Controller {
         if current.pending.is_some() || self.live.is_some() || m1::load()?.is_some() {
             return Err("recover_or_stop_existing_target_first".into());
         }
-        kernel::precheck(&p)?;
+        let window = kernel::precheck(&p)?;
         let record = transition::begin(&current, Kind::Start, None, Some(&p))?;
-        self.activate_and_commit(p, runtime, &record)
+        self.activate_and_commit(p, runtime, &record, window)
     }
     pub fn switch(&mut self, expected: u64, p: Plan, runtime: Arc<Runtime>) -> Result<(), String> {
         let (old, _) = self.switch_source(expected)?;
@@ -140,20 +140,24 @@ impl Controller {
         let record = transition::begin(&current, Kind::Switch, Some(&old), Some(&p))?;
         self.retire(&old)?; // verifies absence, stops old workers and drops per-target runtime
         let restored = transition::advance(&record, Stage::OldRestored)?;
-        if let Err(e) = registered(&p).and_then(|_| kernel::precheck(&p)) {
-            transition::finish(&restored)?;
-            return Err(format!("old_restored_candidate_rejected:{e}"));
-        }
+        let window = match registered(&p).and_then(|_| kernel::precheck(&p)) {
+            Ok(window) => window,
+            Err(e) => {
+                transition::finish(&restored)?;
+                return Err(format!("old_restored_candidate_rejected:{e}"));
+            }
+        };
         let next = transition::advance(&restored, Stage::StartingNew)?;
-        self.activate_and_commit(p, Some(runtime), &next)
+        self.activate_and_commit(p, Some(runtime), &next, window)
     }
     fn activate_and_commit(
         &mut self,
         p: Plan,
         runtime: Option<Arc<Runtime>>,
         record: &Record,
+        window: kernel::GrantWindow,
     ) -> Result<(), String> {
-        let result = self.activate(p, runtime);
+        let result = self.activate(p, runtime, window);
         // If any guest mutation is still possible, activate has kept its owner journal.
         if result.is_ok() || (m1::load()?.is_none() && self.live.is_none()) {
             transition::finish(record)?;

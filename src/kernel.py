@@ -597,19 +597,22 @@ def scalar(values, kind, width, default=None):
 
 
 def parse_tuple(payload, ipv6=False):
-    values = attributes(payload)
+    return parse_tuple_values(attributes(payload), ipv6)
+
+
+def parse_tuple_values(values, ipv6=False):
     require(1 in values and 2 in values, "missing_conntrack_tuple")
     addresses, protocol = attributes(values[1]), attributes(values[2])
     number = scalar(protocol, 1, 1)
     if number not in (6, 17):
         return None
-    source, destination, width, address = (3, 4, 16, ipaddress.IPv6Address) if ipv6 else (1, 2, 4, ipaddress.IPv4Address)
+    source, destination, width = (3, 4, 16) if ipv6 else (1, 2, 4)
     require(source in addresses and destination in addresses and len(addresses[source]) == width and len(addresses[destination]) == width, "invalid_conntrack_tuple_address")
     return (
         number,
-        str(address(addresses[source])),
+        str(ipaddress.IPv6Address(addresses[source])) if ipv6 else socket.inet_ntop(socket.AF_INET, addresses[source]),
         scalar(protocol, 2, 2),
-        str(address(addresses[destination])),
+        str(ipaddress.IPv6Address(addresses[destination])) if ipv6 else socket.inet_ntop(socket.AF_INET, addresses[destination]),
         scalar(protocol, 3, 2),
     )
 
@@ -626,15 +629,19 @@ def parse_entry(payload):
     ipv6 = payload[0] == socket.AF_INET6
     values = attributes(payload[4:])
     require(CTA_ORIG in values and CTA_REPLY in values, "missing_conntrack_directions")
+    original_values = attributes(values[CTA_ORIG])
+    original = parse_tuple_values(original_values, ipv6)
+    reply_values = attributes(values[CTA_REPLY])
+    reply = parse_tuple_values(reply_values, ipv6)
     return {
-        "original": parse_tuple(values[CTA_ORIG], ipv6),
-        "reply": parse_tuple(values[CTA_REPLY], ipv6),
+        "original": original,
+        "reply": reply,
         "mark": scalar(values, CTA_MARK, 4, 0),
         # CTA_ID is an opaque four-byte kernel ID: decoding and re-encoding
         # in the same order preserves it, including on little-endian guests.
         "id": scalar(values, CTA_ID, 4),
         "zone": scalar(values, CTA_ZONE, 2, 0),
-        "tuple_zones": (scalar(attributes(values[CTA_ORIG]), 3, 2, 0), scalar(attributes(values[CTA_REPLY]), 3, 2, 0)),
+        "tuple_zones": (scalar(original_values, 3, 2, 0), scalar(reply_values, 3, 2, 0)),
         "status": scalar(values, CTA_STATUS, 4),
     }
 
@@ -725,42 +732,65 @@ def authorized_origin(p, value):
     return not p["origins"] and (address, port) != endpoint(p["ingress"])
 
 
+class Ownership:
+    def __init__(self, p):
+        self.cookie = p["cookie"]
+        self.guest = p["guest"]
+        self.ingress = endpoint(p["ingress"])
+        self.dns = p.get("system_dns")
+        self.origins = frozenset(p["origins"])
+        # Only immutable plan predicates survive between fresh dumps.
+
+    def owned(self, entry, authorized=None):
+        original, reply = entry["original"], entry["reply"]
+        if original is None or reply is None:
+            return False
+        dns = self.dns is not None and (original[3], original[4]) == (self.dns, 53)
+        if not (
+            entry["mark"] == self.cookie
+            and entry["zone"] == 0
+            and entry["tuple_zones"] == (0, 0)
+            and entry["status"] & 0x128 == 0x128  # CONFIRMED, DST_NAT, DST_NAT_DONE
+            and original[0] == reply[0]
+            and integer(entry["id"], 0, 0xffffffff)
+            and original[0] in (6, 17)
+            and (original[1] == self.guest or (dns and entry["status"] & 0x90 == 0x90))
+            and 1 <= original[2] <= 65535
+            and (reply[1], reply[2]) == self.ingress
+            and reply[3] == self.guest
+            and 1 <= reply[4] <= 65535
+        ):
+            return False
+        origin = f"{original[3]}:{original[4]}"
+        if authorized is None:
+            authorized = {}
+        if origin not in authorized:
+            try:
+                destination = endpoint(origin)
+                authorized[origin] = origin in self.origins if self.dns is None else not self.origins and destination != self.ingress
+            except Failure:
+                authorized[origin] = False
+        return authorized[origin]
+
+    def entries(self, entries):
+        result, originals, replies, authorized = [], set(), set(), {}
+        for entry in entries:
+            if entry["mark"] == self.cookie:
+                require(self.owned(entry, authorized), "instance_mark_has_unproven_mapping")
+                original, reply = entry["original"], entry["reply"]
+                require(original not in originals and reply not in replies, "duplicate_conntrack_mapping")
+                originals.add(original)
+                replies.add(reply)
+                result.append(entry)
+        return result
+
+
 def owned(p, entry):
-    original, reply = entry["original"], entry["reply"]
-    if original is None or reply is None:
-        return False
-    ingress = endpoint(p["ingress"])
-    origin = f"{original[3]}:{original[4]}"
-    dns = p.get("system_dns") is not None and (original[3], original[4]) == (p["system_dns"], 53)
-    try:
-        authorized = authorized_origin(p, origin)
-    except Failure:
-        return False
-    return (
-        entry["mark"] == p["cookie"]
-        and entry["zone"] == 0
-        and entry["tuple_zones"] == (0, 0)
-        and entry["status"] & 0x128 == 0x128  # CONFIRMED, DST_NAT, DST_NAT_DONE
-        and original[0] == reply[0]
-        and integer(entry["id"], 0, 0xffffffff)
-        and original[0] in (6, 17)
-        and (original[1] == p["guest"] or (dns and entry["status"] & 0x90 == 0x90))
-        and 1 <= original[2] <= 65535
-        and authorized
-        and (reply[1], reply[2]) == ingress
-        and reply[3] == p["guest"]
-        and 1 <= reply[4] <= 65535
-    )
+    return Ownership(p).owned(entry)
 
 
 def owned_entries(p, entries):
-    result = []
-    for entry in entries:
-        if entry["mark"] == p["cookie"]:
-            require(owned(p, entry), "instance_mark_has_unproven_mapping")
-            require(not any(old["original"] == entry["original"] or old["reply"] == entry["reply"] for old in result), "duplicate_conntrack_mapping")
-            result.append(entry)
-    return result
+    return Ownership(p).entries(entries)
 
 
 def inspect_mappings(p, ct):
@@ -772,15 +802,48 @@ def inspect_mappings(p, ct):
     return entries
 
 
+class MappingIndex:
+    def __init__(self, prepared, entries):
+        prepared.entries(entries)
+        self.cookie = prepared.cookie
+        self.guest = prepared.guest
+        self.ingress = prepared.ingress
+        self.replies = {}
+        for entry in entries:
+            reply = entry["reply"]
+            if reply is not None:
+                # Include foreign marks and every zone: either can make an
+                # otherwise owned transport candidate ambiguous.
+                self.replies[reply] = None if reply in self.replies else entry
+
+    def resolve(self, protocol, peer):
+        require(protocol in ("tcp", "udp"), "invalid_lookup_protocol")
+        address, port = endpoint(peer)
+        require(address == self.guest, "invalid_lookup_peer")
+        number = 6 if protocol == "tcp" else 17
+        candidate = self.replies.get((number, *self.ingress, address, port))
+        if candidate is None or candidate["mark"] != self.cookie:
+            return None
+        original = candidate["original"]
+        return f"{original[3]}:{original[4]}"
+
+
+def prepare_lookup(p):
+    validate({"operation": "precheck", "plan": p, "protocol": None, "peer": None})
+    return Ownership(p)
+
+
+def resolve_queries(prepared, entries, queries):
+    # Neither the index nor destination-predicate memoization survives this
+    # snapshot. Foreign marks/zones are included in transport ambiguity checks.
+    index = MappingIndex(prepared, entries)
+    return [index.resolve(protocol, peer) for protocol, peer in queries]
+
+
 def resolve(p, entries, protocol, peer):
-    owned_entries(p, entries)
-    peer = endpoint(peer)
-    ingress = endpoint(p["ingress"])
-    number = 6 if protocol == "tcp" else 17
-    candidates = [entry for entry in entries if entry["reply"] is not None and entry["reply"][0] == number and (entry["reply"][1], entry["reply"][2]) == ingress and (entry["reply"][3], entry["reply"][4]) == peer]
-    require(len(candidates) == 1 and owned(p, candidates[0]), "mapping_missing_ambiguous_or_unowned")
-    original = candidates[0]["original"]
-    return f"{original[3]}:{original[4]}"
+    origin = resolve_queries(prepare_lookup(p), entries, [(protocol, peer)])[0]
+    require(origin is not None, "mapping_missing_ambiguous_or_unowned")
+    return origin
 
 
 def execute(request):
@@ -816,6 +879,10 @@ def execute(request):
                 install_rules(p, test=True)
                 if operation == "install":
                     install_rules(p)
+                else:
+                    # Windows and the WSL VM need not agree on wall-clock seconds.
+                    # Issue and validate in the guest; RPC transit can only shorten the window.
+                    return {"ok": True, "operation": operation, "grant_deadline": int(time.time()) + 30}
             elif operation in ("remove", "inspect"):
                 present, rules = inspect_firewall(p, firewall(), True)
                 ipv6_rules = None

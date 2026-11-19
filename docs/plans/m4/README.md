@@ -1,0 +1,43 @@
+# M4：Windows GPUI 控制台
+
+## 运行方式
+
+将 `wsl-proxy-desktop.exe` 与同版本的 `wsl-proxyctl.exe` 放在同一个目录，运行桌面 EXE。窗口是 GPUI 原生渲染，不是浏览器页面。首次连接会以当前用户身份启动配套控制器的 `daemon` 模式；整个 UI 不需要以 Windows 管理员身份运行。
+
+1. 在**总览**选择候选发行版、用于隔离检查的不同对照发行版，以及 Windows 业务入口端口。只选中目标不会接管网络。可先运行只读预检；失败时处理显示的能力缺项，程序不自行安装 WSL 软件。
+2. 在**策略**填写宿主机已有 SOCKS5 入口、住宅凭据名称、DoH 上游的字面 IPv4:端口与 TLS 名称、健康检测域名及直连白名单。导入 `.env` 是一次明确操作：文件路径交给当前用户的本地后台，用户名/密码不显示在编辑器中。保存草稿不会改变正在运行的链路。
+3. **显式保存策略**，回到总览确认启动。候选 B 和实际 A 是两个不同字段；确认切换才开始释放 A。若另一个窗口修改了策略或接管代次已经变化，陈旧操作会被拒绝，而不是重新发送。根据后台返回的实际状态决定是否继续。
+4. **连接与诊断**显示实际转发的活跃/最近连接、原目标、命中策略、累计字节与采样速率。普通 UDP 不支持双跳时显示拒绝，不算直连。出口地址不是 SOCKS 节点参数或 HTTPS 的对端地址；只有显式点击“检测出口”才从实际受管发行版访问 IPPure，并记录观测时间。DNS 就绪是有时间戳的探测结果，不表示所有域名在此后都一定可用。
+5. **关窗不是停止。** 窗口可以关闭和重新打开，后台继续持有当前目标与规则。需要恢复原网时，明确确认“停止并恢复直连”。后台在状态未知或需要恢复时不会因为 UI 退出而放行。无法从 GUI 停止时，用下述命令查询或恢复。
+
+## 后台与故障边界
+
+- `wsl-proxyctl.exe session` 仍是 CLI 自己持锁的前台模式，EOF 保留原有的正常停止语义。桌面使用独立的命名管道后台，两者不能同时拥有同一个用户的网络控制权。已有 CLI 会话时不要强杀它来启动桌面；先在原会话中正常停止并退出。
+- 窗口与后台通过仅当前用户、本机可连接的命名管道交换有界 JSON。客户端在发送请求前核对服务端进程的用户和配套 EXE 身份。读写有时限，未确认的变更不会因窗口断连被自动重放。拿不到状态时应显示未知，并重新读取后台，而不是使用过期绿色状态。
+- 关闭窗口后也能在同目录 PowerShell 调用：`'{"command":"status"}' | .\wsl-proxyctl.exe rpc`。要主动停止，将状态中的实际 `operation_generation` 带入 `{"command":"stop","expected_generation":…}`。正常恢复至 `idle` 后，发送 `{"command":"shutdown_daemon"}` 可退出后台，便于替换 EXE。不能带着活动规则退出后台；如果后台已崩溃，沿用 [M3 的独立恢复流程](../m3/README.md)，不手删恢复日志。
+- 桌面草稿在当前 Windows 用户 LocalAppData 的 `WSLProxyLab\desktop-policy.json`，含策略、选择和版本，不含住宅密码。保存操作原子替换，并核对版本避免覆盖另一窗口的修改。脱敏诊断导出到同一用户目录，只保留状态与数值计数，不导出原始请求正文、目的地址、域名、凭据引用或任意错误全文。凭据存储与忘记操作仍走 Windows Credential Manager。
+- 连接记录是有界的内存数据，不是抓包：最多 256 条活跃、128 条近期记录；近期保留 5 分钟。`tx`/`rx` 是入口实际处理的传输字节；速率是两次采样的增量，不是线路测速。无内核映射时不虚构目标或域名。
+
+## 构建
+
+- 原生 Windows：准备 Rust 和 GPUI 所需的 Windows 构建工具，执行 `cargo build --locked --release -p wsl-proxyctl -p wsl-proxy-desktop`。两件产物位于同一 `target\release`。仓库默认 Cargo 成员仍是控制器，构建 CLI 无需编译 GPUI。
+- WSL 交叉构建：使用 [隔离构建脚本](../../../scripts/build-desktop-windows.sh)，环境要求见 `--help`。脚本只修正临时 GPUI 源副本对宿主平台的编译开关，使用 Windows 自带的 Direct3D HLSL 编译器生成真实 shader 字节码，不修改 Cargo 注册表、仓库锁文件或 Windows 全局工具链。产物是 Windows x64 EXE；这不是安装包或已签名的发布渠道。
+
+## 本机原生验收
+
+交付目录：`D:\WSL\ProxyLab\m4-lab\final\`。两件需放在同一目录，启动 `wsl-proxy-desktop.exe`。本机使用 WSL 交叉构建的 Windows x64 release；桌面 SHA-256 `626ff6cad62c6b51a8126360e35d4739a470dd40b68d7849d4f9e162cebcd935`，后台 `466c23b76c9bd7b2d1612dbc320e0fc05852fe71c42eb17f28e0b4599dc2fbdf`。
+
+| 实际操作 | 证据与边界 |
+|---|---|
+| 打开窗口、选择和保存 | 原生 HWND 显示中文总览、策略和连接诊断。通过窗口选择 Target 与 Control、编辑非秘密字段并显式保存。实测凭据导入走同目录 CLI 的 IPC，没有用原生文件选择器导入真实秘密。 |
+| 启动与关窗 | GUI 启动确认后，实际目标为 `WSLProxyLab-Target`，操作代次 17，DNS 已受管。仅关闭该窗口后，独立 `status` 仍报告 `forwarding_managed`、同一目标和代次。预先运行的 Target 服务此时完成一次新的住宅出口 HTTPS 200，Control 仍是原出口。Target 的另一次请求连接被重置，保留该失败。 |
+| 重新打开 | 新窗口重新取得后台目标和代次 17，并显示真实 DNS、业务连接、规则结果及字节数。UI 发起了显式出口探测与脱敏报告导出，不把导出文件当作完整流量日志。 |
+| 取消 / 停止 | 在窗口打开停止确认后取消，接管继续；再次打开并确认，进入 `idle`（18）。32 项恢复比较一致。原 `.env` 未修改，临时凭据、策略、实验服务和监听均已清理。`kernel/cleanup.json` 记录 5 个新增模块完整移除且未卸载任何基线模块，两组 DNS、路由及受测表/规则与本轮基线相符。 |
+
+`qa/01-native-bootstrap.png`、`qa/08-reopened-active.png`、`qa/09-real-diagnostics.png` 和 `qa/11-ui-stopped-idle.png` 是实际窗口截图，`qa/frontend-closed-status.json` 及 `frontend-closed-pulse-*` 是关窗期间证据。第一次冷预检拒绝、一次 WSL 启动超时均未跳过检查、未自动重放修改。完整的活跃接管轮使用 `qa/delivery` 双件；交付版额外校正了未保存/未连接提示和同端口切换预检，不能把 M3 的 CLI 双向切换记录写成 M4 的 GUI 双向实测。
+
+交付目录 `final` 的双件另做了空闲态实机冒烟：实际窗口截图见 `qa/final-release-idle.png`；关闭窗口后，同目录 RPC 仍返回 `idle`、代次 18；随后显式关闭空闲后台，无剩余进程，未重新创建测试策略。见 `qa/final-release-after-close-status.json` 和 `qa/final-release-cleanup.json`。
+
+完整验收汇总见 `qa/acceptance-summary.json`。关窗再打开后，后台累计收发字节从 797/5,552 增至 2,732/15,329，并显示 35 条近期连接。主动出口探测确认 `matches_residential=true`，导出的诊断中未找到导入的 IP、用户名或密码。活跃态的连续性由目标、代次及实际服务请求证明，未直接记录活跃后台的 PID 连续性。本轮对 Control 的候选预检被拒，Target 未改变；**没有执行 GUI 切换命令或切换确认**。停止确认的取消与执行均已实测。
+
+测试：控制器主程序 82 项、可移植 IPC 5 项通过；Windows 原生 IPC 9 项通过，含拒绝不匹配的服务端映像、客户端提前断开、半包与超时。发布打包、签名、升级/卸载回归和更广泛平台兼容仍属于 M5。

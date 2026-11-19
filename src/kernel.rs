@@ -5,27 +5,42 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 
 const SCRIPT: &str = include_str!("kernel.py");
 
+/// One-shot window issued by the very guest that enforces its expiry. Never journal or renew it.
+pub struct GrantWindow {
+    cookie: u32,
+    deadline: u64,
+}
+
 /// Checks the target, required kernel features and absence of an existing owner.
 /// This must succeed before persisting a new installation journal.
-pub fn precheck(p: &Plan) -> Result<(), String> {
-    invoke(p, "precheck").map(|_| ())
+pub fn precheck(p: &Plan) -> Result<GrantWindow, String> {
+    let deadline = invoke(p, "precheck", None)?
+        .grant_deadline
+        .ok_or("kernel_missing_guest_grant_window")?;
+    Ok(GrantWindow {
+        cookie: p.cookie,
+        deadline,
+    })
 }
 
 pub fn install(p: &Plan) -> Result<(), String> {
-    invoke(p, "install").map(|_| ())
+    invoke(p, "install", None).map(|_| ())
 }
 
 /// Arms one short-lived install after the Windows recovery journal is persisted.
 /// Call once per immutable Plan, never retry even after an uncertain response;
 /// recover with remove and choose a new generation before another activation.
-pub fn arm(p: &Plan) -> Result<(), String> {
-    invoke(p, "arm").map(|_| ())
+pub fn arm(p: &Plan, window: GrantWindow) -> Result<(), String> {
+    if window.cookie != p.cookie {
+        return Err("grant_window_target_changed".into());
+    }
+    invoke(p, "arm", Some(window.deadline)).map(|_| ())
 }
 
 /// Removes interception before deleting precisely identified owned mappings.
 /// The Windows ingress must remain alive until this succeeds; TCP must reconnect.
 pub fn remove(p: &Plan) -> Result<(), String> {
-    invoke(p, "remove").map(|_| ())
+    invoke(p, "remove", None).map(|_| ())
 }
 
 /// A read-only observation of this generation, not permission to delete it.
@@ -50,7 +65,7 @@ impl Ownership {
 /// The caller must first verify the current Windows registration. A stale guest
 /// identity can attest absence only; surviving or ambiguous artifacts fail closed.
 pub fn inspect(p: &Plan) -> Result<Ownership, String> {
-    invoke(p, "inspect")?
+    invoke(p, "inspect", None)?
         .ownership
         .ok_or_else(|| "kernel_missing_ownership".into())
 }
@@ -72,26 +87,17 @@ struct Response {
     operation: String,
     origin: Option<SocketAddrV4>,
     ownership: Option<Ownership>,
+    grant_deadline: Option<u64>,
 }
 
-fn invoke(p: &Plan, operation: &str) -> Result<Response, String> {
+fn invoke(p: &Plan, operation: &str, deadline: Option<u64>) -> Result<Response, String> {
     validate(p)?;
     let request = Request {
         operation,
         plan: p,
         protocol: None,
         peer: None,
-        deadline: if operation == "arm" {
-            Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|_| "kernel_invalid_host_clock")?
-                    .as_secs()
-                    + 30,
-            )
-        } else {
-            None
-        },
+        deadline,
     };
     let bytes = serde_json::to_vec(&request)
         .map_err(|error| format!("kernel_request_encoding_failed: {error}"))?;
@@ -113,6 +119,11 @@ fn parse_response(output: &str, operation: &str) -> Result<Response, String> {
         .map_err(|error| format!("kernel_invalid_response: {error}"))?;
     if !response.ok || response.operation != operation {
         return Err("kernel_response_operation_mismatch".into());
+    }
+    if (operation == "precheck") != response.grant_deadline.is_some()
+        || response.grant_deadline == Some(0)
+    {
+        return Err("kernel_invalid_guest_grant_window".into());
     }
     if operation != "lookup" && response.origin.is_some() {
         return Err("kernel_unexpected_origin".into());

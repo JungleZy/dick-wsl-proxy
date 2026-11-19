@@ -199,8 +199,49 @@ pub struct Controller {
     pub(crate) live: Option<(Plan, Ingress)>,
     pub(crate) readiness: Option<Result<Readiness, String>>,
     pub(crate) runtime: Option<Arc<Runtime>>,
+    recent_exit: Option<serde_json::Value>,
 }
 impl Controller {
+    /// Explicit operator request only: observe the target's actual TLS-verified public exit.
+    pub(crate) fn probe_exit(&mut self, expected: u64) -> Result<(), String> {
+        let (plan, runtime) = self.switch_source(expected)?;
+        if runtime.policy.allows_domain("my.ippure.com") {
+            return Err("exit_probe_domain_is_direct".into());
+        }
+        let script = concat!(
+            "exec /usr/bin/python3 -I - <<'WPL_EXIT'\n",
+            include_str!("exit_probe.py"),
+            "\nWPL_EXIT\n"
+        );
+        let raw =
+            host::guest_script(&plan.target, script).map_err(|_| "target_exit_probe_failed")?;
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ResultIp {
+            ip: Ipv4Addr,
+            peer: Ipv4Addr,
+            country: String,
+        }
+        let observed: ResultIp =
+            serde_json::from_str(&raw).map_err(|_| "invalid_exit_probe_response")?;
+        if runtime.policy.allows_ip(observed.peer)
+            || runtime.dns.direct_alias(observed.peer)?.is_some()
+            || runtime
+                .policy
+                .is_reserved_endpoint(SocketAddrV4::new(observed.peer, 443))
+        {
+            return Err("exit_probe_destination_not_chained".into());
+        }
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "invalid_clock")?
+            .as_secs();
+        self.recent_exit = Some(
+            serde_json::json!({"ip":observed.ip,"country":observed.country,"checked_unix_seconds":t,"matches_residential":runtime.policy.matches_residence(observed.ip)}),
+        );
+        Ok(())
+    }
+
     pub(crate) fn settled_status(&self) -> Result<serde_json::Value, String> {
         use serde_json::json;
         let disk = load()?;
@@ -218,7 +259,7 @@ impl Controller {
                         Err(e) => Some(e),
                     });
                 Ok(
-                    json!({"phase":if issue.is_some(){"recovery_required"}else if p.system_dns.is_some(){"forwarding_managed"}else{"forwarding_scoped"},"active_target":p.target.name,"config_generation":p.cookie,"ingress":p.ingress,"origins":p.origins,"issue":issue,"forwarding":ingress.diagnostics(),"dns_managed":p.system_dns.is_some() && issue.is_none(),"startup_verified":self.readiness.as_ref().and_then(|r|r.as_ref().ok())}),
+                    json!({"phase":if issue.is_some(){"recovery_required"}else if p.system_dns.is_some(){"forwarding_managed"}else{"forwarding_scoped"},"active_target":p.target.name,"config_generation":p.cookie,"ingress":p.ingress,"origins":p.origins,"issue":issue,"forwarding":ingress.diagnostics(),"dns_managed":p.system_dns.is_some() && issue.is_none(),"startup_verified":self.readiness.as_ref().and_then(|r|r.as_ref().ok()),"active_policy":self.runtime.as_ref().map(|r|r.policy.public_summary()),"recent_exit":self.recent_exit}),
                 )
             }
             (None, Some(d)) => Ok(
@@ -231,6 +272,7 @@ impl Controller {
         &mut self,
         p: Plan,
         runtime: Option<Arc<Runtime>>,
+        window: kernel::GrantWindow,
     ) -> Result<(), String> {
         if p.system_dns.is_some() != runtime.is_some() {
             return Err("policy_mode_mismatch".into());
@@ -247,7 +289,7 @@ impl Controller {
                 return Err(e);
             }
         };
-        if let Err(e) = kernel::arm(&p).and_then(|_| kernel::install(&p)) {
+        if let Err(e) = kernel::arm(&p, window).and_then(|_| kernel::install(&p)) {
             if runtime.is_some() {
                 // A partial filter/NAT transaction is not proof of either a healthy or an
                 // idle target. Keep ownership and stop all forwarding until explicit recovery.
@@ -275,7 +317,9 @@ impl Controller {
                     let forwarding = sockets.diagnostics();
                     let shutdown = sockets.stop().err();
                     self.live = Some((p, sockets));
-                    let reason = format!("managed_readiness_failed:{e}; ingress_stop:{shutdown:?}; forwarding:{forwarding}");
+                    let reason = format!(
+                        "managed_readiness_failed:{e}; ingress_stop:{shutdown:?}; forwarding:{forwarding}"
+                    );
                     self.readiness = Some(Err(reason.clone()));
                     return Err(reason);
                 }
@@ -319,6 +363,7 @@ impl Controller {
         self.live = None;
         self.readiness = None;
         self.runtime = None;
+        self.recent_exit = None;
         Ok(())
     }
 }

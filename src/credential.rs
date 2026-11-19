@@ -75,7 +75,7 @@ fn valid_endpoint(endpoint: SocketAddrV4) -> bool {
         && ip.octets()[0] < 240
 }
 
-fn target_name(name: &str) -> Result<Vec<u16>, String> {
+pub(crate) fn target_name(name: &str) -> Result<Vec<u16>, String> {
     if name.is_empty()
         || name.len() > 128
         || !name

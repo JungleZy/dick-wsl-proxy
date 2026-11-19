@@ -1,4 +1,5 @@
 mod credential;
+mod desktop_control;
 mod host;
 mod ingress;
 mod kernel;
@@ -101,6 +102,15 @@ enum Command {
         #[arg(long)]
         expected_generation: Option<u64>,
     },
+    /// Installer-only: hold the current-user controller lock while idle until release or EOF.
+    #[serde(skip)]
+    Maintenance,
+    /// Run the current-user desktop broker independently of any window.
+    #[serde(skip)]
+    Daemon,
+    /// Submit one JSON request on stdin to an already running desktop broker.
+    #[serde(skip)]
+    Rpc,
     #[command(hide = true)]
     #[serde(skip)]
     LeaseWorker { cookie: u32 },
@@ -240,32 +250,51 @@ fn preflight<'a>(
     })
 }
 
-fn dispatch(request: Command, controller: &mut m1::Controller) -> Result<u8, Failure> {
+fn dispatch_result(
+    request: Command,
+    controller: &mut m1::Controller,
+) -> Result<(u8, serde_json::Value), Failure> {
     let registry = || host::distributions().map_err(|e| Failure::new("enumeration_failed", e));
     let error = |e: String| Failure::new("controller_error", e);
-    match request {
-        Command::List => emit(&registry()?)?,
-        Command::Status => emit(&controller.status().map_err(error)?)?,
+    let response = match request {
+        Command::List => serde_json::json!(registry()?),
+        Command::Status => controller.status().map_err(error)?,
         Command::Preflight {
             target,
             witness,
             port,
         } => {
             let all = registry()?;
-            let result = preflight(
-                &all,
-                &target,
-                witness.as_deref(),
-                port,
-                controller.status().map_err(error)?,
-                None,
-            )?;
-            emit(&result)?;
-            return Ok(if result.passed { 0 } else { 2 });
+            let state = controller.status().map_err(error)?;
+            // Switching back to the same port must not test-bind over the daemon's own
+            // exclusive sockets. Only the current, authenticated owner qualifies as witness.
+            let reserved = if state["phase"] == "forwarding_managed" {
+                let active = state["active_target"].as_str();
+                let other = find(&all, &target)?;
+                let proof = witness.as_deref().map(|w| find(&all, w)).transpose()?;
+                if proof.is_some_and(|w| Some(w.name.as_str()) == active && w.id != other.id) {
+                    let generation = state["operation_generation"]
+                        .as_u64()
+                        .ok_or_else(|| error("missing_operation_generation".into()))?;
+                    Some(
+                        controller
+                            .switch_source(generation)
+                            .map_err(error)?
+                            .0
+                            .ingress,
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let result = preflight(&all, &target, witness.as_deref(), port, state, reserved)?;
+            return Ok((if result.passed { 0 } else { 2 }, serde_json::json!(result)));
         }
         Command::ImportCredential { name, env_file } => {
             credential::import(&name, &env_file).map_err(error)?;
-            emit(&serde_json::json!({"credential_imported":true}))?;
+            serde_json::json!({"credential_imported":true})
         }
         Command::ForgetCredential { name } => {
             if m1::load().map_err(error)?.is_some()
@@ -277,7 +306,7 @@ fn dispatch(request: Command, controller: &mut m1::Controller) -> Result<u8, Fai
                 ));
             }
             credential::remove(&name).map_err(error)?;
-            emit(&serde_json::json!({"credential_removed":true}))?;
+            serde_json::json!({"credential_removed":true})
         }
         Command::Switch {
             target,
@@ -306,8 +335,7 @@ fn dispatch(request: Command, controller: &mut m1::Controller) -> Result<u8, Fai
                 Some(source.ingress),
             )?;
             if !result.passed {
-                emit(&result)?;
-                return Ok(2);
+                return Ok((2, serde_json::json!(result)));
             }
             let runtime = match profile {
                 Some(path) => m2::Runtime::from_file(&path),
@@ -326,7 +354,7 @@ fn dispatch(request: Command, controller: &mut m1::Controller) -> Result<u8, Fai
             controller
                 .switch(expected_generation, new, runtime)
                 .map_err(error)?;
-            emit(&controller.status().map_err(error)?)?;
+            controller.status().map_err(error)?
         }
         request @ (Command::Start { .. } | Command::StartScoped { .. }) => {
             let (target, witness, port, origins, profile, expected_generation) = match request {
@@ -374,8 +402,7 @@ fn dispatch(request: Command, controller: &mut m1::Controller) -> Result<u8, Fai
                 None,
             )?;
             if !result.passed {
-                emit(&result)?;
-                return Ok(2);
+                return Ok((2, serde_json::json!(result)));
             }
             let runtime = profile
                 .as_deref()
@@ -398,26 +425,62 @@ fn dispatch(request: Command, controller: &mut m1::Controller) -> Result<u8, Fai
             controller
                 .start(plan, runtime, expected_generation)
                 .map_err(error)?;
-            emit(&controller.status().map_err(error)?)?;
+            controller.status().map_err(error)?
         }
         Command::Stop {
             expected_generation,
         } => {
             lifecycle::checked(expected_generation).map_err(error)?;
             controller.stop().map_err(error)?;
-            emit(&controller.status().map_err(error)?)?;
+            controller.status().map_err(error)?
         }
-        Command::Session | Command::LeaseWorker { .. } => {
+        Command::Session
+        | Command::Daemon
+        | Command::Rpc
+        | Command::Maintenance
+        | Command::LeaseWorker { .. } => {
             return Err(Failure::new(
                 "invalid_request",
                 "Cannot nest a controller session or custodian",
             ));
         }
-    }
-    Ok(0)
+    };
+    Ok((0, response))
+}
+
+fn dispatch(request: Command, controller: &mut m1::Controller) -> Result<u8, Failure> {
+    let (rc, response) = dispatch_result(request, controller)?;
+    emit(&response)?;
+    Ok(rc)
 }
 
 fn run(command: Command) -> Result<u8, Failure> {
+    if matches!(command, Command::Rpc) {
+        use std::io::Read;
+        const LIMIT: u64 = 1024 * 1024;
+        let mut bytes = Vec::new();
+        io::stdin()
+            .lock()
+            .take(LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| Failure::new("rpc_input", e.to_string()))?;
+        if bytes.len() as u64 > LIMIT {
+            return Err(Failure::new("rpc_input", "Request exceeds limit"));
+        }
+        let req = serde_json::from_slice(&bytes)
+            .map_err(|_| Failure::new("rpc_input", "Expected one JSON request"))?;
+        let reply =
+            wsl_proxyctl::ipc::request(&req).map_err(|e| Failure::new("rpc_transport", e))?;
+        let rc = if reply.get("code").is_some() {
+            1
+        } else if reply.get("passed").and_then(|v| v.as_bool()) == Some(false) {
+            2
+        } else {
+            0
+        };
+        emit(&reply)?;
+        return Ok(rc);
+    }
     if let Command::LeaseWorker { cookie } = command {
         let plan = m1::load()
             .map_err(|e| Failure::new("lease_journal", e))?
@@ -435,6 +498,41 @@ fn run(command: Command) -> Result<u8, Failure> {
         host::LockError::Other(s) => Failure::new("lock_failed", s),
     })?;
     let mut controller = m1::Controller::default();
+    if matches!(command, Command::Maintenance) {
+        // Do not start WSL, try recovery or even consult a live guest. A journal or pending
+        // transition is sufficient reason to refuse. _lock stays alive across the handshake.
+        let record =
+            transition::load().map_err(|e| Failure::new("maintenance_state_unknown", e))?;
+        let active = m1::load().map_err(|e| Failure::new("maintenance_state_unknown", e))?;
+        if active.is_some() || record.pending.is_some() {
+            return Err(Failure::new(
+                "maintenance_requires_restore",
+                "Restore the existing target before updating or uninstalling",
+            ));
+        }
+        emit(
+            &serde_json::json!({"maintenance":true,"protocol":1,"phase":"idle","operation_generation":record.generation,"version":env!("CARGO_PKG_VERSION"),"pid":std::process::id()}),
+        )?;
+        use std::io::Read;
+        let mut release = String::new();
+        io::stdin()
+            .lock()
+            .take(10)
+            .read_line(&mut release)
+            .map_err(|e| Failure::new("maintenance_input", e.to_string()))?;
+        if !matches!(release.as_str(), "" | "release\n" | "release\r\n") {
+            return Err(Failure::new(
+                "maintenance_input",
+                "Expected release or end of input",
+            ));
+        }
+        return Ok(0);
+    }
+    if matches!(command, Command::Daemon) {
+        wsl_proxyctl::ipc::serve(|req| desktop_control::handle(req, &mut controller))
+            .map_err(|e| Failure::new("daemon_failed", e))?;
+        return Ok(0);
+    }
     if matches!(command, Command::Session) {
         dispatch(Command::Status, &mut controller)?;
     } else {

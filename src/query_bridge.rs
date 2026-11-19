@@ -9,7 +9,10 @@ use std::io::BufRead;
 #[cfg(any(windows, test))]
 const RESPONSE_LIMIT: usize = 4096;
 #[cfg(any(windows, test))]
-const REQUEST_LIMIT: usize = 512;
+const REQUEST_LIMIT: usize = 2048;
+#[cfg(any(windows, test))]
+const GUEST_TIMING_LIMIT_US: u64 = 12_000_000;
+pub(crate) const MAX_LOOKUPS: usize = 16;
 #[cfg(windows)]
 const BOOTSTRAP_LIMIT: usize = 128 * 1024;
 
@@ -54,30 +57,50 @@ try:
     exec(compile(initial['kernel'], '<embedded-kernel>', 'exec'), kernel)
     plan = kernel['validate']({'operation': 'precheck', 'plan': initial['plan'], 'protocol': None, 'peer': None})
     kernel['guard'](plan)
+    prepared = kernel['prepare_lookup'](plan)
     del initial
     emit({'kind': 'ready'})
     sequence = 0
     while True:
         signal.alarm(65)
-        request = receive(512)
+        request = receive(2048)
         if request is None:
             break
         signal.alarm(12)
         require = kernel['require']
-        require(isinstance(request, dict) and set(request) == {'id', 'protocol', 'peer'}, 'invalid_query')
+        require(isinstance(request, dict) and set(request) == {'id', 'lookups'}, 'invalid_query')
         require(type(request['id']) is int and request['id'] == sequence + 1 and request['id'] <= 0xffffffffffffffff, 'invalid_query_sequence')
-        require(request['protocol'] in ('tcp', 'udp'), 'invalid_query_protocol')
-        peer = kernel['endpoint'](request['peer'])
-        require(peer[0] == plan['guest'], 'invalid_query_peer')
+        lookups = request['lookups']
+        require(isinstance(lookups, list) and 1 <= len(lookups) <= 16, 'invalid_query_count')
+        keys = []
+        for item in lookups:
+            require(isinstance(item, dict) and set(item) == {'protocol','peer'} and item['protocol'] in ('tcp','udp'), 'invalid_query_item')
+            require(kernel['endpoint'](item['peer'])[0] == plan['guest'], 'invalid_query_peer')
+            keys.append((item['protocol'], item['peer']))
         sequence = request['id']
         try:
+            read_start = time.monotonic_ns()
             ct = kernel['Conntrack']()
             try:
-                origin = kernel['resolve'](plan, ct.dump(), request['protocol'], request['peer'])
-                require(kernel['authorized_origin'](plan, origin), 'unrelated_query_origin')
+                payloads = ct.request(kernel['CT_GET'], kernel['ROOT'] | kernel['MATCH'])
             finally:
                 ct.close()
-            emit({'kind': 'origin', 'id': sequence, 'origin': origin})
+            read_end = time.monotonic_ns()
+            # Read includes fresh socket construction, netlink envelope checks,
+            # and socket close; decode includes tuple validation and indexing.
+            try:
+                entries = [kernel['parse_entry'](payload) for payload in payloads]
+            finally:
+                del payloads
+            try:
+                origins = kernel['resolve_queries'](prepared, entries, keys)
+            finally:
+                del entries
+            decode_end = time.monotonic_ns()
+            kernel_read_us = (read_end - read_start) // 1000
+            decode_lookup_us = (decode_end - read_end) // 1000
+            require(0 <= kernel_read_us + decode_lookup_us <= 12000000, 'invalid_query_timing')
+            emit({'kind': 'origins', 'id': sequence, 'origins': origins, 'kernel_read_us': kernel_read_us, 'decode_lookup_us': decode_lookup_us})
         except (kernel['Failure'], OSError, ValueError, KeyError, TypeError, UnicodeError) as error:
             emit({'kind': 'lookup_error', 'id': sequence, 'error': reason(error)})
 except Exception as error:
@@ -85,12 +108,29 @@ except Exception as error:
     sys.exit(1)
 "#;
 
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub(crate) struct Lookup {
+    pub protocol: &'static str,
+    pub peer: SocketAddrV4,
+}
+
+/// Guest durations per physical batch, measured with a monotonic clock.
+/// `kernel_read_us` includes fresh Conntrack socket construction, the netlink
+/// request/envelope validation, and socket close (not just kernel execution).
+/// `decode_lookup_us` covers tuple decoding/validation and snapshot indexing.
+/// Neither includes JSON/stdio transit, host queueing, or helper startup.
+#[derive(Debug)]
+pub struct BatchOrigins {
+    pub origins: Vec<Option<SocketAddrV4>>,
+    pub kernel_read_us: u64,
+    pub decode_lookup_us: u64,
+}
+
 #[cfg(any(windows, test))]
 #[derive(Serialize)]
 struct Query {
     id: u64,
-    protocol: &'static str,
-    peer: SocketAddrV4,
+    lookups: Vec<Lookup>,
 }
 
 #[cfg(any(windows, test))]
@@ -98,9 +138,19 @@ struct Query {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Response {
     Ready {},
-    Origin { id: u64, origin: SocketAddrV4 },
-    LookupError { id: u64, error: String },
-    Fatal { error: String },
+    Origins {
+        id: u64,
+        origins: Vec<Option<SocketAddrV4>>,
+        kernel_read_us: u64,
+        decode_lookup_us: u64,
+    },
+    LookupError {
+        id: u64,
+        error: String,
+    },
+    Fatal {
+        error: String,
+    },
 }
 
 #[cfg(any(windows, test))]
@@ -133,6 +183,17 @@ fn read_response(reader: &mut impl BufRead, buffer: &mut Vec<u8>) -> Result<Resp
         && (error.is_empty() || error.len() > 512 || error.chars().any(char::is_control))
     {
         return Err("query_transport_invalid_error".into());
+    }
+    if let Response::Origins {
+        kernel_read_us,
+        decode_lookup_us,
+        ..
+    } = &response
+        && kernel_read_us
+            .checked_add(*decode_lookup_us)
+            .is_none_or(|total| total > GUEST_TIMING_LIMIT_US)
+    {
+        return Err("query_transport_invalid_timing".into());
     }
     Ok(response)
 }
@@ -183,16 +244,18 @@ impl QueryBridge {
 
     /// A failed lookup keeps the batch usable. A transport failure discards it;
     /// only a subsequent request may reopen it, never replaying a sent request.
-    pub fn query(&mut self, proto: &str, peer: SocketAddrV4) -> Result<SocketAddrV4, String> {
+    pub fn query_batch(&mut self, lookups: Vec<Lookup>) -> Result<BatchOrigins, String> {
         #[cfg(windows)]
         {
-            let protocol = match proto {
-                "tcp" => "tcp",
-                "udp" => "udp",
-                _ => return Err("query_lookup_invalid_protocol".into()),
-            };
-            if peer.ip() != &self.plan.guest || peer.port() == 0 {
-                return Err("query_lookup_invalid_peer".into());
+            if lookups.is_empty()
+                || lookups.len() > MAX_LOOKUPS
+                || lookups.iter().any(|key| {
+                    !matches!(key.protocol, "tcp" | "udp")
+                        || key.peer.ip() != &self.plan.guest
+                        || key.peer.port() == 0
+                })
+            {
+                return Err("query_lookup_invalid_batch".into());
             }
             if self.transport.as_ref().is_none_or(|batch| !batch.active()) {
                 if self
@@ -218,7 +281,7 @@ impl QueryBridge {
                 .transport
                 .as_mut()
                 .expect("a transport was opened above")
-                .query(protocol, peer, &self.plan);
+                .query(lookups, &self.plan);
             if result
                 .as_ref()
                 .is_err_and(|error| error.starts_with("query_transport_"))
@@ -233,7 +296,7 @@ impl QueryBridge {
         }
         #[cfg(not(windows))]
         {
-            let _ = (proto, peer);
+            let _ = lookups;
             Err("unsupported_platform: Windows host required".into())
         }
     }
@@ -256,10 +319,12 @@ impl Drop for QueryBridge {
 
 #[cfg(windows)]
 mod windows {
-    use super::{BOOTSTRAP, BOOTSTRAP_LIMIT, Plan, Query, REQUEST_LIMIT, Response, read_response};
+    use super::{
+        BOOTSTRAP, BOOTSTRAP_LIMIT, BatchOrigins, Lookup, Plan, Query, REQUEST_LIMIT, Response,
+        read_response,
+    };
     use serde::Serialize;
     use std::io::{BufReader, Write};
-    use std::net::SocketAddrV4;
     use std::os::windows::io::AsRawHandle;
     use std::os::windows::process::CommandExt;
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -432,28 +497,40 @@ mod windows {
 
         pub(super) fn query(
             &mut self,
-            protocol: &'static str,
-            peer: SocketAddrV4,
+            lookups: Vec<Lookup>,
             plan: &Plan,
-        ) -> Result<SocketAddrV4, String> {
+        ) -> Result<BatchOrigins, String> {
+            let count = lookups.len();
             self.sequence += 1;
             self.requests
                 .as_ref()
                 .ok_or("query_transport_closed")?
                 .try_send(Query {
                     id: self.sequence,
-                    protocol,
-                    peer,
+                    lookups,
                 })
                 .map_err(|error| format!("query_transport_request_channel_failed: {error}"))?;
             let response = self.receive(QUERY_DEADLINE)?;
             self.last_used = Instant::now();
             match response {
-                Response::Origin { id, origin } if id == self.sequence => {
-                    if !super::origin_allowed(plan, origin) {
+                Response::Origins {
+                    id,
+                    origins,
+                    kernel_read_us,
+                    decode_lookup_us,
+                } if id == self.sequence && origins.len() == count => {
+                    if !origins
+                        .iter()
+                        .flatten()
+                        .all(|origin| super::origin_allowed(plan, *origin))
+                    {
                         return Err("query_transport_unrelated_origin".into());
                     }
-                    Ok(origin)
+                    Ok(BatchOrigins {
+                        origins,
+                        kernel_read_us,
+                        decode_lookup_us,
+                    })
                 }
                 Response::LookupError { id, error } if id == self.sequence => {
                     Err(format!("query_lookup_{error}"))
@@ -525,7 +602,7 @@ mod windows {
                 });
             let usable = matches!(
                 result,
-                Ok(Response::Origin { .. } | Response::LookupError { .. })
+                Ok(Response::Origins { .. } | Response::LookupError { .. })
             );
             if responses.send(result).is_err() || !usable {
                 return;
@@ -609,7 +686,7 @@ mod tests {
 
     #[test]
     fn response_is_one_ordered_bounded_frame() {
-        let mut reader = Cursor::new(b"{\"kind\":\"ready\"}\n{\"kind\":\"origin\",\"id\":7,\"origin\":\"172.20.0.1:8080\"}\n");
+        let mut reader = Cursor::new(b"{\"kind\":\"ready\"}\n{\"kind\":\"origins\",\"id\":7,\"origins\":[null,\"172.20.0.1:8080\"],\"kernel_read_us\":123,\"decode_lookup_us\":45}\n");
         let mut buffer = Vec::new();
         assert_eq!(
             read_response(&mut reader, &mut buffer).unwrap(),
@@ -617,9 +694,11 @@ mod tests {
         );
         assert_eq!(
             read_response(&mut reader, &mut buffer).unwrap(),
-            Response::Origin {
+            Response::Origins {
                 id: 7,
-                origin: "172.20.0.1:8080".parse().unwrap()
+                origins: vec![None, Some("172.20.0.1:8080".parse().unwrap())],
+                kernel_read_us: 123,
+                decode_lookup_us: 45,
             }
         );
         assert!(
@@ -644,13 +723,44 @@ mod tests {
             "{\"kind\":\"ready\"}",
             "{\"kind\":\"ready\",\"operation\":\"install\"}\n",
             "{\"kind\":\"origin\",\"id\":1}\n",
-            "{\"kind\":\"lookup_error\",\"id\":1,\"error\":\"\"}\n",
+            "{\"kind\":\"origins\",\"id\":1}\n",
             "{\"kind\":\"fatal\",\"error\":\"bad\\nerror\"}\n",
         ] {
             assert!(
                 read_response(&mut Cursor::new(frame), &mut buffer).is_err(),
                 "{frame}"
             );
+        }
+    }
+
+    #[test]
+    fn response_rejects_malformed_or_unbounded_guest_timings() {
+        let mut buffer = Vec::new();
+        for metadata in [
+            "",
+            ",\"kernel_read_us\":1",
+            ",\"kernel_read_us\":-1,\"decode_lookup_us\":0",
+            ",\"kernel_read_us\":1.5,\"decode_lookup_us\":0",
+            ",\"kernel_read_us\":\"1\",\"decode_lookup_us\":0",
+            ",\"kernel_read_us\":null,\"decode_lookup_us\":0",
+            ",\"kernel_read_us\":0,\"decode_lookup_us\":12000001",
+            ",\"kernel_read_us\":12000000,\"decode_lookup_us\":1",
+            ",\"kernel_read_us\":18446744073709551615,\"decode_lookup_us\":1",
+            ",\"kernel_read_us\":18446744073709551616,\"decode_lookup_us\":0",
+            ",\"kernel_read_us\":0,\"decode_lookup_us\":0,\"kernel_read_us\":1",
+            ",\"kernel_read_us\":0,\"decode_lookup_us\":0,\"other_us\":1",
+        ] {
+            let frame = format!("{{\"kind\":\"origins\",\"id\":1,\"origins\":[null]{metadata}}}\n");
+            assert!(
+                read_response(&mut Cursor::new(frame), &mut buffer).is_err(),
+                "{metadata}"
+            );
+        }
+        for (kernel_read_us, decode_lookup_us) in [(0, 0), (12_000_000, 0), (0, 12_000_000)] {
+            let frame = format!(
+                "{{\"kind\":\"origins\",\"id\":1,\"origins\":[null],\"kernel_read_us\":{kernel_read_us},\"decode_lookup_us\":{decode_lookup_us}}}\n"
+            );
+            assert!(read_response(&mut Cursor::new(frame), &mut buffer).is_ok());
         }
     }
 
@@ -672,15 +782,20 @@ mod tests {
         for protocol in ["tcp", "udp"] {
             let bytes = serde_json::to_vec(&Query {
                 id: u64::MAX,
-                protocol,
-                peer: "255.255.255.255:65535".parse().unwrap(),
+                lookups: vec![
+                    Lookup {
+                        protocol,
+                        peer: "255.255.255.255:65535".parse().unwrap()
+                    };
+                    MAX_LOOKUPS
+                ],
             })
             .unwrap();
             assert!(bytes.len() < REQUEST_LIMIT);
             let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(value.as_object().unwrap().len(), 3);
+            assert_eq!(value.as_object().unwrap().len(), 2);
             assert!(value.get("operation").is_none());
-            assert_eq!(value["protocol"], protocol);
+            assert_eq!(value["lookups"][0]["protocol"], protocol);
         }
     }
 }

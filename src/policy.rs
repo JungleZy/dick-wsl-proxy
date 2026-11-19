@@ -4,16 +4,16 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::credential::{self, Residential};
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_CONFIG: u64 = 1024 * 1024;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Config {
+pub(crate) struct Config {
     first_hop: String,
     credential: String,
     dns_upstream: String,
@@ -31,6 +31,13 @@ fn default_health_domain() -> String {
     "ippure.com".into()
 }
 
+impl Config {
+    pub(crate) fn validate_draft(&self) -> Result<(), String> {
+        credential::target_name(&self.credential)?;
+        Validated::new(self.clone()).map(|_| ())
+    }
+}
+
 struct Network {
     address: u32,
     mask: u32,
@@ -38,6 +45,7 @@ struct Network {
 
 // Immutable, secret-bearing runtime state. Never serialize or derive Debug for this type.
 pub struct Policy {
+    credential_ref: String,
     first_hop: SocketAddrV4,
     residential: Residential,
     dns_upstream: SocketAddrV4,
@@ -58,8 +66,7 @@ impl Policy {
         if bytes.len() as u64 > MAX_CONFIG {
             return Err("policy file exceeds size limit".into());
         }
-        let config: Config = serde_json::from_slice(&bytes)
-            .map_err(|_| "invalid policy JSON or unsupported policy field")?;
+        let config = crate::desktop_control::decode_policy(&bytes)?;
         let validated = Validated::new(config)?;
         let residential = credential::load(&validated.credential)?;
         Self::assemble(validated, residential)
@@ -76,6 +83,7 @@ impl Policy {
             return Err("policy contains an endpoint loop".into());
         }
         Ok(Self {
+            credential_ref: config.credential,
             first_hop: config.first_hop,
             residential,
             dns_upstream: config.dns_upstream,
@@ -85,6 +93,14 @@ impl Policy {
             direct_suffixes: config.direct_suffixes,
             health_domain: config.health_domain,
         })
+    }
+
+    pub(crate) fn public_summary(&self) -> serde_json::Value {
+        serde_json::json!({"first_hop":self.first_hop,"credential":self.credential_ref,"dns_upstream":self.dns_upstream,"dns_tls_name":self.dns_tls_name,"health_domain":self.health_domain})
+    }
+
+    pub(crate) fn matches_residence(&self, ip: Ipv4Addr) -> bool {
+        self.residential.endpoint().ip() == &ip
     }
 
     /// Establishes first-hop SOCKS5 -> authenticated residential SOCKS5 -> literal IPv4.
