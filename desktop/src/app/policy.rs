@@ -38,14 +38,21 @@ impl Desktop {
                     .gap_3()
                     .child(card_header("直连规则", "每行一个目标，按类型分别匹配。"))
                     .child(
-                        self.button(
-                            "save-policy",
-                            "保存规则",
-                            UiAction::Save,
-                            locked || self.profile_path.is_none(),
-                            cx,
-                        )
-                        .primary(),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(badge(save_message, save_color, save_background))
+                            .child(
+                                self.button(
+                                    "save-policy",
+                                    "保存规则",
+                                    UiAction::Save,
+                                    locked || self.profile_path.is_none(),
+                                    cx,
+                                )
+                                .primary(),
+                            ),
                     ),
             )
             .child(
@@ -82,35 +89,25 @@ impl Desktop {
                     ),
             );
 
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(div().flex().justify_end().child(badge(
-                save_message,
-                save_color,
-                save_background,
-            )))
-            .child(exceptions)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div().text_base().text_color(rgb(MUTED)).child(
-                            self.profile_path
-                                .clone()
-                                .unwrap_or_else(|| "等待 SQLite 配置路径。".into()),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_base()
-                            .text_color(rgb(if self.error { RUST } else { MUTED }))
-                            .child(self.notice.clone()),
+        div().flex().flex_col().gap_3().child(exceptions).child(
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .child(
+                    div().text_base().text_color(rgb(MUTED)).child(
+                        self.profile_path
+                            .clone()
+                            .unwrap_or_else(|| "等待 SQLite 配置路径。".into()),
                     ),
-            )
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_base()
+                        .text_color(rgb(if self.error { RUST } else { MUTED }))
+                        .child(self.notice.clone()),
+                ),
+        )
     }
 }
