@@ -16,6 +16,10 @@ pub fn valid_resolver(ip: Ipv4Addr) -> bool {
     a != 0 && a != 127 && a < 224 && !(a == 169 && b == 254)
 }
 
+fn average_dns_latency_ms(total: Duration) -> u32 {
+    u32::try_from((total.as_millis() / 2).max(1)).unwrap_or(u32::MAX)
+}
+
 fn parse_resolver(contents: &str) -> Result<Ipv4Addr, String> {
     let mut result = None;
     for line in contents.lines() {
@@ -138,7 +142,7 @@ impl Runtime {
             system_dns: server,
             fresh_udp_dns: true,
             fresh_tcp_dns: true,
-            dns_latency_ms: u32::try_from((dns_elapsed.as_millis() / 2).max(1)).unwrap_or(u32::MAX),
+            dns_latency_ms: average_dns_latency_ms(dns_elapsed),
             https_host: host.to_string(),
             https_status: status,
             checked_unix_seconds: std::time::SystemTime::now()
@@ -168,5 +172,12 @@ mod tests {
         ] {
             assert!(parse_resolver(unsound).is_err());
         }
+    }
+
+    #[test]
+    fn averages_dns_probe_latency_with_a_nonzero_floor() {
+        assert_eq!(average_dns_latency_ms(Duration::ZERO), 1);
+        assert_eq!(average_dns_latency_ms(Duration::from_millis(5)), 2);
+        assert_eq!(average_dns_latency_ms(Duration::from_millis(8)), 4);
     }
 }
