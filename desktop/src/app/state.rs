@@ -27,6 +27,7 @@ pub(crate) struct Desktop {
     pub(crate) status_valid: bool,
     pub(crate) traffic_history: Vec<TrafficSample>,
     pub(crate) dns_history: Vec<f32>,
+    pub(crate) dns_checked_at: Option<u64>,
     pub(crate) distributions: Vec<Value>,
     pub(crate) selected: Option<String>,
     pub(crate) witness: Option<String>,

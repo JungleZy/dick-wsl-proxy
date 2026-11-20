@@ -91,6 +91,10 @@ if [[ -z "$gpui_build_script" ]]; then
 fi
 gpui_build_backup="$build_root/gpui-pre-windows-0.3.12.build.rs.orig"
 cp "$gpui_build_script" "$gpui_build_backup"
+restore_gpui_build_script() {
+    cp "$gpui_build_backup" "$gpui_build_script"
+}
+trap restore_gpui_build_script EXIT
 python3 - "$gpui_build_script" <<'PY'
 from pathlib import Path
 import sys
@@ -146,10 +150,6 @@ if "__wsl_proxy_cross_shader_patch__" not in source:
     )
     path.write_text(source)
 PY
-restore_gpui_build_script() {
-    cp "$gpui_build_backup" "$gpui_build_script"
-}
-trap restore_gpui_build_script EXIT
 cargo build --manifest-path "$build_root/workspace/Cargo.toml" --release --locked --target x86_64-pc-windows-gnu \
     --package wsl-proxy-desktop --package wsl-proxyctl
 cp "$CARGO_TARGET_DIR/x86_64-pc-windows-gnu/release/wsl-proxy-desktop.exe" \

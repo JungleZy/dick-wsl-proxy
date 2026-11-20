@@ -4,6 +4,7 @@ use serde::Serialize;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 pub struct Runtime {
     pub policy: Arc<Policy>,
@@ -53,6 +54,7 @@ pub struct Readiness {
     pub system_dns: Ipv4Addr,
     pub fresh_udp_dns: bool,
     pub fresh_tcp_dns: bool,
+    pub dns_latency_ms: u32,
     pub https_host: String,
     pub https_status: u16,
     pub checked_unix_seconds: u64,
@@ -83,6 +85,7 @@ impl Runtime {
     /// Exercise the actual target's sockets (not a Windows probe that skips the NAT rules).
     pub fn verify(&self, p: &Plan) -> Result<Readiness, String> {
         let server = p.system_dns.ok_or("missing_system_resolver")?;
+        let mut dns_elapsed = Duration::ZERO;
         for (label, tcp) in [("udp", false), ("tcp", true)] {
             let name = format!("wpl-{:08x}-{label}.example.com", p.cookie);
             self.dns.arm_probe(&name)?;
@@ -92,8 +95,10 @@ impl Runtime {
                 u8::from(tcp),
                 include_str!("guest/dns_probe.py")
             );
+            let started = Instant::now();
             let result = host::guest_script(&p.target, &script)
                 .map_err(|_| format!("{label}_dns_probe_failed"))?;
+            dns_elapsed = dns_elapsed.saturating_add(started.elapsed());
             if result.trim() != "ok" || !self.dns.probe_seen() {
                 return Err(format!("{label}_dns_not_verified_through_upstream"));
             }
@@ -133,6 +138,7 @@ impl Runtime {
             system_dns: server,
             fresh_udp_dns: true,
             fresh_tcp_dns: true,
+            dns_latency_ms: u32::try_from((dns_elapsed.as_millis() / 2).max(1)).unwrap_or(u32::MAX),
             https_host: host.to_string(),
             https_status: status,
             checked_unix_seconds: std::time::SystemTime::now()
