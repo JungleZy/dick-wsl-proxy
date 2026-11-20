@@ -1,0 +1,353 @@
+# 项目审查：`main` @ `f97b25e`
+
+> 拉取 `8ce39d8` 后的复审见 [`project-review-8ce39d8.md`](project-review-8ce39d8.md)。下文"刷新列表"回归已在 `8ce39d8` 修复，其余发现截至该提交仍未变。
+
+**结论：在已验证的环境里（WSL2 NAT、Linux 6.18），没有发现会让非白名单流量静默直连、或让 Windows 入口变成开放代理的代码缺陷。故障一律"拒绝而不放行"，这条主线是成立的。真正的问题有三类：**
+
+1. **隔离成立有一个没检查的前提。** 规则用 `-m cgroup --path /` 区分发行版，它依赖内核按调用者的 cgroup 命名空间解析路径。预检不检查内核版本，也不做实际匹配自检。换到较旧内核上，可能把对照发行版的流量也接管（H1）。
+2. **可用性和恢复路径偏脆。** 目标在下面几种情况下会"整体断网、卡在待恢复"：
+   - 一次对端重置就能让整个入口退出（H2）；
+   - 切换中断后，`stop` 依赖旧发行版仍然在（M1、M2）；
+   - 元数据通道卡顿后，会全停 30 秒（M3）；
+   - 域名白名单的合成地址会耗尽（M4）。
+
+   这些都不泄露流量，但用户可能没有文档允许的出路。
+3. **当前 HEAD 不等于已验收的 0.1.3。** 0.1.3 之后的两次重构：
+   - 没有实机复验；
+   - 引入了一个桌面端回归（刷新列表失效）；
+   - 打破了 `clippy -D warnings` 门槛；
+   - 版本号仍是 `0.1.3`。
+
+**需要负责人拍板的事**（细节在后文对应编号）：
+
+| 决策 | 为什么要你定 |
+|---|---|
+| H1：预检里加"实际匹配自检"，还是只加内核版本下限 | 涉及预检契约和支持矩阵（M5） |
+| M1/M2：中断恢复时能否先撤新目标、不再要求旧目标可达 | 改的是 M3 已写定的恢复顺序 |
+| M4：合成地址对同一"域名+真实 IP"能否复用，要不要提供显式重置命令 | 改的是 M2 有意设计的"只烧不回收" |
+| HEAD 打包前是否升版本并重跑 M4 桌面冒烟 | 决定 HEAD 能不能当发布候选 |
+| 末节"报给负责人"的文档不一致 | 按 `AGENTS.md`，`docs/arch/` 和 `decisions.md` 的改动不在实现任务里顺手做 |
+
+## 审查范围和证据等级
+
+读过的范围：
+
+- **后端四块：** guest 内核辅助、数据面、DNS/策略/凭据、控制面/IPC，各由一个子审查先完整过一遍。中等及以上的发现，我再逐条对照代码复核。
+- **我自己读的：** 桌面端的交互和状态逻辑（`backend.rs`、`bootstrap.rs`、`actions.rs`、`chrome.rs` 全文，各页面的按钮条件和状态映射）、`scripts/`、`packaging/`、`docs/arch/`、`docs/decisions.md`、`docs/plans/` 全部，以及 `docs/discussions/` 中的实现方案、交接、两份重构记录。
+- **没有细读：** `docs/discussions/netcoffee-paired-results.md` 和 `wsl-proxy-validation.md` 只看了开头；桌面页面的布局和样式代码没有逐行看。
+
+每条发现标注证据等级：
+
+- **本人复核**：我读代码确认了问题所在的代码行为。
+- **子审查未复核**：只有子审查读过，我没有再看。
+- **需实机**：结论取决于 Windows 或 Linux 内核的实际行为，读代码定不了。
+
+本次**没有**改代码、没有启用接管、没有在任何 WSL 里执行规则操作。
+
+### 本次实际跑过的检查
+
+| 检查 | 结果 |
+|---|---|
+| `python3 src/kernel_test.py` | 54/54 通过（子审查执行）。注意：加 `-I` 运行会报 `ModuleNotFoundError`，因为 `-I` 不把脚本目录加进搜索路径 |
+| `python3 -I scripts/test_package_windows.py` | 2/2 通过 |
+| `cargo test --locked`（Linux） | **没跑起来**。`native-tls` 在 Linux 上依赖 `openssl-sys`，本机没有 OpenSSL 开发包。本次没有安装任何东西，所以没有 Rust 单元测试结果 |
+| `cargo check --locked --target x86_64-pc-windows-gnu --all-targets` | 通过，9 条告警 |
+| `cargo clippy --locked --target x86_64-pc-windows-gnu --all-targets -- -D warnings` | **失败**。HEAD 有 8 条未使用导入（`src/managed_dns.rs:2-5,24,27`、`src/ingress.rs:31`），另有 1 条 `fetch_update` 弃用（`src/ingress.rs:1113`）。同样的命令在 `4b159ab` 上只报弃用这一条，所以未使用导入是 `be0fe1d` 引入的；弃用告警取决于工具链版本（本机 1.99） |
+| 桌面 crate 测试 | 0 个测试。Linux 上 `cargo check -p wsl-proxy-desktop` 只编译非 Windows 的桩 `main`，对 `app/` 什么也没验证 |
+
+## 发现总表
+
+| 编号 | 严重度 | 问题 | 位置 | 证据 |
+|---|---|---|---|---|
+| H1 | 高 | 发行版隔离依赖内核的 cgroup 路径语义，没有门槛也没有自检 | `src/kernel.py:336,338,351,399` | 规则：本人复核；内核行为：需实机 |
+| H2 | 高 | TCP `accept` 一旦返回 ConnectionReset，整个入口退出，目标全断 | `src/ingress.rs:654-661`，`src/ingress/tcp.rs:59-64` | 代码：本人复核；微软文档列有该错误码；未实机复现 |
+| M1 | 中 | 切换中断后，`stop` 要求旧发行版仍注册且可达，否则永远清不掉 | `src/lifecycle.rs:12-28,185-196` | 本人复核 |
+| M2 | 中 | guest 侧删除规则复用完整身份检查，环境一变就删不掉 | `src/kernel.py:860-872` | 代码：本人复核；(b) 场景：需实机 |
+| M3 | 中 | 元数据查询同步阻塞入口主循环，传输出错后全停 30 秒 | `src/ingress.rs:482-486`，`src/query_bridge.rs:176-206,253-256` | 本人复核 |
+| M4 | 中 | 域名白名单的合成地址只分配不回收，长期运行后失效且跨重启不可恢复 | `src/managed_dns.rs:13-18,178-238`，`src/managed_dns/ledger.rs:52-100` | 本人复核 |
+| M5 | 中 | AAAA 和 SVCB ipv6hint 不检查是否落在合成地址段 | `src/managed_dns/wire.rs:160,186-193,289-297` | 缺口：本人复核；能否利用：需实机 |
+| M6 | 中 | HTTPS 就绪探测不核对流量是否真的走了双跳 | `src/m2.rs:100-125` | 本人复核 |
+| M7 | 中 | TCP DNS 在 Windows 上可能按非阻塞 socket 读，连接内第二个查询失败 | `src/ingress.rs:958-967,983-1029` | 代码：本人复核；继承非阻塞：需实机 |
+| M8 | 中 | TCP 半关闭后 15 秒是绝对期限，单向长下载会被截断 | `src/ingress/tcp.rs:163-171` | 本人复核 |
+| M9 | 中 | lease 和 daemon 进程没有脱离父进程的作业对象 | `src/lease.rs:89-97`，`src/ipc/windows.rs:266-279` | 子审查未复核；需实机 |
+| L1–L16 | 低 | 见"低严重度"一节 | — | — |
+
+## 高严重度
+
+### H1 隔离依赖内核按调用者 cgroup 命名空间解析 `--path /`
+
+**现象。** 所有引流和保护规则都用 `-m cgroup --path /` 匹配 socket（`src/kernel.py:336,338,351,399`）。规则由目标发行版里的 `iptables-legacy-restore` 写入，意图是让 `/` 指"目标发行版自己的 cgroup 命名空间根"。
+
+**前提。** 内核解析这个路径时尊重调用者的命名空间，是主线提交 `74e4b956`（"cgroup: Honor caller's cgroup NS when resolving path"，2022 年 8 月）带来的。在那之前，`/` 解析成全局默认层级的根。
+
+- 该提交在 2022 年 10 月回移到了 5.15 和 5.19 稳定分支；
+- 补丁说明提到，当时这个函数唯一的调用者在 netfilter 里。
+
+以上来自公开的补丁和回移记录，具体是哪个 tag 合入的我没有核对，也没有核对 `xt_cgroup` 的源码。旧内核上的实际行为仍需实测。
+
+**触发。** 在没有这个提交的内核上（5.10 系 WSL 内核，或回移之前的 5.15 早期版本），所有发行版共享同一个网络命名空间：
+
+1. 对照发行版的 socket 也会命中规则，被打上本实例的连接标记并做 DNAT；
+2. Windows 侧的归属核验（标记、zone、DST_NAT、回包源）全部满足；
+3. 由于两个发行版共用 guest IP，Windows 无法分辨，对照的流量会被当成目标流量送进住宅出口。
+
+这直接违反"不接管其他发行版"的核心承诺，而且是静默的。
+
+**缺口。** 预检只核对命名空间身份（`src/probe/mod.rs`）。`probe.sh:155` 采集了 `kernel.release`，但没有用来判定。M1/M3 的实机证据都在 6.18 上取得，覆盖不到旧内核。
+
+**建议。** 按项目一贯"以证据判定"的风格，在预检里加一个实际匹配自检：
+
+1. 在目标里装一条只计数、不改流量的 `--path /` 临时规则；
+2. 分别从目标和对照发起一次连接；
+3. 要求目标命中、对照零命中，否则拒绝启动。
+
+只加内核版本下限更简单，但它依赖"哪些版本做过回移"的外部知识。
+
+### H2 一次对端重置就能让整个 TCP 入口退出
+
+**现象。** `src/ingress.rs:654-661` 对 `listener.accept()` 的错误只放过 `WouldBlock`，以及 `transient()` 认定的 `Interrupted` / `ConnectionAborted`（`src/ingress/tcp.rs:59-64`）。其余错误直接 `return Err`，经 `Shared::fail` 调用 `request_stop`（`src/ingress.rs:256-263`），整个入口停止。规则留在原处，目标的新连接全部失败，直到显式 `stop`。
+
+**触发。** 微软的 `accept` 文档在错误码里列出了 `WSAECONNRESET`，含义是"有连接到达，但在调用 accept 之前被远端终止"。其他运行时（CPython、Go）也有人在 accept 上遇到过这个错误，通行做法是忽略它、继续 accept。本次没有实机复现。按文档：
+
+- 任何能连到入口端口的进程，连上后立即发 RST，就能触发（例如 `SO_LINGER 0` 或端口扫描）；
+- 对端 IP 检查在 `accept` 之后，所以共用虚拟网卡的其他发行版、Windows 本机进程都能做到；
+- 同一文件的 UDP 收包路径（`src/ingress.rs:722-727`）已经显式放过 `ConnectionReset`，TCP 这边没有。
+
+**建议。** 把 `ConnectionReset` 以及只影响单个待接受连接的错误当作可跳过。子审查还提到 `src/ingress/udp_pump.rs:219-220` 遇到 POLLERR 同样会退出，把握更低，可以一并看。
+
+## 中严重度
+
+### M1 切换中断后的 `stop` 依赖旧目标仍然存在
+
+`src/lifecycle.rs:185-196` 对两个阶段的处理：
+
+- `old_restored` 阶段：必须先通过 `verify_gone(old)` 才能 `finish`；
+- `starting_new` 阶段：必须先 `verify_gone(old)`，再 `retire(new)`。
+
+`verify_gone` 会经 `registered()`（`src/lifecycle.rs:12-18`）逐字段比对注册信息，再通过 `wsl.exe` 读旧发行版的内核状态。
+
+**触发。** A→B 切换时，B 的就绪探测失败，停在 `starting_new`，B 保留阻断规则。此时只要出现以下任一情况，`stop` 就永远失败：
+
+- A 被注销；
+- A 被移动（`base_path` 变了）；
+- A 的 WSL 启动超时（M3 实测记录里出现过 `ERROR_TIMEOUT`）。
+
+**后果。** B 的规则撤不掉，`pending` 清不掉，后台永远是 `recovery_required`。文档禁止手删 `m3-operation.json`，用户因此没有出路。`old_restored` 阶段同理：没有任何规则，却也无法回到空闲。
+
+**建议。** 旧目标在进入 `old_restored` 时已经核实过一次。可以先 `retire(new)`；旧目标不可达时，以那次核实作为证据收尾，或者提供一条明确的"旧目标已不存在"人工确认路径。这改变了 M3 写定的顺序，需要负责人定。
+
+### M2 删除规则复用完整的身份检查
+
+**现象。** `execute()` 对 `remove` 也调用完整的 `guard()`（`src/kernel.py:860-872`）。只有 `inspect` 容忍身份变化。`guard()` 检查的内容包括：
+
+- boot ID；
+- cgroup 命名空间与根；
+- 全量 `/proc` 进程扫描；
+- eth0 唯一地址；
+- 唯一默认路由。
+
+可是删除本来就按 tag（cookie 加 plan 摘要）精确匹配，并不需要这些前提。
+
+**触发。**
+
+- (a) 接管期间，Target 里多了一条默认路由，或者地址变了，`stop` 就失败。
+- (b) 只执行 `wsl --terminate Target`，而 VM 因为别的发行版还在运行：
+  - 共享网络命名空间里的旧规则指向一个已经失效的 cgroup，控制器拒绝清理；
+  - 重新启动的 Target 进程匹配不到旧规则，可能直接出网。
+
+  这一条需实机。
+
+**关系。** M1 记录里写过"不以旧身份删除现有内核对象"的保守策略，所以 (b) 部分是有意为之。但它和"不以重启 WSL 作为恢复手段"放在一起，会让用户无路可走。建议删除时只要求"tag 精确匹配 + 发行版名一致"，把其他身份项降级为报告信息。
+
+### M3 元数据通道一卡，整个入口跟着停
+
+**现象。** 入口主线程在 `src/ingress.rs:482-486` 同步 `rx.recv()` 等待查询结果，没有超时。UDP 收发和 TCP `accept` 都在这个线程上。`src/query_bridge.rs` 里的相关参数：
+
+| 参数 | 位置 | 值 |
+|---|---|---|
+| 单次查询期限 | `src/query_bridge.rs:254` | 12 秒 |
+| 传输出错后的冷却 | `src/query_bridge.rs:181-206` | 30 秒，期间所有查询直接失败 |
+| 空闲多久后需要冷启动 | `src/query_bridge.rs:256` | 40 秒 |
+| 冷启动期限 | `src/query_bridge.rs:253` | 30 秒 |
+
+冷启动指重新拉起 `wsl.exe` 和 guest 校验脚本，在第一个包的路径上同步完成。
+
+**后果。** guest 侧一次卡顿，目标最多冻结 12 秒；随后任何传输错误再让它全断 30 秒，已建立的 UDP 流也会被逐条拆掉。不泄露流量，但对用户就是"间歇性断网"。M1 记录里"逐包冷启动 WSL 导致超时"是同一根因的早期表现。
+
+**建议。** 把等待移出主循环，或至少给等待设上限。冷却改成短退避。考虑在接管期间保持查询通道常驻，或提前预热。
+
+### M4 合成地址只烧不回收
+
+**现象。** `assign()`（`src/managed_dns.rs:178-238`）只要旧别名过期，就分配新号；按代码注释，过期号"在本会话和磁盘上都保持烧掉"。
+
+- 会话内表 `entries` 从不删除过期项，上限 `MAX_ALIASES = 16_384`；
+- 磁盘高水位的终身上限 `ALIAS_SPACE = 131_070`，每次会话至少再占一个 32 号的块（`ALIAS_BLOCK`）。
+
+**触发示例。** 一个白名单 CDN 域名，每次返回 4 个 IP，TTL 60 秒，查询间隔都超过 TTL：
+
+- 一天烧约 5,760 个号；
+- 约 3 天碰到会话上限；
+- 约 3 周耗尽终身号段。
+
+**后果。**
+
+- 之后 `assign` 返回错误，这次 DNS 查询没有任何应答，客户端只能等超时；
+- 磁盘号段耗尽时报 "automatic reset is forbidden"，但仓库里没有任何重置命令，文档也没写怎么恢复；
+- `ledger.rs` 改名失败时会留下 `.pending` 文件，之后同样永久拒绝分配（"manual recovery required"），也没写怎么人工恢复。
+
+**建议。** 高水位的本意是"不把旧地址授予另一个域名"。按这个本意，对同一"域名 + 真实 IP"复用原号没有跨域风险。同时清理过期的会话项，并提供一个只在空闲时可用、写进文档的显式重置。
+
+### M5 AAAA 和 ipv6hint 能"借用"合成地址
+
+**现象。** `src/managed_dns/wire.rs:186-193` 只对 A 记录、`:289-297` 只对 SVCB 的 ipv4hint（key 4）检查是否落在 198.18.0.0/15。AAAA 里的 `::ffff:198.18.x.y` 和 ipv6hint（key 6）都不查。
+
+**可能的利用。** 能否实际利用需实机：
+
+1. 攻击者控制一个非白名单域名的权威服务器，让它返回 AAAA `::ffff:198.18.0.N`。别名号从 `198.18.0.1` 顺序分配，很好猜。
+2. 双栈客户端用这个映射地址连接，实际发出的是 IPv4 包，被 IPv4 规则引到 Windows。
+3. Windows 查到这是有效别名，就直连白名单域名的真实 IP，SNI 却是攻击者的域名。
+4. 如果两者在同一个 CDN 上，攻击方能看到用户的真实 Windows 出口。
+
+**建议。** 把落在合成段的 IPv4 映射或兼容 AAAA，以及 ipv6hint，按和 A 记录相同的规则处理。
+
+### M6 HTTPS 就绪探测证明不了走的是双跳
+
+**对比。** DNS 探测要求 Windows 侧亲眼看到查询（`probe_seen`）。HTTPS 探测（`src/m2.rs:100-125`）只看 guest 自报的状态码和对端 IP：只要对端 IP 不在白名单、不是别名、不是保留端点就判通过。它不核对 Windows 侧这条流是否经过了入口和双跳，比如 `chain_tcp` 计数有没有增加。
+
+**后果。** 如果 DNS 规则生效而业务 TCP 规则没生效，探测会经 WSL NAT 直接出网并"成功"，状态照样报 `forwarding_managed`。这违背计划里"业务出口和 DNS 都验证通过才报已接管"的门槛。规则是事务式写入的，这种部分生效的情况是否现实需实机。
+
+**建议。** 要求入口侧证据，例如探测期间 `chain_tcp` 计数增加，或者给这条探测流加 Windows 可见的标记。
+
+### M7 TCP DNS 可能在非阻塞 socket 上按阻塞方式读
+
+**现象。** 监听 socket 设成了非阻塞（`src/ingress.rs:68`）。TCP DNS 路径 `serve_dns_tcp`（`:983`）只设了读写超时，没把接受到的 socket 改回阻塞。`read_dns_query` 遇到 `WouldBlock` 时直接报 "TCP DNS frame read failed"（`:966`）。
+
+**触发。** Windows 上 `accept` 得到的 socket 通常继承监听 socket 的非阻塞模式（需实机）。如果成立：
+
+- 同一连接上的第二个查询，读的时候会立刻 `WouldBlock`；
+- 晚于元数据查询才到达的第一个查询，同样会失败。
+
+M2 记录里状态已经出现过这条错误文本，可作旁证。业务 relay 路径本来就按非阻塞写，不受影响。
+
+**建议。** 进入 `serve_dns_tcp` 前显式 `set_nonblocking(false)`。
+
+### M8 半关闭后 15 秒是绝对期限
+
+**现象。** `src/ingress/tcp.rs:163-171` 从第一次看到 EOF 起计时，此后即使有数据流动也不刷新，到 `HALF_CLOSE_TIMEOUT = 15s`（`src/ingress.rs:42`）就报错收尾。
+
+**触发。** 客户端发完请求后关闭写方向（`nc -N`、部分 RPC 客户端），之后下载超过 15 秒，连接被关闭。对没有长度字段的协议，截断看起来和正常结束一样。
+
+**建议。** 有进展时刷新期限，或者只保留空闲期限。
+
+### M9 后台进程没有脱离作业对象（需实机）
+
+子审查指出，`src/lease.rs:89-97` 和 `src/ipc/windows.rs:266-279` 创建子进程时没有用 `CREATE_BREAKAWAY_FROM_JOB`。
+
+**后果。** 如果控制器跑在"作业关闭即终止"的作业里（OpenSSH 会话、计划任务、某些启动器），作业结束时控制器和 lease 会被一起杀掉，规则还在时端口就被释放。这违背 M1"控制器崩溃不释放端口"的约束。GUI 如果也在这类作业里，关窗会连带杀掉 daemon，违背"关窗不是停止"。
+
+我没有复核这段代码，结论取决于 Windows 作业对象的配置。
+
+## 低严重度
+
+| 编号 | 问题 | 位置 | 证据 |
+|---|---|---|---|
+| L1 | `session` 的 stdin 读出错（例如一行非 UTF-8 字节）时，`?` 直接返回，跳过 EOF 停止；非法 JSON 却只报错继续，两者不一致 | `src/main.rs:545-552` | 本人复核 |
+| L2 | `/proc` 扫描只捕获 `FileNotFoundError`；进程恰好退出时抛 `ProcessLookupError`，预检或停止偶发失败 | `src/kernel.py:147-157` | 本人复核代码；子审查在本机复现了 ESRCH |
+| L3 | 外部规则检测 `mark_mentions` 不识别 `CONNMARK --save-mark/--restore-mark`，也不看 nft；残留映射只按 mark 找，外部改写标记后，`remove` 可能漏删却报成功 | `src/kernel.py:433-453` 等 | 子审查未复核 |
+| L4 | conntrack 8 秒期限从对象构造起算，早于 iptables 操作；xtables 锁被占用时可能耗尽，需要再 stop 一次 | `src/kernel.py:667,882` | 子审查未复核 |
+| L5 | 安装许可期限用墙上时钟；主机休眠恢复或校时时会跳，可改用 `CLOCK_BOOTTIME`（boot ID 已固定同一次启动） | `src/kernel.py:203-305` | 子审查未复核；存疑 |
+| L6 | M2 规则只对 `0/8`、`127/8`、`169.254/16`、`224/4`、`240/4` 返回，没有排除本机地址；目标访问自己 eth0 上的服务也会被引到 Windows 再走双跳，结果失败 | `src/kernel.py:358-359` | 本人复核规则；是否属于设计意图需确认 |
+| L7 | 预检失败分支输出的是没赋值的 `$workloads`，诊断信息为空 | `src/probe/probe.sh:93` | 本人复核 |
+| L8 | 注册表里任一无关子键格式异常，整个发行版枚举失败，status/stop 随之失败 | `src/host.rs:102-117` | 子审查未复核 |
+| L9 | 白名单域名应答里有 TTL 0、CNAME 无 A、地址集含私网 IP、名字含非主机名字符时，整次查询无应答，而不是回 SERVFAIL | `src/managed_dns/wire.rs:356-398` | 子审查未复核 |
+| L10 | 策略文件带 UTF-8 BOM 时被拒（`serde_json` 不跳过 BOM；Windows PowerShell 5.1 的 `-Encoding UTF8` 会写 BOM）；`.env` 导入处理了 BOM，策略文件没有 | `src/desktop_control.rs:109` | 子审查未复核 |
+| L11 | 满 64 条 TCP 时先 `accept` 再关闭，突发连接得到"连上就 EOF"，而不是留在 backlog 排队 | `src/ingress.rs:667-669` | 本人复核 |
+| L12 | relay 两侧都没设 `TCP_NODELAY`，空闲时每 5 ms 轮询一次，小包往返可能多出延迟 | `src/ingress/tcp.rs`，`src/ingress.rs:39` | 存疑，需测 |
+| L13 | daemon 拉起后提前退出（例如 CLI 会话占着锁）时，客户端空等 15 秒，只报 `ipc_daemon_start_timeout`，真实原因被吞掉 | `src/ipc/windows.rs:583-592` | 子审查未复核 |
+| L14 | 管道名可预测：daemon 未运行时，同用户的低完整性进程可能抢先注册并向 GUI 伪造状态；客户端核验没有检查服务端令牌的完整性级别 | `src/ipc/windows.rs:151-153,216-235` | 子审查未复核；需实机 |
+| L15 | `persist` 写日志不限长度，`load` 只接受 16 KiB；路径极长时写得进、读不出 | `src/m1.rs:152-189` | 子审查未复核；现实中几乎触发不了 |
+| L16 | 桌面在 `forwarding_scoped`（规则仍在生效）时，状态徽标显示"空闲" | `desktop/src/app/overview.rs:144-150` | 本人复核 |
+
+## 当前 HEAD 与已验收 0.1.3 的差别
+
+0.1.3 的实机验收记录随 `4b159ab`/`648f6cb` 入库。之后又有三个提交：
+
+| 提交 | 内容 | 实机验证 |
+|---|---|---|
+| `0fd66af` | 桌面端拆成 13 个模块，并调整交互 | 它自己的记录写明"没有真实 Windows 桌面会话"，只做了编译 |
+| `be0fe1d` | `src/` 模块搬家；**同时**改了 `src/kernel.py` 的 netlink 属性解码热路径 | 只跑了离线测试，没有性能数据 |
+| `f97b25e` | 撤回构建脚本里对宿主 `cc`/`gcc` 的检查 | 无 |
+
+两个 `Cargo.toml` 的版本仍是 `0.1.3`。
+
+由此带来的具体问题：
+
+- **桌面"刷新列表"回归（本人复核）。** `desktop/src/app/bootstrap.rs:206-208` 收到 `list` 回复后只改提示文字，不更新 `self.distributions`。重构前（`0fd66af^:desktop/src/app.rs:386-389`）会更新。用户点了"刷新列表"会看到"列表已刷新"，但新注册的发行版不出现；目前只能用"重连"绕过去。
+- **`clippy -D warnings` 门槛已破。** 见上文"本次实际跑过的检查"。M0–M3 记录都把它当作通过条件。
+- **"重构"提交里夹带了行为相关改动。** `kernel.py` 的修改语义上等价，测试也补了。但它本来是 handoff 交接的那项性能任务，现在没有任何测量，handoff 的目标（降低单并发 UDP 延迟）实际仍未完成。
+
+**建议。** 不要把 HEAD 当作 0.1.3 打包。安装器对"同版本、不同构建"会拒绝，这一点正好兜底。下一次候选包前：
+
+1. 升版本；
+2. 修掉未使用导入和刷新列表；
+3. 至少重跑 M4 的桌面冒烟（打开、选择、启动、关窗、重开、停止）。
+
+## 工程与测试基础
+
+- **没有 CI，也没有固定工具链。** 质量门槛全靠人工，已经出现漂移。仓库没有 `rust-toolchain.toml`，弃用类告警会随工具链变化。建议至少配一个 Windows runner，跑 `clippy -D warnings`、Rust 测试和 Python 测试。
+- **Linux 上跑 Rust 测试需要 OpenSSL 开发包。** handoff 让新机直接跑 `cargo test`，但没写这个前提。桌面重构记录里写的是"临时解压了宿主工具链和 OpenSSL 开发文件"。
+- **测试空白。** 以下都来自子审查：
+  - `lifecycle.rs`、`lease.rs`、`main.rs` 没有测试模块；
+  - `m1.rs` 的 persist/load/forget 没有测试；M1 和 L1 正落在这里；
+  - Python 测试里 `guard()` 全部被 mock 掉，M2、L2 没有覆盖；
+  - Windows 专属路径在 Linux 测试机上完全覆盖不到：`query_bridge` 的 Transport、`udp_pump::wait`、`accept` 错误分支（H2、M7 正好落在这里）；
+  - DoH 的 chunked 解析没有正反测试；
+  - 桌面 crate 0 个测试，`actions.rs`/`bootstrap.rs` 里的 busy/reading/epoch 状态机本可以脱离 GPUI 单测；
+  - 525 行的 PowerShell 安装器只有实机 QA，没有自动化测试。
+- **发布流程有手工环节。** `scripts/package-windows.py` 需要的 build record 和 `cargo metadata` 输入，仓库里没有脚本生成。`scripts/build-desktop-windows.sh` 因为要替换 GPUI 来源而没有 `--locked`，它固定的 mingw `.deb` 版本只适用于特定 Ubuntu 版本。
+- **可读性（低优先级）。** 几处状态 JSON 是数百字符的单行 `json!`（`src/m1.rs:262`、`src/lifecycle.rs:90`、`src/desktop_control.rs:199`），改动时 diff 很难读。`m1.rs`/`m2.rs` 按里程碑命名，不反映职责。
+
+## 已声明的边界：不算缺陷，但值得再议
+
+- **容器和其他网络命名空间的流量静默直连。** 规则只挂在 OUTPUT。Target 里 Docker/Podman bridge 容器的流量走 FORWARD，没有本地 socket，cgroup 也匹配不到，所以既不被引流也不被拦截，直接从 WSL NAT 出网，控制器不报错。M5 支持矩阵写了"不宣称保护 FORWARD、容器独立网络"，所以不违约。但 M5 的完成条件还写着"不能保证隔离则拒绝启用严格模式"。建议预检至少探测 `ip_forward`、额外的网络命名空间或 dockerd，发现后提示用户或拒绝启动。
+- **以下文档已明确接受的限制，本次不作为发现：** UDP 128 条满表时拒绝新流；安静回收后迟到的回包丢失；不迁移已有 TCP；不防本机 root 或管理员。
+
+## 报给负责人：文档之间、文档与代码之间的不一致
+
+本次没有修改任何既有文档。
+
+1. `docs/discussions/handoff-0.1.3.md:35` 列的代码路径（`src/metadata_lane.rs`、`src/udp_pump.rs` 等）已在 `be0fe1d` 移到 `src/ingress/`。这份文档是交接时"第一份要读"的。
+2. `docs/discussions/rust-gpui-implementation.md:3` 仍写着"方案已确认，产品尚未实现"，而架构文档链接到它。
+3. `AGENTS.md` 提到 `docs/contracts/`，这个目录不存在。
+4. `docs/discussions/desktop-gpui-optimization.md` 说构建脚本"现在明确要求宿主 `cc` 和 `gcc`"，`f97b25e` 又把这项检查撤掉了。两者必有一个不对；如果 GPUI 资源编译确实要宿主 `gcc`，缺了它的机器会在构建中途失败。
+5. 同一份文档说未使用导入是控制器"已有的"告警；实际上 `4b159ab` 没有，是同一轮的 `be0fe1d` 引入的。
+6. 桌面在没有策略文件时预填实验值：`127.0.0.1:7892`、`223.5.5.5:443`/`dns.alidns.com`、`ippure.com`、`my-residence`（`src/desktop_control.rs:123`）。这与 `rust-gpui-implementation.md` §1 的"实验中的端口和 IP 是样本，不是程序默认值"冲突。DoH 上游预填国内解析商，是否合适也值得一议。
+7. M2 记录说"返回私网地址的名称不会因 DNS 白名单获得别名"，子审查读到的实现是整次解析失败（L9，未复核）。
+8. M2 记录说"应用自带 DoH/DoT 是普通业务连接"。但 `src/policy.rs:182-189` 有意拒绝 guest 直连 `dns_upstream`、首跳和住宅端点，所以上游配成 `8.8.8.8:443` 时，guest 里访问同一 IP:端口的 DoH 会被拒。这是合理的安全选择，但文档没写。
+9. `docs/clash链式代理教程.docx` 没有被任何文档引用，也不在 arch/discussions/plans 结构里。我检查过，里面只有占位符，没有凭据。
+10. 多份文档写入了部分脱敏的真实出口网段和 AS 号：`docs/plans/m3/README.md:36-37`、`docs/discussions/netcoffee-paired-results.md:11`、`docs/discussions/wsl-proxy-validation.md:111-112`。仓库配置了 GitHub 远端；如果仓库公开，会暴露维护者所在运营商的 /24 和住宅出口的 /24。是否保留由负责人定。
+
+## 做得好的地方
+
+- **归属判定从严。** 认定映射属于本实例，要求同时满足 cookie、zone 0、DST_NAT 状态、回包源为入口。同一回包元组有多个候选即判歧义并拒绝，删除前再按原始元组加内核 ID 核对一次。四个子审查都没找到"查不清就放行"的路径。
+- **故障不降级。** 首跳、住宅、DNS 上游、入口、元数据任一环节出错都是拒绝，没有回落直连、单跳或本地解析的代码。
+- **跨边界输入受控。** Windows 传进 guest 的参数只以 hex 形式出现，给 `iptables-restore` 的片段走白名单，子进程不经 shell。安装许可由同一个 guest 签发和核验期限，一次性核销，撤销后留标记。
+- **IPC 与安装器防御到位。** 管道的 DACL 受保护、首实例句柄持有到进程结束、拒绝远程客户端、服务端模拟权限限制在识别级。安装器有归属标记、ACL 与重解析点检查、事务日志和 `-Recover`。打包结果确定且可复核。
+- **文档对证据边界诚实。** 失败轮、173/174 这类不完美的数字都保留了，没有把局部验证写成全量保证。
+
+## 本次没有覆盖的
+
+- 任何 Windows 或 WSL 实机测试；Rust 单元测试（见上文原因）。
+- 依赖漏洞扫描（`cargo audit`）和第三方许可证审查。
+- 桌面页面布局代码（`views.rs`、`policy.rs`、`components.rs` 的渲染部分）只扫过交互逻辑；`scripts/build-desktop-hlsl.c` 只粗读。
+- 安装器读过全文，没发现问题，但没有逐个切点推演 TOCTOU。
+- 性能没有测量，只有子审查的静态热点判断：每批查询都要整表导出 conntrack，并用纯 Python 逐行完整解码；可以先只解析顶层属性再按需解码，或请内核按回包元组过滤。
+
+## 建议的处理顺序
+
+1. **H2**：改动小、收益大。
+2. **HEAD 卫生**：未使用导入、刷新列表、升版本、CI。
+3. **H1**：先定"自检还是版本门槛"。
+4. **M1/M2**：先定恢复顺序是否调整，再改代码并补 `lifecycle` 测试。
+5. **M3–M8**：逐项修，Windows 相关的（M7、M9、L14）先实机复现。
+6. **文档不一致**：按上节清单，由负责人决定怎么并入。

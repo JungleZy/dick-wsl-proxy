@@ -1,0 +1,439 @@
+# GPUI 桌面端 UI 重构建议
+
+> 讨论稿，2026-11-20，基于 `main` @ `8ce39d8`。只提建议，不改代码。范围限 `desktop/src/app/` 的显示层；不动 IPC 协议、后台状态机、`docs/arch/` 和 `docs/decisions.md`。
+
+## 结论
+
+**界面显得粗糙，主要不是颜色没调好，而是下面四个根因叠在一起：**
+
+1. **字号和间距没有统一的刻度。** gpui-component 的 `Root` 每帧都把 rem 设成主题字号（`root.rs:398`），本项目设的是 14px。代码里的 `text_xs()`、`gap_1()`、`p_3()` 全按 rem 计算：`text_xs` 实际只有 10.5px（共 19 处，多数是中文标签和说明），`gap_1` 是 3.5px，`p_3` 是 10.5px。这些尺寸是算出来的，不是猜的。预期的效果是中文小字发虚、元素落在半像素上对不齐，但当前构建还没截到清晰的图，这一点要等截图确认。
+2. **颜色绕开了主题系统。** 代码里共有 82 处 `rgb(0x…)`，颜色都来自 `theme.rs` 的 18 个常量。其中只有 12 处是在 `app.rs` 里把值写进 gpui-component 的 `Theme`，其余约 70 处是页面直接取色，完全不经过主题。组件库自带的灰色、边框、hover 色和手写部分的颜色来自两套色板，混在一起显得脏。primary 的 hover 色 `0x1e40af` 和 primary 本身 `0x087ea4` 甚至不是同一个色相（`app.rs:32-33`）。在这种写法下，深色模式做不了。
+3. **常驻外壳占掉约四成高度，页面没有视觉重心。** 原生标题栏、藏青页头、路径条、按钮式 tab 条、底部提示栏，一共五层常驻，按当前代码估算约 325px / 840px。后台状态在页头、总览、底栏各显示一次；10 个面板个个带"标题 + 一句说明"；代码里有 15 处彩色徽标调用，正文数值也用了不少彩色字，结果没有一处能抓住视线。
+4. **组件库只用了 Button 和 Input，其余都是手写。** gpui-component 0.5.1 已经有 TitleBar、Sidebar、Tag、GroupBox、DescriptionList、Form、Table、Dialog、Notification、Alert、Select，这些一个都没用。手写版本缺 hover、选中、加载、空态等交互状态；连接记录表是定宽 `div` 拼出来的；危险操作的确认是贴在底部的一条色带，不是对话框。
+
+**建议只走一条路线：不升级 gpui / gpui-component，在 0.5.1 范围内分四步改。** 构建脚本会按校验和给 gpui 0.2.2 打补丁（`scripts/build-desktop-windows.sh`），升级要单独立项。
+
+- **第 0 步：打底。** 把颜色、字体、圆角统一放进一份主题 JSON（亮、暗两套语义色）；建立 px 字号刻度和 4px 间距刻度；挂上图标资源。这一步不改布局，但后面每一步都要靠它。gpui-component 0.5.1 本体不带图标文件，图标在另一个 crate `gpui-component-assets` 里；`app.rs:22` 的 `Application::new()` 也没挂任何资源，所以组件里的图标现在全是空白（详见 2.4）。
+- **第 1 步：换外壳。** 改用自定义 TitleBar、左侧 Sidebar 和 28px 状态栏；去掉藏青页头、全局路径条和按钮式 tab；确认色带改为 Dialog。
+- **第 2 步：逐页换组件。** 依次改总览、策略、诊断三页。
+- **第 3 步：整理代码结构。** 引入有类型的状态视图模型和无状态组件，加快捷键，补上能在 Linux 跑的单元测试。
+
+**每一步都要用真实 Windows 截图验收，每页至少一张，不能只看编译通过。** 之前一次只做了编译验证的桌面重构（`0fd66af`），就带出过"刷新列表不更新列表"的回归（见 `project-review-f97b25e.md`，HEAD 已修复）。
+
+**不要做的事：**
+- 不要继续在 `div()` 上调色、加说明文字。
+- 不要在同一个改动里升级 GPUI。
+- 不要把"状态未知""需要处理""操作后无法确认状态"这类持续存在的故障改成会自动消失的 toast。
+
+## 1. 依据和证据边界
+
+- **代码**：读了桌面端 GPUI 相关的全部 13 个文件，即 `desktop/src/app.rs` 和 `desktop/src/app/` 下的 12 个文件。
+- **截图**：
+  - `D:\WSL\ProxyLab\runtime-qa-20261120\normal\desktop-current.png` 是唯一一张对应 HEAD 构建的截图（exe 哈希与 QA 记录一致），但窗口大部分被其他程序挡住了，看不出页面内容。
+  - 同目录的 `desktop-preflight.png` 是改版前的中间版本（窗口标题"单目标管理"、标签"工作区""目标与对照"，这些字样在当前源码里已经不存在）。
+  - `m4-lab/qa/*.png` 更早。
+
+  这些旧截图只用来说明页面组成和尺寸比例，不当作当前界面的证据。
+- **没能补拍当前构建**：从 WSL 调用 Windows 程序时报 `UtilAcceptVsock: accept4 failed 110`，WSL 与 Windows 之间的互通不可用。所以"现状"一律以代码（`文件:行号`）为准。
+- **gpui-component 的能力**：以本机 cargo 缓存里的 0.5.1 源码为准（`~/.cargo/registry/src/index.crates.io-*/gpui-component-0.5.1/`）。下文写 `src/xxx.rs` 的都是指这份源码。GitHub `main` 分支上的写法只作参考，0.5.1 里没有的另列在第 9 节。
+
+## 2. 现状问题（带位置）
+
+### 2.1 字号和间距刻度
+
+GPUI 的 `text_*`、`p_*`、`gap_*` 都按 rem 计算；gpui-component 的 `Root::render` 每帧执行 `window.set_rem_size(cx.theme().font_size)`（`src/root.rs:398`），本项目把 `font_size` 设成 14px（`app.rs:28`）。所以：
+
+| 写法 | rem | 实际像素 | 本项目用法 |
+|---|---|---|---|
+| `text_xs()` | 0.75 | **10.5px** | 19 处：字段说明、指标标签、徽标文字、底栏标题 |
+| `text_sm()` | 0.875 | 12.25px | 14 处：面板说明、提示文字 |
+| `text_base()` | 1 | 14px | 指标数值 |
+| `text_lg()` / `text_xl()` / `text_2xl()` | 1.125 / 1.25 / 1.5 | 15.75 / 17.5 / 21px | 面板标题、页头、状态大字 |
+| `gap_1()` / `gap_2()` / `gap_3()` | 0.25 / 0.5 / 0.75 | 3.5 / 7 / 10.5px | 到处都在用 |
+| `p_3()` / `p_5()` / `px_6()` | 0.75 / 1.25 / 1.5 | 10.5 / 17.5 / 21px | 面板、指标卡、外壳 |
+
+**后果：**
+- Windows 上 10.5px 的微软雅黑不在像素网格上，小字发虚。
+- 半像素间距让相邻元素的对齐线互相错开。
+- 标题档位相差不到 2px（15.75、17.5），层级拉不开。
+
+### 2.2 颜色
+
+- `theme.rs:3-20` 定义了 18 个颜色常量。全部 82 处 `rgb()` 中，12 处在 `app.rs` 里写进主题，其余约 70 处是页面直接 `rgb(CONST)`，完全不经过 `cx.theme()`。
+- `app.rs:25-43` 先 `Theme::change(Light)`，再逐个改字段。但 0.5.1 的 `Theme::change` 每次都会调用 `apply_config`，用配置重新铺一遍颜色，配置里没写的字体、字号、圆角会被重置成默认值（`src/theme/schema.rs:645` 起，默认 16px、`.SystemUIFont`）。也就是说，以后一旦跟随系统切换亮暗、或者再调一次 `Theme::change`，这些手工改的值全部丢失。
+- primary 的 hover 色 `0x1e40af` 是皇家蓝，primary 是青蓝 `0x087ea4`，鼠标悬停时按钮会变色相（`app.rs:32-33`）。
+- 颜色被用来区分"身份"而不是"状态"：目标候选是蓝字、对照环境是青字、DNS 是青字或锈红字（`overview.rs:187-203`），状态色反而被冲淡了。
+
+### 2.3 布局和信息层级
+
+**外壳高度**（按当前代码的 padding 和字号估算；改版前截图的实测比例是 367/870 ≈ 42%，与估算一致）：
+
+| 层 | 位置 | 估算高度 |
+|---|---|---|
+| Windows 原生标题栏 | `app.rs:45-50`（未自定义） | ~31px |
+| 藏青页头：Logo、标题、副标题、后台徽标、两个按钮 | `views.rs:38-112` | ~68px |
+| 路径条：标题行和四个事实卡 | `chrome.rs:98-164` | ~118px |
+| 按钮式 tab 条和草稿徽标 | `views.rs:114-149` | ~52px |
+| 底部提示栏 | `views.rs:223-266` | ~56px |
+| **合计** | | **~325px / 840px ≈ 39%** |
+
+出现确认请求时还要再加一条约 130px 的确认色带（`views.rs:163-222`），内容区剩下不到一半。
+
+**信息重复：**
+- 后台在线/未知在页头徽标里显示，总览"当前保护状态"里显示，底栏活动徽标里又显示一次。
+- 路径条的四个值，就是策略页里的字段值。
+- "草稿未保存"在 tab 条右侧有一个徽标（`views.rs:25-29`），在策略页标题旁又有一个（`policy.rs:14-20`）。
+
+**说明文字太多：** 10 个 `panel(title, caption)` 每个都带一句说明，另有 18 处 `fact()` 和多处灰色提示句。用户每屏要读十几句"这是什么、不代表什么"，真正的状态值反而被埋住。这些句子承载的安全语义要保留（见 4.5），但应该收到少数固定位置。
+
+**主操作不突出：** 总览的状态面板里，启动/切换/停止/复核四个按钮并排（`overview.rs:213-256`），每种状态下真正该点的那个和其余禁用按钮一样大。下方"运行启动预检"又是一个 primary（`overview.rs:282`），同一屏出现了两个主按钮。
+
+### 2.4 交互状态缺失
+
+- **图标全部空白。** gpui-component 0.5.1 只把图标映射成 `icons/*.svg` 路径（`src/icon.rs:124` 起），自己不带 SVG 文件，`grep` 不到任何 `AssetSource` 或 `include_bytes`。`Application::new()` 默认的资源源 `()` 对任何路径都返回 `None`（gpui `src/assets.rs:21-28`）。因此下列组件内部用到的图标现在都画不出来：
+
+  | 组件 | 内部用到的图标 |
+  |---|---|
+  | TitleBar | WindowMinimize / Maximize / Restore / Close |
+  | Dialog | Close |
+  | Alert、Notification | CircleCheck / CircleX / Info / TriangleAlert / Close |
+  | Select | ChevronDown / Inbox |
+  | Table | SortAscending / SortDescending / ChevronsUpDown / Inbox |
+  | Spinner、按钮加载态 | Loader |
+  | Sidebar | ChevronRight / PanelLeftClose / PanelLeftOpen |
+  | NumberInput | Plus / Minus |
+  | 输入框清除按钮 | CircleX |
+
+  这是第 1、2 步的硬前置条件。
+- **发行版列表**（`overview.rs:59-150`）：每行一个 `div` 加两个按钮，4 个发行版就是 8 个按钮，行本身既没有 hover 也不能点；"未分配"徽标和按钮文字表达的是同一件事。
+- **加载状态**：按钮发出请求后只有底栏文字从"…中"开始变化，按钮本身没有 loading，其余按钮整体灰掉（`locked()`）。用户看不出是哪个操作在跑。
+- **连接记录表**（`diagnostics.rs:14-131, 205-240`）：用固定像素宽的 `div` 拼表头和行，没有对齐基线、hover、列宽调整、粘性表头，空态和表头之间也没有分隔。每 2 秒轮询一次就整体重建最多 384 行。
+- **确认**（`views.rs:163-222`）：用页面底部的一条色带代替模态对话框。键盘 Esc 不起作用，焦点不会移过去，页面其余部分只是被 `locked()` 灰掉。
+
+### 2.5 内容呈现
+
+- 确认文案里显示的是发行版 GUID，不是名称：`actions.rs:207, 212` 把 `selection()` 返回的 id 直接拼进 `将接管 {target}…`。旧截图 `m4-lab/qa/06-start-confirm.png` 里能看到 `{7e6fe44b-…}` 这样的字样。
+- 出口检测时间直接显示 Unix 秒数并标成 "UTC"（`overview.rs:314-321`）；IP、地区、比对结论、时间用 `·` 串成一行长句。
+- "操作版本""配置版本"这类内部计数器，以和"运行目标"同等的分量放在首屏（`overview.rs:205-211`）。
+
+### 2.6 代码结构（只列和 UI 质量直接相关的）
+
+- `Desktop` 是一个有 32 个 `pub(crate)` 字段的大结构（`state.rs:12-45`），所有页面都是 `impl Desktop` 上返回 `Div` 的方法。组件拿到的是整个 `Desktop`，所以很难写成可复用、可单独预览的组件。
+- 状态一直以 `serde_json::Value` 的形式穿过渲染层：`self.status["forwarding"]["traffic"]["tx_bytes"]`。路由、阶段、原因的中文映射写在渲染循环里（`diagnostics.rs:42-73`），既没法单测，也容易漏分支。
+- `button()` 的 `UiAction` 大 `match` 和直接 `Button::new` 两种写法混用（例如 `diagnostics.rs:254`）。
+
+## 3. 从 GitHub 学到的
+
+**先说版本问题：上游当前的写法不能直接照抄。** gpui-component 已改名为 gpui-kit，最新版本到了 v0.10.0；原文档站 `longbridge.github.io/gpui-component` 现在只显示一个跳转提示。0.5.1 自带的 `docs/` 文档也和源码对不上，例如 `root.md` 写的是 `render_dialog_layer(cx)`，源码里实际是 `(window, cx)`。所以下面的参考一律以 **v0.5.1 tag 下的 story 示例源码**为准，再拿本机 0.5.1 源码核对一遍。
+
+下面所有链接都固定在具体 commit 或 tag 上：
+
+| 缩写 | 地址 |
+|---|---|
+| `U:` | `https://github.com/longbridge/gpui-component/blob/v0.5.1/` |
+| `Z:` | `https://github.com/zed-industries/zed/blob/7279c76ef71d45504d7cfea00ee054f852ca0fbf/` |
+| `B:` | `https://github.com/emamoah/bandmeter/blob/aa68b8709108518dcae37dd882dab17645779bb1/` |
+| `R:` | `https://github.com/vicanso/zedis/blob/v0.2.0/` |
+| `P:` | `https://github.com/Kuddev/pebrel/blob/e74057251c97/` |
+
+### 3.1 最值得参考的同栈项目
+
+**bandmeter** 是一个网络流量监控工具，依赖是 `gpui = "0.2.2"`、`gpui-component = "0.5.1"`、`gpui-component-assets = "0.5.1"`，和本项目一模一样，题材也接近（`B:bandmeter/Cargo.toml`）。它的代码可以直接照着写，已核实：
+
+- **图标**：`Application::new().with_assets(gpui_component_assets::Assets)`（`B:bandmeter/src/bin/bandmeter/main.rs#L273`）。
+- **主题**：只改少数几个 token，强调色只给两条数据曲线用（`main.rs#L257-L266`）。正文统一用 `foreground` / `muted_foreground`（`components/table.rs#L46-L48`）。
+- **表格**：
+  - `TableState::new(delegate, window, cx)` 建表（`main.rs#L94`）；
+  - 数据更新时用 `self.exe_table.update(cx, |t, cx| { t.delegate_mut().filter_stats(..); cx.notify(); })`（`main.rs#L145-L148`）；
+  - delegate 的骨架见 `components/table/exe_table.rs`。
+
+  这正是 4.4 节连接表需要的写法。
+
+**zedis**（Redis 客户端）依赖 gpui 0.2.2 + gpui-component 0.5.0（`R:Cargo.toml#L28-L30`，已核实），版本也很接近。调研子任务读了它的源码，报告如下几点，我没有逐行复核：
+- 外壳：标题栏 + 窄图标栏 + 内容区，三层浮层由应用自己挂（`R:src/main.rs#L149-L182`）。
+- 状态栏是一行 `h_flex().border_t_1()`，文字用 `muted_foreground`，里面放 `.small()` 的控件（`R:src/views/status_bar.rs`）。
+- 自定义 `AssetSource` 先查组件库的图标，再查自己的图标（`R:src/assets.rs`）。
+
+### 3.2 gpui-component 0.5.1 自己的示例（story）
+
+story 的行号，是在调研子任务下载的 v0.5.1 源码里逐条核对的。组件 API 另外在本机 0.5.1 源码里核对过：
+
+- **浮层要自己挂。** 顶层视图末尾要追加 `Root::render_dialog_layer` / `render_notification_layer`，story 的写法见 `U:crates/story/src/lib.rs#L266-L285`。
+- **自定义标题栏。** 窗口创建时设 `titlebar: Some(TitleBar::title_bar_options())`（`U:crates/story/src/lib.rs#L212`）。story 的外壳就是 TitleBar + 可调宽度的 Sidebar，没用 DockArea。
+- **确认对话框。** `dialog.confirm().child(..).button_props(DialogButtonProps::default().ok_text(..).ok_variant(ButtonVariant::Danger)).on_ok(|_, window, cx| { …; true })`（`U:crates/story/src/dialog_story.rs#L297-L321`）。`on_ok` 返回 `true` 才会关闭对话框。
+- **通知去重。** `Notification::info(..).id::<T>()`：同一个 id 的新通知会替换旧的，不会越堆越多（`U:crates/story/src/notification_story.rs#L142-L146`，0.5.1 源码 `notification.rs:174`）。
+- **改名发生在 0.4.0，不在 0.5。** Modal→Dialog、Drawer→Sheet、Dropdown→Select、Indicator→Spinner 这些改名都在 0.4.0。0.5.0 的破坏性改动是 TableDelegate 重构和滚动条 API 改名。以上都已对照两个版本的 GitHub 发布说明核实。所以网上 0.4 时期的表格、滚动条示例在 0.5.1 上编译不过，不要照抄。
+
+### 3.3 Zed 的设计原则（可借鉴，组件不能直接用）
+
+Zed 的 `ui` crate 没有发布到 crates.io，这里只借鉴原则。下面引用的文件和行号都已在 `7279c76` 的源码里核对：
+
+- **颜色只用按用途命名的 token。** 组件只接受语义 `Color` 枚举；`Color::Custom` 的注释原文写着 "highly, HIGHLY recommended not to use"（`Z:crates/ui/src/styles/color.rs#L33`）。对应到本项目，就是第 5 节的"页面代码不出现 `rgb()`"。
+- **字号只有少数几档，而且先按 px 定义。** 正文只有 16 / 14 / 12 / 10px 四档，用 `rems_from_px(14.)` 这样的写法由 px 换算成 rem（`Z:crates/ui/src/styles/typography.rs#L134-L160`）。间距是固定档位表（`Z:crates/ui/src/styles/spacing.rs#L29-L44`）。本项目 rem 是 14px，更应该直接按 px 定刻度（第 5 节）。
+
+  Zed 的英文 UI 用到 10px，中文不要照搬，最小用 12px。
+- **默认是中性色，强调色用得很淡。**
+  - 默认按钮样式是 `Subtle`：透明底，悬停才出底色（`Z:crates/ui/src/components/button/button_like.rs#L147`）。
+  - Banner 的状态色只做很淡的底：成功和错误用 10% 不透明度做底、20% 做边框，提示和警告用自身已经很浅的底色再减半，并且都配一个图标（`Z:crates/ui/src/components/banner.rs#L76-L101`）。
+
+  对应到本项目：把 15 处实底彩色徽标减少到"每块区域最多一个状态 Tag"。
+- **列表行必须有三种状态。** 悬停、按下、选中各对应一个 token（`Z:crates/ui/src/components/list/list_item.rs#L380-L384`）。对应到本项目：发行版下拉项和连接表行都要有 hover。
+- **UI 检查清单**（`Z:docs/src/development/ui-checklist.md`）。其中这几条可以直接搬进本项目的截图验收：
+  - 快捷键能不能被发现；
+  - 亮、暗两种模式下都好看；
+  - hover 和焦点状态清晰；
+  - 窗口变矮时还能用。
+
+### 3.4 提示分层（来自 pebrel，只借鉴约定）
+
+pebrel 是一个 Windows 终端，用的是自己 fork 的 gpui-component `=0.5.2`，上游没有这个版本。所以只学它的约定，不抄 API。
+
+它的提示分三层（`P:pebrel_app/src/gpui_shell/toast.rs` 开头的注释，已核实原文）：
+- 已经结束、没有待办动作的事，用 toast，自动消失，同时写一行日志；
+- 需要用户看到、值得停留一会儿的事，用消息栏；
+- 必须由用户决定的事，用对话框。
+
+**判断标准是"有没有待办动作"，不是严重程度。** 本项目在此基础上再收紧一条：凡是会让接管操作被禁用的状态（状态未知、需要恢复、操作后无法确认状态），一律放在不会自己消失的位置，直到状态恢复为止（见 4.1 状态栏和 4.5）。
+
+pebrel 的另一个做法也值得照着做：在 Windows 上为中文显式配置 UI 字体和一串回退字体，其中包括 Microsoft YaHei UI。
+
+## 4. 目标设计
+
+### 4.1 外壳：TitleBar、Sidebar、状态栏
+
+**为什么选左侧边栏，不选顶部 tab：**
+- 窗口是横版（1280×840，最小 1120×720），竖向空间比横向紧张。侧边栏占的是宽度，省下来的是高度。
+- 侧边栏底部天然适合常驻放"后台连接"和"最近观测时间"，这样就不需要藏青页头和底部提示栏各放一份。
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│ ◆ WSL 代理控制台     ● 保护接管中 · WSLProxyLab-Target       ⟳   ─  □  ×   │ TitleBar 34px
+├───────────────┬──────────────────────────────────────────────────────────┤
+│ ▦ 总览         │ 总览                                       [ 停止接管 ]   │ 页头 ~48px
+│ ⚙ 策略     •   │                                                          │
+│ ◔ 连接与诊断    │   （页面内容，独占滚动）                                   │
+│               │                                                          │
+│               │                                                          │
+│───────────────│                                                          │
+│ ● 后台在线     │                                                          │
+│   2 秒前观测   │                                                          │
+├───────────────┴──────────────────────────────────────────────────────────┤
+│ ◌ 运行预检中…                                        关闭窗口不会停止接管    │ 状态栏 28px
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+- **TitleBar**（`src/title_bar.rs`）：
+  - 窗口创建时设 `WindowOptions { titlebar: Some(TitleBar::title_bar_options()), .. }`。0.5.1 在 Windows 上会自己画最小化、最大化、关闭按钮，并标好拖拽区（`title_bar.rs:154-225, 303`）。
+  - 标题栏里放：应用名、全局阶段标签（Tag，阶段 → 语义色）、当前运行目标名、刷新按钮（只有图标，带 tooltip 和快捷键）。
+  - "重新连接后台"不常用，挪到侧边栏底部"后台在线"那一行的菜单或按钮里。
+- **Sidebar**（`src/sidebar/`）：
+  - `Sidebar::left()` + `SidebarMenu` + `SidebarMenuItem::new("总览").icon(IconName::LayoutDashboard).active(..)`。
+  - 策略项在有未保存草稿时，用 `suffix` 显示一个小圆点。这样 tab 条右侧那个"草稿"徽标就可以删了。
+  - footer 放后台连接状态和观测时间。
+- **状态栏**（自绘一行，高 28px）：左边放当前活动（Spinner 加操作名）或最近一条提示，右边固定写"关闭窗口不会停止接管"。持续性的错误一直留在这里，直到状态恢复，不会自动消失。
+- **对话框和通知层**：0.5.1 的 `Root` **不会自己**渲染这两层，顶层视图要在末尾追加 `Root::render_dialog_layer(window, cx)` 和 `Root::render_notification_layer(window, cx)`（`src/root.rs:279, 335`；写法照 `U:crates/story/src/lib.rs#L266-L285`），否则 `open_dialog` / `push_notification` 调了也不显示。
+- **通知的用法**：只给"已完成、没有后续动作"的结果用，例如策略已保存、诊断已导出、列表已刷新。每种通知固定一个 `.id::<T>()`，连续触发时只会替换，不会越堆越多。凡是会让操作被禁用的状态都不用通知，留在状态栏和页面里（规则见 3.4）。
+- **去掉的东西**：藏青页头、全局路径条（挪进总览，见 4.2）、按钮式 tab 条、底部那块两行高的提示栏。估计内容区能多出约 250px 高度。
+
+### 4.2 总览
+
+```
+┌ 当前状态 ───────────────────────────────────────────────────────────────┐
+│ 保护接管中  [实时保护]                                2 秒前 · 操作版本 24 │
+│ 运行目标   WSLProxyLab-Target        系统 DNS   已接管（启动时检查）       │
+│ 公网出口   203.0.113.10 · 已匹配配置出口 · 14:02 检测     [ 复核出口 ]     │
+│                                         [ 切换至目标 ]   [ 停止接管 ]     │
+└────────────────────────────────────────────────────────────────────────┘
+  路径（策略摘要，不代表线路健康）
+  Target  ›  127.0.0.1:7892  ›  住宅凭据（Windows 凭据库）  ›  DoH dns.example
+┌ 启动准备 ─────────────────────────┐ ┌ 预检结果 ─────────────────────────────┐
+│ 目标 WSL   [ WSLProxyLab-Target ▾ ]│ │ ✓ 通过 · 仍需确认启动                  │
+│ 对照 WSL   [ WSLProxyLab-Control ▾]│ │ 目标身份   Target    ✓ 身份验证通过    │
+│ 入口端口   [ 43531        − + ]    │ │ 对照环境   Control   ✓ 身份验证通过    │
+│ [ 刷新列表 ]          [ 运行预检 ] │ │                                        │
+└───────────────────────────────────┘ └───────────────────────────────────────┘
+```
+
+- **状态卡**：
+  - 阶段用 20px 的大字，后面跟一个 Tag。
+  - 关键事实用 `DescriptionList::new().columns(2)`（`src/description_list.rs`）。
+  - "操作版本"降为右上角的灰色小字。
+  - 出口时间改成本地时间；IP 和比对结论分开显示。
+- **主操作随状态变化，每屏只有一个主按钮**：
+  - 空闲时：主按钮是"启动保护接管"。
+  - 接管中：主按钮是"停止接管"（danger），"切换""复核出口"降为次要按钮。
+  - 需要恢复时：只保留"恢复并停止"。
+  - 和当前状态无关的按钮直接隐藏，不要整排灰着。例如接管中就不显示"启动"。
+  - **停止、恢复类按钮在状态未知时不要隐藏**：显示为禁用，旁边写明原因，例如"后台状态未确认，请先刷新"。用户要能看到"停止"这条路一直在。
+- **目标和对照**：用两个 `Select`（`src/select.rs`，需要各自的 `SelectState` 实体）替代"每行两个按钮"。下拉项显示 `名称 · WSL 2`；非 WSL2 的项禁用；在"对照"里排除当前目标。
+- **端口**：用 `NumberInput`（`src/input/number_input.rs`），配合 `InputState::validate` 或 `pattern` 限定 1024–65535（`src/input/state.rs:737, 759`），输错时在字段下方直接提示，不用等点了按钮才在底栏报错。
+- **预检结果**：
+  - 通过时用 `Alert::success`，有阻断项时用 `Alert::error` 并逐条列出（`src/alert.rs`）。
+  - 两个观测（目标身份、对照环境）用 DescriptionList 显示。
+  - 还没跑预检时只显示一行灰字，不要一整块面板。
+- **路径条**：从全局外壳挪到这里，改成一行面包屑样式：用 `IconName::ChevronRight` 分隔，等宽字体显示地址。标题后面保留"策略摘要，不代表线路健康"这句话。
+
+### 4.3 策略
+
+- 整页用 `v_form()` 加 `field().label(..).description(..).required(..)`（`src/form/`）。四个分组 `GroupBox`（链路 / DNS 保护 / 直连例外 / 住宅凭据）替代现在的 `panel()`。表单最大宽度约 760px 并居中，不要拉满 1280。
+- 0.5.1 也有 `Settings` / `SettingPage` 组件，但它是一整套"左侧分类、右侧开关"的设置窗口；策略页是一张带多行输入的单页表单，用 Form 更合适。
+- **改动底栏**：有未保存改动时，在页面底部浮出一条"有未保存更改 · 保存前不会生效 [放弃] [保存策略]"。保存成功后底栏收起，并推一条会自动消失的 success 通知。"放弃"复用已有的 `accept_profile` 回填逻辑，这是一个新功能，可以放到第 2 步之后再做。
+- 三个直连例外的多行输入用 `InputState::auto_grow(3, 10)`（`src/input/state.rs:426`），替代固定的 112px 高度。
+- 凭据导入、删除放在独立的 GroupBox 里。"删除已保存凭据"改走 Dialog 确认，它是不可逆操作，现在点一下就直接执行。
+- 页面顶部"策略工作台"标题和草稿徽标删掉，由侧边栏圆点和改动底栏代替。
+
+### 4.4 连接与诊断
+
+- **指标行**：四个指标块（上行速率 / 下行速率 / 累计上行 / 累计下行）。标签 12px 灰色；数值 20px，等宽或数字等宽字体，这样每 2 秒刷新时数字不会左右跳。
+- **健康行**：工作线程状态用 Tag，DNS 观测用一行文字，最后一次转发错误用 `Alert::warning`。
+- **连接表**：`Table` + `TableState<ConnectionsDelegate>`（`src/table/`），写法照 bandmeter（3.1 节）。
+  - 列：ID | 协议 | 已观测目的端（等宽字体）| 路由（Tag）| 状态 · 阶段 | ↑/↓（`Column::text_right()` 右对齐）| 判定原因。
+  - 表格可以加 `.stripe(true)` 显示斑马纹。
+  - 得到的是列对齐、hover、列宽可调、粘性表头和统一的空态（`render_empty`）。
+  - 最多 384 行，性能收益不大，主要是为了好看、好用。
+  - 代价：需要一个 `Entity<TableState<_>>`，在 `accept_status` 里更新 delegate 的行数据并通知它重绘。
+- "策略声明"面板（三条固定文字）压缩成表格上方的一行说明，或者整块删掉，它描述的是配置，不是观测结果。
+- 导出脱敏诊断、打开报告位置放到页头右侧，导出成功后推一条 success 通知，通知里带"打开位置"按钮（`Notification::action`）。
+
+### 4.5 必须保留的安全提示
+
+下面这些话现在分散在各种说明句里，改版后**一句都不能丢**，只是挪到固定位置：
+
+| 语义 | 现在的位置 | 改版后的位置 |
+|---|---|---|
+| 关闭窗口不会停止接管 | 底栏右侧徽标、初始提示 | 状态栏右侧常驻 |
+| 状态未知不等于正常；未知时禁用接管操作 | 页头"状态未知"徽标、`accept_status` 的报错 | TitleBar 阶段 Tag 显示"状态未知"（warning 色）；总览状态卡显示 `Alert::warning`；停止、恢复按钮保持可见但禁用，并写明原因 |
+| 草稿不等于生效 | tab 条徽标、策略页徽标 | 侧边栏"策略"项上的圆点，加策略页改动底栏的文案 |
+| 路径是策略摘要，不代表健康 | 路径条右上灰字 | 总览路径行的标题后缀 |
+| 出口检测只代表这一次 | 底栏提示 | 出口行的检测时间和 tooltip |
+| 停止会中断现有 TCP 连接 | 确认色带 | Dialog 正文 |
+| 凭据秘密不显示、源文件不删除 | 凭据面板说明 | 凭据 GroupBox 的 field description |
+
+## 5. 视觉规范
+
+**字号**（不用 `text_xs` / `text_sm` 这些按 rem 算的写法，统一用 px）：
+
+| 档位 | 字号 / 行高 | 用途 |
+|---|---|---|
+| caption | 12 / 18 | 字段说明、表头、次要元信息（中文不要小于 12px） |
+| body-sm | 13 / 20 | 表格单元格、标签文字 |
+| body | 14 / 22 | 正文、输入框、按钮（等于主题字号） |
+| title | 16 / 24，semibold | 分组标题 |
+| page | 20 / 28，semibold | 页面标题、阶段大字 |
+| metric | 24 / 32，等宽 | 诊断指标数值 |
+
+**间距**：只用 4 的倍数（4 / 8 / 12 / 16 / 24 / 32），在代码里定义成 `px()` 常量，不用 `gap_1` / `p_3` 这些按 rem 算的写法。分组之间 24px，分组内字段之间 16px，标签和控件之间 8px。
+
+**主题字号保持 14px**：gpui-component 的组件高度按 rem 计算（例如按钮的 `h_8` = 2rem = 28px），14px 的 rem 给出的是适合控制台的紧凑密度。改成 16px 能让 rem 刻度变成整数，但所有组件都会整体变大，不建议。
+
+代价要说清楚：px 常量只修得了自己写的部分。组件内部仍然按 rem 计算，有些内边距会落在半像素上（例如 `px_3` = 10.5px）。这是换取 14px 紧凑密度的代价，可以接受。
+
+**颜色规则：**
+- 正文和数值默认都用 `foreground` / `muted_foreground`，**不用颜色区分"目标""对照"这类身份**。
+- 语义色（success / warning / danger / info）只出现在 Tag、Alert、状态圆点、危险按钮上。
+- 品牌色只用在 primary：主按钮、选中项、焦点环。
+- 每屏最多一个 primary 按钮。
+
+**主题 JSON**：新建 `desktop/assets/theme.json`，格式和 `src/theme/default-theme.json` 一样（`ThemeSet`，含 light 和 dark 两项）。字体、字号、圆角也写进去，切换亮暗时就不会被重置：
+
+下面是示意片段，只演示格式，颜色值没有定稿，深色那一项第 4 步再加。配置里没写的颜色键，会自动用 gpui-component 的默认值补上：
+
+```json
+{ "name": "WSL Proxy", "themes": [
+  { "name": "WSL Proxy Light", "mode": "light", "is_default": true,
+    "font.family": "Microsoft YaHei UI", "font.size": 14,
+    "mono_font.family": "Consolas", "radius": 6, "radius.lg": 8,
+    "colors": { "primary.background": "#087ea4", "primary.hover.background": "#0a6d8e",
+                "success.background": "#167d73", "warning.background": "#c47a12",
+                "danger.background": "#b4532a", "muted.foreground": "#61747b",
+                "border": "#d8e0e2", "background": "#f6f7f6", "sidebar.background": "#eef2f1" } } ] }
+```
+
+加载方式：`include_str!` 进来，用 `serde_json::from_str::<ThemeSet>` 解析，把两项分别放进 `Theme::global_mut(cx).light_theme` / `dark_theme`，再调用 `Theme::change(mode, None, cx)`。这几个字段和类型都是 0.5.1 的公开 API（`src/theme/mod.rs:41-66`，`src/theme/schema.rs:16-72`）。
+
+**图标资源**：
+- **推荐做法**：新增依赖 `gpui-component-assets = "=0.5.1"`，然后 `Application::new().with_assets(gpui_component_assets::Assets)`。gpui-component 自己的 story 示例和 bandmeter 都是这么做的（第 3 节）。它内部用 rust-embed 把整套组件图标打进程序。
+- **代价**：`Cargo.lock` 里会多出 rust-embed 等几个依赖。这个 crate 依赖 `gpui 0.2.2`，第 0 步要确认构建脚本给 gpui 打的补丁对它同样生效，也就是 Windows 交叉构建能编过。
+- **需要自己的图标时**（例如导航图标不在 `IconName` 里）：写一个包装的 `AssetSource`，先查自己的 SVG，查不到再交给 `gpui_component_assets::Assets`（zedis 就是这样做的，`R:src/assets.rs`）；自己的图标类型实现 `IconNamed` trait。
+- **不想加依赖的备选**：自己写 `AssetSource`，只用 `include_bytes!` 收进 2.4 节表里那约 30 个 SVG。这样更省依赖，但组件以后再用到新图标就会悄悄变成空白。所以不推荐。
+
+## 6. 手写部件 → 0.5.1 组件对照表
+
+| 手写部件 | 位置 | 换成 | 0.5.1 源码 | 成本 / 风险 |
+|---|---|---|---|---|
+| 原生标题栏和藏青页头 | `app.rs:45-50`，`views.rs:38-112` | `TitleBar` 和 `TitleBar::title_bar_options()` | `src/title_bar.rs` | 中。依赖图标资源；拖拽区、双击最大化、Snap 布局要在 Windows 实机验证 |
+| 按钮式 tab | `views.rs:114-149` | `Sidebar`、`SidebarMenu`、`SidebarMenuItem` | `src/sidebar/` | 低 |
+| `panel()` | `components.rs:54-81` | `GroupBox`（Fill / Outline） | `src/group_box.rs` | 低 |
+| `fact()` | `components.rs:83-109` | `DescriptionList` | `src/description_list.rs` | 低 |
+| `badge()` | `components.rs:27-44` | `Tag::success() / warning() / danger() / secondary()`，可加 `.outline()` | `src/tag.rs` | 低。注意 0.5.1 的 `Badge` 是角标（数字或圆点），不是文字标签 |
+| `field()` | `chrome.rs:72-96` | `v_form()`、`field()`，配合 `InputState::validate / pattern`，端口用 `NumberInput` | `src/form/`、`src/input/` | 低到中 |
+| 发行版行（每行两个按钮） | `overview.rs:47-150` | 两个 `Select`，各有一个 `SelectState` | `src/select.rs` | 中。刷新列表后要用新列表更新两个下拉框的选项和选中值，不能只更新 `self.distributions` |
+| 预检结果面板 | `overview.rs:336-419` | `Alert` 加 `DescriptionList` | `src/alert.rs` | 低 |
+| 确认色带 | `views.rs:163-222` | `window.open_dialog(cx, \|d, _, _\| d.confirm()…)` | `src/dialog.rs`、`src/root.rs:118` | 中，见下方说明 |
+| 底部提示栏 | `views.rs:223-266` | 28px 状态栏，加用于短暂成功提示的 `Notification` | `src/notification.rs`、`src/root.rs:169` | 低。要渲染通知层；持续性错误不能用会自动消失的通知 |
+| 连接记录 | `diagnostics.rs:14-131, 205-240` | `Table` 和 `TableState<D>` | `src/table/` | 中。delegate 要随 2 秒轮询更新 |
+| `route_arrow()` 用文字"→" | `components.rs:46-52` | `Icon::new(IconName::ChevronRight)` | `src/icon.rs` | 依赖图标资源 |
+| 操作中的反馈 | 只有底栏文字 | `Button::loading(true)`、`Spinner` | `src/button/button.rs:307`、`src/spinner.rs` | 低 |
+
+**Dialog 迁移注意事项：**
+- `on_ok` 的签名是 `Fn(&ClickEvent, &mut Window, &mut App) -> bool`，拿到的是 `&mut App`，不是 `Context<Desktop>`；而且构建闭包每帧都会被重新调用（`src/dialog.rs:203`，`src/root.rs:118`）。所以要捕获 `WeakEntity<Desktop>`，在回调里 `update` 回去调用现有的 `confirm()`。
+- **操作版本复核逻辑原样保留。**
+- `self.confirmation` 仍然是状态来源，`locked()` 继续依赖它。所以 `on_cancel`、`on_close`（Esc 和点击遮罩）都必须把它清空，否则界面会一直锁着。
+
+## 7. 代码结构建议
+
+不追求大拆分，只做让上面这些改动可维护、可测试的最小调整：
+
+1. **`ui/` 目录**：
+   - `tokens.rs` 放字号和间距常量，并写一个 `Styled` 扩展 trait，例如 `.text_caption()`、`.text_title()`。
+   - `ui/*.rs` 放无状态组件，用 `#[derive(IntoElement)]` + `RenderOnce`，例如 `PhaseTag`、`RouteTrail`、`MetricTile`。组件只接收需要的值，不接收 `&Desktop`。
+2. **有类型的状态快照**：`accept_status` 一次性把 `Value` 解析成 `StatusSnapshot`，包括 `Phase`、`Route`、`Stage`、`ConnStatus`、`Reason` 这些枚举，每个都有 `label()` 方法。渲染层不再写 `["a"]["b"]`。
+   - 这部分是纯 Rust，可以单独放在一个不受 `cfg(windows)` 限制的模块里，在 Linux 上跑单元测试。
+   - 代价：要把 `serde_json` 从 `[target.'cfg(windows)'.dependencies]` 挪到普通依赖。
+   - 收益：补上审查里提到的"桌面 crate 0 个测试"。
+3. **只给需要独立状态的部件建实体**：连接表的 `TableState`、两个 `SelectState`。三个页面暂时仍然是 `Desktop` 上的渲染方法，不必拆成三个实体。
+4. **用 GPUI action 加快捷键替代 `UiAction` 大 `match` 里的全局操作**：`actions!(wsl_proxy, [RefreshStatus, SaveProfile, ShowOverview, ShowPolicy, ShowDiagnostics])`，绑定 `ctrl-r` / `ctrl-s` / `ctrl-1..3`，在 tooltip 里用 `Kbd` 显示快捷键。
+
+## 8. 分阶段计划和验收
+
+| 步骤 | 内容 | 依赖 | 验收 |
+|---|---|---|---|
+| 0 打底 | 主题 JSON 和加载代码；`ui/tokens.rs`；接入 `gpui-component-assets = "=0.5.1"`；把 19 处 `text_xs` 和半像素间距换成新刻度；修正 hover 色 | 无 | 三页亮色截图；放一个 `Icon` 验证图标能显示；用 `scripts/build-desktop-windows.sh` 完整构建一次，确认新依赖和 gpui 补丁兼容 |
+| 1 外壳 | TitleBar、Sidebar、状态栏；渲染 dialog / notification 层；确认色带改成 Dialog；去掉页头、路径条和 tab 条 | 第 0 步（图标） | 三页截图，加启动确认对话框和停止确认对话框截图；实测 Esc / 取消后不会锁死；实测最小化、最大化、关闭、拖动和双击标题栏 |
+| 2 页面 | 总览（Select、DescriptionList、Alert、单一主按钮）；策略（Form、GroupBox、改动底栏）；诊断（Table、指标行） | 第 1 步 | 每页空态和有数据两种截图；接管中状态下关窗再重开，状态一致（沿用 M4 冒烟流程） |
+| 3 结构 | `StatusSnapshot` 和各枚举；无状态组件；action 和快捷键；Linux 单元测试 | 可以和第 2 步并行 | `cargo test` 覆盖阶段、路由、原因的映射，以及 busy / reading / epoch 状态机 |
+| 4 可选 | 深色主题；跟随系统切换（`gpui_component::init` 只在启动时同步一次系统明暗，之后要自己 `window.observe_window_appearance` 再调 `Theme::change`）；流量折线图（`src/chart/`） | 第 0 步 | 深色模式下三页截图；运行中切换 Windows 深浅色，界面跟着变 |
+
+**每一步都是一个独立提交**，并且先跑一遍现有的 M4 桌面冒烟流程（打开、选择、预检、启动、关窗、重开、停止），再进入下一步。
+
+## 9. 需要升级 gpui-component 才能用的东西
+
+**结论：本方案用不到必须升级的东西。** 第 6 节列出的组件都在 0.5.1 里，而且不需要开任何 feature：0.5.1 只有 `decimal`、`inspector`、`tree-sitter-languages`、`webview` 四个可选 feature，没有默认 feature，所以 `default-features = false` 不会关掉任何组件。
+
+将来如果要升级，先知道这几件事：
+- **改名**：上游已改名为 gpui-kit，最新是 v0.10.0。
+- **新项目的走向**：调研只看了两个新项目（navop、FluxDown）的依赖清单，它们都用 gpui-kit 加一个 gpui 的分支（gpui-fast），没有读源码。
+- **构建脚本**：`scripts/build-desktop-windows.sh` 按校验和锁定并修补 gpui 0.2.2，升级要连同这套补丁一起重做。
+- **建议**：升级应该单独立项，不要和本次 UI 改造混在一起。
+
+**不要照抄的写法：**
+- pebrel 的 `theme.tokens` 字段，以及它那个"`Root` 自带通知层"的行为，都只存在于它自己 fork 的 0.5.2，0.5.1 里没有。
+- GitHub 上主分支的 gpui-kit 示例。
+
+## 10. 顺带发现的问题（报给负责人，不放进重构计划）
+
+- 启动 / 切换确认文案显示发行版 GUID 而不是名称（`actions.rs:207, 212`）。
+- 出口检测时间显示 Unix 秒数并标成 UTC（`overview.rs:317-320`）。
+- 选择凭据文件后的提示写"点击'导入命名凭据'"，但按钮文字是"导入到凭据库"（`actions.rs:287` 对 `policy.rs` 的 `"import"` 按钮）。
+- "删除已保存凭据"没有二次确认（`policy.rs` 的 `"forget"` 按钮直接触发 `UiAction::Forget`）。
+- 同目录的 `project-review-8ce39d8.md` 另报了三条界面问题，改版时文案和状态判定可以一起处理：
+  - N4：诊断模式下显示"未接管"；
+  - N5："见证"和"对照"混用；
+  - N6：没有运行目标时，路径条显示"未选择目标"。
+
+  本文的线框图统一用"对照 WSL"。
+
+## 11. 需要负责人拍板
+
+1. **要不要做深色主题**（第 4 步）。不做的话，主题 JSON 里只保留 light 一项，工作量少一些。
+2. **品牌色是否保留青蓝 `#087ea4`。** 本文按保留来写；换的话只需改主题 JSON 的 primary 一组值。
