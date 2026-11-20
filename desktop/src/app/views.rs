@@ -985,12 +985,6 @@ impl Desktop {
             .flex()
             .flex_col()
             .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .child(badge(save_label, save_color, save_background)),
-            )
             .child(residential)
             .child(
                 div()
@@ -1023,6 +1017,7 @@ impl Desktop {
                         )
                         .primary(),
                     )
+                    .child(badge(save_label, save_color, save_background))
                     .child(
                         div().text_base().text_color(rgb(MUTED)).child(
                             self.profile_path
