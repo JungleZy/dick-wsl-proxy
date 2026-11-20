@@ -122,6 +122,7 @@ impl Desktop {
             status_at: None,
             status_valid: false,
             traffic_history: Vec::new(),
+            dns_history: Vec::new(),
             distributions: Vec::new(),
             selected: None,
             witness: None,
@@ -351,6 +352,17 @@ impl Desktop {
                 if self.traffic_history.len() > 24 {
                     let excess = self.traffic_history.len() - 24;
                     self.traffic_history.drain(0..excess);
+                }
+            }
+            let dns_latency = status["forwarding"]["traffic"]["dns_latency_ms"]
+                .as_f64()
+                .or_else(|| status["dns_latency_ms"].as_f64())
+                .unwrap_or_default() as f32;
+            if dns_latency > 0. {
+                self.dns_history.push(dns_latency);
+                if self.dns_history.len() > 12 {
+                    let excess = self.dns_history.len() - 12;
+                    self.dns_history.drain(0..excess);
                 }
             }
             self.status = status;

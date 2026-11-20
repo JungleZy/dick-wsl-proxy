@@ -350,21 +350,8 @@ impl Desktop {
     }
 
     fn dns_chart(&self) -> Div {
-        let latency = self.status["forwarding"]["traffic"]["dns_latency_ms"]
-            .as_f64()
-            .or_else(|| self.status["dns_latency_ms"].as_f64())
-            .unwrap_or_default() as f32;
-        let data = [
-            ("1".to_owned(), latency),
-            ("2".to_owned(), latency),
-            ("3".to_owned(), latency),
-            ("4".to_owned(), latency),
-            ("5".to_owned(), latency),
-            ("6".to_owned(), latency),
-            ("7".to_owned(), latency),
-            ("8".to_owned(), latency),
-        ];
-        if latency == 0. {
+        let latency = self.dns_history.last().copied().unwrap_or_default();
+        if self.dns_history.is_empty() {
             return chart_card(
                 "DNS 健康",
                 "DoH 响应延迟 · 最近 8 次检查",
@@ -396,12 +383,18 @@ impl Desktop {
                 )
                 .child(
                     div().h(px(118.)).child(
-                        LineChart::new(data)
-                            .id("dns-health")
-                            .x(|point| point.0.clone())
-                            .y(|point| point.1)
-                            .stroke(rgb(TEAL))
-                            .dot(),
+                        LineChart::new(
+                            self.dns_history
+                                .iter()
+                                .enumerate()
+                                .map(|(index, value)| ((index + 1).to_string(), *value))
+                                .collect::<Vec<_>>(),
+                        )
+                        .id("dns-health")
+                        .x(|point| point.0.clone())
+                        .y(|point| point.1)
+                        .stroke(rgb(TEAL))
+                        .dot(),
                     ),
                 ),
         )
