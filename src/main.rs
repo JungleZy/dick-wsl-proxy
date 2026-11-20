@@ -1,14 +1,16 @@
+mod command;
+mod controller;
 mod credential;
 mod desktop_control;
-mod command;
+mod desktop_store;
+mod environment;
 mod host;
 mod ingress;
 mod kernel;
 mod lease;
-mod plan;
-mod controller;
 mod managed;
 mod managed_dns;
+mod plan;
 mod policy;
 mod ports;
 mod probe;
@@ -80,7 +82,8 @@ fn run(command: Command) -> Result<u8, Failure> {
         // transition is sufficient reason to refuse. _lock stays alive across the handshake.
         let record =
             transition::load().map_err(|e| Failure::new("maintenance_state_unknown", e))?;
-        let active = controller::journal::load().map_err(|e| Failure::new("maintenance_state_unknown", e))?;
+        let active = controller::journal::load()
+            .map_err(|e| Failure::new("maintenance_state_unknown", e))?;
         if active.is_some() || record.pending.is_some() {
             return Err(Failure::new(
                 "maintenance_requires_restore",

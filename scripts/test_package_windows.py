@@ -41,7 +41,7 @@ class PackagingTests(unittest.TestCase):
             (root / "Cargo.lock").write_text('version=4\n[[package]]\nname="wsl-proxyctl"\nversion="0.1.1"\n[[package]]\nname="wsl-proxy-desktop"\nversion="0.1.1"\n[[package]]\nname="example-dep"\nversion="1.0.0"\n')
             crate = root / "local-crate"
             crate.mkdir()
-            (crate / "LICENSE-MIT").write_text("Actual test notice text\n")
+            (crate / "LICENSE-MIT").write_text("Actual test notice text\n", newline="\n")
             for name in pack.SCRIPTS:
                 (root / "packaging/windows" / name).write_text("# test fixture script\n")
             (root / ".env").write_text("MUST_NOT_BUNDLE=secret")

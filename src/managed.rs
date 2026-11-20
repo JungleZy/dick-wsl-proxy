@@ -60,6 +60,12 @@ pub struct Readiness {
 
 impl Runtime {
     pub fn from_file(path: &Path) -> Result<Arc<Self>, String> {
+        if path.extension().and_then(|v| v.to_str()) == Some("sqlite") {
+            let (config, residential) = crate::desktop_store::load_runtime(path)?;
+            let validated = crate::policy::Validated::new(config)?;
+            let policy = Arc::new(Policy::assemble_for_store(validated, residential)?);
+            return Self::with_policy(policy);
+        }
         let policy = Arc::new(Policy::from_file(path)?);
         Self::with_policy(policy)
     }

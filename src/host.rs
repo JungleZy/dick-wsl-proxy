@@ -22,7 +22,10 @@ pub enum LockError {
 }
 
 #[cfg(windows)]
-pub use windows::{acquire, distributions, guest_script, state_dir, wsl_executable};
+pub use windows::{
+    acquire, distributions, guest_script, guest_script_with_timeout, state_dir, wsl_command,
+    wsl_executable,
+};
 
 #[cfg(not(windows))]
 pub fn state_dir() -> Result<std::path::PathBuf, String> {
@@ -36,6 +39,24 @@ pub fn distributions() -> Result<Vec<Distro>, String> {
 
 #[cfg(not(windows))]
 pub fn guest_script(_distro: &Distro, _script: &str) -> Result<String, String> {
+    Err("unsupported_platform: Windows host required".into())
+}
+
+#[cfg(not(windows))]
+pub fn guest_script_with_timeout(
+    _distro: &Distro,
+    _script: &str,
+    _timeout: std::time::Duration,
+) -> Result<String, String> {
+    Err("unsupported_platform: Windows host required".into())
+}
+
+#[cfg(not(windows))]
+pub fn wsl_command(
+    _args: &[String],
+    _input: Option<&[u8]>,
+    _timeout: std::time::Duration,
+) -> Result<String, String> {
     Err("unsupported_platform: Windows host required".into())
 }
 
@@ -71,7 +92,7 @@ mod windows {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use std::os::windows::process::CommandExt;
     use std::path::PathBuf;
-    use std::process::{Child, Command};
+    use std::process::{Child, Command, Stdio};
     use std::ptr;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
@@ -205,44 +226,46 @@ mod windows {
         String::from_utf8(bytes).map_err(|_| "wsl_output_invalid_utf8".into())
     }
 
-    pub fn guest_script(distro: &Distro, script: &str) -> Result<String, String> {
-        if !valid_distribution_id(&distro.id) {
-            return Err("invalid_distribution_id".into());
-        }
+    fn run_wsl_process(
+        args: &[String],
+        input_bytes: Option<&[u8]>,
+        timeout: Duration,
+    ) -> Result<String, String> {
         if cfg!(target_pointer_width = "32") {
             return Err("unsupported_windows_architecture: 64-bit controller required".into());
         }
         let directory = system_directory()?;
-        let start = Instant::now();
-        let mut input = scratch().map_err(|e| e.to_string())?;
-        input
-            .write_all(script.as_bytes())
-            .and_then(|_| input.rewind())
-            .map_err(|e| e.to_string())?;
+        let mut input = input_bytes
+            .map(|bytes| {
+                let mut file = scratch().map_err(|e| e.to_string())?;
+                file.write_all(bytes)
+                    .and_then(|_| file.rewind())
+                    .map_err(|e| e.to_string())?;
+                Ok::<File, String>(file)
+            })
+            .transpose()?;
         let stdout = scratch().map_err(|e| e.to_string())?;
         let stderr = scratch().map_err(|e| e.to_string())?;
+        let stdin = input
+            .as_ref()
+            .map(|file| file.try_clone().map(Stdio::from).map_err(|e| e.to_string()))
+            .transpose()?
+            .unwrap_or_else(Stdio::null);
         let mut child = GuestChild(
             Command::new(directory.join("wsl.exe"))
                 .current_dir(&directory)
-                .args([
-                    "--distribution-id",
-                    &distro.id,
-                    "--cd",
-                    "/",
-                    "--user",
-                    "root",
-                    "--exec",
-                    "/bin/sh",
-                    "-s",
-                ])
+                .args(args)
                 .env("WSL_UTF8", "1")
                 .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
-                .stdin(input)
+                .stdin(stdin)
                 .stdout(stdout.try_clone().map_err(|e| e.to_string())?)
                 .stderr(stderr.try_clone().map_err(|e| e.to_string())?)
                 .spawn()
                 .map_err(|error| format!("wsl_start_failed: {error}"))?,
         );
+        // Keep the backing file alive until the child has consumed its stdin.
+        let _input = input.take();
+        let start = Instant::now();
         let status = loop {
             if let Some(status) = child
                 .0
@@ -256,7 +279,7 @@ mod windows {
                     return Err("wsl_output_limit_exceeded".into());
                 }
             }
-            let remaining = GUEST_DEADLINE
+            let remaining = timeout
                 .checked_sub(start.elapsed())
                 .ok_or("wsl_deadline_exceeded")?;
             thread::sleep(remaining.min(Duration::from_millis(20)));
@@ -272,6 +295,40 @@ mod windows {
             return Err(format!("wsl_exit_failed: {status}: {}", detail.trim()));
         }
         Ok(stdout)
+    }
+
+    pub fn wsl_command(
+        args: &[String],
+        input: Option<&[u8]>,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        run_wsl_process(args, input, timeout)
+    }
+
+    pub fn guest_script(distro: &Distro, script: &str) -> Result<String, String> {
+        guest_script_with_timeout(distro, script, GUEST_DEADLINE)
+    }
+
+    pub fn guest_script_with_timeout(
+        distro: &Distro,
+        script: &str,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        if !valid_distribution_id(&distro.id) {
+            return Err("invalid_distribution_id".into());
+        }
+        let args = vec![
+            "--distribution-id".into(),
+            distro.id.clone(),
+            "--cd".into(),
+            "/".into(),
+            "--user".into(),
+            "root".into(),
+            "--exec".into(),
+            "/bin/sh".into(),
+            "-s".into(),
+        ];
+        run_wsl_process(&args, Some(script.as_bytes()), timeout)
     }
 
     fn local_app_data() -> Result<PathBuf, String> {

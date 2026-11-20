@@ -28,6 +28,33 @@ pub(crate) struct Residential {
     blob: Secret,
 }
 
+pub(crate) fn from_settings(
+    settings: &crate::desktop_store::ResidentialSettings,
+) -> Result<Residential, String> {
+    let text = format!(
+        "ip={}\nport={}\nusername={}\npassword={}\n",
+        settings.ip, settings.port, settings.username, settings.password
+    );
+    parse_env(text.as_bytes())
+}
+
+pub(crate) fn settings(residential: &Residential) -> crate::desktop_store::ResidentialSettings {
+    let bytes = &residential.blob.0;
+    let user_len = bytes[11] as usize;
+    let pass_len = bytes[12] as usize;
+    crate::desktop_store::ResidentialSettings {
+        ip: residential.endpoint.ip().to_string(),
+        port: residential.endpoint.port(),
+        username: String::from_utf8_lossy(&bytes[13..13 + user_len]).into_owned(),
+        password: String::from_utf8_lossy(&bytes[13 + user_len..13 + user_len + pass_len])
+            .into_owned(),
+    }
+}
+
+pub(crate) fn parse_env_bytes(bytes: &[u8]) -> Result<Residential, String> {
+    parse_env(bytes)
+}
+
 impl Residential {
     fn decode(blob: Secret) -> Result<Self, String> {
         let b = &blob.0;

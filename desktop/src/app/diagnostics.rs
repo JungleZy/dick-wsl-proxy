@@ -1,6 +1,6 @@
 //! 诊断页：展示流量指标、DNS 健康、线程状态和有界连接记录。
-use gpui::{prelude::*, *};
-use gpui_component::{Disableable, button::Button};
+use gpui_kit::component::{Disableable, button::Button, scroll::ScrollableElement};
+use gpui_kit::{prelude::*, *};
 use serde_json::json;
 
 use super::backend::Kind;
@@ -20,7 +20,8 @@ fn connection_row() -> Div {
         .py_2()
         .bg(rgb(SURFACE_SOFT))
         .rounded_md()
-        .text_xs()
+        .hover(|style| style.bg(rgb(super::theme::BLUE_SOFT)))
+        .text_base()
 }
 impl Desktop {
     pub(crate) fn diagnostics(&self, cx: &Context<Self>) -> Div {
@@ -32,6 +33,34 @@ impl Desktop {
             || recent.is_some_and(|rows| !rows.is_empty());
         let dns_managed = self.status["dns_managed"] == true;
         let locked = self.locked();
+        let metrics = panel("运行指标", "活动流量与失败阶段").child(
+            div()
+                .flex()
+                .gap_3()
+                .child(fact(
+                    "活动连接",
+                    active
+                        .map(|rows| rows.len().to_string())
+                        .unwrap_or_else(|| "0".into()),
+                    BLUE,
+                ))
+                .child(fact(
+                    "最近连接",
+                    recent
+                        .map(|rows| rows.len().to_string())
+                        .unwrap_or_else(|| "0".into()),
+                    TEAL,
+                ))
+                .child(fact(
+                    "DNS",
+                    if dns_managed {
+                        "已接管"
+                    } else {
+                        "未验证"
+                    },
+                    if dns_managed { TEAL } else { RUST },
+                )),
+        );
         let mut rows = div().flex().flex_col().gap_1();
         for row in active
             .into_iter()
@@ -96,7 +125,7 @@ impl Desktop {
                         div()
                             .w(px(42.))
                             .font_family(MONO_FONT)
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(FontWeight::NORMAL)
                             .child(text(row, "protocol", "—")),
                     )
                     .child(div().w(px(190.)).font_family(MONO_FONT).child(text(
@@ -135,7 +164,7 @@ impl Desktop {
             Some(false) => ("工作线程故障", RUST, DANGER_BG),
             None => ("暂无工作线程观测", MUTED, SURFACE_SOFT),
         };
-        let observed = panel("现场观测", "以下数值来自后台快照；未观测到的值不会被推断。")
+        let observed = panel("现场观测", "当前后台快照")
             .child(
                 div()
                     .flex()
@@ -180,68 +209,72 @@ impl Desktop {
                             .child(badge(health_label, health_color, health_background)),
                     ),
             );
-        let claims = panel(
-            "策略声明",
-            "这是当前配置要求，不等同于每条连接都已验证成功。",
-        )
-        .child(
-            div()
-                .flex()
-                .gap_3()
-                .child(fact("默认路由", "非例外 TCP · 双跳", BLUE))
-                .child(fact("系统 DNS", "按策略经 DoH", TEAL))
-                .child(fact(
-                    "目标凭据",
-                    text(&self.profile, "credential", "未命名"),
-                    INK,
-                )),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(rgb(MUTED))
-                .child("要确认出口是否匹配，请在总览执行“复核公网出口”；结果只代表该次观测。"),
-        );
+        let claims = panel("策略声明", "当前保存配置")
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(fact("默认路由", "非例外 TCP · 双跳", BLUE))
+                    .child(fact("系统 DNS", "按策略经 DoH", TEAL))
+                    .child(fact(
+                        "住宅用户名",
+                        text(&self.residential, "username", "未填写"),
+                        INK,
+                    )),
+            )
+            .child(
+                div()
+                    .text_base()
+                    .text_color(rgb(MUTED))
+                    .child("要确认出口是否匹配，请在总览执行“复核公网出口”；结果只代表该次观测。"),
+            );
         let mut result = div()
             .flex()
             .flex_col()
             .gap_4()
-            .child(observed)
-            .child(claims)
+            .child(metrics)
             .child(
-                panel(
-                    "连接记录 · 有界窗口",
-                    "仅显示后台已验证的 IPv4:端口、路由和阶段；最多保留 384 条记录。",
-                )
-                .child(
-                    connection_row()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(MUTED))
-                        .child(div().w(px(44.)).child("ID"))
-                        .child(div().w(px(42.)).child("协议"))
-                        .child(div().w(px(190.)).child("已观测目的端"))
-                        .child(div().w(px(72.)).child("路由"))
-                        .child(div().w(px(145.)).child("状态 / 阶段"))
-                        .child(div().w(px(142.)).child("字节量"))
-                        .child(div().flex_1().child("判定原因 / 失败阶段")),
-                )
-                .child(if !has_connections {
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_4()
+                    .child(observed.flex_1())
+                    .child(claims.flex_1()),
+            )
+            .child(
+                panel("连接记录 · 有界窗口", "已验证连接 · 最多 384 条").child(
                     div()
-                        .p_5()
-                        .bg(rgb(SURFACE_SOFT))
-                        .rounded_md()
-                        .text_sm()
-                        .text_color(rgb(MUTED))
-                        .child("暂无已观测连接。启动接管并产生流量后，这里会显示记录。")
-                        .into_any_element()
-                } else {
-                    rows.into_any_element()
-                }),
+                        .overflow_x_scrollbar()
+                        .child(
+                            connection_row()
+                                .font_weight(FontWeight::NORMAL)
+                                .text_color(rgb(MUTED))
+                                .child(div().w(px(44.)).child("ID"))
+                                .child(div().w(px(42.)).child("协议"))
+                                .child(div().w(px(190.)).child("已观测目的端"))
+                                .child(div().w(px(72.)).child("路由"))
+                                .child(div().w(px(145.)).child("状态 / 阶段"))
+                                .child(div().w(px(142.)).child("字节量"))
+                                .child(div().flex_1().child("判定原因 / 失败阶段")),
+                        )
+                        .child(if !has_connections {
+                            div()
+                                .p_5()
+                                .bg(rgb(SURFACE_SOFT))
+                                .rounded_md()
+                                .text_base()
+                                .text_color(rgb(MUTED))
+                                .child("暂无已观测连接。启动接管并产生流量后，这里会显示记录。")
+                                .into_any_element()
+                        } else {
+                            rows.into_any_element()
+                        }),
+                ),
             );
         if let Some(error) = forwarding["last_error"].as_str() {
             result = result.child(
                 div()
-                    .text_sm()
+                    .text_base()
                     .text_color(rgb(RUST))
                     .child(format!("最后转发错误（后台报告）：{error}")),
             );
@@ -250,6 +283,13 @@ impl Desktop {
             div()
                 .flex()
                 .gap_2()
+                .child(self.button(
+                    "probe-exit",
+                    "复核公网出口",
+                    UiAction::Probe,
+                    locked || self.phase() != "forwarding_managed",
+                    cx,
+                ))
                 .child(
                     Button::new("export")
                         .label("导出脱敏诊断")
@@ -269,7 +309,7 @@ impl Desktop {
         if let Some(path) = &self.export_path {
             result = result.child(
                 div()
-                    .text_xs()
+                    .text_base()
                     .font_family(MONO_FONT)
                     .text_color(rgb(MUTED))
                     .child(path.clone()),

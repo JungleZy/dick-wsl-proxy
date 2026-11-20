@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WSL Proxy · HTML Design Prototype v2</title>
+  <style>
+    :root {
+      --canvas: #e7e6e2;
+      --window: #f8f8f7;
+      --surface: #ffffff;
+      --surface-soft: #f0f1f2;
+      --ink: #1b2732;
+      --muted: #6f7b84;
+      --line: #d6d9de;
+      --line-strong: #aab5c0;
+      --blue: #3658c8;
+      --blue-dark: #314d91;
+      --blue-soft: #e7edff;
+      --green: #287b61;
+      --green-soft: #e7f1ed;
+      --amber: #a66a1d;
+      --amber-soft: #faf0de;
+      --red: #b34f42;
+      --radius: 10px;
+      --sidebar-width: 216px;
+      --titlebar-height: 42px;
+      --statusbar-height: 34px;
+      --space: 12px;
+      --font-ui: Inter, "Microsoft YaHei UI", "Segoe UI", sans-serif;
+      --font-mono: "IBM Plex Mono", Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--canvas);
+      color: var(--ink);
+      font-family: var(--font-ui);
+      font-size: 14px;
+    }
+    button, input, textarea { font: inherit; }
+    button { cursor: pointer; }
+    .page-wrap { min-height: 100vh; padding: 28px; }
+    .prototype-note {
+      max-width: 1440px;
+      margin: 0 auto 12px;
+      color: var(--muted);
+      font-size: 14px;
+      letter-spacing: .02em;
+    }
+    .app-window {
+      position: relative;
+      display: grid;
+      grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+      grid-template-rows: var(--titlebar-height) minmax(0, 1fr) var(--statusbar-height);
+      width: min(1440px, 100%);
+      height: min(900px, calc(100vh - 72px));
+      min-height: 680px;
+      margin: auto;
+      overflow: hidden;
+      background: var(--window);
+      border: 1px solid #c8cbd0;
+      border-radius: 12px;
+      box-shadow: 0 22px 60px rgba(37, 47, 58, .14);
+    }
+    .titlebar {
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 14px;
+      background: #fbfbfa;
+      border-bottom: 1px solid var(--line);
+      user-select: none;
+    }
+    .brand-mark {
+      display: grid;
+      width: 24px;
+      height: 24px;
+      place-items: center;
+      color: var(--blue);
+    }
+    .brand-mark svg { width: 23px; height: 23px; }
+    .titlebar-brand { font-weight: 700; }
+    .titlebar-crumb { color: var(--muted); }
+    .titlebar-spacer { flex: 1; }
+    .titlebar-action {
+      display: grid;
+      width: 30px;
+      height: 30px;
+      place-items: center;
+      color: #596873;
+      background: transparent;
+      border: 0;
+      border-radius: 6px;
+    }
+    .titlebar-action:hover { background: var(--surface-soft); color: var(--ink); }
+    .titlebar-action svg { width: 16px; height: 16px; }
+    .window-close:hover { color: #fff; background: var(--red); }
+
+    .sidebar {
+      grid-column: 1;
+      grid-row: 2;
+      display: flex;
+      min-width: 0;
+      flex-direction: column;
+      background: #eef0f2;
+      border-right: 1px solid var(--line);
+      transition: width 160ms ease;
+    }
+    .app-window.collapsed { grid-template-columns: 72px minmax(0, 1fr); }
+    .nav { display: grid; gap: 4px; padding: 0 12px; }
+    .nav-item {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      width: 100%;
+      height: 40px;
+      padding: 0 14px;
+      color: var(--ink);
+      text-align: left;
+      background: transparent;
+      border: 0;
+      border-radius: 7px;
+    }
+    .nav-item:hover { background: #e3e8ed; }
+    .nav-item.active { color: var(--blue); font-weight: 400; background: var(--blue-soft); }
+    .nav-item svg { flex: 0 0 20px; width: 20px; height: 20px; color: #65737d; }
+    .nav-item.active svg { color: var(--blue); }
+    .collapsed .nav-item span { display: none; }
+    .collapsed .nav-item { justify-content: center; padding: 0; }
+
+    .main {
+      grid-column: 2;
+      grid-row: 2;
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+      background: var(--window);
+    }
+    .status-badge, .save-badge, .tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 26px;
+      padding: 0 11px;
+      color: var(--green);
+      font-size: 14px;
+      font-weight: 400;
+      background: var(--green-soft);
+      border-radius: 14px;
+    }
+    .status-badge::before { width: 6px; height: 6px; content: ""; border-radius: 50%; background: currentColor; }
+    .save-badge.pending { color: var(--amber); background: var(--amber-soft); white-space: nowrap; }
+    .context-bar {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      min-height: 36px;
+      padding: 0 var(--space);
+      color: var(--muted);
+      background: #eff0f2;
+      border-bottom: 1px solid var(--line);
+      font-size: 14px;
+    }
+    .context-bar strong { color: var(--ink); }
+    .context-bar .spacer { flex: 1; }
+    .content {
+      height: 100%;
+      padding: var(--space);
+      overflow: auto;
+    }
+    .page { display: none; }
+    .page.active { display: block; }
+    .grid-overview { display: grid; grid-template-columns: minmax(0, 1.42fr) minmax(320px, .88fr); gap: var(--space); align-items: start; }
+    .stack { display: grid; gap: var(--space); }
+    .card { padding: var(--space); background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
+    .card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space); margin-bottom: var(--space); }
+    .card-title { margin: 0; font-size: 14px; line-height: 1.25; }
+    .card-subtitle { margin: 6px 0 0; color: var(--muted); font-size: 14px; line-height: 1.4; }
+    .target-row { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 16px; height: 48px; padding: 0 14px; background: var(--surface-soft); border: 1px solid #e1e4e8; border-radius: 7px; }
+    .target-row + .target-row { margin-top: var(--space); }
+    .target-name { min-width: 0; font-weight: 400; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .target-version { margin-left: 8px; color: var(--muted); font-size: 14px; font-weight: 400; }
+    .row-actions { display: flex; gap: 8px; }
+    .btn { display: inline-flex; align-items: center; justify-content: center; height: 34px; padding: 0 16px; color: var(--ink); background: #edf0f2; border: 1px solid #c4ced6; border-radius: 6px; font-size: 14px; font-weight: 400; }
+    .btn svg { width: 15px; height: 15px; margin-right: 7px; }
+    .btn:hover { background: #e2e8ed; }
+    .btn.primary { color: #fff; background: var(--primary, #314d91); border-color: var(--primary, #314d91); }
+    .btn.danger { color: #fff; background: var(--red); border-color: var(--red); }
+    .btn.small { height: 30px; padding: 0 12px; font-size: 14px; }
+    .port-row { display: flex; align-items: center; gap: 12px; margin-top: 16px; }
+    .port-row label { color: var(--muted); font-size: 14px; }
+    .input { width: 100%; height: 32px; padding: 0 12px; color: var(--ink); background: #fff; border: 1px solid var(--line-strong); border-radius: 6px; outline: 0; }
+    .input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(54,88,200,.13); }
+    .input.port { width: 116px; font-family: var(--font-mono); }
+    .metric-line { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 24px; }
+    .metric { padding: 12px; background: var(--surface-soft); border-radius: 7px; }
+    .metric span { display: block; color: var(--muted); font-size: 14px; }
+    .metric strong { display: block; margin-top: 5px; font-family: var(--font-mono); font-size: 14px; }
+    .flow-list { display: grid; gap: 0; }
+    .flow-row { display: grid; grid-template-columns: 112px 1fr; align-items: center; min-height: 44px; border-bottom: 1px solid var(--line); }
+    .flow-row:last-child { border-bottom: 0; }
+    .flow-row span { color: var(--muted); font-size: 14px; }
+    .flow-row strong { font-family: var(--font-mono); font-size: 14px; font-weight: 400; }
+    .home-charts { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(280px, .65fr); gap: var(--space); margin-top: var(--space); }
+    .chart-card { min-width: 0; }
+    .chart-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space); margin-bottom: var(--space); }
+    .chart-title { margin: 0; font-size: 14px; line-height: 1.25; }
+    .chart-meta { color: var(--muted); font-family: var(--font-mono); font-size: 14px; white-space: nowrap; }
+    .chart { display: block; width: 100%; height: 150px; overflow: visible; }
+    .chart-grid-line { stroke: var(--line); stroke-width: 1; }
+    .chart-axis-label { fill: var(--muted); font-family: var(--font-mono); font-size: 14px; }
+    .chart-line { fill: none; stroke-linecap: round; stroke-linejoin: round; stroke-width: 2.5; }
+    .chart-line.tx { stroke: var(--blue); }
+    .chart-line.rx { stroke: var(--green); }
+    .chart-area { fill: url(#trafficFill); opacity: .7; }
+    .chart-dot { fill: var(--surface); stroke-width: 2; }
+    .chart-dot.tx { stroke: var(--blue); }
+    .chart-dot.rx { stroke: var(--green); }
+    .chart-legend { display: flex; align-items: center; gap: 16px; margin-top: var(--space); color: var(--muted); font-size: 14px; }
+    .legend-item { display: inline-flex; align-items: center; gap: 6px; }
+    .legend-dot { width: 7px; height: 7px; border-radius: 50%; }
+    .legend-dot.tx { background: var(--blue); }
+    .legend-dot.rx { background: var(--green); }
+    .bar-list { display: grid; gap: 12px; }
+    .bar-row { display: grid; grid-template-columns: 68px minmax(0, 1fr) 42px; align-items: center; gap: 10px; }
+    .bar-label { color: var(--muted); font-size: 14px; }
+    .bar-track { height: 8px; overflow: hidden; background: var(--surface-soft); border-radius: 4px; }
+    .bar-fill { height: 100%; border-radius: inherit; }
+    .bar-fill.direct { width: 64%; background: var(--blue); }
+    .bar-fill.chain { width: 23%; background: var(--green); }
+    .bar-fill.dns { width: 9%; background: var(--amber); }
+    .bar-fill.reject { width: 4%; background: var(--red); }
+    .bar-value { color: var(--ink); font-family: var(--font-mono); font-size: 14px; text-align: right; }
+    .health-chart { height: 118px; }
+    .health-value { display: flex; align-items: baseline; gap: 8px; margin: 2px 0 8px; }
+    .health-value strong { font-family: var(--font-mono); font-size: 14px; }
+    .health-value span { color: var(--muted); font-size: 14px; }
+    .timeline { display: grid; gap: 0; }
+    .timeline-row { display: grid; grid-template-columns: 48px 12px minmax(0, 1fr); align-items: center; gap: 10px; min-height: 34px; }
+    .timeline-time { color: var(--muted); font-family: var(--font-mono); font-size: 14px; }
+    .timeline-track { position: relative; display: flex; align-self: stretch; justify-content: center; }
+    .timeline-track::before { position: absolute; top: 0; bottom: 0; width: 1px; content: ""; background: var(--line); }
+    .timeline-row:first-child .timeline-track::before { top: 50%; }
+    .timeline-row:last-child .timeline-track::before { bottom: 50%; }
+    .timeline-dot { position: relative; z-index: 1; width: 8px; height: 8px; margin-top: 13px; background: var(--blue); border: 2px solid var(--surface); border-radius: 50%; box-shadow: 0 0 0 1px var(--blue); }
+    .timeline-dot.green { background: var(--green); box-shadow: 0 0 0 1px var(--green); }
+    .timeline-dot.amber { background: var(--amber); box-shadow: 0 0 0 1px var(--amber); }
+    .timeline-copy { min-width: 0; color: var(--ink); font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .timeline-copy span { display: block; margin-top: 2px; color: var(--muted); font-size: 14px; }
+    .section-actions { display: flex; justify-content: flex-end; gap: var(--space); margin-top: var(--space); }
+    .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space); }
+    .field label { display: block; margin-bottom: 7px; color: var(--ink); font-size: 14px; font-weight: 400; }
+    .field .help { margin-top: 6px; color: var(--muted); font-size: 14px; line-height: 1.35; }
+    .policy-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space); }
+    .policy-grid .wide { grid-column: 1 / -1; }
+    .table-wrap { overflow: auto; }
+    .table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+    .table th, .table td { height: 40px; padding: 0 12px; border-bottom: 1px solid var(--line); text-align: left; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .table th { color: var(--muted); font-weight: 400; background: var(--surface-soft); }
+    .empty { display: grid; place-items: center; min-height: 190px; margin-top: 16px; color: var(--muted); background: var(--surface-soft); border-radius: 8px; text-align: center; }
+    .empty strong { display: block; margin-bottom: 8px; color: var(--ink); }
+    .statusbar { grid-column: 1 / -1; grid-row: 3; display: flex; align-items: center; gap: 10px; padding: 0 20px; color: var(--muted); background: #fbfbfa; border-top: 1px solid var(--line); font-size: 14px; }
+    .statusbar-icons { display: flex; align-items: center; gap: 4px; }
+    .status-icon { display: grid; width: 26px; height: 26px; padding: 0; place-items: center; color: var(--muted); background: transparent; border: 0; border-radius: 6px; }
+    .status-icon:hover { color: var(--blue); background: var(--blue-soft); }
+    .status-icon svg { width: 17px; height: 17px; }
+    .statusbar-spacer { flex: 1; }
+    .dialog-backdrop { position: absolute; inset: 42px 0 34px; display: none; align-items: center; justify-content: center; background: rgba(22,31,40,.32); z-index: 10; }
+    .dialog-backdrop.open { display: flex; }
+    .dialog { width: 480px; padding: 24px; background: #fff; border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 18px 50px rgba(25,36,46,.2); }
+    .dialog h2 { margin: 0; font-size: 14px; }
+    .dialog p { margin: 12px 0 22px; color: var(--muted); line-height: 1.55; }
+    .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
+    @media (max-width: 1050px) {
+      .page-wrap { padding: 12px; }
+      .app-window { height: calc(100vh - 24px); min-height: 620px; }
+      .grid-overview, .policy-grid { grid-template-columns: 1fr; }
+      .home-charts { grid-template-columns: 1fr; }
+      .policy-grid .wide { grid-column: auto; }
+      .content { padding: 14px 18px; }
+      .context-bar, .statusbar { padding-left: 18px; padding-right: 18px; }
+    }
+    @media (max-width: 800px) {
+      .app-window { grid-template-columns: 72px minmax(0, 1fr); }
+      .nav-item span { display: none; }
+      .nav-item { justify-content: center; padding: 0; }
+      .nav-item svg { margin: 0; }
+      .metric-line, .form-grid { grid-template-columns: 1fr; }
+      .content { padding: var(--space); }
+    }
+    .app-window { font-size: 14px; font-weight: 400; }
+    .app-window :where(h1, h2, h3, p, span, strong, label, button, input, textarea, th, td) { font-size: 14px; font-weight: 400; }
+    .app-window .titlebar-brand { font-size: 16px; font-weight: 700; }
+    .app-window .chart-axis-label { font-size: 14px; }
+    .app-window .nav-item.active,
+    .app-window .target-name,
+    .app-window .btn,
+    .app-window .btn.small,
+    .app-window .field label,
+    .app-window .table th,
+    .app-window .metric strong,
+    .app-window .flow-row strong,
+    .app-window .health-value strong,
+    .app-window .empty strong,
+    .app-window .dialog h2 { font-size: 14px; font-weight: 400; }
+  </style>
+</head>
+<body>
+  <div class="page-wrap">
+    <div class="prototype-note">WSL Proxy · HTML design prototype v2 · interactive only · no backend</div>
+    <div class="app-window" id="appWindow">
+      <header class="titlebar">
+        <div class="brand-mark" aria-label="WSL Proxy logo"><svg viewBox="0 0 28 28"><path d="M14 2l9 3v7c0 6-3.6 10.3-9 14-5.4-3.7-9-8-9-14V5l9-3z" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/><path d="M8 13h4l2-4 3 8 2-4h2" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <strong class="titlebar-brand">WSL Proxy</strong>
+        <span class="titlebar-spacer"></span>
+        <button class="titlebar-action" title="设置" aria-label="设置"><svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 2v3M10 15v3M2 10h3M15 10h3M4.3 4.3l2.1 2.1M13.6 13.6l2.1 2.1M15.7 4.3l-2.1 2.1M6.4 13.6l-2.1 2.1" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>
+        <button class="titlebar-action" title="最小化">—</button><button class="titlebar-action" title="最大化">□</button><button class="titlebar-action window-close" title="关闭">×</button>
+      </header>
+
+      <aside class="sidebar">
+        <nav class="nav" aria-label="工作区导航">
+          <button class="nav-item active" data-page="overview"><svg viewBox="0 0 20 20"><rect x="3" y="3" width="5" height="5" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><rect x="12" y="3" width="5" height="5" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><rect x="3" y="12" width="5" height="5" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><rect x="12" y="12" width="5" height="5" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/></svg><span>首页</span></button>
+          <button class="nav-item" data-page="environment"><svg viewBox="0 0 20 20"><path d="M3 5h14v10H3zM6 8h8M6 11h5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><span>环境</span></button>
+          <button class="nav-item" data-page="policy"><svg viewBox="0 0 20 20"><path d="M4 5h12M4 10h12M4 15h12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="8" cy="5" r="2" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="13" cy="10" r="2" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="7" cy="15" r="2" fill="none" stroke="currentColor" stroke-width="1.5"/></svg><span>规则</span></button>
+          <button class="nav-item" data-page="connection"><svg viewBox="0 0 20 20"><path d="M3 11h3l2-5 3 9 2-5h4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg><span>连接</span></button>
+          <button class="nav-item" data-page="logs"><svg viewBox="0 0 20 20"><path d="M5 3h10v14H5zM8 7h4M8 10h4M8 13h3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><span>日志</span></button>
+          <button class="nav-item" data-page="settings"><svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 2v3M10 15v3M2 10h3M15 10h3M4.3 4.3l2.1 2.1M13.6 13.6l2.1 2.1M15.7 4.3l-2.1 2.1M6.4 13.6l-2.1 2.1" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg><span>设置</span></button>
+        </nav>
+      </aside>
+
+      <main class="main">
+        <section class="content">
+          <div class="page active" id="page-overview">
+  <div class="grid-overview">
+    <div class="stack">
+      <section class="card">
+        <div class="card-head"><div><h2 class="card-title">运行状态</h2><p class="card-subtitle">后台状态、接管目标和流量健康度</p></div><button class="btn small primary" data-action="start"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M8 5.5v9l7-4.5-7-4.5z" fill="currentColor"/></svg>启动接管</button></div>
+        <div class="metric-line"><div class="metric"><span>当前目标</span><strong>未选择</strong></div><div class="metric"><span>运行代数</span><strong>—</strong></div><div class="metric"><span>DNS</span><strong>未验证</strong></div></div>
+      </section>
+      <section class="card"><div class="card-head"><div><h2 class="card-title">流量与健康</h2><p class="card-subtitle">来自后台快照的当前指标</p></div></div><div class="flow-list"><div class="flow-row"><span>入口</span><strong>未监听</strong></div><div class="flow-row"><span>工作线程</span><strong>未接管</strong></div><div class="flow-row"><span>最近错误</span><strong>—</strong></div></div></section>
+    </div>
+    <div class="stack">
+      <section class="card"><div class="card-head"><div><h2 class="card-title">保护路径</h2><p class="card-subtitle">当前保存策略摘要</p></div></div><div class="flow-list"><div class="flow-row"><span>下一跳</span><strong>宿主 SOCKS5 → 住宅 SOCKS5</strong></div><div class="flow-row"><span>系统 DNS</span><strong>DoH · dns.alidns.com</strong></div><div class="flow-row"><span>配置</span><strong>SQLite · 已加载</strong></div></div></section>
+      <section class="card"><div class="card-head"><div><h2 class="card-title">最近操作</h2></div></div><p class="small">后台已连接 · 2 秒前观测</p><p class="small">保存策略后需要重新预检</p><p class="small">关闭窗口不会停止接管</p></section>
+    </div>
+  </div>
+  <div class="home-charts">
+    <section class="card chart-card">
+      <div class="chart-head"><div><h2 class="chart-title">流量趋势</h2><p class="card-subtitle">入口吞吐 · 最近 24 小时</p></div><span class="chart-meta">示例数据</span></div>
+      <svg class="chart" viewBox="0 0 720 150" preserveAspectRatio="none" aria-label="最近 24 小时流量趋势">
+        <defs><linearGradient id="trafficFill" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#3658c8" stop-opacity=".16"/><stop offset="1" stop-color="#3658c8" stop-opacity="0"/></linearGradient></defs>
+        <line class="chart-grid-line" x1="0" y1="24" x2="720" y2="24"/><line class="chart-grid-line" x1="0" y1="61" x2="720" y2="61"/><line class="chart-grid-line" x1="0" y1="98" x2="720" y2="98"/><line class="chart-grid-line" x1="0" y1="135" x2="720" y2="135"/>
+        <path class="chart-area" d="M0 135 L60 132 L120 134 L180 124 L240 127 L300 112 L360 118 L420 96 L480 102 L540 80 L600 91 L660 67 L720 76 L720 135 Z"/>
+        <polyline class="chart-line tx" points="0,135 60,132 120,134 180,124 240,127 300,112 360,118 420,96 480,102 540,80 600,91 660,67 720,76"/>
+        <polyline class="chart-line rx" points="0,137 60,136 120,136 180,132 240,134 300,122 360,126 420,108 480,112 540,94 600,101 660,84 720,91"/>
+        <circle class="chart-dot tx" cx="720" cy="76" r="4"/><circle class="chart-dot rx" cx="720" cy="91" r="4"/>
+        <text class="chart-axis-label" x="0" y="149">00</text><text class="chart-axis-label" x="116" y="149">04</text><text class="chart-axis-label" x="236" y="149">08</text><text class="chart-axis-label" x="356" y="149">12</text><text class="chart-axis-label" x="476" y="149">16</text><text class="chart-axis-label" x="596" y="149">20</text><text class="chart-axis-label" x="704" y="149">24</text>
+      </svg>
+      <div class="chart-legend"><span class="legend-item"><i class="legend-dot tx"></i>入口流量</span><span class="legend-item"><i class="legend-dot rx"></i>转发流量</span></div>
+    </section>
+    <section class="card chart-card">
+      <div class="chart-head"><div><h2 class="chart-title">连接路由</h2><p class="card-subtitle">最近观测的流量去向</p></div><span class="chart-meta">示例分布</span></div>
+      <div class="bar-list"><div class="bar-row"><span class="bar-label">直连</span><div class="bar-track"><div class="bar-fill direct"></div></div><span class="bar-value">64%</span></div><div class="bar-row"><span class="bar-label">住宅链路</span><div class="bar-track"><div class="bar-fill chain"></div></div><span class="bar-value">23%</span></div><div class="bar-row"><span class="bar-label">DNS</span><div class="bar-track"><div class="bar-fill dns"></div></div><span class="bar-value">9%</span></div><div class="bar-row"><span class="bar-label">拒绝</span><div class="bar-track"><div class="bar-fill reject"></div></div><span class="bar-value">4%</span></div></div>
+    </section>
+    <section class="card chart-card">
+      <div class="chart-head"><div><h2 class="chart-title">DNS 健康</h2><p class="card-subtitle">DoH 响应延迟 · 最近 12 次检查</p></div><span class="chart-meta">示例趋势</span></div>
+      <div class="health-value"><strong>42 ms</strong><span>示例中位延迟</span></div>
+      <svg class="chart health-chart" viewBox="0 0 720 118" preserveAspectRatio="none" aria-label="DNS 健康趋势">
+        <line class="chart-grid-line" x1="0" y1="18" x2="720" y2="18"/><line class="chart-grid-line" x1="0" y1="58" x2="720" y2="58"/><line class="chart-grid-line" x1="0" y1="98" x2="720" y2="98"/>
+        <polyline class="chart-line rx" points="0,82 65,75 130,81 195,58 260,65 325,48 390,53 455,42 520,49 585,33 650,40 720,28"/>
+        <circle class="chart-dot rx" cx="720" cy="28" r="4"/><text class="chart-axis-label" x="0" y="114">12 次前</text><text class="chart-axis-label" x="660" y="114">现在</text>
+      </svg>
+    </section>
+    <section class="card chart-card">
+      <div class="chart-head"><div><h2 class="chart-title">事件时间线</h2><p class="card-subtitle">后台与接管状态变化</p></div><span class="chart-meta">最近 3 条</span></div>
+      <div class="timeline"><div class="timeline-row"><span class="timeline-time">刚刚</span><div class="timeline-track"><i class="timeline-dot"></i></div><div class="timeline-copy">后台心跳正常<span>服务仍处于待接管</span></div></div><div class="timeline-row"><span class="timeline-time">2 分钟</span><div class="timeline-track"><i class="timeline-dot green"></i></div><div class="timeline-copy">配置库已加载<span>SQLite · 本机配置</span></div></div><div class="timeline-row"><span class="timeline-time">5 分钟</span><div class="timeline-track"><i class="timeline-dot amber"></i></div><div class="timeline-copy">等待环境预检<span>目标 WSL 尚未选择</span></div></div></div>
+    </section>
+  </div>
+</div>
+<div class="page" id="page-environment">
+  <div class="grid-overview">
+    <div class="stack">
+      <section class="card"><div class="card-head"><div><h2 class="card-title">WSL 环境</h2><p class="card-subtitle">选择目标与见证，页面不会直接改变接管状态</p></div></div><div class="target-row"><div class="target-name">WSLProxyLab-Target <span class="target-version">WSL 2</span></div><div class="row-actions"><button class="btn small primary">设为目标</button></div></div><div class="target-row"><div class="target-name">WSLProxyLab-Control <span class="target-version">WSL 2</span></div><div class="row-actions"><button class="btn small primary">设为见证</button></div></div><div class="port-row"><label>Windows 入口端口</label><input class="input port" value="43531"></div></section>
+      <section class="card"><div class="card-head"><div><h2 class="card-title">环境基线</h2><p class="card-subtitle">启动前检查的只读能力</p></div></div><div class="metric-line"><div class="metric"><span>网络模式</span><strong>NAT</strong></div><div class="metric"><span>cgroup</span><strong>待检查</strong></div><div class="metric"><span>NAT 表</span><strong>待检查</strong></div></div></section>
+    </div>
+    <div class="stack"><section class="card"><div class="card-head"><div><h2 class="card-title">预检</h2><p class="card-subtitle">目标身份、cgroup、NAT 表和入口端口</p></div><span class="save-badge pending">未运行</span></div><p class="body">选择目标和见证后执行，只读检查不会落规则。</p><div class="section-actions"><button class="btn primary">运行预检</button></div></section><section class="card"><div class="card-head"><div><h2 class="card-title">端口占用</h2><p class="card-subtitle">当前入口端口的可用性</p></div></div><div class="flow-list"><div class="flow-row"><span>TCP</span><strong>未检查</strong></div><div class="flow-row"><span>UDP</span><strong>未检查</strong></div></div></section></div>
+  </div>
+</div>
+          <div class="page" id="page-policy"><section class="card"><div class="card-head"><div><h2 class="card-title">直连规则</h2><p class="card-subtitle">只在这里维护 IPv4、精确域名和域名后缀例外</p></div><button class="btn primary" data-action="save">保存规则</button></div><div class="form-grid"><div class="field"><label>IPv4 / CIDR</label><textarea class="input" rows="7" placeholder="每行一个 IPv4 或 CIDR"></textarea><span class="help">例如 192.0.2.0/24</span></div><div class="field"><label>精确域名</label><textarea class="input" rows="7" placeholder="每行一个精确域名"></textarea><span class="help">不填写 URL</span></div><div class="field"><label>域名后缀</label><textarea class="input" rows="7" placeholder="每行一个域名后缀"></textarea><span class="help">按域名边界匹配</span></div></div></section></div>
+          <div class="page" id="page-connection"><section class="card"><div class="card-head"><div><h2 class="card-title">运行指标</h2><p class="card-subtitle">活动流量与失败阶段</p></div><button class="btn small primary">导出报告</button></div><div class="metric-line"><div class="metric"><span>活动</span><strong>0</strong></div><div class="metric"><span>最近</span><strong>0</strong></div><div class="metric"><span>DNS</span><strong>未验证</strong></div></div></section><section class="card" style="margin-top:12px"><div class="card-head"><div><h2 class="card-title">连接记录</h2><p class="card-subtitle">已验证记录 · 保留最近 384 条</p></div></div><div class="table-wrap"><table class="table"><thead><tr><th style="width:60px">ID</th><th style="width:80px">协议</th><th>目的</th><th style="width:110px">路由</th><th style="width:110px">阶段</th></tr></thead><tbody></tbody></table></div><div class="empty"><div><strong>暂无连接记录</strong><span>启动接管后显示实际目标、路由和阶段。</span></div></div></section></div>
+          <div class="page" id="page-logs"><section class="card"><div class="card-head"><div><h2 class="card-title">运行日志</h2><p class="card-subtitle">后台事件、预检结果和接管生命周期</p></div><div class="row-actions"><button class="btn small">全部</button><button class="btn small">错误</button></div></div><div class="table-wrap"><table class="table"><thead><tr><th style="width:96px">时间</th><th style="width:88px">级别</th><th>事件</th><th style="width:170px">来源</th></tr></thead><tbody><tr><td>刚刚</td><td><span class="tag">信息</span></td><td>后台心跳正常，等待接管目标</td><td>runtime</td></tr><tr><td>2 分钟前</td><td><span class="tag">信息</span></td><td>SQLite 配置已加载</td><td>desktop_store</td></tr><tr><td>5 分钟前</td><td><span class="save-badge pending">待处理</span></td><td>目标 WSL 尚未选择，预检未执行</td><td>preflight</td></tr></tbody></table></div></section></div>          <div class="page" id="page-settings"><div class="policy-grid"><section class="card wide"><div class="card-head"><div><h2 class="card-title">住宅 SOCKS5</h2><p class="card-subtitle">个人配置直接填写，保存到 SQLite</p></div></div><div class="form-grid"><div class="field"><label>服务器 IPv4</label><input class="input" value="203.0.113.8"></div><div class="field"><label>端口</label><input class="input" value="38888"></div><div class="field"><label>用户名</label><input class="input" value="demo-user"></div><div class="field"><label>密码</label><input class="input" value="demo-pass-2026"></div></div></section><section class="card"><div class="card-head"><div><h2 class="card-title">宿主 SOCKS5</h2><p class="card-subtitle">第一跳连接</p></div></div><input class="input" value="127.0.0.1:7892"></section><section class="card"><div class="card-head"><div><h2 class="card-title">DNS 保护</h2><p class="card-subtitle">DoH 上游与 TLS</p></div></div><div class="stack"><input class="input" value="223.5.5.5:443"><input class="input" value="dns.alidns.com"><input class="input" value="ippure.com"></div></section><section class="card"><div class="card-head"><div><h2 class="card-title">存储</h2><p class="card-subtitle">本机配置和运行数据</p></div></div><div class="flow-list"><div class="flow-row"><span>配置库</span><strong>SQLite</strong></div><div class="flow-row"><span>状态</span><strong>已加载</strong></div></div></section><section class="card"><div class="card-head"><div><h2 class="card-title">窗口</h2><p class="card-subtitle">桌面行为</p></div></div><div class="flow-list"><div class="flow-row"><span>关闭窗口</span><strong>保持后台运行</strong></div><div class="flow-row"><span>语言</span><strong>简体中文</strong></div></div></section></div></div>
+        </section>
+      </main>
+      <footer class="statusbar"><div class="statusbar-icons"><button class="status-icon" title="后台在线" aria-label="后台在线"><svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10 2v3M10 15v3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button><button class="status-icon" title="未接管" aria-label="未接管"><svg viewBox="0 0 20 20"><path d="M10 2l6 2v5c0 4-2.5 7-6 9-3.5-2-6-5-6-9V4l6-2z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></button><button class="status-icon" title="SQLite 配置已加载" aria-label="SQLite 配置已加载"><svg viewBox="0 0 20 20"><ellipse cx="10" cy="4" rx="6" ry="2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M4 4v6c0 1 2.7 2 6 2s6-1 6-2V4M4 10v6c0 1 2.7 2 6 2s6-1 6-2v-6" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button></div></footer>
+      <div class="dialog-backdrop" id="dialog"><div class="dialog" role="dialog" aria-modal="true"><h2>确认启动接管</h2><p>将接管选定 WSL 的 TCP 和系统 DNS。启动前会再次执行预检，非直连流量会按策略处理。</p><div class="dialog-actions"><button class="btn" data-action="close-dialog">取消</button><button class="btn primary" data-action="close-dialog">确认并执行</button></div></div></div>
+    </div>
+  </div>
+  <script>
+    const labels = {overview: '首页', environment: '环境', policy: '规则', connection: '连接', logs: '日志', settings: '设置'};
+    const app = document.getElementById('appWindow');
+    const dialog = document.getElementById('dialog');
+    function showPage(page) {
+      document.querySelectorAll('[data-page]').forEach(item => item.classList.toggle('active', item.dataset.page === page));
+      document.querySelectorAll('.page').forEach(item => item.classList.toggle('active', item.id === `page-${page}`));
+    }
+    document.querySelectorAll('[data-page]').forEach(item => item.addEventListener('click', () => showPage(item.dataset.page)));
+    document.querySelectorAll('[data-action="start"]').forEach(item => item.addEventListener('click', () => dialog.classList.add('open')));
+    document.querySelectorAll('[data-action="close-dialog"]').forEach(item => item.addEventListener('click', () => dialog.classList.remove('open')));
+    document.addEventListener('keydown', event => { if (event.key === 'Escape') dialog.classList.remove('open'); });
+    document.querySelector('[data-action="save"]')?.addEventListener('click', event => { event.currentTarget.textContent = '已保存'; setTimeout(() => event.currentTarget.textContent = '保存策略', 1200); });
+  </script>
+</body>
+</html>

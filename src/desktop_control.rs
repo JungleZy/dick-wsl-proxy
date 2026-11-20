@@ -1,118 +1,106 @@
 use crate::{
     controller,
+    desktop_store::{self, ResidentialSettings},
+    environment::{self, InstallOptions},
     host,
-    policy::{profile::{Document, Preferences}, Config},
-    transition,
+    policy::{Config, profile::Preferences},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Save {
+struct SqliteSave {
     profile: Config,
     desktop: Preferences,
+    #[serde(default)]
+    residential: Option<ResidentialSettings>,
     expected_revision: Option<String>,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvironmentCreate {
+    name: String,
+    source_path: String,
+    install_path: String,
+    #[serde(default)]
+    install_zsh: bool,
+    #[serde(default)]
+    install_chrome: bool,
+    #[serde(default)]
+    install_chinese: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvironmentEdit {
+    name: String,
+    #[serde(default)]
+    install_zsh: bool,
+    #[serde(default)]
+    install_chrome: bool,
+    #[serde(default)]
+    install_chinese: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvironmentKey {
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvironmentBackup {
+    name: String,
+    backup_path: String,
+}
+
+fn environment_options(zsh: bool, chrome: bool, chinese: bool) -> InstallOptions {
+    InstallOptions {
+        zsh,
+        chrome,
+        chinese,
+    }
+}
+
+fn require_idle(controller: &mut controller::Controller) -> Result<(), crate::command::Failure> {
+    let phase = controller
+        .status()
+        .map_err(|error| crate::command::Failure::new("controller_error", error))?["phase"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_owned();
+    if phase != "idle" {
+        return Err(crate::command::Failure::new(
+            "environment_requires_idle",
+            "先停止接管并恢复直连，再管理 WSL 环境",
+        ));
+    }
+    Ok(())
+}
 fn profile_path() -> Result<PathBuf, String> {
-    Ok(host::state_dir()?.join("desktop-policy.json"))
+    desktop_store::path()
 }
-const MAX: usize = 256 * 1024;
-fn read_doc(path: &Path) -> Result<Option<Document>, String> {
-    let mut opts = OpenOptions::new();
-    opts.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        opts.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let f = match opts.open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("desktop_profile_open:{e}")),
-    };
-    let meta = f.metadata().map_err(|e| e.to_string())?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if meta.file_attributes()
-            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-            != 0
-        {
-            return Err("desktop_profile_reparse_point".into());
-        }
-    }
-    if !meta.is_file() || meta.len() > MAX as u64 {
-        return Err("desktop_profile_not_regular_or_too_large".into());
-    }
-    let mut bytes = Vec::new();
-    f.take((MAX + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    if bytes.len() > MAX {
-        return Err("desktop_profile_too_large".into());
-    }
-    let doc: Document = serde_json::from_slice(&bytes).map_err(|_| "desktop_profile_invalid")?;
-    if doc.revision == 0 {
-        return Err("desktop_profile_revision_invalid".into());
-    }
-    doc.profile.validate_draft()?;
-    doc.desktop.validate()?;
-    Ok(Some(doc))
+
+fn sqlite_view(path: &Path) -> Result<Value, String> {
+    let record = desktop_store::ensure(path)?;
+    Ok(desktop_store::view(path, &record))
 }
-fn view(path: &Path, doc: Option<Document>) -> Value {
-    match doc {
-        Some(d) => {
-            json!({"exists":true,"revision":d.revision.to_string(),"path":path,"profile":d.profile,"desktop":d.desktop})
-        }
-        None => {
-            json!({"exists":false,"revision":null,"path":path,"desktop":Preferences::default(),"profile":{"first_hop":"127.0.0.1:7892","credential":"my-residence","dns_upstream":"223.5.5.5:443","dns_tls_name":"dns.alidns.com","health_domain":"ippure.com","direct_ips":[],"direct_domains":[],"direct_suffixes":[],"allow_loopback_residential":false}})
-        }
-    }
-}
-fn save(path: &Path, req: Save) -> Result<Value, String> {
-    req.profile.validate_draft()?;
-    req.desktop.validate()?;
-    let current = read_doc(path)?.map(|d| d.revision);
-    if req.expected_revision != current.map(|n| n.to_string()) {
-        return Err("stale_profile_revision: reload the saved profile".into());
-    }
-    let d = Document {
-        revision: current
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or("revision_exhausted")?,
-        profile: req.profile,
-        desktop: req.desktop,
-    };
-    let bytes = serde_json::to_vec_pretty(&d).map_err(|e| e.to_string())?;
-    if bytes.len() > MAX {
-        return Err("desktop_profile_too_large".into());
-    }
-    let tmp = path.with_file_name(format!(
-        "desktop-policy-{}-{}.tmp",
-        std::process::id(),
-        d.revision
-    ));
-    let mut f = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&tmp)
-        .map_err(|e| e.to_string())?;
-    let commit = (|| {
-        f.write_all(&bytes)?;
-        f.sync_all()?;
-        drop(f);
-        transition::atomic_replace(&tmp, path)
-    })();
-    if let Err(e) = commit {
-        let _ = fs::remove_file(tmp);
-        return Err(format!("desktop_profile_commit:{e}"));
-    }
-    Ok(view(path, Some(d)))
+
+fn sqlite_save(path: &Path, req: SqliteSave) -> Result<Value, String> {
+    let record = desktop_store::save(
+        path,
+        req.profile,
+        req.desktop,
+        req.residential,
+        req.expected_revision,
+    )?;
+    Ok(desktop_store::view(path, &record))
 }
 // Diagnostics are an allowlist, not a recursive 'remove password' filter. No free-form
 // strings, flow addresses, hostnames, distribution names, paths, or credential references.
@@ -175,16 +163,77 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
         let data = match cmd.as_str() {
             "profile_get" => {
                 let p = profile_path().map_err(bad)?;
-                view(&p, read_doc(&p).map_err(bad)?)
+                sqlite_view(&p).map_err(bad)?
             }
             "profile_save" => {
                 let request = request
                     .as_object_mut()
                     .ok_or_else(|| bad("invalid_request".into()))?;
                 request.remove("command");
-                let req = serde_json::from_value::<Save>(Value::Object(std::mem::take(request)))
-                    .map_err(|_| bad("invalid_desktop_profile_fields".into()))?;
-                save(&profile_path().map_err(bad)?, req).map_err(bad)?
+                let req =
+                    serde_json::from_value::<SqliteSave>(Value::Object(std::mem::take(request)))
+                        .map_err(|_| bad("invalid_desktop_profile_fields".into()))?;
+                sqlite_save(&profile_path().map_err(bad)?, req).map_err(bad)?
+            }
+            "environment_view" => {
+                let request = request
+                    .as_object_mut()
+                    .ok_or_else(|| bad("invalid_environment_fields".into()))?;
+                request.remove("command");
+                let req = serde_json::from_value::<EnvironmentKey>(Value::Object(std::mem::take(
+                    request,
+                )))
+                .map_err(|_| bad("invalid_environment_fields".into()))?;
+                environment::view(&req.name).map_err(bad)?
+            }
+            "environment_create" => {
+                require_idle(controller)?;
+                let request = request
+                    .as_object_mut()
+                    .ok_or_else(|| bad("invalid_environment_fields".into()))?;
+                request.remove("command");
+                let req = serde_json::from_value::<EnvironmentCreate>(Value::Object(
+                    std::mem::take(request),
+                ))
+                .map_err(|_| bad("invalid_environment_fields".into()))?;
+                let environment = environment::create(
+                    &req.name,
+                    &req.source_path,
+                    &req.install_path,
+                    environment_options(req.install_zsh, req.install_chrome, req.install_chinese),
+                )
+                .map_err(bad)?;
+                json!({"environment":environment,"distributions":host::distributions().map_err(bad)?})
+            }
+            "environment_edit" => {
+                require_idle(controller)?;
+                let request = request
+                    .as_object_mut()
+                    .ok_or_else(|| bad("invalid_environment_fields".into()))?;
+                request.remove("command");
+                let req = serde_json::from_value::<EnvironmentEdit>(Value::Object(std::mem::take(
+                    request,
+                )))
+                .map_err(|_| bad("invalid_environment_fields".into()))?;
+                let environment = environment::edit(
+                    &req.name,
+                    environment_options(req.install_zsh, req.install_chrome, req.install_chinese),
+                )
+                .map_err(bad)?;
+                json!({"environment":environment})
+            }
+            "environment_backup" => {
+                require_idle(controller)?;
+                let request = request
+                    .as_object_mut()
+                    .ok_or_else(|| bad("invalid_environment_fields".into()))?;
+                request.remove("command");
+                let req = serde_json::from_value::<EnvironmentBackup>(Value::Object(
+                    std::mem::take(request),
+                ))
+                .map_err(|_| bad("invalid_environment_fields".into()))?;
+                let backup = environment::backup(&req.name, &req.backup_path).map_err(bad)?;
+                json!({"backup":backup})
             }
             "export_diagnostics" => export(controller).map_err(bad)?,
             "probe_exit" => {
@@ -210,10 +259,12 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                 if matches!(&*cmd, "start" | "switch") && request["profile"].is_string() {
                     let path = profile_path().map_err(bad)?;
                     let expect = request.as_object_mut().unwrap().remove("profile_revision");
+                    let current_revision = desktop_store::revision(&path).map_err(bad)?;
+                    let current_revision = current_revision.to_string();
                     if request["profile"].as_str().map(Path::new) != Some(path.as_path())
-                        || read_doc(&path).map_err(bad)?.is_none_or(|d| {
-                            expect.as_ref().and_then(Value::as_str) != Some(&d.revision.to_string())
-                        })
+                        || current_revision == "0"
+                        || expect.as_ref().and_then(Value::as_str)
+                            != Some(current_revision.as_str())
                     {
                         return Err(bad("saved_profile_revision_required".into()));
                     }
@@ -240,22 +291,5 @@ mod tests {
         assert!(!v.to_string().contains("secret"));
         assert_eq!(v["tx_bytes"], 12);
         assert_eq!(v["counters"]["chain_tcp"], 4);
-    }
-    #[test]
-    fn stale_editor_cannot_overwrite_a_newer_policy() {
-        let p = std::env::temp_dir().join(format!("wpl-profile-cas-{}.json", std::process::id()));
-        let defaults = view(&p, None);
-        let make = || Save {
-            profile: serde_json::from_value(defaults["profile"].clone()).unwrap(),
-            desktop: Preferences::default(),
-            expected_revision: None,
-        };
-        let first = save(&p, make()).unwrap();
-        let stale = save(&p, make()).unwrap_err();
-        let current = read_doc(&p).unwrap().unwrap();
-        fs::remove_file(&p).unwrap();
-        assert_eq!(first["revision"], "1");
-        assert!(stale.contains("stale_profile"));
-        assert_eq!(current.revision, 1);
     }
 }

@@ -10,13 +10,15 @@ pub(crate) enum Kind {
     List,
     Preflight,
     Save,
-    Import,
-    Forget,
     Start,
     Switch,
     Stop,
     Export,
     Probe,
+    EnvironmentView,
+    EnvironmentCreate,
+    EnvironmentEdit,
+    EnvironmentBackup,
 }
 
 impl Kind {
@@ -24,12 +26,13 @@ impl Kind {
         matches!(
             self,
             Self::Save
-                | Self::Import
-                | Self::Forget
                 | Self::Start
                 | Self::Switch
                 | Self::Stop
                 | Self::Probe
+                | Self::EnvironmentCreate
+                | Self::EnvironmentEdit
+                | Self::EnvironmentBackup
         )
     }
     pub(crate) fn label(self) -> &'static str {
@@ -39,13 +42,15 @@ impl Kind {
             Self::List => "刷新列表",
             Self::Preflight => "运行预检",
             Self::Save => "保存策略",
-            Self::Import => "导入凭据",
-            Self::Forget => "删除凭据",
             Self::Start => "启动接管",
             Self::Switch => "切换目标",
             Self::Stop => "停止并恢复",
             Self::Export => "导出诊断",
             Self::Probe => "检测出口",
+            Self::EnvironmentView => "查看环境",
+            Self::EnvironmentCreate => "新增环境",
+            Self::EnvironmentEdit => "编辑环境",
+            Self::EnvironmentBackup => "备份环境",
         }
     }
 }

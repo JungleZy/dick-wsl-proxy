@@ -74,6 +74,13 @@ impl Policy {
     }
 
     fn assemble(config: Validated, residential: Residential) -> Result<Self, String> {
+        Self::assemble_for_store(config, residential)
+    }
+
+    pub(crate) fn assemble_for_store(
+        config: Validated,
+        residential: Residential,
+    ) -> Result<Self, String> {
         if residential.endpoint().ip().is_loopback() && !config.allow_loopback_residential {
             return Err("loopback residential endpoint requires explicit laboratory opt-in".into());
         }
@@ -203,7 +210,7 @@ impl Policy {
     }
 }
 
-struct Validated {
+pub(crate) struct Validated {
     first_hop: SocketAddrV4,
     credential: String,
     dns_upstream: SocketAddrV4,
@@ -216,7 +223,7 @@ struct Validated {
 }
 
 impl Validated {
-    fn new(config: Config) -> Result<Self, String> {
+    pub(crate) fn new(config: Config) -> Result<Self, String> {
         let first_hop: SocketAddrV4 = config
             .first_hop
             .parse()

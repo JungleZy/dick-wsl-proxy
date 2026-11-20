@@ -1,13 +1,14 @@
 //! 处理用户发起的校验、策略保存、接管、切换、停止和凭据操作。
 
-use gpui::{prelude::*, *};
-use gpui_component::input::InputState;
+use gpui_kit::component::{WindowExt, dialog::DialogButtonProps};
+use gpui_kit::{prelude::*, *};
 use serde_json::{Value, json};
 
 use super::backend::Kind;
 use super::components::text;
-use super::model::Confirmation;
+use super::model::{Confirmation, EnvironmentEditor, Field};
 use super::state::Desktop;
+use std::path::Path;
 
 impl Desktop {
     pub(crate) fn fail(&mut self, error: impl Into<String>, cx: &mut Context<Self>) {
@@ -33,8 +34,8 @@ impl Desktop {
     pub(crate) fn locked(&self) -> bool {
         self.busy.is_some() || self.reading || self.confirmation.is_some()
     }
-    pub(crate) fn field_value(field: &Entity<InputState>, cx: &App) -> String {
-        field.read(cx).value().trim().to_owned()
+    pub(crate) fn field_value(field: &Field, cx: &App) -> String {
+        field.value(cx)
     }
     pub(crate) fn profile_field_value(profile: &Value, key: &str, array: bool) -> String {
         if array {
@@ -50,7 +51,12 @@ impl Desktop {
                 })
                 .unwrap_or_default()
         } else {
-            profile[key].as_str().unwrap_or_default().trim().to_owned()
+            profile[key]
+                .as_str()
+                .map(str::trim)
+                .map(str::to_owned)
+                .or_else(|| profile[key].as_u64().map(|value| value.to_string()))
+                .unwrap_or_default()
         }
     }
     pub(crate) fn draft_is_dirty(&self, cx: &App) -> bool {
@@ -62,7 +68,6 @@ impl Desktop {
         }
         for (field, key, array) in [
             (&self.fields.first_hop, "first_hop", false),
-            (&self.fields.credential, "credential", false),
             (&self.fields.dns_upstream, "dns_upstream", false),
             (&self.fields.dns_tls_name, "dns_tls_name", false),
             (&self.fields.health_domain, "health_domain", false),
@@ -71,6 +76,18 @@ impl Desktop {
             (&self.fields.direct_suffixes, "direct_suffixes", true),
         ] {
             if Self::field_value(field, cx) != Self::profile_field_value(&self.profile, key, array)
+            {
+                return true;
+            }
+        }
+        for (field, key) in [
+            (&self.fields.residential_ip, "ip"),
+            (&self.fields.residential_port, "port"),
+            (&self.fields.residential_username, "username"),
+            (&self.fields.residential_password, "password"),
+        ] {
+            if Self::field_value(field, cx)
+                != Self::profile_field_value(&self.residential, key, false)
             {
                 return true;
             }
@@ -110,7 +127,6 @@ impl Desktop {
         let mut profile = self.profile.as_object().cloned().unwrap_or_default();
         for (field, key, array) in [
             (&self.fields.first_hop, "first_hop", false),
-            (&self.fields.credential, "credential", false),
             (&self.fields.dns_upstream, "dns_upstream", false),
             (&self.fields.dns_tls_name, "dns_tls_name", false),
             (&self.fields.health_domain, "health_domain", false),
@@ -133,7 +149,26 @@ impl Desktop {
                 },
             );
         }
+        profile.insert("credential".into(), json!("desktop-residence"));
         Value::Object(profile)
+    }
+
+    pub(crate) fn residential_draft(&self, cx: &App) -> Result<Value, &'static str> {
+        let port = self.residential_port(cx)?;
+        Ok(json!({
+            "ip": Self::field_value(&self.fields.residential_ip, cx),
+            "port": port,
+            "username": Self::field_value(&self.fields.residential_username, cx),
+            "password": Self::field_value(&self.fields.residential_password, cx),
+        }))
+    }
+
+    pub(crate) fn residential_port(&self, cx: &App) -> Result<u16, &'static str> {
+        Self::field_value(&self.fields.residential_port, cx)
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port > 0)
+            .ok_or("住宅服务器端口需为 1–65535 的整数。")
     }
 
     pub(crate) fn preflight(&mut self, cx: &mut Context<Self>) {
@@ -152,7 +187,44 @@ impl Desktop {
         }
     }
 
-    pub(crate) fn prepare(&mut self, kind: Kind, cx: &mut Context<Self>) {
+    fn open_confirmation_dialog(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(confirmation) = self.confirmation.as_ref() else {
+            return;
+        };
+        let message = confirmation.message.clone();
+        let view = cx.entity().clone();
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let ok_view = view.clone();
+            let cancel_view = view.clone();
+            dialog
+                .confirm()
+                .title(
+                    div()
+                        .text_base()
+                        .font_weight(FontWeight::NORMAL)
+                        .child("确认保护操作"),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("确认并执行")
+                        .cancel_text("取消"),
+                )
+                .description(div().text_base().child(message.clone()))
+                .on_ok(move |_, _, cx| {
+                    ok_view.update(cx, |this, cx| this.confirm(cx));
+                    true
+                })
+                .on_cancel(move |_, _, cx| {
+                    cancel_view.update(cx, |this, cx| {
+                        this.confirmation = None;
+                        cx.notify();
+                    });
+                    true
+                })
+        });
+    }
+
+    pub(crate) fn prepare(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
         if self.locked() {
             return;
         }
@@ -169,6 +241,7 @@ impl Desktop {
                     "将停止接管并恢复直连。现有 TCP 连接会中断，需要重连；只清理本控制器的规则。"
                         .into(),
             });
+            self.open_confirmation_dialog(window, cx);
             cx.notify();
             return;
         }
@@ -213,6 +286,7 @@ impl Desktop {
                 )
             },
         });
+        self.open_confirmation_dialog(window, cx);
         cx.notify();
     }
 
@@ -235,56 +309,152 @@ impl Desktop {
                 return;
             }
         };
-        self.send(Kind::Save, json!({"command":"profile_save","profile":self.draft(cx),"expected_revision":self.revision,
+        let residential = match self.residential_draft(cx) {
+            Ok(value) => value,
+            Err(error) => {
+                self.fail(error, cx);
+                return;
+            }
+        };
+        self.send(Kind::Save, json!({"command":"profile_save","profile":self.draft(cx),"residential":residential,"expected_revision":self.revision,
             "desktop":{"target":self.selected,"witness":self.witness,"port":port}}), cx);
     }
 
-    pub(crate) fn credentials(&mut self, forget: bool, cx: &mut Context<Self>) {
-        if !self.idle() {
-            self.fail("凭据操作仅在后台空闲时可用。", cx);
+    pub(crate) fn environment_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.locked() {
             return;
         }
-        let name = Self::field_value(&self.fields.credential, cx);
-        if name.is_empty() {
-            self.fail("请先填写凭据名称。", cx);
-            return;
-        }
-        if forget {
-            self.send(
-                Kind::Forget,
-                json!({"command":"forget_credential","name":name}),
-                cx,
-            );
-        } else {
-            let path = Self::field_value(&self.fields.env_path, cx);
-            if path.is_empty() {
-                self.fail("请选择 .env 文件或输入绝对 Windows 路径。", cx);
-                return;
-            }
-            self.send(
-                Kind::Import,
-                json!({"command":"import_credential","name":name,"env_file":path}),
-                cx,
-            );
-        }
+        self.environment_editor = Some(EnvironmentEditor::Create);
+        self.environment_edit_target = None;
+        self.environment_detail = None;
+        self.environment_zsh = true;
+        self.environment_chrome = false;
+        self.environment_chinese = true;
+        self.fields.environment_name.set_value("", window, cx);
+        self.fields.environment_source.set_value("", window, cx);
+        self.fields.environment_install.set_value("", window, cx);
+        self.fields.environment_backup.set_value("", window, cx);
+        self.notice = "填写 rootfs tar 和安装目录，然后创建环境。".into();
+        self.error = false;
+        cx.notify();
     }
 
-    pub(crate) fn choose_env(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn environment_edit(
+        &mut self,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.locked() {
+            return;
+        }
+        self.environment_editor = Some(EnvironmentEditor::Edit);
+        self.environment_edit_target = Some(name.clone());
+        self.environment_detail = None;
+        self.fields
+            .environment_name
+            .set_value(name.clone(), window, cx);
+        self.fields.environment_source.set_value("", window, cx);
+        self.fields.environment_install.set_value("", window, cx);
+        self.send(
+            Kind::EnvironmentView,
+            json!({"command":"environment_view","name":name}),
+            cx,
+        );
+    }
+
+    pub(crate) fn environment_view(&mut self, name: String, cx: &mut Context<Self>) {
+        self.send(
+            Kind::EnvironmentView,
+            json!({"command":"environment_view","name":name}),
+            cx,
+        );
+    }
+
+    pub(crate) fn environment_submit(&mut self, cx: &mut Context<Self>) {
+        let name = Self::field_value(&self.fields.environment_name, cx);
+        if name.is_empty() {
+            self.fail("请填写环境名称。", cx);
+            return;
+        }
+        let Some(editor) = self.environment_editor else {
+            self.fail("请先点击新增环境或编辑。", cx);
+            return;
+        };
+        let (kind, request) = match editor {
+            EnvironmentEditor::Create => {
+                let source = Self::field_value(&self.fields.environment_source, cx);
+                let install = Self::field_value(&self.fields.environment_install, cx);
+                if source.is_empty() || install.is_empty() {
+                    self.fail("新增环境需要 rootfs tar 和安装目录。", cx);
+                    return;
+                }
+                (
+                    Kind::EnvironmentCreate,
+                    json!({
+                        "command":"environment_create",
+                        "name":name,
+                        "source_path":source,
+                        "install_path":install,
+                        "install_zsh":self.environment_zsh,
+                        "install_chrome":self.environment_chrome,
+                        "install_chinese":self.environment_chinese
+                    }),
+                )
+            }
+            EnvironmentEditor::Edit => {
+                let target = self
+                    .environment_edit_target
+                    .clone()
+                    .unwrap_or_else(|| name.clone());
+                (
+                    Kind::EnvironmentEdit,
+                    json!({
+                        "command":"environment_edit",
+                        "name":target,
+                        "install_zsh":self.environment_zsh,
+                        "install_chrome":self.environment_chrome,
+                        "install_chinese":self.environment_chinese
+                    }),
+                )
+            }
+        };
+        self.send(kind, request, cx);
+    }
+
+    pub(crate) fn environment_backup(&mut self, name: String, cx: &mut Context<Self>) {
+        let path = Self::field_value(&self.fields.environment_backup, cx);
+        if path.is_empty() {
+            self.fail("请填写备份文件路径。", cx);
+            return;
+        }
+        self.send(
+            Kind::EnvironmentBackup,
+            json!({"command":"environment_backup","name":name,"backup_path":path}),
+            cx,
+        );
+    }
+
+    pub(crate) fn environment_cancel(&mut self, cx: &mut Context<Self>) {
+        self.environment_editor = None;
+        self.environment_edit_target = None;
+        self.environment_detail = None;
+        cx.notify();
+    }
+
+    pub(crate) fn environment_pick_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let picker = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("选择住宅代理凭据 .env（不显示内容）".into()),
+            prompt: Some("选择 WSL rootfs tar".into()),
         });
         cx.spawn_in(window, async move |view, cx| match picker.await {
             Ok(Ok(Some(paths))) => {
                 if let Some(path) = paths.first() {
                     let path = path.to_string_lossy().into_owned();
                     let _ = view.update_in(cx, |this, window, cx| {
-                        this.fields
-                            .env_path
-                            .update(cx, |state, cx| state.set_value(path, window, cx));
-                        this.notice = "已选择凭据文件。点击“导入命名凭据”才会由后台读取。".into();
+                        this.fields.environment_source.set_value(path, window, cx);
                         cx.notify();
                     });
                 }
@@ -292,7 +462,54 @@ impl Desktop {
             Ok(Ok(None)) => {}
             _ => {
                 let _ = view.update_in(cx, |this, _, cx| {
-                    this.fail("无法打开文件选择器。可直接粘贴绝对 Windows 路径。", cx)
+                    this.fail("无法打开文件选择器，请直接填写绝对路径。", cx)
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub(crate) fn environment_pick_install(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picker = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("选择 WSL 安装目录".into()),
+        });
+        cx.spawn_in(window, async move |view, cx| match picker.await {
+            Ok(Ok(Some(paths))) => {
+                if let Some(path) = paths.first() {
+                    let path = path.to_string_lossy().into_owned();
+                    let _ = view.update_in(cx, |this, window, cx| {
+                        this.fields.environment_install.set_value(path, window, cx);
+                        cx.notify();
+                    });
+                }
+            }
+            Ok(Ok(None)) => {}
+            _ => {
+                let _ = view.update_in(cx, |this, _, cx| {
+                    this.fail("无法打开文件夹选择器，请直接填写绝对路径。", cx)
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub(crate) fn environment_pick_backup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picker = cx.prompt_for_new_path(Path::new("."), Some("wsl-environment.tar"));
+        cx.spawn_in(window, async move |view, cx| match picker.await {
+            Ok(Ok(Some(path))) => {
+                let path = path.to_string_lossy().into_owned();
+                let _ = view.update_in(cx, |this, window, cx| {
+                    this.fields.environment_backup.set_value(path, window, cx);
+                    cx.notify();
+                });
+            }
+            Ok(Ok(None)) => {}
+            _ => {
+                let _ = view.update_in(cx, |this, _, cx| {
+                    this.fail("无法打开保存位置选择器，请直接填写绝对路径。", cx)
                 });
             }
         })
