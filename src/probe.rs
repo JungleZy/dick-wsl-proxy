@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 
-const SCRIPT: &str = include_str!("probe.sh");
+const SCRIPT: &str = include_str!("guest/probe.sh");
 
 #[derive(Debug, Serialize)]
 pub struct Observation {

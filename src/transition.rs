@@ -1,6 +1,6 @@
 //! Durable transition intent, independent of the immutable active-session journal.
 //! Callers hold the current-user controller lock and mutate guests only after a write succeeds.
-use crate::{host, m1::Plan};
+use crate::{host, plan::Plan};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -373,5 +373,4 @@ pub fn finish(expected: &Record) -> Result<Record, String> {
     finish_at(&journal()?, expected)
 }
 #[cfg(test)]
-#[path = "transition/tests.rs"]
 mod tests;

@@ -1,4 +1,4 @@
-use crate::m1::Plan;
+use crate::plan::Plan;
 use std::net::SocketAddrV4;
 
 #[cfg(any(windows, test))]
@@ -19,7 +19,6 @@ const BOOTSTRAP_LIMIT: usize = 128 * 1024;
 // Only this fixed program is an argument to wsl.exe. The embedded kernel source
 // and all plan/query values travel as JSON over stdin, never through a shell.
 #[cfg(windows)]
-#[path = "query_bridge/bootstrap.rs"]
 mod bootstrap;
 #[cfg(windows)]
 use bootstrap::BOOTSTRAP;
@@ -322,7 +321,7 @@ mod windows {
                 plan: &'a Plan,
             }
             let mut initial = serde_json::to_vec(&Initial {
-                kernel: include_str!("kernel.py"),
+                kernel: include_str!("guest/kernel.py"),
                 plan,
             })
             .map_err(|error| format!("query_transport_bootstrap_encoding_failed: {error}"))?;
@@ -556,5 +555,4 @@ mod windows {
     }
 }
 #[cfg(test)]
-#[path = "query_bridge/tests.rs"]
 mod tests;

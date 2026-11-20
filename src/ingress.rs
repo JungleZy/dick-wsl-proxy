@@ -8,27 +8,21 @@ use std::time::{Duration, Instant};
 
 use socket2::{Protocol, Type};
 
-use crate::m1::Plan;
+use crate::plan::Plan;
 use crate::query_bridge::Lookup;
-#[path = "ingress/metadata_lane.rs"]
 mod metadata_lane;
 use metadata_lane::{MetadataLane, Observation};
 
-#[path = "ingress/flow_stats.rs"]
 mod flow_stats;
 use flow_stats::{Flow, FlowStats};
-#[path = "ingress/metadata_timing.rs"]
 mod metadata_timing;
 use metadata_timing::MetadataTiming;
-#[path = "ingress/udp_admission.rs"]
 mod udp_admission;
 use udp_admission::{Retirement as UdpRetirement, UdpActivity};
-#[path = "ingress/udp_pump.rs"]
 mod udp_pump;
 use udp_pump::UdpPump;
-#[path = "ingress/tcp.rs"]
 mod tcp;
-use tcp::{forward_tcp, relay, transient};
+use tcp::{forward_tcp, transient};
 
 const MAX_TCP: usize = 64;
 const MAX_UDP: usize = 128;
@@ -54,7 +48,7 @@ pub struct Ingress {
 }
 
 impl Ingress {
-    pub fn bind(plan: &Plan, runtime: Option<Arc<crate::m2::Runtime>>) -> Result<Self, String> {
+    pub fn bind(plan: &Plan, runtime: Option<Arc<crate::managed::Runtime>>) -> Result<Self, String> {
         validate(plan)?;
         if plan.system_dns.is_some() != runtime.is_some() {
             return Err("M2 ingress requires exactly one matching policy runtime".into());
@@ -544,7 +538,7 @@ enum Route {
 // original endpoint. DNS aliases are never inferred from application payloads.
 fn route_details(
     plan: &Plan,
-    runtime: Option<&crate::m2::Runtime>,
+    runtime: Option<&crate::managed::Runtime>,
     protocol: &str,
     original: SocketAddrV4,
 ) -> Result<(Route, &'static str), String> {
@@ -581,7 +575,7 @@ fn route_details(
 
 fn route(
     plan: &Plan,
-    runtime: Option<&crate::m2::Runtime>,
+    runtime: Option<&crate::managed::Runtime>,
     protocol: &str,
     original: SocketAddrV4,
 ) -> Result<Route, String> {
@@ -590,7 +584,7 @@ fn route(
 
 fn select_route(
     plan: &Plan,
-    runtime: Option<&crate::m2::Runtime>,
+    runtime: Option<&crate::managed::Runtime>,
     protocol: &str,
     original: SocketAddrV4,
     flow: &Flow,
@@ -629,7 +623,7 @@ fn run(
     listener: TcpListener,
     udp: UdpSocket,
     shared: Arc<Shared>,
-    runtime: Option<Arc<crate::m2::Runtime>>,
+    runtime: Option<Arc<crate::managed::Runtime>>,
 ) -> Result<(), String> {
     let mut workers = TcpWorkers {
         shared: Arc::clone(&shared),
@@ -891,7 +885,7 @@ impl Drop for DnsUdpSlot {
 // stall the ingress UDP loop, and every job is joined before socket release.
 fn schedule_dns_udp(
     plan: &Arc<Plan>,
-    runtime: &Arc<crate::m2::Runtime>,
+    runtime: &Arc<crate::managed::Runtime>,
     udp: &UdpSocket,
     (original, peer): (SocketAddrV4, SocketAddrV4),
     request: &[u8],
@@ -982,7 +976,7 @@ fn read_dns_query(client: &mut impl Read, request: &mut Vec<u8>) -> Result<bool,
 
 fn serve_dns_tcp(
     plan: &Plan,
-    runtime: &crate::m2::Runtime,
+    runtime: &crate::managed::Runtime,
     mut client: TcpStream,
     registration: &TcpRegistration,
     original: SocketAddrV4,
@@ -1144,5 +1138,4 @@ impl<T: Write> Write for Metered<'_, T> {
 }
 
 #[cfg(test)]
-#[path = "ingress/tests.rs"]
 mod tests;

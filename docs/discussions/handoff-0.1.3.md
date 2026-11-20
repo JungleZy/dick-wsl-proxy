@@ -38,7 +38,7 @@
 
 ## 换机与 GitHub 上传清单
 
-- **GitHub 带走源码和锁文件，不只带走本文。** 提交前用 `git status --short` 检查 `src/`（含 Python 测试和新增 Rust 模块）、`desktop/`、两个 `Cargo.toml`、`Cargo.lock`、`scripts/`、`packaging/windows/` 和 `docs/` 的预期改动；用 `git diff --cached --name-only` 核对实际暂存清单。新机克隆后两个包版本均应为 `0.1.3`。构建和预检见[仓库入口](../../README.MD)，原生桌面构建见 [M4](../plans/m4/README.md)。
+- **GitHub 带走源码和锁文件，不只带走本文。** 提交前用 `git status --short` 检查 `src/`（含 Python 测试和新增 Rust 模块）、`desktop/`、两个 `Cargo.toml`、`Cargo.lock`、`scripts/`、`packaging/windows/` 和 `docs/` 的预期改动；用 `git diff --cached --name-only` 核对实际暂存清单。新机克隆后两个包版本均应为 `0.1.3`。构建和预检见[仓库入口](../../README.md)，原生桌面构建见 [M4](../plans/m4/README.md)。
 - **仓库外材料需要单独迁移。** 旧机证据根目录是 `D:\WSL\ProxyLab\udp-latency-lab\`。若要复现实验，离开旧机前优先**私下备份** `final-result.json`、`perf/performance-results.json`、`perf/benchmark-plan.json`、`perf/temporary-harness-sources.tar.gz`；逐单元原始数据在 `perf/m5-perf-013-final/`。这些不会随 `git clone` 出现，不要把含本机网络和进程信息的整目录直接公开。若不迁移，仓库仍有[性能数据、支持范围及验收口径](../plans/m5/README.md)，但不能据此声称已在新机复跑。
 - **不要迁移为版本控制内容：**`.env`、订阅链接、住宅凭据或密码、Windows 凭据库、个人策略、控制器活动/恢复日志、`target/` 或整套 WSL 镜像。新机按 [M2 配置指南](../plans/m2/README.md) 单独导入需要的凭据；本地 scoped 回显压测不需要住宅凭据。旧机对实验模块加载的许可不沿用到新机。
 - 如需搬运**同一已测候选包**，旧机文件在证据根目录的 `final/package/wsl-proxy-0.1.3-windows-x64.zip`，SHA-256 为 `2cd2342bd9524e2649b8fc48abaea4e1e3e389dacdf40f12fb5d66a5fe184eed`。这只是文件一致性校验，不是签名，也不是公开分发许可。

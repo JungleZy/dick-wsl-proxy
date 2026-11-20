@@ -1,7 +1,7 @@
 //! Combine only queries already waiting for a fresh conntrack observation. No cache,
 //! collection delay, retries or shared results between observations.
 use crate::{
-    m1::Plan,
+    plan::Plan,
     query_bridge::{BatchOrigins, Lookup, MAX_LOOKUPS, QueryBridge},
 };
 use std::{

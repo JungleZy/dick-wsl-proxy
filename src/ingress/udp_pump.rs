@@ -112,7 +112,7 @@ impl UdpPump {
     pub(super) fn forward(
         &mut self,
         plan: &Plan,
-        runtime: Option<&crate::m2::Runtime>,
+        runtime: Option<&crate::managed::Runtime>,
         ingress: &UdpSocket,
         flows: &mut BTreeMap<SocketAddrV4, UdpFlow>,
         mut observations: DestinationGroup,

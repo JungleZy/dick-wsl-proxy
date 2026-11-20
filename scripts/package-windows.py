@@ -92,8 +92,8 @@ def assemble(args):
     require(record.get("cargo_lock_sha256") == digest(lock_bytes), "Build record lock mismatch")
     require(metadata.get("resolve") is not None, "Cargo metadata requires resolved graph")
     if not args.qa_vintage:
-        for manifest in (ROOT / "Cargo.toml", ROOT / "desktop/Cargo.toml"):
-            require(tomllib.loads(manifest.read_text())["package"]["version"] == args.version, "Source package version mismatch")
+        source = tomllib.loads((ROOT / "Cargo.toml").read_text())
+        require(source["workspace"]["package"]["version"] == args.version, "Source workspace version mismatch")
         for p in metadata["packages"]:
             if p["id"] in metadata["workspace_members"]:
                 require(p["version"] == args.version, "Metadata workspace version mismatch")

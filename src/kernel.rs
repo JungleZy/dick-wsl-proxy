@@ -1,9 +1,9 @@
-use crate::m1::Plan;
+use crate::plan::Plan;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
-const SCRIPT: &str = include_str!("kernel.py");
+const SCRIPT: &str = include_str!("guest/kernel.py");
 
 /// One-shot window issued by the very guest that enforces its expiry. Never journal or renew it.
 pub struct GrantWindow {

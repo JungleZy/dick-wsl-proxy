@@ -1,9 +1,10 @@
 //! Serialize changes under the Windows controller lock. The operation log records
 //! ordering; only authenticated kernel evidence and the owner journal authorize cleanup.
+use super::{journal, Controller};
 use crate::{
     host, kernel, lease,
-    m1::{self, Controller, Plan},
-    m2::Runtime,
+    managed::Runtime,
+    plan::Plan,
     transition::{self, Intent, Kind, Record, Stage},
 };
 use serde_json::{Value, json};
@@ -49,7 +50,7 @@ pub fn checked(expected: Option<u64>) -> Result<Record, String> {
 impl Controller {
     pub fn status(&self) -> Result<Value, String> {
         let op = transition::load()?;
-        let owner = m1::load()?;
+        let owner = journal::load()?;
         if self
             .live
             .as_ref()
@@ -103,7 +104,7 @@ impl Controller {
             .runtime
             .as_deref()
             .ok_or("switch_requires_live_managed_owner")?;
-        if m1::load()?.as_ref() != Some(p) || !self.readiness.as_ref().is_some_and(Result::is_ok) {
+        if journal::load()?.as_ref() != Some(p) || !self.readiness.as_ref().is_some_and(Result::is_ok) {
             return Err("active_owner_unverified".into());
         }
         ingress.health()?;
@@ -119,7 +120,7 @@ impl Controller {
         expected: Option<u64>,
     ) -> Result<(), String> {
         let current = checked(expected)?;
-        if current.pending.is_some() || self.live.is_some() || m1::load()?.is_some() {
+        if current.pending.is_some() || self.live.is_some() || journal::load()?.is_some() {
             return Err("recover_or_stop_existing_target_first".into());
         }
         let window = kernel::precheck(&p)?;
@@ -159,7 +160,7 @@ impl Controller {
     ) -> Result<(), String> {
         let result = self.activate(p, runtime, window);
         // If any guest mutation is still possible, activate has kept its owner journal.
-        if result.is_ok() || (m1::load()?.is_none() && self.live.is_none()) {
+        if result.is_ok() || (journal::load()?.is_none() && self.live.is_none()) {
             transition::finish(record)?;
         }
         result
@@ -167,7 +168,7 @@ impl Controller {
     pub fn stop(&mut self) -> Result<(), String> {
         let mut record = checked(None)?;
         if record.pending.is_none() {
-            let Some(p) = m1::load()? else {
+            let Some(p) = journal::load()? else {
                 return if self.live.is_none() {
                     Ok(())
                 } else {
@@ -183,7 +184,7 @@ impl Controller {
                 record = transition::advance(&record, Stage::OldRestored)?;
             }
             Stage::OldRestored => {
-                if self.live.is_some() || m1::load()?.is_some() {
+                if self.live.is_some() || journal::load()?.is_some() {
                     return Err("unexpected_owner_in_restored_gap".into());
                 }
                 verify_gone(pending.old.as_ref().ok_or("missing_old_owner")?)?;

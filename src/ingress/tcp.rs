@@ -11,7 +11,7 @@ pub(super) fn forward_tcp(
     plan: &Plan,
     client: TcpStream,
     registration: &TcpRegistration,
-    runtime: Option<&crate::m2::Runtime>,
+    runtime: Option<&crate::managed::Runtime>,
 ) -> Result<(), String> {
     let shared = &registration.shared;
     let flow = &registration.flow;
@@ -59,7 +59,9 @@ pub(super) fn forward_tcp(
 pub(super) fn transient(error: &io::Error) -> bool {
     matches!(
         error.kind(),
-        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+        io::ErrorKind::Interrupted
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
     )
 }
 
@@ -179,4 +181,15 @@ pub(super) fn relay(
     let _ = client.shutdown(Shutdown::Both);
     let _ = upstream.shutdown(Shutdown::Both);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_reset_is_transient() {
+        let error = io::Error::from(io::ErrorKind::ConnectionReset);
+        assert!(transient(&error));
+    }
 }

@@ -437,7 +437,7 @@ Rust Book 12.3 建议把逻辑放进 `lib.rs`，目的是可测试。本项目�
 
 | 项 | 现状 | 处理 |
 |---|---|---|
-| `README.MD` 扩展名大写 | 仓库里其他文档都叫 `README.md`；handoff 有一处链接写的是 `../../README.MD`；`AGENTS.md` 的正文写的是 `README.md`。Cargo 只自动识别 `README.md`/`README.txt`/`README`，但本项目 `publish = false`，没有实际影响 | **报负责人**。我倾向于改成 `README.md`，同时修掉 handoff 里那一处链接；收益只是一致性，优先级低 |
+| `README.md` 文件名 | 已统一为仓库惯用的 `README.md`；handoff 链接已同步 | 已处理：根入口统一为 `README.md`，并修复 handoff 引用 |
 | `docs/clash链式代理教程.docx` | 没有任何文档引用，也不属于 arch/discussions/plans 中的任何一类（第一份复审第 9 条） | **报负责人**，不在本方案里处理 |
 | `AGENTS.md` 提到的 `docs/contracts/` | 目录不存在（第一份复审第 3 条） | **报负责人**。按 `AGENTS.md` 的约定，改文档体系属于设计变更 |
 | `docs/plans/` 里的旧源码路径 | M0 的 `src/probe.sh` 在 `be0fe1d` 后就已失效；本方案执行后，M1/M3 里的 `src/m1.rs`、`src/lifecycle.rs` 等也会失效 | **不改**，执行记录保持原样，用 3.1 节的对照表 |

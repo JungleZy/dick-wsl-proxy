@@ -1,8 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::{self, BufReader, Read, Write};
-use std::net::{Ipv4Addr, TcpStream};
-use std::path::Path;
+use std::io::{BufReader, Write};
+use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -16,15 +14,12 @@ const IO_DEADLINE: Duration = Duration::from_secs(10);
 const ALIAS_START: u32 = u32::from_be_bytes([198, 18, 0, 1]);
 const ALIAS_SPACE: u32 = 131_070;
 const ALIAS_BLOCK: u32 = 32;
-#[path = "managed_dns/http.rs"]
 mod http;
 use http::{DeadlineStream, read_http};
-#[path = "managed_dns/wire.rs"]
 mod wire;
-use wire::{Message, a_address, finish_answer, put_name, reserved, word};
-#[path = "managed_dns/ledger.rs"]
+use wire::{Message, finish_answer, reserved};
 mod ledger;
-use ledger::{AliasLedger, read_alias_highwater};
+use ledger::AliasLedger;
 
 /// Session-local DNS through the authenticated proxy chain. Ordinary IN queries,
 /// including AAAA, pass through; IPv6 blocking belongs to the Target kernel rules.
@@ -238,5 +233,4 @@ impl Aliases {
     }
 }
 #[cfg(test)]
-#[path = "managed_dns/tests.rs"]
 mod tests;

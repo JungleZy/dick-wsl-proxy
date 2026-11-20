@@ -1,5 +1,5 @@
 //! Runtime-only M2 configuration. The recovery journal never contains credentials or policy.
-use crate::{host, m1::Plan, managed_dns::ManagedDns, policy::Policy, probe::Snapshot};
+use crate::{host, managed_dns::ManagedDns, plan::Plan, policy::Policy, probe::Snapshot};
 use serde::Serialize;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::Path;
@@ -84,7 +84,7 @@ impl Runtime {
             let script = format!(
                 "exec /usr/bin/python3 -I - <<'WPL_DNS'\nname='{name}'\nserver='{server}'\ntcp={}\n{}\nWPL_DNS\n",
                 u8::from(tcp),
-                include_str!("probe/dns_probe.py")
+                include_str!("guest/dns_probe.py")
             );
             let result = host::guest_script(&p.target, &script)
                 .map_err(|_| format!("{label}_dns_probe_failed"))?;
@@ -104,7 +104,7 @@ impl Runtime {
             .collect::<String>();
         let script = format!(
             "exec /usr/bin/python3 -I - <<'WPL_TLS'\nname=bytes.fromhex('{encoded}').decode('ascii')\n{}\nWPL_TLS\n",
-            include_str!("probe/https_probe.py")
+            include_str!("guest/https_probe.py")
         );
         let response = host::guest_script(&p.target, &script)
             .map_err(|_| "target_https_probe_failed".to_string())?;

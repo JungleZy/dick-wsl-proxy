@@ -1,6 +1,11 @@
 // Managed DNS wire, alias, ledger, and transport tests.
 use super::*;
-use std::net::TcpListener;
+use super::ledger::read_alias_highwater;
+use super::wire::{a_address, put_name, word};
+use std::fs;
+use std::io::{self, Read};
+use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::thread;
 
 fn query(host: &str) -> Vec<u8> {

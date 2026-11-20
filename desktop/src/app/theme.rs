@@ -9,7 +9,6 @@ pub(crate) const BLUE: u32 = 0x087ea4;
 pub(crate) const CYAN: u32 = 0x12b8d4;
 pub(crate) const TEAL: u32 = 0x167d73;
 pub(crate) const RUST: u32 = 0xb4532a;
-pub(crate) const AMBER: u32 = 0xc47a12;
 pub(crate) const RULE: u32 = 0xcbd7d8;
 pub(crate) const MUTED: u32 = 0x61747b;
 pub(crate) const WHITE: u32 = 0xffffff;

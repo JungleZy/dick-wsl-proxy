@@ -3,7 +3,7 @@
 //! and releases them only after an explicit, journal-backed stop has removed the guest rules.
 #[cfg(windows)]
 mod windows {
-    use crate::m1::Plan;
+    use crate::plan::Plan;
     use socket2::Socket;
     use std::io::{Read, Write};
     use std::os::windows::io::{AsRawSocket, FromRawSocket};
@@ -189,7 +189,7 @@ mod windows {
 pub use windows::{alive, release, reserve, worker};
 #[cfg(not(windows))]
 mod unsupported {
-    use crate::m1::Plan;
+    use crate::plan::Plan;
     use socket2::Socket;
     pub fn reserve(_: &Plan, _: &Socket, _: &Socket) -> Result<(), String> {
         Err("Windows required".into())

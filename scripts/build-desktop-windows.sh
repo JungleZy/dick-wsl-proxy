@@ -84,6 +84,16 @@ if [[ ! -f "$build_root/crates/gpui-0.2.2/.cross-host-corrected" ]]; then
 PATCH
     touch "$build_root/crates/gpui-0.2.2/.cross-host-corrected"
 fi
+if [[ ! -f "$build_root/crates/gpui-0.2.2/.f32-literal-corrected" ]]; then
+    patch --batch -p0 -d "$build_root/crates" <<'PATCH'
+--- gpui-0.2.2/src/taffy.rs
++++ gpui-0.2.2/src/taffy.rs
+@@ -312 +312 @@
+-            unit.map(|count| vec![repeat(count, vec![minmax(length(0.0), fr(1.0))])])
++            unit.map(|count| vec![repeat(count, vec![minmax(length(0.0_f32), fr(1.0_f32))])])
+PATCH
+    touch "$build_root/crates/gpui-0.2.2/.f32-literal-corrected"
+fi
 cat > "$build_root/tools/hlsl-wsl" <<'PYTHON'
 #!/usr/bin/env python3
 import os

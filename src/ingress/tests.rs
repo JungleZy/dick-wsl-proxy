@@ -1,5 +1,6 @@
 // Ingress integration and flow behavior tests.
 use super::*;
+use super::tcp::relay;
 
 fn tcp_pair() -> (TcpStream, TcpStream) {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();

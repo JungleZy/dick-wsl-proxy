@@ -39,11 +39,9 @@ pub fn serve(handler: impl FnMut(Value) -> (Value, bool)) -> Result<(), String> 
 }
 
 #[cfg(any(windows, test))]
-#[path = "ipc/framing.rs"]
 mod framing;
 
 #[cfg(windows)]
-#[path = "ipc/windows.rs"]
 mod windows;
 
 #[cfg(test)]

@@ -36,8 +36,8 @@ class PackagingTests(unittest.TestCase):
             root = Path(temporary)
             (root / "desktop").mkdir()
             (root / "packaging/windows").mkdir(parents=True)
-            (root / "Cargo.toml").write_text('[package]\nname="wsl-proxyctl"\nversion="0.1.1"\n')
-            (root / "desktop/Cargo.toml").write_text('[package]\nname="wsl-proxy-desktop"\nversion="0.1.1"\n')
+            (root / "Cargo.toml").write_text("[workspace]\nmembers=[\"desktop\"]\n\n[workspace.package]\nversion=\"0.1.1\"\nedition=\"2024\"\npublish=false\n\n[package]\nname=\"wsl-proxyctl\"\nversion.workspace=true\nedition.workspace=true\npublish.workspace=true\n")
+            (root / "desktop/Cargo.toml").write_text("[package]\nname=\"wsl-proxy-desktop\"\nversion.workspace=true\nedition.workspace=true\npublish.workspace=true\n")
             (root / "Cargo.lock").write_text('version=4\n[[package]]\nname="wsl-proxyctl"\nversion="0.1.1"\n[[package]]\nname="wsl-proxy-desktop"\nversion="0.1.1"\n[[package]]\nname="example-dep"\nversion="1.0.0"\n')
             crate = root / "local-crate"
             crate.mkdir()

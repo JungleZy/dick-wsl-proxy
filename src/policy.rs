@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::credential::{self, Residential};
 
+pub(crate) mod profile;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_CONFIG: u64 = 1024 * 1024;
 
@@ -66,7 +67,7 @@ impl Policy {
         if bytes.len() as u64 > MAX_CONFIG {
             return Err("policy file exceeds size limit".into());
         }
-        let config = crate::desktop_control::decode_policy(&bytes)?;
+        let config = profile::decode_policy(&bytes)?;
         let validated = Validated::new(config)?;
         let residential = credential::load(&validated.credential)?;
         Self::assemble(validated, residential)

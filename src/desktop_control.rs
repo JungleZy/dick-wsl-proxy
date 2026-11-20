@@ -1,49 +1,15 @@
-use crate::{host, m1, policy::Config, transition};
-use serde::{Deserialize, Serialize};
+use crate::{
+    controller,
+    host,
+    policy::{profile::{Document, Preferences}, Config},
+    transition,
+};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(deny_unknown_fields)]
-struct Preferences {
-    target: Option<String>,
-    witness: Option<String>,
-    port: u16,
-}
-impl Default for Preferences {
-    fn default() -> Self {
-        Self {
-            target: None,
-            witness: None,
-            port: 43531,
-        }
-    }
-}
-impl Preferences {
-    fn validate(&self) -> Result<(), String> {
-        if self.port < 1024
-            || [self.target.as_deref(), self.witness.as_deref()]
-                .into_iter()
-                .flatten()
-                .any(|n| n.is_empty() || n.len() > 256 || n.chars().any(char::is_control))
-        {
-            return Err("invalid_desktop_preferences".into());
-        }
-        if self.target.is_some() && self.target == self.witness {
-            return Err("same_distribution".into());
-        }
-        Ok(())
-    }
-}
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Document {
-    revision: u64,
-    profile: Config,
-    desktop: Preferences,
-}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Save {
@@ -96,23 +62,6 @@ fn read_doc(path: &Path) -> Result<Option<Document>, String> {
     doc.profile.validate_draft()?;
     doc.desktop.validate()?;
     Ok(Some(doc))
-}
-pub fn decode_policy(bytes: &[u8]) -> Result<Config, String> {
-    // Console users can still supply a plain policy. The desktop stores preferences and
-    // revision atomically in a typed envelope; neither format can contain passwords.
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Input {
-        Plain(Config),
-        Desktop(Document),
-    }
-    match serde_json::from_slice::<Input>(bytes)
-        .map_err(|_| "invalid policy JSON or unsupported policy field")?
-    {
-        Input::Plain(c) => Ok(c),
-        Input::Desktop(d) if d.revision > 0 => Ok(d.profile),
-        _ => Err("invalid desktop policy revision".into()),
-    }
 }
 fn view(path: &Path, doc: Option<Document>) -> Value {
     match doc {
@@ -198,7 +147,7 @@ fn sanitized(s: &Value) -> Value {
     }
     json!({"schema":1,"phase":phase,"operation_generation":s["operation_generation"].as_u64(),"dns_managed":s["dns_managed"].as_bool(),"fresh_udp_dns":s["startup_verified"]["fresh_udp_dns"].as_bool(),"fresh_tcp_dns":s["startup_verified"]["fresh_tcp_dns"].as_bool(),"https_status":s["startup_verified"]["https_status"].as_u64(),"tx_bytes":s["forwarding"]["traffic"]["tx_bytes"].as_u64(),"rx_bytes":s["forwarding"]["traffic"]["rx_bytes"].as_u64(),"counters":counters})
 }
-fn export(controller: &m1::Controller) -> Result<Value, String> {
+fn export(controller: &controller::Controller) -> Result<Value, String> {
     let doc = sanitized(&controller.status()?);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -215,9 +164,9 @@ fn export(controller: &m1::Controller) -> Result<Value, String> {
     Ok(json!({"path":path}))
 }
 
-pub fn handle(mut request: Value, controller: &mut m1::Controller) -> (Value, bool) {
-    let result = (|| -> Result<(Value, bool), crate::Failure> {
-        let bad = |m: String| crate::Failure::new("desktop_request_failed", m);
+pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (Value, bool) {
+    let result = (|| -> Result<(Value, bool), crate::command::Failure> {
+        let bad = |m: String| crate::command::Failure::new("desktop_request_failed", m);
         let cmd = request
             .get("command")
             .and_then(Value::as_str)
@@ -269,9 +218,9 @@ pub fn handle(mut request: Value, controller: &mut m1::Controller) -> (Value, bo
                         return Err(bad("saved_profile_revision_required".into()));
                     }
                 }
-                let req = serde_json::from_value::<crate::Command>(request)
+                let req = serde_json::from_value::<crate::command::Command>(request)
                     .map_err(|_| bad("invalid_request_fields".into()))?;
-                return crate::dispatch_result(req, controller).map(|(_, v)| (v, false));
+                return crate::command::dispatch_result(req, controller).map(|(_, v)| (v, false));
             }
             _ => return Err(bad("command_not_available_on_desktop_channel".into())),
         };
