@@ -62,25 +62,35 @@ impl Desktop {
         let exceptions = panel("直连例外", "每行一个目标，按类型分别匹配。").child(
             div()
                 .flex()
+                .flex_wrap()
                 .gap_3()
-                .child(self.field(
-                    "IPv4 / CIDR",
-                    "例如 192.0.2.0/24。",
-                    &self.fields.direct_ips,
-                    true,
-                ))
-                .child(self.field(
-                    "精确域名",
-                    "每行一个域名，不填写 URL。",
-                    &self.fields.direct_domains,
-                    true,
-                ))
-                .child(self.field(
-                    "域名后缀",
-                    "按域名边界匹配。",
-                    &self.fields.direct_suffixes,
-                    true,
-                )),
+                .child(
+                    self.field(
+                        "IPv4 / CIDR",
+                        "例如 192.0.2.0/24。",
+                        &self.fields.direct_ips,
+                        true,
+                    )
+                    .min_w(px(260.)),
+                )
+                .child(
+                    self.field(
+                        "精确域名",
+                        "每行一个域名，不填写 URL。",
+                        &self.fields.direct_domains,
+                        true,
+                    )
+                    .min_w(px(260.)),
+                )
+                .child(
+                    self.field(
+                        "域名后缀",
+                        "按域名边界匹配。",
+                        &self.fields.direct_suffixes,
+                        true,
+                    )
+                    .min_w(px(260.)),
+                ),
         );
 
         div()

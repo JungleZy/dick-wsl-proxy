@@ -873,36 +873,50 @@ impl Desktop {
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .gap_3()
-                        .child(self.field(
-                            "服务器 IPv4",
-                            "住宅出口服务器地址。",
-                            &self.fields.residential_ip,
-                            false,
-                        ))
-                        .child(self.field(
-                            "服务器端口",
-                            "范围 1–65535。",
-                            &self.fields.residential_port,
-                            false,
-                        )),
+                        .child(
+                            self.field(
+                                "服务器 IPv4",
+                                "住宅出口服务器地址。",
+                                &self.fields.residential_ip,
+                                false,
+                            )
+                            .min_w(px(320.)),
+                        )
+                        .child(
+                            self.field(
+                                "服务器端口",
+                                "范围 1–65535。",
+                                &self.fields.residential_port,
+                                false,
+                            )
+                            .min_w(px(320.)),
+                        ),
                 )
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .gap_3()
-                        .child(self.field(
-                            "用户名",
-                            "SOCKS5 认证用户名。",
-                            &self.fields.residential_username,
-                            false,
-                        ))
-                        .child(self.field(
-                            "密码",
-                            "SOCKS5 认证密码。",
-                            &self.fields.residential_password,
-                            false,
-                        )),
+                        .child(
+                            self.field(
+                                "用户名",
+                                "SOCKS5 认证用户名。",
+                                &self.fields.residential_username,
+                                false,
+                            )
+                            .min_w(px(320.)),
+                        )
+                        .child(
+                            self.field(
+                                "密码",
+                                "SOCKS5 认证密码。",
+                                &self.fields.residential_password,
+                                false,
+                            )
+                            .min_w(px(320.)),
+                        ),
                 ),
         );
         let host = card(
@@ -983,16 +997,16 @@ impl Desktop {
                     .flex()
                     .flex_wrap()
                     .gap_3()
-                    .child(host.flex_1())
-                    .child(dns.flex_1()),
+                    .child(host.flex_1().min_w(px(320.)))
+                    .child(dns.flex_1().min_w(px(320.))),
             )
             .child(
                 div()
                     .flex()
                     .flex_wrap()
                     .gap_3()
-                    .child(storage.flex_1())
-                    .child(window.flex_1()),
+                    .child(storage.flex_1().min_w(px(320.)))
+                    .child(window.flex_1().min_w(px(320.))),
             )
             .child(
                 div()
