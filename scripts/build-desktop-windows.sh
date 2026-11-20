@@ -7,7 +7,7 @@ output_dir=$(realpath -m -- "${WSL_PROXY_OUTPUT_DIR:-$build_root/output}")
 jobs=${WSL_PROXY_BUILD_JOBS:-2}
 if [[ ${1:-} == --help ]]; then
     printf '%s\n' 'Usage: scripts/build-desktop-windows.sh [--clean]' \
-        'Requires WSL interop, Rust with x86_64-pc-windows-gnu, host cc and gcc, Ubuntu apt-get/dpkg-deb, curl, tar, patch, Python 3.' \
+        'Requires WSL interop, Rust with x86_64-pc-windows-gnu, Ubuntu apt-get/dpkg-deb, curl, tar, patch, Python 3.' \
         'WSL_PROXY_BUILD_DIR: isolated compiler/source/cache directory (default /tmp/wsl-proxy-desktop-build)' \
         'WSL_PROXY_OUTPUT_DIR: output EXE directory (default BUILD_DIR/output)' \
         'WSL_PROXY_BUILD_JOBS: Cargo parallel jobs (default 2)' \
@@ -21,7 +21,7 @@ if [[ ${1:-} == --clean ]]; then
     exit 0
 fi
 if [[ $# != 0 ]]; then printf 'Unknown argument: %s\n' "$1" >&2; exit 2; fi
-for tool in cargo rustc cc gcc curl tar patch python3 apt-get dpkg-deb wslpath powershell.exe; do
+for tool in cargo rustc curl tar patch python3 apt-get dpkg-deb wslpath powershell.exe; do
     command -v "$tool" >/dev/null || { printf 'Missing prerequisite: %s\n' "$tool" >&2; exit 1; }
 done
 stdlib=$(rustc --print target-libdir --target x86_64-pc-windows-gnu)
