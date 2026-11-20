@@ -354,7 +354,7 @@ impl Desktop {
         if self.dns_history.is_empty() {
             return chart_card(
                 "DNS 健康",
-                "DoH 响应延迟 · 最近 8 次检查",
+                "DoH 响应延迟 · 最近 12 次检查",
                 div()
                     .p_4()
                     .bg(rgb(SURFACE_SOFT))
@@ -366,7 +366,7 @@ impl Desktop {
         }
         chart_card(
             "DNS 健康",
-            "DoH 响应延迟 · 最近 8 次检查",
+            "DoH 响应延迟 · 最近 12 次检查",
             div()
                 .flex()
                 .flex_col()
