@@ -13,24 +13,13 @@ use std::path::{Path, PathBuf};
 const DEFAULT_CREDENTIAL_NAME: &str = "desktop-residence";
 const MAX_TEXT: usize = 256 * 1024;
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ResidentialSettings {
     pub(crate) ip: String,
     pub(crate) port: u16,
     pub(crate) username: String,
     pub(crate) password: String,
-}
-
-impl Default for ResidentialSettings {
-    fn default() -> Self {
-        Self {
-            ip: String::new(),
-            port: 0,
-            username: String::new(),
-            password: String::new(),
-        }
-    }
 }
 
 pub(crate) struct Record {
@@ -75,10 +64,10 @@ fn env_candidates() -> Vec<PathBuf> {
 
 fn default_residential() -> ResidentialSettings {
     for candidate in env_candidates() {
-        if let Ok(bytes) = fs::read(&candidate) {
-            if let Ok(value) = credential::parse_env_bytes(&bytes) {
-                return credential::settings(&value);
-            }
+        if let Ok(bytes) = fs::read(&candidate)
+            && let Ok(value) = credential::parse_env_bytes(&bytes)
+        {
+            return credential::settings(&value);
         }
     }
     ResidentialSettings::default()
@@ -186,17 +175,15 @@ pub(crate) fn ensure(path: &Path) -> Result<Record, String> {
             profile: Config,
             desktop: Preferences,
         }
-        if let Ok(legacy) = serde_json::from_slice::<Legacy>(&bytes) {
-            if legacy.revision > 0
-                && legacy.profile.validate_draft().is_ok()
-                && legacy.desktop.validate().is_ok()
-            {
-                let residential = default_residential();
-                let profile_json =
-                    serde_json::to_string(&legacy.profile).map_err(|e| e.to_string())?;
-                let desktop_json =
-                    serde_json::to_string(&legacy.desktop).map_err(|e| e.to_string())?;
-                connection
+        if let Ok(legacy) = serde_json::from_slice::<Legacy>(&bytes)
+            && legacy.revision > 0
+            && legacy.profile.validate_draft().is_ok()
+            && legacy.desktop.validate().is_ok()
+        {
+            let residential = default_residential();
+            let profile_json = serde_json::to_string(&legacy.profile).map_err(|e| e.to_string())?;
+            let desktop_json = serde_json::to_string(&legacy.desktop).map_err(|e| e.to_string())?;
+            connection
                     .execute(
                         "INSERT OR REPLACE INTO desktop_state (id, revision, profile_json, desktop_json, residential_ip, residential_port, residential_username, residential_password) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                         params![
@@ -210,13 +197,12 @@ pub(crate) fn ensure(path: &Path) -> Result<Record, String> {
                         ],
                     )
                     .map_err(|e| format!("desktop_store_legacy_migrate:{e}"))?;
-                return Ok(Record {
-                    revision: legacy.revision,
-                    profile: legacy.profile,
-                    desktop: legacy.desktop,
-                    residential,
-                });
-            }
+            return Ok(Record {
+                revision: legacy.revision,
+                profile: legacy.profile,
+                desktop: legacy.desktop,
+                residential,
+            });
         }
     }
     let profile = default_profile()?;
