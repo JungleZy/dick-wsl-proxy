@@ -3,7 +3,7 @@
 use gpui::{prelude::*, *};
 use serde_json::Value;
 
-use super::theme::{INK, MUTED, RULE, SURFACE, SURFACE_SOFT};
+use super::theme::{BLUE, CYAN, INK, MUTED, RULE, SURFACE, SURFACE_SOFT};
 
 pub(crate) fn text(value: &Value, key: &str, fallback: &str) -> String {
     value[key].as_str().unwrap_or(fallback).to_owned()
@@ -33,7 +33,7 @@ pub(crate) fn badge(label: impl Into<SharedString>, color: u32, background: u32)
         .py_1()
         .bg(rgb(background))
         .rounded_md()
-        .child(div().w(px(7.)).h(px(7.)).rounded_md().bg(rgb(color)))
+        .child(div().w(px(6.)).h(px(6.)).rounded_md().bg(rgb(color)))
         .child(
             div()
                 .text_xs()
@@ -41,6 +41,14 @@ pub(crate) fn badge(label: impl Into<SharedString>, color: u32, background: u32)
                 .text_color(rgb(color))
                 .child(label.into()),
         )
+}
+
+pub(crate) fn route_arrow() -> Div {
+    div()
+        .text_lg()
+        .font_weight(FontWeight::BOLD)
+        .text_color(rgb(BLUE))
+        .child("→")
 }
 
 pub(crate) fn panel(title: &'static str, caption: impl Into<SharedString>) -> Div {
@@ -58,6 +66,9 @@ pub(crate) fn panel(title: &'static str, caption: impl Into<SharedString>) -> Di
                 .flex()
                 .flex_col()
                 .gap_1()
+                .border_l_2()
+                .border_color(rgb(CYAN))
+                .pl_3()
                 .child(
                     div()
                         .text_lg()
@@ -65,12 +76,7 @@ pub(crate) fn panel(title: &'static str, caption: impl Into<SharedString>) -> Di
                         .text_color(rgb(INK))
                         .child(title),
                 )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(MUTED))
-                        .child(caption.into()),
-                ),
+                .child(div().text_sm().text_color(rgb(MUTED)).child(caption.into())),
         )
 }
 
@@ -83,6 +89,8 @@ pub(crate) fn fact(label: &'static str, value: impl Into<SharedString>, color: u
         .min_w_0()
         .p_3()
         .bg(rgb(SURFACE_SOFT))
+        .border_l_2()
+        .border_color(rgb(RULE))
         .rounded_md()
         .child(
             div()

@@ -2,17 +2,17 @@
 
 use gpui::{prelude::*, *};
 use gpui_component::{
+    Disableable,
     button::Button,
     input::{Input, InputState},
-    Disableable,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::backend::Kind;
-use super::components::{badge, fact, text};
+use super::components::{badge, fact, route_arrow, text};
 use super::model::UiAction;
 use super::state::Desktop;
-use super::theme::{BLUE, DANGER_BG, INK, MUTED, RUST, RULE, SURFACE_SOFT, SUCCESS_BG, TEAL};
+use super::theme::{BLUE, DANGER_BG, INK, MUTED, RULE, RUST, SUCCESS_BG, SURFACE_SOFT, TEAL};
 impl Desktop {
     pub(crate) fn button(
         &self,
@@ -77,6 +77,7 @@ impl Desktop {
         multiline: bool,
     ) -> Div {
         let input = Input::new(state).disabled(self.locked());
+        let input = if multiline { input.h(px(112.)) } else { input };
         div()
             .flex()
             .flex_col()
@@ -90,11 +91,7 @@ impl Desktop {
                     .text_color(rgb(INK))
                     .child(label),
             )
-            .child(if multiline {
-                input.h(px(112.)).into_any_element()
-            } else {
-                input.into_any_element()
-            })
+            .child(input)
             .child(div().text_xs().text_color(rgb(MUTED)).child(hint))
     }
 
@@ -104,24 +101,24 @@ impl Desktop {
         } else {
             &self.profile
         };
-        let active = text(&self.status, "active_target", "无当前目标");
-        let first_hop = text(policy, "first_hop", "未配置");
+        let active = text(&self.status, "active_target", "未选择目标");
+        let first_hop = text(policy, "first_hop", "未配置宿主代理");
         let dns = text(policy, "dns_tls_name", "未配置");
         let (title, status, status_color, status_background) = if !self.status_valid {
-            ("状态未知 · 路径未确认", "需确认", RUST, DANGER_BG)
+            ("路由观测 · 尚未确认", "需刷新", RUST, DANGER_BG)
         } else if self.status["active_policy"].is_object() {
-            ("运行路径 · 双跳与 DNS", "运行中", TEAL, SUCCESS_BG)
+            ("实时保护路径", "接管中", TEAL, SUCCESS_BG)
         } else if self.profile_exists {
-            ("已保存路径 · 等待启动", "待启动", BLUE, SURFACE_SOFT)
+            ("已保存保护路径", "待启动", BLUE, SURFACE_SOFT)
         } else {
-            ("默认路径预览", "未配置", MUTED, SURFACE_SOFT)
+            ("保护路径预览", "未配置", MUTED, SURFACE_SOFT)
         };
         div()
             .flex()
             .flex_col()
             .gap_3()
             .px_6()
-            .py_5()
+            .py_4()
             .bg(rgb(SURFACE_SOFT))
             .border_b_1()
             .border_color(rgb(RULE))
@@ -135,30 +132,34 @@ impl Desktop {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).child(title))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(INK))
+                                    .child(title),
+                            )
                             .child(badge(status, status_color, status_background)),
                     )
                     .child(
                         div()
                             .text_xs()
                             .text_color(rgb(MUTED))
-                            .child("仅表示策略路径，不代表节点健康。"),
+                            .child("路径是策略摘要；健康度见总览与诊断。"),
                     ),
             )
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_3()
+                    .gap_2()
                     .child(fact("目标 WSL", active, INK))
-                    .child(div().text_lg().text_color(rgb(MUTED)).child("→"))
+                    .child(route_arrow())
                     .child(fact("宿主代理", first_hop, INK))
-                    .child(div().text_lg().text_color(rgb(MUTED)).child("→"))
-                    .child(fact("住宅出口", "凭据保存在 Windows · 不显示秘密", INK))
-                    .child(div().text_lg().text_color(rgb(MUTED)).child("→"))
+                    .child(route_arrow())
+                    .child(fact("住宅凭据", "Windows 凭据库 · 不显示秘密", INK))
+                    .child(route_arrow())
                     .child(fact("DNS", format!("DoH · {dns}"), INK)),
             )
     }
-
 }
-

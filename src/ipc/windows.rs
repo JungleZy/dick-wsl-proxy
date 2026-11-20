@@ -40,7 +40,7 @@ mod inner {
         CREATE_NO_WINDOW, CreateEventW, CreateProcessW, GetCurrentProcess, INFINITE, OpenProcess,
         OpenProcessToken, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
         QueryFullProcessImageNameW, ResetEvent, STARTF_USESTDHANDLES, STARTUPINFOW,
-        WaitForSingleObject,
+        TerminateProcess, WaitForSingleObject,
     };
 
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -64,6 +64,63 @@ mod inner {
         fn drop(&mut self) {
             // All overlapped operations are completed/cancelled before this point.
             unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    fn terminate_spawned(process: HANDLE) -> io::Result<()> {
+        let terminate_error = if unsafe { TerminateProcess(process, 1) } == 0 {
+            Some(io::Error::last_os_error())
+        } else {
+            None
+        };
+        let wait = unsafe {
+            WaitForSingleObject(
+                process,
+                START_TIMEOUT.as_millis().min(u32::MAX as u128) as u32,
+            )
+        };
+        if wait == WAIT_OBJECT_0 {
+            return Ok(());
+        }
+        if wait == WAIT_TIMEOUT {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "ipc_spawn_cleanup_timeout",
+            ));
+        }
+        Err(terminate_error.unwrap_or_else(io::Error::last_os_error))
+    }
+
+    enum SpawnError {
+        Io(io::Error),
+        Cleanup {
+            original: io::Error,
+            cleanup: io::Error,
+        },
+    }
+
+    impl From<io::Error> for SpawnError {
+        fn from(error: io::Error) -> Self {
+            Self::Io(error)
+        }
+    }
+
+    impl SpawnError {
+        fn report(self, context: &str) -> String {
+            match self {
+                Self::Io(error) => report(context, error),
+                Self::Cleanup { original, cleanup } => format!(
+                    "{}; {}",
+                    report(context, original),
+                    report("ipc_spawn_cleanup", cleanup)
+                ),
+            }
+        }
+    }
+    fn cleanup_spawn_error(process: HANDLE, original: io::Error) -> SpawnError {
+        match terminate_spawned(process) {
+            Ok(()) => SpawnError::Io(original),
+            Err(cleanup) => SpawnError::Cleanup { original, cleanup },
         }
     }
 
@@ -234,13 +291,13 @@ mod inner {
             Ok(())
         }
 
-        fn spawn(&self, sid: &str) -> io::Result<Handle> {
+        fn spawn(&self, sid: &str) -> Result<Handle, SpawnError> {
             let application = wide(self.path.as_os_str())?;
             if application.contains(&(b'"' as u16)) {
-                return Err(io::Error::new(
+                return Err(SpawnError::Io(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "ipc_invalid_executable",
-                ));
+                )));
             }
             let mut command = vec![b'"' as u16];
             command.extend_from_slice(&application[..application.len() - 1]);
@@ -278,12 +335,35 @@ mod inner {
                 )
             } == 0
             {
-                return Err(io::Error::last_os_error());
+                return Err(SpawnError::Io(io::Error::last_os_error()));
             }
-            let process = Handle::checked(info.hProcess)?;
-            let _thread = Handle::checked(info.hThread)?;
-            self.verify_process(process.0, sid)?;
+            let process = match Handle::checked(info.hProcess) {
+                Ok(process) => process,
+                Err(error) => {
+                    if !info.hThread.is_null() && info.hThread != INVALID_HANDLE_VALUE {
+                        unsafe { CloseHandle(info.hThread) };
+                    }
+                    return Err(SpawnError::Io(error));
+                }
+            };
+            let _thread = match Handle::checked(info.hThread) {
+                Ok(thread) => thread,
+                Err(error) => {
+                    return Err(cleanup_spawn_error(process.0, error));
+                }
+            };
+            if let Err(error) = self.verify_process(process.0, sid) {
+                return Err(cleanup_spawn_error(process.0, error));
+            }
             Ok(process)
+        }
+    }
+
+    fn cleanup_started_daemon(context: &str, error: io::Error, child: Handle) -> String {
+        let failure = report(context, error);
+        match terminate_spawned(child.0) {
+            Ok(()) => failure,
+            Err(cleanup) => format!("{failure}; {}", report("ipc_spawn_cleanup", cleanup)),
         }
     }
 
@@ -572,31 +652,85 @@ mod inner {
         // no inherited handles, and null standard handles under CREATE_NO_WINDOW.
         let child = executable
             .spawn(&sid)
-            .map_err(|error| report("ipc_daemon_start_failed", error))?;
+            .map_err(|error| error.report("ipc_daemon_start_failed"))?;
         let deadline = Instant::now() + START_TIMEOUT;
         loop {
             match open_pipe(&name, deadline) {
-                Ok(pipe) => {
-                    return authenticate(&pipe, &executable, &sid)
-                        .map_err(|error| report("ipc_untrusted_server", error));
-                }
-                Err(error) if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => {
-                    if Instant::now() >= deadline {
-                        return Err("ipc_daemon_start_timeout".into());
+                Ok(pipe) => match authenticate(&pipe, &executable, &sid) {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        return Err(cleanup_started_daemon("ipc_untrusted_server", error, child));
                     }
-                    // Waiting/sleeping, not polling a hot loop. A concurrent
-                    // launcher may win first-instance ownership; never kill it.
-                    if unsafe { WaitForSingleObject(child.0, 50) } == WAIT_OBJECT_0 {
+                },
+                Err(error) if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => {
+                    if Instant::now() < deadline {
+                        // A concurrent launcher may win first-instance ownership. Keep waiting
+                        // for its pipe; only terminate this child after a genuine startup timeout.
+                        unsafe { WaitForSingleObject(child.0, 50) };
                         std::thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
+                    // Close the probe/terminate race: a child can create its pipe just after
+                    // the timed-out probe. Prefer a late authenticated pipe over killing it.
+                    match open_pipe(&name, Instant::now() + Duration::from_millis(100)) {
+                        Ok(pipe) => match authenticate(&pipe, &executable, &sid) {
+                            Ok(()) => return Ok(()),
+                            Err(error) => {
+                                return Err(cleanup_started_daemon(
+                                    "ipc_untrusted_server",
+                                    error,
+                                    child,
+                                ));
+                            }
+                        },
+                        Err(final_error)
+                            if final_error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) =>
+                        {
+                            if unsafe { WaitForSingleObject(child.0, 0) } == WAIT_OBJECT_0 {
+                                return Err(report("ipc_daemon_start_timeout", error));
+                            }
+                            return Err(cleanup_started_daemon(
+                                "ipc_daemon_start_timeout",
+                                error,
+                                child,
+                            ));
+                        }
+                        Err(final_error)
+                            if final_error.raw_os_error() == Some(ERROR_SEM_TIMEOUT as i32)
+                                || final_error.kind() == io::ErrorKind::TimedOut =>
+                        {
+                            return Err(report("ipc_daemon_start_timeout", final_error));
+                        }
+                        Err(final_error) => {
+                            if unsafe { WaitForSingleObject(child.0, 0) } == WAIT_OBJECT_0 {
+                                return Err(report("ipc_daemon_connect_failed", final_error));
+                            }
+                            return Err(cleanup_started_daemon(
+                                "ipc_daemon_connect_failed",
+                                final_error,
+                                child,
+                            ));
+                        }
                     }
                 }
                 Err(error)
                     if error.raw_os_error() == Some(ERROR_SEM_TIMEOUT as i32)
                         || error.kind() == io::ErrorKind::TimedOut =>
                 {
-                    return Err("ipc_daemon_start_timeout".into());
+                    // The named pipe exists but is busy. Do not kill the child: it may be
+                    // the healthy daemon serving another request or a concurrent winner.
+                    return Err(report("ipc_daemon_start_timeout", error));
                 }
-                Err(error) => return Err(report("ipc_daemon_connect_failed", error)),
+                Err(error) => {
+                    if unsafe { WaitForSingleObject(child.0, 0) } == WAIT_OBJECT_0 {
+                        return Err(report("ipc_daemon_connect_failed", error));
+                    }
+                    return Err(cleanup_started_daemon(
+                        "ipc_daemon_connect_failed",
+                        error,
+                        child,
+                    ));
+                }
             }
         }
     }

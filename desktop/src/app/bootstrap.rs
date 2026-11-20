@@ -9,7 +9,7 @@ use gpui::{prelude::*, *};
 use gpui_component::input::{InputEvent, InputState};
 use serde_json::{Value, json};
 
-use super::backend::{worker, Job, Kind};
+use super::backend::{Job, Kind, worker};
 use super::model::{Fields, Page};
 use super::state::Desktop;
 
@@ -50,6 +50,7 @@ impl Desktop {
             &fields.direct_ips,
             &fields.direct_domains,
             &fields.direct_suffixes,
+            &fields.port,
         ] {
             subscriptions.push(cx.subscribe(field, |this, _, event, cx| {
                 if matches!(event, InputEvent::Change) && !this.loading_fields {
@@ -60,14 +61,6 @@ impl Desktop {
                 }
             }));
         }
-        subscriptions.push(cx.subscribe(&fields.port, |this, _field, event, cx| {
-            if matches!(event, InputEvent::Change) && !this.loading_fields {
-                this.preflight = None;
-                this.preflight_key = None;
-                this.dirty = this.draft_is_dirty(cx);
-                cx.notify();
-            }
-        }));
         let (sender, replies) = worker();
         let mut this = Self {
             page: Page::Overview,
@@ -204,6 +197,23 @@ impl Desktop {
                         self.accept_status(value);
                     }
                     Kind::List => {
+                        self.distributions = value.as_array().cloned().unwrap_or_default();
+                        let valid = |id: &Option<String>| {
+                            id.as_ref().is_some_and(|id| {
+                                self.distributions.iter().any(|distro| {
+                                    distro["id"].as_str() == Some(id) && distro["version"] == 2
+                                })
+                            })
+                        };
+                        if !valid(&self.selected) {
+                            self.selected = None;
+                        }
+                        if !valid(&self.witness) {
+                            self.witness = None;
+                        }
+                        self.preflight = None;
+                        self.preflight_key = None;
+                        self.dirty = self.draft_is_dirty(cx);
                         self.notice = "列表已刷新；未启动 WSL。".into();
                     }
                     Kind::Save => {
@@ -211,7 +221,9 @@ impl Desktop {
                         self.notice = "策略已保存；不会立即改变当前接管。".into();
                     }
                     Kind::Preflight => {
-                        self.notice = if value["passed"] == true {
+                        let passed = value["passed"] == true;
+                        self.error = !passed;
+                        self.notice = if passed {
                             "预检通过；仍需确认启动。"
                         } else {
                             "预检未通过；请查看阻断项。"
@@ -223,7 +235,8 @@ impl Desktop {
                         self.fields
                             .env_path
                             .update(cx, |state, cx| state.set_value("", window, cx));
-                        self.credential_notice = "凭据已写入 Windows 凭据管理器；源文件未删除。".into();
+                        self.credential_notice =
+                            "凭据已写入 Windows 凭据管理器；源文件未删除。".into();
                         self.notice = "凭据已导入；秘密不会显示。".into();
                     }
                     Kind::Forget => {
@@ -243,7 +256,8 @@ impl Desktop {
                             self.preflight = Some(value);
                             self.fail("操作前预检未通过；请查看阻断项。", cx);
                         } else {
-                            self.notice = format!("{}已完成；请以后台状态为准。", reply.kind.label());
+                            self.notice =
+                                format!("{}已完成；请以后台状态为准。", reply.kind.label());
                             self.preflight = None;
                         }
                     }
@@ -322,5 +336,4 @@ impl Desktop {
         self.loading_fields = false;
         self.dirty = false;
     }
-
 }

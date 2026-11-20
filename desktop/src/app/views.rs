@@ -7,25 +7,31 @@ use super::components::badge;
 use super::model::{Page, UiAction};
 use super::state::Desktop;
 use super::theme::{
-    BLUE, DANGER_BG, INK, MUTED, NAVY, PAPER, RULE, RUST, SUCCESS_BG, SURFACE,
-    SURFACE_SOFT, TEAL, WARNING_BG, WHITE,
+    BLUE, DANGER_BG, DISPLAY_FONT, HEADER_MUTED, INK, MUTED, NAVY, PAPER, RULE, RUST, SUCCESS_BG,
+    SURFACE, SURFACE_SOFT, TEAL, UI_FONT, WARNING_BG, WHITE,
 };
 impl Render for Desktop {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let age = self
             .status_at
             .map(|time| format!("{} 秒前观测", time.elapsed().as_secs()))
-            .unwrap_or_else(|| "暂无状态".into());
+            .unwrap_or_else(|| "等待首次观测".into());
         let (connection_label, connection_color, connection_background) = if self.status_valid {
             ("后台在线", TEAL, SUCCESS_BG)
         } else {
             ("状态未知", RUST, DANGER_BG)
         };
+        let header_disabled = self.locked() || self.refreshing;
+        let (draft_label, draft_color, draft_background) = if self.dirty {
+            ("草稿未保存", RUST, WARNING_BG)
+        } else {
+            ("草稿独立于后台", MUTED, SURFACE_SOFT)
+        };
         let mut body = div()
             .size_full()
             .flex()
             .flex_col()
-            .font_family("Microsoft YaHei UI")
+            .font_family(UI_FONT)
             .text_base()
             .text_color(rgb(INK))
             .bg(rgb(PAPER))
@@ -35,7 +41,7 @@ impl Render for Desktop {
                     .items_center()
                     .justify_between()
                     .px_6()
-                    .py_5()
+                    .py_4()
                     .bg(rgb(NAVY))
                     .child(
                         div()
@@ -44,10 +50,11 @@ impl Render for Desktop {
                             .gap_3()
                             .child(
                                 div()
-                                    .w(px(38.))
-                                    .h(px(38.))
+                                    .w(px(34.))
+                                    .h(px(34.))
                                     .flex()
                                     .items_center()
+                                    .justify_center()
                                     .rounded_md()
                                     .bg(rgb(BLUE))
                                     .text_lg()
@@ -62,8 +69,8 @@ impl Render for Desktop {
                                     .gap_1()
                                     .child(
                                         div()
-                                            .text_2xl()
-                                            .font_family("DengXian")
+                                            .text_xl()
+                                            .font_family(DISPLAY_FONT)
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(rgb(WHITE))
                                             .child("WSL 代理控制台"),
@@ -71,8 +78,8 @@ impl Render for Desktop {
                                     .child(
                                         div()
                                             .text_xs()
-                                            .text_color(rgb(0xb8c7d9))
-                                            .child("单目标 / 独立后台 / 可恢复"),
+                                            .text_color(rgb(HEADER_MUTED))
+                                            .child("网络控制室 / 单目标 / 可恢复操作"),
                                     ),
                             ),
                     )
@@ -86,24 +93,19 @@ impl Render for Desktop {
                                 connection_color,
                                 connection_background,
                             ))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0xb8c7d9))
-                                    .child(age),
-                            )
+                            .child(div().text_xs().text_color(rgb(HEADER_MUTED)).child(age))
                             .child(self.button(
                                 "refresh",
                                 "刷新状态",
                                 UiAction::Refresh,
-                                self.locked() || self.refreshing,
+                                header_disabled,
                                 cx,
                             ))
                             .child(self.button(
                                 "reconnect",
                                 "重新连接后台",
                                 UiAction::Reconnect,
-                                self.locked() || self.refreshing,
+                                header_disabled,
                                 cx,
                             )),
                     ),
@@ -124,7 +126,7 @@ impl Render for Desktop {
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(MUTED))
-                            .child("工作区"),
+                            .child("控制面板"),
                     )
                     .children(
                         [
@@ -143,11 +145,7 @@ impl Render for Desktop {
                         }),
                     )
                     .child(div().flex_1())
-                    .child(badge(
-                        if self.dirty { "有未保存更改" } else { "草稿与后台分离" },
-                        if self.dirty { RUST } else { MUTED },
-                        if self.dirty { WARNING_BG } else { SURFACE_SOFT },
-                    )),
+                    .child(badge(draft_label, draft_color, draft_background)),
             )
             .child(
                 div()
@@ -183,7 +181,7 @@ impl Render for Desktop {
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .child(badge("请确认", RUST, DANGER_BG))
+                                    .child(badge("需要确认", RUST, DANGER_BG))
                                     .child(
                                         div()
                                             .font_weight(FontWeight::SEMIBOLD)
@@ -191,12 +189,10 @@ impl Render for Desktop {
                                             .child(format!("确认{}", confirmation.kind.label())),
                                     ),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(MUTED))
-                                    .child(format!("代数 {} · 需重新检查", confirmation.generation)),
-                            ),
+                            .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
+                                "操作版本 {} · 将再次检查",
+                                confirmation.generation
+                            ))),
                     )
                     .child(
                         div()
@@ -213,7 +209,7 @@ impl Render for Desktop {
                             .child(
                                 self.button(
                                     "confirm",
-                                    "执行",
+                                    "确认并执行",
                                     UiAction::Confirm,
                                     self.busy.is_some(),
                                     cx,
@@ -224,13 +220,18 @@ impl Render for Desktop {
                     ),
             );
         }
-        let (activity_label, activity_color, activity_background) = if self.busy.is_some() || self.reading {
-            (self.busy.map(Kind::label).unwrap_or("读取中"), RUST, WARNING_BG)
-        } else if self.error {
-            ("需要处理", RUST, DANGER_BG)
-        } else {
-            ("关闭窗口不影响接管", MUTED, SURFACE_SOFT)
-        };
+        let (activity_label, activity_color, activity_background) =
+            if self.busy.is_some() || self.reading {
+                (
+                    self.busy.map(Kind::label).unwrap_or("读取中"),
+                    RUST,
+                    WARNING_BG,
+                )
+            } else if self.error {
+                ("需要处理", RUST, DANGER_BG)
+            } else {
+                ("关闭窗口不影响接管", MUTED, SURFACE_SOFT)
+            };
         body.child(
             div()
                 .px_6()
@@ -252,7 +253,7 @@ impl Render for Desktop {
                                 .text_xs()
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(MUTED))
-                                .child("提示"),
+                                .child("操作提示"),
                         )
                         .child(
                             div()
@@ -261,11 +262,7 @@ impl Render for Desktop {
                                 .child(self.notice.clone()),
                         ),
                 )
-                .child(badge(
-                    activity_label,
-                    activity_color,
-                    activity_background,
-                )),
+                .child(badge(activity_label, activity_color, activity_background)),
         )
     }
 }

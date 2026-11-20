@@ -10,7 +10,6 @@ use super::model::Confirmation;
 use super::state::Desktop;
 
 impl Desktop {
-
     pub(crate) fn fail(&mut self, error: impl Into<String>, cx: &mut Context<Self>) {
         self.notice = error.into();
         self.error = true;
@@ -71,7 +70,8 @@ impl Desktop {
             (&self.fields.direct_domains, "direct_domains", true),
             (&self.fields.direct_suffixes, "direct_suffixes", true),
         ] {
-            if Self::field_value(field, cx) != Self::profile_field_value(&self.profile, key, array) {
+            if Self::field_value(field, cx) != Self::profile_field_value(&self.profile, key, array)
+            {
                 return true;
             }
         }
@@ -100,10 +100,7 @@ impl Desktop {
                 return Ok((target, owner.to_owned(), self.port(cx)?));
             }
         }
-        let witness = self
-            .witness
-            .clone()
-            .ok_or("请选择不同的对照 WSL。")?;
+        let witness = self.witness.clone().ok_or("请选择不同的对照 WSL。")?;
         if target == witness {
             return Err("目标和对照不能相同。".into());
         }
@@ -140,6 +137,8 @@ impl Desktop {
     }
 
     pub(crate) fn preflight(&mut self, cx: &mut Context<Self>) {
+        self.preflight = None;
+        self.preflight_key = None;
         match self.selection(cx) {
             Ok((target, witness, port)) => {
                 self.preflight_key = Some((target.clone(), witness.clone(), port));
@@ -163,17 +162,18 @@ impl Desktop {
         };
         if kind == Kind::Stop {
             self.confirmation = Some(Confirmation {
-                kind, generation, request: json!({"command":"stop","expected_generation":generation}),
-                message: "将停止接管并恢复直连。现有 TCP 连接会中断，需要重连；只清理本控制器的规则。".into(),
+                kind,
+                generation,
+                request: json!({"command":"stop","expected_generation":generation}),
+                message:
+                    "将停止接管并恢复直连。现有 TCP 连接会中断，需要重连；只清理本控制器的规则。"
+                        .into(),
             });
             cx.notify();
             return;
         }
         if self.dirty || !self.profile_exists || self.profile_path.is_none() {
-            self.fail(
-                "请先保存策略和目标选择。未保存内容不会生效。",
-                cx,
-            );
+            self.fail("请先保存策略和目标选择。未保存内容不会生效。", cx);
             return;
         }
         let (target, witness, port) = match self.selection(cx) {

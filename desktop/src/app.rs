@@ -16,7 +16,7 @@ mod theme;
 mod views;
 
 use state::Desktop;
-use theme::{BLUE, INK, NAVY, PAPER, RUST, RULE, SURFACE, TITLE};
+use theme::{BLUE, INK, NAVY, PAPER, RULE, RUST, SURFACE, TITLE};
 
 pub fn run() {
     Application::new().run(|cx: &mut App| {

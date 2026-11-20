@@ -1,31 +1,49 @@
 //! 总览页：选择目标/对照发行版、运行能力预检并展示后台实况。
 use gpui::{prelude::*, *};
-use gpui_component::{button::{Button, ButtonVariants}, Disableable};
+use gpui_component::{
+    Disableable,
+    button::{Button, ButtonVariants},
+};
 
 use super::backend::Kind;
 use super::components::{badge, fact, panel, text};
 use super::model::UiAction;
 use super::state::Desktop;
 use super::theme::{
-    BLUE, DANGER_BG, INK, MUTED, RUST, RULE, SURFACE, SURFACE_SOFT, SUCCESS_BG, TEAL,
+    BLUE, DANGER_BG, INK, MUTED, RULE, RUST, SUCCESS_BG, SURFACE, SURFACE_SOFT, TARGET_BG, TEAL,
 };
 impl Desktop {
-
     pub(crate) fn overview(&self, cx: &Context<Self>) -> Div {
-        let phase = match self.phase() {
-            "idle" => "空闲",
-            "forwarding_managed" => "接管中",
+        let phase_id = self.phase();
+        let phase = match phase_id {
+            "idle" => "空闲待命",
+            "forwarding_managed" => "保护接管中",
             "forwarding_scoped" => "诊断模式",
             "recovery_required" => "需要恢复",
             _ => "状态未知",
         };
-        let color = if !self.status_valid || self.phase() == "recovery_required" {
+        let active = phase_id == "forwarding_managed";
+        let risk = !self.status_valid || phase_id == "recovery_required";
+        let idle = self.idle();
+        let locked = self.locked();
+        let dns_managed = self.status["dns_managed"] == true;
+        let state_color = if risk {
             RUST
-        } else if self.phase() == "forwarding_managed" {
+        } else if active {
             TEAL
         } else {
             INK
         };
+        let (state_label, state_background) = if risk {
+            ("需要关注", DANGER_BG)
+        } else if active {
+            ("实时保护", SUCCESS_BG)
+        } else {
+            ("未接管", SURFACE_SOFT)
+        };
+        let target_name = self.distribution_name(self.selected.as_deref());
+        let witness_name = self.distribution_name(self.witness.as_deref());
+
         let mut choices = div().flex().flex_col().gap_2();
         if self.distributions.is_empty() {
             choices = choices.child(
@@ -35,7 +53,7 @@ impl Desktop {
                     .rounded_md()
                     .text_sm()
                     .text_color(rgb(MUTED))
-                    .child("暂无 WSL。点击“刷新列表”；仅支持 WSL2。"),
+                    .child("没有发现 WSL2 发行版。刷新列表后再选择目标。"),
             );
         }
         for (index, distro) in self.distributions.iter().enumerate() {
@@ -45,21 +63,22 @@ impl Desktop {
             let selected = self.selected.as_deref() == Some(id.as_str());
             let witness = self.witness.as_deref() == Some(id.as_str());
             let row_background = if selected {
-                0xeaf2ff
+                TARGET_BG
             } else if witness {
-                0xeaf8f6
+                SUCCESS_BG
             } else {
                 SURFACE_SOFT
             };
             let role = if selected {
-                badge("目标 WSL", BLUE, 0xeaf2ff)
+                badge("当前目标", BLUE, TARGET_BG)
             } else if witness {
-                badge("对照 WSL", TEAL, SUCCESS_BG)
+                badge("见证环境", TEAL, SUCCESS_BG)
             } else {
-                badge("未选择", MUTED, SURFACE)
+                badge("未分配", MUTED, SURFACE)
             };
             let target_id = id.clone();
             let witness_id = id;
+            let selection_disabled = locked || version != 2;
             choices = choices.child(
                 div()
                     .flex()
@@ -95,11 +114,11 @@ impl Desktop {
                     .child(
                         Button::new(("select-target", index))
                             .label(if selected {
-                                "已选目标"
+                                "目标已选"
                             } else {
                                 "设为目标"
                             })
-                            .disabled(self.locked() || version != 2)
+                            .disabled(selection_disabled)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.selected = Some(target_id.clone());
                                 if this.witness == this.selected {
@@ -114,11 +133,11 @@ impl Desktop {
                     .child(
                         Button::new(("select-witness", index))
                             .label(if witness {
-                                "已选对照"
+                                "见证已选"
                             } else {
-                                "设为对照"
+                                "设为见证"
                             })
-                            .disabled(self.locked() || version != 2 || selected)
+                            .disabled(selection_disabled || selected)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.witness = Some(witness_id.clone());
                                 this.preflight = None;
@@ -129,212 +148,157 @@ impl Desktop {
                     ),
             );
         }
-        let target_name = self
-            .distributions
-            .iter()
-            .find(|d| d["id"].as_str() == self.selected.as_deref())
-            .map(|d| text(d, "name", "未知"))
-            .unwrap_or_else(|| "未选择".into());
-        let witness_name = self
-            .distributions
-            .iter()
-            .find(|d| d["id"].as_str() == self.witness.as_deref())
-            .map(|d| text(d, "name", "未知"))
-            .unwrap_or_else(|| "未选择".into());
-        let (phase_status, phase_background) = if !self.status_valid || self.phase() == "recovery_required" {
-            ("需关注", DANGER_BG)
-        } else if self.phase() == "forwarding_managed" {
-            ("运行中", SUCCESS_BG)
-        } else {
-            ("空闲", SURFACE_SOFT)
-        };
-        let mut state = panel("后台状态", "显示后台最后状态，不随页面选择变化")
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .text_2xl()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(color))
-                                    .child(phase),
-                            )
-                            .child(badge(phase_status, color, phase_background)),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child(self.status_at.map(|_| "已有快照").unwrap_or("等待状态")),
-                    ),
-            )
-            .child(fact(
-                "当前目标",
-                text(&self.status, "active_target", "无当前目标"),
-                color,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .gap_3()
-                    .child(fact("目标 WSL · 待生效", target_name, BLUE))
-                    .child(fact("对照 WSL · 不接管", witness_name, TEAL)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_3()
-                    .child(fact(
-                        "操作版本",
-                        self.generation()
-                            .map(|g| g.to_string())
-                            .unwrap_or_else(|| "未确认".into()),
-                        INK,
-                    ))
-                    .child(fact(
-                        "配置版本",
-                        self.status["config_generation"]
-                            .as_u64()
-                            .map(|g| g.to_string())
-                            .unwrap_or_else(|| "无已确认运行配置".into()),
-                        INK,
-                    )),
-            )
-            .child(fact(
-                "DNS 观测",
-                self.dns_label(),
-                if self.status["dns_managed"] == true {
-                    TEAL
-                } else {
-                    RUST
-                },
-            ))
-            .child(fact("公网出口", self.exit_label(), INK))
-            .child(self.button(
-                "probe-exit",
-                "检测公网出口",
-                UiAction::Probe,
-                self.locked() || !self.status_valid || self.phase() != "forwarding_managed",
-                cx,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(
-                        self.button(
-                            "start",
-                            "启动接管",
-                            UiAction::Prepare(Kind::Start),
-                            self.locked() || !self.idle(),
-                            cx,
+
+        let mut status_panel = panel(
+            "当前保护状态",
+            "后台最后一次观测；页面选择不会改变已运行目标。",
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_2xl()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(state_color))
+                                .child(phase),
                         )
-                        .primary(),
-                    )
-                    .child(self.button(
-                        "switch",
-                        "切换至目标",
-                        UiAction::Prepare(Kind::Switch),
-                        self.locked() || !self.status_valid || self.phase() != "forwarding_managed",
+                        .child(badge(state_label, state_color, state_background)),
+                )
+                .child(
+                    div().text_xs().text_color(rgb(MUTED)).child(
+                        self.status_at
+                            .map(|_| "快照已记录")
+                            .unwrap_or("等待后台状态"),
+                    ),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .gap_3()
+                .child(fact(
+                    "运行目标",
+                    text(&self.status, "active_target", "无当前目标"),
+                    state_color,
+                ))
+                .child(fact("目标候选", target_name, BLUE))
+                .child(fact("见证环境", witness_name, TEAL)),
+        )
+        .child(
+            div()
+                .flex()
+                .gap_3()
+                .child(fact(
+                    "DNS 观测",
+                    self.dns_label(),
+                    if dns_managed { TEAL } else { RUST },
+                ))
+                .child(fact("公网出口", self.exit_label(), INK))
+                .child(fact(
+                    "操作版本",
+                    self.generation()
+                        .map(|g| g.to_string())
+                        .unwrap_or_else(|| "未确认".into()),
+                    INK,
+                )),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .child(
+                    self.button(
+                        "start",
+                        "启动保护接管",
+                        UiAction::Prepare(Kind::Start),
+                        locked || !idle,
                         cx,
-                    ))
-                    .child(
-                        self.button(
-                            "stop",
-                            if self.phase() == "recovery_required" {
-                                "恢复并停止"
-                            } else {
-                                "停止接管"
-                            },
-                            UiAction::Prepare(Kind::Stop),
-                            self.locked() || !self.status_valid || self.idle(),
-                            cx,
-                        )
-                        .danger(),
-                    ),
-            );
+                    )
+                    .primary(),
+                )
+                .child(self.button(
+                    "switch",
+                    "切换至目标",
+                    UiAction::Prepare(Kind::Switch),
+                    locked || !self.status_valid || !active,
+                    cx,
+                ))
+                .child(
+                    self.button(
+                        "stop",
+                        if phase_id == "recovery_required" {
+                            "恢复并停止"
+                        } else {
+                            "停止接管"
+                        },
+                        UiAction::Prepare(Kind::Stop),
+                        locked || !self.status_valid || idle,
+                        cx,
+                    )
+                    .danger(),
+                )
+                .child(self.button(
+                    "probe-exit",
+                    "复核公网出口",
+                    UiAction::Probe,
+                    locked || !self.status_valid || !active,
+                    cx,
+                )),
+        );
         if let Some(issue) = self.status["issue"].as_str() {
-            state = state.child(
+            status_panel = status_panel.child(
                 div()
                     .text_sm()
                     .text_color(rgb(RUST))
-                    .child(format!("问题：{issue}")),
+                    .child(format!("后台问题：{issue}")),
             );
         }
-        if self.phase() == "recovery_required" {
-            state = state.child(fact(
-                "记录目标 · 需恢复",
-                text(&self.status, "recorded_target", "请查看诊断"),
-                RUST,
-            ));
-        }
-        let mut page = div()
-            .flex()
-            .flex_col()
-            .gap_4()
+
+        let selection = panel("目标与启动准备", "选择只修改草稿；启动前会再次执行预检。")
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(MUTED))
+                    .child("选择目标与见证"),
+            )
+            .child(choices)
+            .child(self.field("入口端口", "范围：1024–65535。", &self.fields.port, false))
             .child(
                 div()
                     .flex()
-                    .gap_4()
-                    .items_start()
+                    .gap_2()
+                    .child(self.button("list", "刷新发行版列表", UiAction::List, locked, cx))
                     .child(
-                        panel(
-                            "目标与对照",
-                            "选择不会接管；预检只读。",
-                        )
-                        .w(px(490.))
-                        .child(choices)
-                        .child(self.field(
-                            "入口端口",
-                            "范围：1024–65535。",
-                            &self.fields.port,
-                            false,
-                        ))
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .child(self.button(
-                                    "list",
-                                    "刷新列表",
-                                    UiAction::List,
-                                    self.locked(),
-                                    cx,
-                                ))
-                                .child(
-                                    self.button(
-                                        "preflight",
-                                        "运行预检",
-                                        UiAction::Preflight,
-                                        self.locked(),
-                                        cx,
-                                    )
-                                    .primary(),
-                                ),
-                        ),
-                    )
-                    .child(state.flex_1()),
-            )
-            .child(self.preflight_panel());
-        if self.phase() == "recovery_required" {
-            page = page.child(
-                div()
-                    .p_4()
-                    .border_l_4()
-                    .border_color(rgb(RUST))
-                    .bg(rgb(0xfff4ed))
-                    .child("检测到未完成操作。请查看诊断，然后执行“恢复并停止”。不会自动切换或清理其他目标。"),
+                        self.button("preflight", "运行启动预检", UiAction::Preflight, locked, cx)
+                            .primary(),
+                    ),
             );
-        }
-        page
+        div().flex().flex_col().gap_4().child(status_panel).child(
+            div()
+                .flex()
+                .gap_4()
+                .items_start()
+                .child(selection.w(px(490.)))
+                .child(self.preflight_panel().flex_1()),
+        )
+    }
+
+    fn distribution_name(&self, id: Option<&str>) -> String {
+        self.distributions
+            .iter()
+            .find(|distribution| distribution["id"].as_str() == id)
+            .map(|distribution| text(distribution, "name", "未知"))
+            .unwrap_or_else(|| "未选择".into())
     }
 
     fn exit_label(&self) -> String {
@@ -378,20 +342,17 @@ impl Desktop {
                 .text_sm()
                 .text_color(rgb(MUTED))
                 .child("预检尚未运行或选择已变更。启动前会再次检查；非直连 TCP 和系统 DNS 经双跳，其他 UDP 不代理。");
-};
+        };
         let passed = result["passed"] == true;
-        let mut panel = panel(
-            "预检结果",
-            if passed {
-                "通过 · 仍需确认启动"
-            } else {
-                "未通过 · 未启动"
-            },
-        )
-        .child(badge(
-            if passed { "通过" } else { "有阻断" },
-            if passed { TEAL } else { RUST },
-            if passed { SUCCESS_BG } else { DANGER_BG },
+        let (result_label, result_color, result_background, result_caption) = if passed {
+            ("通过", TEAL, SUCCESS_BG, "通过 · 仍需确认启动")
+        } else {
+            ("有阻断", RUST, DANGER_BG, "未通过 · 未启动")
+        };
+        let mut panel = panel("预检结果", result_caption).child(badge(
+            result_label,
+            result_color,
+            result_background,
         ));
         if let Some(blockers) = result["blockers"].as_array() {
             for blocker in blockers {
@@ -414,6 +375,11 @@ impl Desktop {
             if observation.is_object() {
                 let snapshot = &observation["snapshot"];
                 let identity_valid = snapshot["identity_valid"] == true;
+                let (identity_label, identity_color, identity_background) = if identity_valid {
+                    ("身份验证通过", TEAL, SUCCESS_BG)
+                } else {
+                    ("未确认", RUST, DANGER_BG)
+                };
                 let mut observation_panel = div()
                     .flex()
                     .flex_col()
@@ -426,15 +392,13 @@ impl Desktop {
                             .flex()
                             .items_center()
                             .justify_between()
-                            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(format!(
-                                "{label} · {}",
-                                text(&observation["distribution"], "name", "未知")
-                            )))
-                            .child(badge(
-                                if identity_valid { "身份验证通过" } else { "未确认" },
-                                if identity_valid { TEAL } else { RUST },
-                                if identity_valid { SUCCESS_BG } else { DANGER_BG },
-                            )),
+                            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(
+                                format!(
+                                    "{label} · {}",
+                                    text(&observation["distribution"], "name", "未知")
+                                ),
+                            ))
+                            .child(badge(identity_label, identity_color, identity_background)),
                     );
                 if let Some(blockers) = snapshot["blockers"].as_array() {
                     for blocker in blockers {
@@ -453,5 +417,4 @@ impl Desktop {
         }
         panel
     }
-
 }
