@@ -226,7 +226,7 @@ impl Desktop {
                 div()
                     .text_base()
                     .text_color(rgb(MUTED))
-                    .child("要确认出口是否匹配，请在总览执行“复核公网出口”；结果只代表该次观测。"),
+                    .child("要确认出口是否匹配，请在首页执行“复核公网出口”；结果只代表该次观测。"),
             );
         let mut result = div()
             .flex()
