@@ -30,7 +30,7 @@
 
 - `cargo check -p wsl-proxy-desktop` 通过。
 - `cargo clippy --workspace --locked --all-targets -- -D warnings` 通过。
-- `cargo test --workspace --locked` 通过，5 个库测试和 105 个控制器测试全部通过。
+- `cargo test --workspace --locked` 通过，5 个库测试和 106 个控制器测试全部通过。
 - `python -m unittest discover -s scripts -p 'test_package_windows.py'` 通过，2 个打包测试通过。
 - `scripts/build-desktop-windows.sh` 通过，生成 Windows x64 原生发布版桌面程序和控制器。
 - `bash -n scripts/build-desktop-windows.sh` 和 `git diff --check` 通过。
