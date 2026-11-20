@@ -865,12 +865,12 @@ def execute(request):
         try:
             guard(p, check_resolver=operation not in ("remove", "inspect"), write_tools=operation != "inspect")
         except Failure as error:
-            changed = {"boot_changed", "cgroup_namespace_changed", "cgroup_root_changed", "guest_address_changed", "gateway_changed_or_ambiguous"}
-            if operation != "inspect" or str(error) not in changed:
+            stale_context_errors = {"boot_changed", "cgroup_namespace_changed", "cgroup_root_changed", "guest_address_changed", "gateway_changed_or_ambiguous"}
+            if operation not in ("inspect", "remove") or str(error) not in stale_context_errors:
                 raise
-            # The Windows caller has rechecked registration; the guard already
-            # checked root and distro name. Only independently proved absence
-            # is safe when xt_cgroup paths belong to an older namespace.
+            # Only inspect and remove may continue after these stale-context errors:
+            # inspect attests absence, while remove deletes exact per-instance
+            # firewall and conntrack artifacts below. All other operations fail.
             identity_matches = False
         if operation == "arm":
             grant(p, "arm", request["deadline"])
