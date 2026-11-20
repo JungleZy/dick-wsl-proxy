@@ -611,6 +611,16 @@ def parse_tuple(payload, ipv6=False):
     return parse_tuple_values(attributes(payload), ipv6)
 
 
+def ipv6_text(value):
+    rendered = str(ipaddress.IPv6Address(value))
+    if "." not in rendered:
+        return rendered
+    prefix, dotted = rendered.rsplit(":", 1)
+    octets = [int(part) for part in dotted.split(".")]
+    mapped = f"{octets[0] << 8 | octets[1]:x}:{octets[2] << 8 | octets[3]:x}"
+    return prefix + mapped if prefix.endswith(":") else prefix + ":" + mapped
+
+
 def parse_tuple_values(values, ipv6=False):
     require(1 in values and 2 in values, "missing_conntrack_tuple")
     addresses, protocol = attributes(values[1]), attributes(values[2])
@@ -621,9 +631,9 @@ def parse_tuple_values(values, ipv6=False):
     require(source in addresses and destination in addresses and len(addresses[source]) == width and len(addresses[destination]) == width, "invalid_conntrack_tuple_address")
     return (
         number,
-        str(ipaddress.IPv6Address(addresses[source])) if ipv6 else socket.inet_ntop(socket.AF_INET, addresses[source]),
+        ipv6_text(addresses[source]) if ipv6 else socket.inet_ntop(socket.AF_INET, addresses[source]),
         scalar(protocol, 2, 2),
-        str(ipaddress.IPv6Address(addresses[destination])) if ipv6 else socket.inet_ntop(socket.AF_INET, addresses[destination]),
+        ipv6_text(addresses[destination]) if ipv6 else socket.inet_ntop(socket.AF_INET, addresses[destination]),
         scalar(protocol, 3, 2),
     )
 

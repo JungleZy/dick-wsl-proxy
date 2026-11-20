@@ -8,7 +8,14 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+if os.name == "nt":
+    from test_windows_compat import WindowsPosixOS, prepare_import
+
+    prepare_import()
 import kernel
+
+if os.name == "nt":
+    WindowsPosixOS().install(kernel)
 
 
 def plan():
