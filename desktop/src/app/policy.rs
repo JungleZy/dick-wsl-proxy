@@ -1,12 +1,13 @@
-//! 规则页：维护路由、DNS 和直连例外。
+//! 规则页：维护直连例外。
 
 use gpui_kit::component::button::ButtonVariants as _;
 use gpui_kit::{prelude::*, *};
 
-use super::components::{badge, panel};
+use super::components::badge;
 use super::model::UiAction;
 use super::state::Desktop;
-use super::theme::{MUTED, RUST, SUCCESS_BG, SURFACE_SOFT, TEAL, WARNING_BG};
+use super::theme::{MUTED, RULE, RUST, SUCCESS_BG, SURFACE, SURFACE_SOFT, TEAL, WARNING_BG};
+use super::views::card_header;
 
 impl Desktop {
     pub(crate) fn policy_page(&self, cx: &Context<Self>) -> Div {
@@ -20,15 +21,33 @@ impl Desktop {
         } else {
             ("尚未保存", MUTED, SURFACE_SOFT)
         };
-
-        let route =
-            panel("路由", "默认流量经双跳，只有明确列入例外的目标才会直连。").child(self.field(
-                "宿主 SOCKS5 代理",
-                "填写 IPv4:端口。",
-                &self.fields.first_hop,
-                false,
-            ));
-        let dns = panel("DNS 保护", "系统 DNS 通过代理链访问 DoH。")
+        let exceptions = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_3()
+            .bg(rgb(SURFACE))
+            .border_1()
+            .border_color(rgb(RULE))
+            .rounded_md()
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .justify_between()
+                    .gap_3()
+                    .child(card_header("直连规则", "每行一个目标，按类型分别匹配。"))
+                    .child(
+                        self.button(
+                            "save-policy",
+                            "保存规则",
+                            UiAction::Save,
+                            locked || self.profile_path.is_none(),
+                            cx,
+                        )
+                        .primary(),
+                    ),
+            )
             .child(
                 div()
                     .flex()
@@ -36,62 +55,32 @@ impl Desktop {
                     .gap_3()
                     .child(
                         self.field(
-                            "DoH 上游 IPv4:端口",
-                            "固定地址，通过宿主代理链访问 HTTPS。",
-                            &self.fields.dns_upstream,
-                            false,
+                            "IPv4 / CIDR",
+                            "例如 192.0.2.0/24。",
+                            &self.fields.direct_ips,
+                            true,
                         )
-                        .min_w(px(420.)),
+                        .min_w(px(260.)),
                     )
                     .child(
                         self.field(
-                            "DoH TLS 主机名",
-                            "用于 SNI 和证书校验。",
-                            &self.fields.dns_tls_name,
-                            false,
+                            "精确域名",
+                            "每行一个域名，不填写 URL。",
+                            &self.fields.direct_domains,
+                            true,
                         )
-                        .min_w(px(420.)),
+                        .min_w(px(260.)),
+                    )
+                    .child(
+                        self.field(
+                            "域名后缀",
+                            "按域名边界匹配。",
+                            &self.fields.direct_suffixes,
+                            true,
+                        )
+                        .min_w(px(260.)),
                     ),
-            )
-            .child(self.field(
-                "启动健康检查域名",
-                "启动时验证链路，不加入直连例外。",
-                &self.fields.health_domain,
-                false,
-            ));
-        let exceptions = panel("直连例外", "每行一个目标，按类型分别匹配。").child(
-            div()
-                .flex()
-                .flex_wrap()
-                .gap_3()
-                .child(
-                    self.field(
-                        "IPv4 / CIDR",
-                        "例如 192.0.2.0/24。",
-                        &self.fields.direct_ips,
-                        true,
-                    )
-                    .min_w(px(260.)),
-                )
-                .child(
-                    self.field(
-                        "精确域名",
-                        "每行一个域名，不填写 URL。",
-                        &self.fields.direct_domains,
-                        true,
-                    )
-                    .min_w(px(260.)),
-                )
-                .child(
-                    self.field(
-                        "域名后缀",
-                        "按域名边界匹配。",
-                        &self.fields.direct_suffixes,
-                        true,
-                    )
-                    .min_w(px(260.)),
-                ),
-        );
+            );
 
         div()
             .flex()
@@ -102,14 +91,6 @@ impl Desktop {
                 save_color,
                 save_background,
             )))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_3()
-                    .child(route.flex_1().min_w(px(420.)))
-                    .child(dns.flex_1().min_w(px(420.))),
-            )
             .child(exceptions)
             .child(
                 div()
@@ -117,21 +98,18 @@ impl Desktop {
                     .items_center()
                     .gap_3()
                     .child(
-                        self.button(
-                            "save-policy",
-                            "保存规则",
-                            UiAction::Save,
-                            locked || self.profile_path.is_none(),
-                            cx,
-                        )
-                        .primary(),
-                    )
-                    .child(
                         div().text_base().text_color(rgb(MUTED)).child(
                             self.profile_path
                                 .clone()
                                 .unwrap_or_else(|| "等待 SQLite 配置路径。".into()),
                         ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_base()
+                            .text_color(rgb(if self.error { RUST } else { MUTED }))
+                            .child(self.notice.clone()),
                     ),
             )
     }
