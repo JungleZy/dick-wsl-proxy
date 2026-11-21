@@ -65,7 +65,7 @@ pub struct Policy {
 pub(crate) struct UdpChain {
     socket: UdpSocket,
     residential_relay: SocketAddrV4,
-    target: SocketAddrV4,
+    target: SocketAddr,
     // Keep both TCP UDP-ASSOCIATE control channels alive for the lifetime of
     // the UDP mapping. They are intentionally opaque after the handshake.
     _first_control: TcpStream,
@@ -73,55 +73,66 @@ pub(crate) struct UdpChain {
 }
 
 impl UdpChain {
-    fn packet(destination: SocketAddrV4, payload: &[u8]) -> Vec<u8> {
-        let mut packet = Vec::with_capacity(10 + payload.len());
-        packet.extend_from_slice(&[0, 0, 0, 1]);
-        packet.extend_from_slice(&destination.ip().octets());
-        packet.extend_from_slice(&destination.port().to_be_bytes());
+    fn packet(destination: impl Into<SocketAddr>, payload: &[u8]) -> Vec<u8> {
+        let destination = destination.into();
+        let capacity = match destination {
+            SocketAddr::V4(_) => 10,
+            SocketAddr::V6(_) => 22,
+        };
+        let mut packet = Vec::with_capacity(capacity + payload.len());
+        packet.extend_from_slice(&[0, 0, 0]);
+        match destination {
+            SocketAddr::V4(destination) => {
+                packet.push(1);
+                packet.extend_from_slice(&destination.ip().octets());
+                packet.extend_from_slice(&destination.port().to_be_bytes());
+            }
+            SocketAddr::V6(destination) => {
+                packet.push(4);
+                packet.extend_from_slice(&destination.ip().octets());
+                packet.extend_from_slice(&destination.port().to_be_bytes());
+            }
+        }
         packet.extend_from_slice(payload);
         packet
     }
 
     fn parse_packet(
         bytes: &[u8],
-        expected_source: SocketAddrV4,
-        expected_destination: SocketAddrV4,
+        expected_source: impl Into<SocketAddr>,
+        expected_destination: impl Into<SocketAddr>,
     ) -> io::Result<&[u8]> {
-        if bytes.len() < 10 || bytes[..3] != [0, 0, 0] || bytes[3] != 1 {
+        let expected_source = expected_source.into();
+        let expected_destination = expected_destination.into();
+        if bytes.len() < 4 || bytes[..3] != [0, 0, 0] {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid nested SOCKS5 UDP response",
             ));
         }
-        let source = SocketAddrV4::new(
-            Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]),
-            u16::from_be_bytes([bytes[8], bytes[9]]),
-        );
-        if source != expected_source {
+        let (source, source_end) = decode_udp_address(bytes, 3)?;
+        if !same_endpoint(source, expected_source) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unexpected nested SOCKS5 UDP source",
             ));
         }
         // The outer relay's payload is itself an inner SOCKS5 UDP response.
-        let inner = &bytes[10..];
-        if inner.len() < 10 || inner[..3] != [0, 0, 0] || inner[3] != 1 {
+        let inner = &bytes[source_end..];
+        if inner.len() < 4 || inner[..3] != [0, 0, 0] {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid residential SOCKS5 UDP response",
             ));
         }
-        let destination = SocketAddrV4::new(
-            Ipv4Addr::new(inner[4], inner[5], inner[6], inner[7]),
-            u16::from_be_bytes([inner[8], inner[9]]),
-        );
-        if destination != expected_destination {
+        let (destination, destination_end) = decode_udp_address(inner, 3)?;
+        if !same_endpoint(destination, expected_destination) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unexpected residential SOCKS5 UDP destination",
             ));
         }
-        Ok(&inner[10..])
+        Ok(&inner[destination_end..])
     }
 
     pub(crate) fn send(&self, payload: &[u8]) -> io::Result<usize> {
@@ -132,7 +143,7 @@ impl UdpChain {
             ));
         }
         let inner = Self::packet(self.target, payload);
-        let outer = Self::packet(self.residential_relay, &inner);
+        let outer = Self::packet(SocketAddr::V4(self.residential_relay), &inner);
         let sent = self.socket.send(&outer)?;
         if sent == outer.len() {
             Ok(payload.len())
@@ -147,7 +158,11 @@ impl UdpChain {
     pub(crate) fn recv(&self, buffer: &mut [u8]) -> io::Result<usize> {
         let mut packet = vec![0; 65_535];
         let size = self.socket.recv(&mut packet)?;
-        let payload = Self::parse_packet(&packet[..size], self.residential_relay, self.target)?;
+        let payload = Self::parse_packet(
+            &packet[..size],
+            SocketAddr::V4(self.residential_relay),
+            self.target,
+        )?;
         if payload.len() > buffer.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -182,6 +197,78 @@ impl UdpChain {
     pub(crate) fn as_raw_socket(&self) -> std::os::unix::io::RawFd {
         use std::os::fd::AsRawFd;
         self.socket.as_raw_fd()
+    }
+}
+
+fn decode_udp_address(bytes: &[u8], offset: usize) -> io::Result<(SocketAddr, usize)> {
+    let atyp = *bytes.get(offset).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing nested SOCKS5 address type",
+        )
+    })?;
+    match atyp {
+        1 => {
+            let end = offset.checked_add(1 + 4 + 2).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "nested SOCKS5 address overflow")
+            })?;
+            if bytes.len() < end {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated nested SOCKS5 IPv4 address",
+                ));
+            }
+            let ip = Ipv4Addr::new(
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+                bytes[offset + 4],
+            );
+            let port = u16::from_be_bytes([bytes[offset + 5], bytes[offset + 6]]);
+            if port == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "nested SOCKS5 address has zero port",
+                ));
+            }
+            Ok((SocketAddr::V4(SocketAddrV4::new(ip, port)), end))
+        }
+        4 => {
+            let end = offset.checked_add(1 + 16 + 2).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "nested SOCKS5 address overflow")
+            })?;
+            if bytes.len() < end {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated nested SOCKS5 IPv6 address",
+                ));
+            }
+            let mut octets = [0; 16];
+            octets.copy_from_slice(&bytes[offset + 1..offset + 17]);
+            let ip = Ipv6Addr::from(octets);
+            let port = u16::from_be_bytes([bytes[offset + 17], bytes[offset + 18]]);
+            if port == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "nested SOCKS5 address has zero port",
+                ));
+            }
+            Ok((SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)), end))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported nested SOCKS5 address type",
+        )),
+    }
+}
+
+fn same_endpoint(left: SocketAddr, right: SocketAddr) -> bool {
+    match (left, right) {
+        (SocketAddr::V4(left), SocketAddr::V4(right)) => left == right,
+        (SocketAddr::V6(left), SocketAddr::V6(right)) => {
+            left.ip() == right.ip() && left.port() == right.port()
+        }
+        _ => false,
     }
 }
 
@@ -339,12 +426,18 @@ impl Policy {
     /// Establishes a nested SOCKS5 UDP association for a non-whitelisted UDP
     /// destination. The first relay transports the residential relay's own
     /// SOCKS5 UDP envelope, so neither hop is bypassed.
-    pub(crate) fn chain_udp(&self, dest: SocketAddrV4) -> Result<UdpChain, String> {
-        if dest == self.first_hop
-            || dest == self.residential.endpoint()
-            || dest == self.dns_upstream
-            || !valid_endpoint(dest, cfg!(test))
-        {
+    pub(crate) fn chain_udp(&self, dest: impl Into<SocketAddr>) -> Result<UdpChain, String> {
+        let dest = dest.into();
+        let valid = match dest {
+            SocketAddr::V4(dest) => {
+                dest != self.first_hop
+                    && dest != self.residential.endpoint()
+                    && dest != self.dns_upstream
+                    && valid_endpoint(dest, cfg!(test))
+            }
+            SocketAddr::V6(dest) => valid_ipv6_endpoint(dest),
+        };
+        if !valid {
             return Err("UDP chain destination is reserved or unsupported".into());
         }
         let deadline = Instant::now() + SETUP_TIMEOUT;
@@ -830,8 +923,8 @@ mod tests {
 
     #[test]
     fn nested_udp_envelope_round_trips_and_rejects_wrong_source() {
-        let target = "203.0.113.9:443".parse().unwrap();
-        let relay = "198.51.100.7:53000".parse().unwrap();
+        let target: SocketAddrV4 = "203.0.113.9:443".parse().unwrap();
+        let relay: SocketAddrV4 = "198.51.100.7:53000".parse().unwrap();
         let payload = b"udp-payload";
         let inner = UdpChain::packet(target, payload);
         let outer = UdpChain::packet(relay, &inner);
@@ -839,8 +932,21 @@ mod tests {
             UdpChain::parse_packet(&outer, relay, target).unwrap(),
             payload
         );
-        let wrong = "198.51.100.8:53000".parse().unwrap();
+        let wrong: SocketAddrV4 = "198.51.100.8:53000".parse().unwrap();
         assert!(UdpChain::parse_packet(&outer, wrong, target).is_err());
+    }
+
+    #[test]
+    fn nested_udp_envelope_preserves_an_ipv6_inner_destination() {
+        let relay: SocketAddrV4 = "198.51.100.7:53000".parse().unwrap();
+        let target: SocketAddrV6 = "[2001:db8:1234::9]:443".parse().unwrap();
+        let payload = b"ipv6-udp-payload";
+        let inner = UdpChain::packet(SocketAddr::V6(target), payload);
+        let outer = UdpChain::packet(SocketAddr::V4(relay), &inner);
+        assert_eq!(
+            UdpChain::parse_packet(&outer, SocketAddr::V4(relay), SocketAddr::V6(target)).unwrap(),
+            payload
+        );
     }
 
     #[test]
@@ -858,7 +964,7 @@ mod tests {
             SocketAddr::V4(address) => address,
             _ => unreachable!(),
         };
-        let target = "203.0.113.9:443".parse().unwrap();
+        let target: SocketAddrV4 = "203.0.113.9:443".parse().unwrap();
         let policy = policy(first_endpoint, residential_endpoint);
 
         let control = thread::spawn(move || {

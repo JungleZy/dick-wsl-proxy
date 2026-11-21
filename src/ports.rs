@@ -1,5 +1,6 @@
 use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::mem::size_of;
+use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
 use std::num::NonZeroU16;
 
 use serde::Serialize;
@@ -43,6 +44,37 @@ pub(crate) fn bind_exclusive(
         };
         if result != 0 {
             // SAFETY: read the calling thread's socket error immediately after failure.
+            return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+        }
+    }
+    socket.bind(&address.into())?;
+    Ok(socket)
+}
+
+pub(crate) fn bind_exclusive_v6(
+    address: SocketAddrV6,
+    kind: Type,
+    protocol: Protocol,
+) -> io::Result<Socket> {
+    let socket = Socket::new(Domain::IPV6, kind, Some(protocol))?;
+    socket.set_only_v6(true)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{
+            SO_EXCLUSIVEADDRUSE, SOL_SOCKET, WSAGetLastError, setsockopt,
+        };
+        let exclusive = 1i32;
+        let result = unsafe {
+            setsockopt(
+                socket.as_raw_socket() as _,
+                SOL_SOCKET,
+                SO_EXCLUSIVEADDRUSE,
+                (&exclusive as *const i32).cast(),
+                size_of::<i32>() as i32,
+            )
+        };
+        if result != 0 {
             return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
         }
     }

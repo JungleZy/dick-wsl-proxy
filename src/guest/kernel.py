@@ -101,7 +101,12 @@ def validate(request):
         require(isinstance(ipv6, dict) and set(ipv6) == {"guest", "ingress"}, "invalid_ipv6_plan")
         guest6 = endpoint6("[" + ipv6["guest"] + "]:1")[0]
         ingress6 = endpoint6(ipv6["ingress"])
-        require(guest6 != ingress6[0] and ingress6[1] >= 1024, "invalid_ipv6_plan")
+        require(
+            "system_dns" in p
+            and guest6 != ingress6[0]
+            and ingress6[1] >= 1024,
+            "invalid_ipv6_plan",
+        )
     require("system_dns" not in p or unicast(p["system_dns"]), "invalid_system_dns")
     target = p["target"]
     require(isinstance(target, dict) and set(target) == {"id", "name", "base_path", "version"}, "invalid_target")
@@ -191,6 +196,29 @@ def guard(p, check_resolver=True, write_tools=True):
             require(shutil.which(command, path="/usr/sbin:/usr/bin:/sbin:/bin") is not None, "missing_prerequisite: " + command)
         if check_resolver:
             resolver_layout(p, read_text("/etc/resolv.conf"))
+    if p.get("ipv6") is not None:
+        addresses6 = json.loads(run(["ip", "-j", "-6", "address", "show", "dev", "eth0"]))
+        require(isinstance(addresses6, list) and len(addresses6) == 1, "guest_ipv6_interface_ambiguous")
+        globals6 = [
+            item.get("local")
+            for item in addresses6[0].get("addr_info", [])
+            if item.get("family") == "inet6" and item.get("scope") == "global"
+        ]
+        require(globals6 == [p["ipv6"]["guest"]], "guest_ipv6_address_changed")
+        routes6 = json.loads(run(["ip", "-j", "-6", "route", "show", "default"]))
+        require(
+            isinstance(routes6, list)
+            and len(routes6) == 1
+            and routes6[0].get("dev") == "eth0"
+            and routes6[0].get("gateway") == endpoint6(p["ipv6"]["ingress"])[0],
+            "ipv6_gateway_changed_or_ambiguous",
+        )
+        ingress_address = p["ipv6"]["ingress"][1:].rsplit("]:", 1)[0]
+        raw_address, _, scope = ingress_address.partition("%")
+        if ipaddress.IPv6Address(raw_address).is_unicast_link_local:
+            require(scope.isdigit() and int(scope) > 0, "ipv6_ingress_scope_missing")
+        else:
+            require(not scope, "ipv6_ingress_scope_unexpected")
 
 
 @contextmanager
@@ -993,7 +1021,10 @@ class Ownership6:
             and entry["status"] & 0x128 == 0x128
             and original[0] == reply[0]
             and original[0] in (6, 17)
-            and original[1] == self.guest
+            and (
+                original[1] == self.guest
+                or (unicast6(original[1]) and entry["status"] & 0x90 == 0x90)
+            )
             and (reply[1], reply[2]) == self.ingress
             and reply[3] == self.guest
             and 1 <= original[2] <= 65535
@@ -1013,9 +1044,27 @@ class Ownership6:
         return result
 
 
+def unicast6(value):
+    try:
+        address = ipaddress.IPv6Address(value)
+    except (ValueError, TypeError):
+        return False
+    return not address.is_unspecified and not address.is_loopback and not address.is_multicast
+
+
 def resolve6(p, entries, protocol, peer):
+    origin = resolve6_optional(p, entries, protocol, peer)
+    require(origin is not None, "mapping_missing_ambiguous_or_unowned")
+    return origin
+
+
+def resolve6_optional(p, entries, protocol, peer):
     prepared = Ownership6(p)
     entries = prepared.entries(entries)
+    return resolve6_prepared(prepared, entries, protocol, peer)
+
+
+def resolve6_prepared(prepared, entries, protocol, peer):
     _, port = endpoint6(peer)
     number = 6 if protocol == "tcp" else 17
     candidate = None
@@ -1026,9 +1075,15 @@ def resolve6(p, entries, protocol, peer):
                 raise Failure("mapping_missing_ambiguous_or_unowned")
             candidate = entry
     if candidate is None:
-        raise Failure("mapping_missing_ambiguous_or_unowned")
+        return None
     original = candidate["original"]
     return f"[{original[3]}]:{original[4]}"
+
+
+def resolve6_queries(p, entries, queries):
+    prepared = Ownership6(p)
+    entries = prepared.entries(entries)
+    return [resolve6_prepared(prepared, entries, protocol, peer) for protocol, peer in queries]
 
 
 def inspect_mappings(p, ct):

@@ -53,6 +53,7 @@ fn tcp_relays_both_directions_and_preserves_half_close() {
     let ingress = Ingress {
         shared,
         worker: None,
+        ipv6_worker: None,
     };
     let diagnostics = ingress.diagnostics();
     let traffic = &diagnostics["traffic"];
@@ -92,7 +93,7 @@ fn dns_metering_counts_partial_transport_without_retaining_questions() {
     }
     let shared = Arc::new(Shared::new());
     let flow = shared.flows.begin("tcp");
-    flow.destination("192.0.2.53:53".parse().unwrap());
+    flow.destination("192.0.2.53:53".parse::<SocketAddr>().unwrap());
     flow.selected("dns", "system_dns");
     flow.stage("dns");
     let mut input = io::Cursor::new([0, 12, 1]);
@@ -112,6 +113,7 @@ fn dns_metering_counts_partial_transport_without_retaining_questions() {
     let ingress = Ingress {
         shared,
         worker: None,
+        ipv6_worker: None,
     };
     let diagnostics = ingress.diagnostics();
     assert_eq!(diagnostics["traffic"]["tx_bytes"], 3);
@@ -430,6 +432,7 @@ fn metadata_failures_are_visible_without_stopping_ingress() {
     let ingress = Ingress {
         shared: Arc::clone(&shared),
         worker: None,
+        ipv6_worker: None,
     };
     let diagnostics = ingress.diagnostics();
     let counters = &diagnostics["counters"];
@@ -524,6 +527,7 @@ fn stop_drains_workers_and_reports_prior_failure_once() {
     let mut ingress = Ingress {
         shared,
         worker: Some(worker),
+        ipv6_worker: None,
     };
 
     assert_eq!(ingress.stop().unwrap_err(), "prior forwarding failure");

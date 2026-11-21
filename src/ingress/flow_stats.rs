@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::net::SocketAddrV4;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -41,7 +41,7 @@ struct Record {
 }
 
 struct Details {
-    destination: Option<SocketAddrV4>,
+    destination: Option<SocketAddr>,
     route: Option<&'static str>,
     reason: Option<&'static str>,
     status: &'static str,
@@ -191,9 +191,9 @@ impl Record {
 }
 
 impl Flow {
-    pub(super) fn destination(&self, destination: SocketAddrV4) {
+    pub(super) fn destination(&self, destination: impl Into<SocketAddr>) {
         let mut details = lock(&self.record.details);
-        details.destination = Some(destination);
+        details.destination = Some(destination.into());
         details.stage = "policy";
     }
 
@@ -297,7 +297,7 @@ mod tests {
     fn rows_transition_and_preserve_logical_destination_without_payloads() {
         let stats = Arc::new(FlowStats::new());
         let flow = stats.begin("tcp");
-        flow.destination("198.18.0.1:443".parse().unwrap());
+        flow.destination("198.18.0.1:443".parse::<SocketAddr>().unwrap());
         flow.selected("direct", "domain_alias");
         flow.stage("connect");
         let (active, _) = stats.snapshot();

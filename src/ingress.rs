@@ -26,6 +26,7 @@ mod udp_pump;
 use udp_pump::UdpPump;
 mod tcp;
 use tcp::{forward_tcp, transient};
+mod ipv6;
 
 const MAX_TCP: usize = 64;
 const MAX_UDP: usize = 128;
@@ -49,6 +50,7 @@ const MAX_ERROR_BYTES: usize = 512;
 pub struct Ingress {
     shared: Arc<Shared>,
     worker: Option<JoinHandle<Result<(), String>>>,
+    ipv6_worker: Option<JoinHandle<Result<(), String>>>,
 }
 
 impl Ingress {
@@ -70,34 +72,96 @@ impl Ingress {
             .map_err(|e| format!("configure TCP ingress: {e}"))?;
         udp.set_nonblocking(true)
             .map_err(|e| format!("configure UDP ingress: {e}"))?;
+        let ipv6_sockets = if let Some(ipv6) = &plan.ipv6 {
+            let tcp6 = crate::ports::bind_exclusive_v6(ipv6.ingress, Type::STREAM, Protocol::TCP)
+                .map_err(|e| format!("bind IPv6 TCP ingress {}: {e}", ipv6.ingress))?;
+            let udp6 = crate::ports::bind_exclusive_v6(ipv6.ingress, Type::DGRAM, Protocol::UDP)
+                .map_err(|e| format!("bind IPv6 UDP ingress {}: {e}", ipv6.ingress))?;
+            tcp6.listen(MAX_TCP as i32)
+                .map_err(|e| format!("listen on IPv6 TCP ingress: {e}"))?;
+            tcp6.set_nonblocking(true)
+                .map_err(|e| format!("configure IPv6 TCP ingress: {e}"))?;
+            udp6.set_nonblocking(true)
+                .map_err(|e| format!("configure IPv6 UDP ingress: {e}"))?;
+            Some((tcp6, udp6))
+        } else {
+            None
+        };
         // Authenticate the transient metadata lane before handing duplicate binds
         // to the lease owner. A failed handshake must not leave a custody lease.
         let shared = Arc::new(Shared::new());
         let bridge = MetadataLane::start(plan, Arc::clone(&shared.stopping))?;
-        crate::lease::reserve(plan, &tcp, &udp, None)?;
+        crate::lease::reserve(
+            plan,
+            &tcp,
+            &udp,
+            ipv6_sockets.as_ref().map(|(tcp, udp)| (tcp, udp)),
+        )?;
 
         *lock(&shared.bridge) = Some(bridge);
         let worker_shared = Arc::clone(&shared);
         let plan = Arc::new(plan.clone());
-        let worker = thread::Builder::new()
+        let worker_plan = Arc::clone(&plan);
+        let worker_runtime = runtime.clone();
+        let worker = match thread::Builder::new()
             .name("m1-ingress".into())
             .spawn(move || {
                 let result = run(
-                    plan,
+                    worker_plan,
                     tcp.into(),
                     udp.into(),
                     Arc::clone(&worker_shared),
-                    runtime,
+                    worker_runtime,
                 );
                 if let Err(error) = &result {
                     worker_shared.fail(error.clone());
                 }
                 result
-            })
-            .map_err(|e| format!("start ingress worker: {e}"))?;
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                shared.request_stop();
+                if let Some(mut bridge) = lock(&shared.bridge).take() {
+                    let _ = bridge.close();
+                }
+                let _ = crate::lease::release(&plan);
+                return Err(format!("start ingress worker: {error}"));
+            }
+        };
+        let ipv6_worker = if let Some((tcp6, udp6)) = ipv6_sockets {
+            let worker_shared = Arc::clone(&shared);
+            let worker_plan = Arc::clone(&plan);
+            let runtime = runtime.clone();
+            let lease_plan = Arc::clone(&plan);
+            match thread::Builder::new()
+                .name("m1-ingress-ipv6".into())
+                .spawn(move || {
+                    ipv6::run(
+                        worker_plan,
+                        tcp6.into(),
+                        udp6.into(),
+                        worker_shared,
+                        runtime,
+                    )
+                }) {
+                Ok(worker) => Some(worker),
+                Err(error) => {
+                    shared.request_stop();
+                    let _ = worker.join();
+                    if let Some(mut bridge) = lock(&shared.bridge).take() {
+                        let _ = bridge.close();
+                    }
+                    let _ = crate::lease::release(&lease_plan);
+                    return Err(format!("start IPv6 ingress worker: {error}"));
+                }
+            }
+        } else {
+            None
+        };
         Ok(Self {
             shared,
             worker: Some(worker),
+            ipv6_worker,
         })
     }
 
@@ -111,6 +175,13 @@ impl Ingress {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => self.shared.fail(error),
                 Err(_) => self.shared.fail("ingress worker panicked".into()),
+            }
+        }
+        if let Some(worker) = self.ipv6_worker.take() {
+            match worker.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => self.shared.fail(error),
+                Err(_) => self.shared.fail("IPv6 ingress worker panicked".into()),
             }
         }
         if let Some(mut bridge) = lock(&self.shared.bridge).take()
@@ -131,7 +202,17 @@ impl Ingress {
             return Err(error.clone());
         }
         match self.worker.as_ref() {
-            Some(worker) if !worker.is_finished() && !self.shared.is_stopping() => Ok(()),
+            Some(worker) if !worker.is_finished() && !self.shared.is_stopping() => {
+                if self
+                    .ipv6_worker
+                    .as_ref()
+                    .is_some_and(|worker| worker.is_finished())
+                {
+                    Err("IPv6 ingress worker stopped unexpectedly".into())
+                } else {
+                    Ok(())
+                }
+            }
             Some(_) => Err("ingress worker stopped unexpectedly".into()),
             None => Err("ingress is stopped".into()),
         }

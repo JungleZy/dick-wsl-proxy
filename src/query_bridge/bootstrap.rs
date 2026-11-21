@@ -56,25 +56,51 @@ try:
         keys = []
         for item in lookups:
             require(isinstance(item, dict) and set(item) == {'protocol','peer'} and item['protocol'] in ('tcp','udp'), 'invalid_query_item')
-            require(kernel['endpoint'](item['peer'])[0] == plan['guest'], 'invalid_query_peer')
+            if isinstance(item['peer'], str) and item['peer'].startswith('['):
+                peer = kernel['endpoint6'](item['peer'])
+                require('ipv6' in plan and peer[0] == kernel['endpoint6']('[' + plan['ipv6']['guest'] + ']:1')[0], 'invalid_query_peer')
+            else:
+                peer = kernel['endpoint'](item['peer'])
+                require(peer[0] == plan['guest'], 'invalid_query_peer')
             keys.append((item['protocol'], item['peer']))
         sequence = request['id']
         try:
             read_start = time.monotonic_ns()
             ct = kernel['Conntrack']()
             try:
-                payloads = ct.request(kernel['CT_GET'], kernel['ROOT'] | kernel['MATCH'])
+                want_v4 = any(not peer.startswith('[') for _, peer in keys)
+                want_v6 = any(peer.startswith('[') for _, peer in keys)
+                payloads = []
+                if want_v4:
+                    payloads.extend((payload, False) for payload in ct.request(kernel['CT_GET'], kernel['ROOT'] | kernel['MATCH']))
+                if want_v6:
+                    payloads.extend((payload, True) for payload in ct.request(kernel['CT_GET'], kernel['ROOT'] | kernel['MATCH'], ipv6=True))
             finally:
                 ct.close()
             read_end = time.monotonic_ns()
             # Read includes fresh socket construction, netlink envelope checks,
             # and socket close; decode includes tuple validation and indexing.
             try:
-                entries = [kernel['parse_entry'](payload) for payload in payloads]
+                entries = {
+                    False: [kernel['parse_entry'](payload) for payload, ipv6 in payloads if not ipv6],
+                    True: [kernel['parse_entry'](payload) for payload, ipv6 in payloads if ipv6],
+                }
             finally:
                 del payloads
             try:
-                origins = kernel['resolve_queries'](prepared, entries, keys)
+                origins = []
+                v4_keys = [(protocol, peer) for protocol, peer in keys if not peer.startswith('[')]
+                v4_origins = kernel['resolve_queries'](prepared, entries[False], v4_keys) if v4_keys else []
+                v6_keys = [(protocol, peer) for protocol, peer in keys if peer.startswith('[')]
+                v6_origins = kernel['resolve6_queries'](plan, entries[True], v6_keys) if v6_keys else []
+                v4_index = v6_index = 0
+                for _, peer in keys:
+                    if peer.startswith('['):
+                        origins.append(v6_origins[v6_index])
+                        v6_index += 1
+                    else:
+                        origins.append(v4_origins[v4_index])
+                        v4_index += 1
             finally:
                 del entries
             decode_end = time.monotonic_ns()

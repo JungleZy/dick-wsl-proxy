@@ -1,7 +1,7 @@
 use crate::plan::Plan;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 
 const SCRIPT: &str = include_str!("guest/kernel.py");
 
@@ -85,7 +85,7 @@ struct Request<'a> {
 struct Response {
     ok: bool,
     operation: String,
-    origin: Option<SocketAddrV4>,
+    origin: Option<SocketAddr>,
     ownership: Option<Ownership>,
     grant_deadline: Option<u64>,
 }
@@ -142,9 +142,6 @@ fn parse_response(output: &str, operation: &str) -> Result<Response, String> {
 }
 
 pub(crate) fn validate(p: &Plan) -> Result<(), String> {
-    if p.ipv6.is_some() {
-        return Err("ipv6_transparent_path_unavailable".into());
-    }
     let target = &p.target;
     if !uuid(&target.id, true)
         || target.version != 2
@@ -190,12 +187,34 @@ pub(crate) fn validate(p: &Plan) -> Result<(), String> {
             return Err("kernel_invalid_original_endpoint".into());
         }
     }
+    if let Some(ipv6) = &p.ipv6 {
+        if p.system_dns.is_none()
+            || !global_unicast(ipv6.guest)
+            || !valid_ipv6_ingress(ipv6.ingress)
+            || ipv6.guest == *ipv6.ingress.ip()
+        {
+            return Err("kernel_invalid_ipv6_endpoints".into());
+        }
+    }
     Ok(())
 }
 
 fn unicast(ip: Ipv4Addr) -> bool {
     let [first, second, _, _] = ip.octets();
     first != 0 && first != 127 && first < 224 && !(first == 169 && second == 254)
+}
+
+fn global_unicast(ip: Ipv6Addr) -> bool {
+    !ip.is_unspecified() && !ip.is_loopback() && !ip.is_multicast() && !ip.is_unicast_link_local()
+}
+
+fn valid_ipv6_ingress(address: std::net::SocketAddrV6) -> bool {
+    address.port() >= 1024
+        && (!address.ip().is_unicast_link_local() || address.scope_id() != 0)
+        && (address.ip().is_unicast_link_local() || address.scope_id() == 0)
+        && !address.ip().is_unspecified()
+        && !address.ip().is_multicast()
+        && !address.ip().is_loopback()
 }
 
 fn decimal(value: &str) -> bool {
@@ -320,6 +339,18 @@ mod tests {
             p.system_dns = Some(value.parse().unwrap());
             assert!(validate(&p).is_err(), "{value}");
         }
+    }
+
+    #[test]
+    fn accepts_a_scoped_ipv6_plan_for_managed_mode() {
+        let mut p = plan();
+        p.system_dns = Some("10.255.255.254".parse().unwrap());
+        p.origins.clear();
+        p.ipv6 = Some(crate::plan::Ipv6Plan {
+            guest: "2001:db8:1::2".parse().unwrap(),
+            ingress: std::net::SocketAddrV6::new("fe80::1".parse().unwrap(), 43771, 0, 2),
+        });
+        assert!(validate(&p).is_ok());
     }
 
     #[test]

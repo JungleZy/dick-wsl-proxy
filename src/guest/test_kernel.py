@@ -185,6 +185,30 @@ class ConntrackTests(unittest.TestCase):
         with self.assertRaises(kernel.Failure):
             kernel.resolve6(p, [forged], "udp", "[2001:db8:1::2]:45000")
 
+    def test_ipv6_mapping_accepts_a_forwarded_source_only_after_snat(self):
+        p = comprehensive_plan()
+        p["ipv6"] = {
+            "guest": "2001:db8:1::2",
+            "ingress": "[fe80::1%2]:43771",
+        }
+        forwarded = {
+            "original": (17, "fd00::10", 44000, "2001:db8:2::9", 443),
+            "reply": (17, "fe80::1", 43771, "2001:db8:1::2", 45000),
+            "mark": p["cookie"],
+            "id": 1,
+            "zone": 0,
+            "tuple_zones": (0, 0),
+            "status": 0x188 | 0x20 | 0x90,
+        }
+        self.assertEqual(
+            kernel.resolve6(p, [forwarded], "udp", "[2001:db8:1::2]:45000"),
+            "[2001:db8:2::9]:443",
+        )
+        unnat = copy.deepcopy(forwarded)
+        unnat["status"] &= ~0x90
+        with self.assertRaises(kernel.Failure):
+            kernel.resolve6(p, [unnat], "udp", "[2001:db8:1::2]:45000")
+
     def test_nested_tuple_round_trip_and_opaque_id_bytes(self):
         value = entry(identifier=0x78563412)
         parsed = kernel.parse_entry(encoded_entry(value))

@@ -26,6 +26,15 @@ fn original_destination_bounds_remain_explicit_in_both_modes() {
     assert!(!origin_allowed(&plan, "93.184.216.34:443".parse().unwrap()));
     plan.origins.clear();
     assert!(origin_allowed(&plan, "93.184.216.34:443".parse().unwrap()));
+    plan.ipv6 = Some(crate::plan::Ipv6Plan {
+        guest: "2001:db8:1::2".parse().unwrap(),
+        ingress: "[fe80::1%2]:43771".parse().unwrap(),
+    });
+    assert!(origin_allowed(
+        &plan,
+        "[2001:db8:2::9]:443".parse().unwrap()
+    ));
+    assert!(!origin_allowed(&plan, "[fe80::1%2]:443".parse().unwrap()));
     for endpoint in [
         "127.0.0.1:443",
         "0.0.0.0:443",
@@ -154,4 +163,17 @@ fn requests_have_only_fixed_readonly_fields_and_fit_the_bound() {
         assert!(value.get("operation").is_none());
         assert_eq!(value["lookups"][0]["protocol"], protocol);
     }
+}
+
+#[test]
+fn requests_preserve_ipv6_scope_in_the_wire_endpoint() {
+    let query = Query {
+        id: 1,
+        lookups: vec![Lookup {
+            protocol: "tcp",
+            peer: "[2001:db8:1::2]:45000".parse().unwrap(),
+        }],
+    };
+    let value: serde_json::Value = serde_json::to_value(query).unwrap();
+    assert_eq!(value["lookups"][0]["peer"], "[2001:db8:1::2]:45000");
 }
