@@ -373,7 +373,7 @@ def m2_artifacts(p):
         # packets arriving from non-WSL-host interfaces, then SNAT them back
         # to the guest address so the Windows ingress can use the same
         # authenticated reply tuple as local workload traffic.
-        hooks.append(["-A", "PREROUTING", "!", "-i", "eth0", "!", "-i", "lo", "-p", protocol, "-m", protocol, *fresh, *comment, "-j", chain])
+        hooks.append(["-A", "PREROUTING", "!", "-i", "eth0", "-p", protocol, "-m", protocol, *fresh, *comment, "-j", chain])
         hooks.append(["-A", "POSTROUTING", "-d", ingress + "/32", "-p", protocol, "-m", protocol, "--dport", str(ingress_port), "-m", "conntrack", "--ctdir", "ORIGINAL", "--ctstate", "DNAT", "-m", "connmark", "--mark", mark, *comment, "-j", "SNAT", "--to-source", p["guest"]])
     guards = [
         ["-A", "OUTPUT", *local, "-m", "conntrack", "!", "--ctorigdst", "127.0.0.0/8", *comment, "-j", guard_chain],
@@ -694,6 +694,12 @@ class Conntrack:
         self.socket.settimeout(2)
         self.pid = self.socket.getsockname()[0]
         self.sequence = 0
+        self.begin()
+
+    def begin(self):
+        # Reuse one authenticated netlink socket for the lifetime of the
+        # long-lived query helper. The deadline is per kernel operation, not
+        # per helper process.
         self.deadline = time.monotonic() + 8
 
     def close(self):
@@ -764,6 +770,32 @@ class Conntrack:
         except OSError as error:
             if error.errno != errno.ENOENT:
                 raise
+
+
+_REAL_CONNTRACK = Conntrack
+_CONNTRACK = None
+
+
+def acquire_conntrack():
+    global _CONNTRACK
+    # Tests and diagnostic callers may replace Conntrack with a fake. Keep
+    # those instances request-local so one fake cannot leak between cases.
+    if Conntrack is not _REAL_CONNTRACK:
+        return Conntrack(), False
+    if _CONNTRACK is None:
+        _CONNTRACK = Conntrack()
+    else:
+        _CONNTRACK.begin()
+    return _CONNTRACK, True
+
+
+def discard_conntrack(connection):
+    global _CONNTRACK
+    if _CONNTRACK is connection:
+        try:
+            connection.close()
+        finally:
+            _CONNTRACK = None
 
 
 def authorized_origin(p, value):
@@ -925,7 +957,7 @@ def execute(request):
             grant(p, "consume")
         elif operation == "remove":
             grant(p, "revoke")
-        ct = Conntrack()
+        ct, cached_conntrack = acquire_conntrack()
         try:
             if operation in ("precheck", "install"):
                 inspect_firewall(p, firewall(), False)
@@ -986,8 +1018,15 @@ def execute(request):
                 origin = resolve(p, ct.dump(), request["protocol"], request["peer"])
                 return {"ok": True, "operation": operation, "origin": origin}
             return {"ok": True, "operation": operation}
+        except (OSError, Failure) as error:
+            if cached_conntrack and (
+                isinstance(error, OSError) or "conntrack_" in str(error)
+            ):
+                discard_conntrack(ct)
+            raise
         finally:
-            ct.close()
+            if not cached_conntrack:
+                ct.close()
 
 
 def main():

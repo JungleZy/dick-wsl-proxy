@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use socket2::{Protocol, Type};
 
 use crate::plan::Plan;
+use crate::policy::UdpChain;
 use crate::query_bridge::Lookup;
 mod metadata_lane;
 use metadata_lane::{MetadataLane, Observation};
@@ -200,6 +201,7 @@ struct HealthCounters {
     direct_tcp: u64,
     direct_udp: u64,
     chain_tcp: u64,
+    chain_udp: u64,
     dns_tcp: u64,
     dns_udp: u64,
     rejected_tcp: u64,
@@ -555,7 +557,7 @@ enum Route {
 fn route_details(
     plan: &Plan,
     runtime: Option<&crate::managed::Runtime>,
-    protocol: &str,
+    _protocol: &str,
     original: SocketAddrV4,
 ) -> Result<(Route, &'static str), String> {
     let Some(runtime) = runtime else {
@@ -582,10 +584,8 @@ fn route_details(
         Ok((Route::Direct(actual), "domain_alias"))
     } else if runtime.policy.allows_ip(*actual.ip()) {
         Ok((Route::Direct(actual), "ip_or_cidr"))
-    } else if protocol == "tcp" {
-        Ok((Route::Chain, "default_chain"))
     } else {
-        Err("non-whitelisted UDP rejected: two-hop UDP is unavailable".into())
+        Ok((Route::Chain, "default_chain"))
     }
 }
 
@@ -626,7 +626,8 @@ fn select_route(
         (Ok(Route::Dns), _) => &mut counters.dns_udp,
         (Ok(Route::Direct(_)), "tcp") => &mut counters.direct_tcp,
         (Ok(Route::Direct(_)), _) => &mut counters.direct_udp,
-        (Ok(Route::Chain), _) => &mut counters.chain_tcp,
+        (Ok(Route::Chain), "tcp") => &mut counters.chain_tcp,
+        (Ok(Route::Chain), _) => &mut counters.chain_udp,
         (Err(_), "tcp") => &mut counters.rejected_tcp,
         (Err(_), _) => &mut counters.rejected_udp,
     };
@@ -776,9 +777,9 @@ fn run(
             };
             let stats = new_stats.as_ref().unwrap_or_else(|| &flows[&peer].stats);
             stats.stage("policy");
-            let target =
+            let (target, chained) =
                 match select_route(&plan, runtime.as_deref(), "udp", origin, stats, &shared) {
-                    Ok(Route::Direct(target)) => target,
+                    Ok(Route::Direct(target)) => (Some(target), false),
                     Ok(Route::Dns) => {
                         stats.stage("dns");
                         let runtime = runtime.as_ref().expect("DNS route requires M2 runtime");
@@ -801,13 +802,7 @@ fn run(
                         )?;
                         continue;
                     }
-                    Ok(Route::Chain) => {
-                        // There is no authenticated two-hop UDP implementation.
-                        stats.failed();
-                        flows.remove(&peer);
-                        shared.record_error("udp", "UDP chain transport unavailable".into());
-                        continue;
-                    }
+                    Ok(Route::Chain) => (None, true),
                     Err(error) => {
                         flows.remove(&peer);
                         shared.record_error("udp", error);
@@ -835,11 +830,27 @@ fn run(
                 }
                 let stats = new_stats.expect("new UDP mapping has an accounting record");
                 stats.stage("connect");
-                let flow = match UdpFlow::connect(origin, target, stats) {
-                    Ok(flow) => flow,
-                    Err(error) => {
-                        shared.record_error("udp", format!("create origin socket: {error}"));
+                let flow = if chained {
+                    let Some(runtime) = runtime.as_ref() else {
+                        stats.failed();
+                        shared.record_error("udp", "UDP chain requires managed runtime".into());
                         continue;
+                    };
+                    match UdpFlow::connect_chain(origin, origin, &runtime.policy, stats) {
+                        Ok(flow) => flow,
+                        Err(error) => {
+                            shared.record_error("udp", error);
+                            continue;
+                        }
+                    }
+                } else {
+                    let target = target.expect("direct UDP route has a target");
+                    match UdpFlow::connect(origin, target, stats) {
+                        Ok(flow) => flow,
+                        Err(error) => {
+                            shared.record_error("udp", format!("create origin socket: {error}"));
+                            continue;
+                        }
                     }
                 };
                 // Socket creation and UDP connect do not yield this lane. Reuse
@@ -1091,10 +1102,66 @@ fn admit_udp(flows: &mut BTreeMap<SocketAddrV4, UdpFlow>, shared: &Shared, now: 
 struct UdpFlow {
     generation: u64,
     origin: SocketAddrV4,
-    target: SocketAddrV4,
-    socket: UdpSocket,
+    target: Option<SocketAddrV4>,
+    socket: UdpTransport,
     activity: UdpActivity,
     stats: Flow,
+}
+
+enum UdpTransport {
+    Direct(UdpSocket),
+    Chain(UdpChain),
+}
+
+impl UdpTransport {
+    fn send(&self, payload: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Direct(socket) => socket.send(payload),
+            Self::Chain(chain) => chain.send(payload),
+        }
+    }
+
+    fn recv(&self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Direct(socket) => socket.recv(buffer),
+            Self::Chain(chain) => chain.recv(buffer),
+        }
+    }
+
+    #[cfg(test)]
+    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        match self {
+            Self::Direct(socket) => socket.set_nonblocking(nonblocking),
+            Self::Chain(chain) => chain.set_nonblocking(nonblocking),
+        }
+    }
+
+    #[cfg(test)]
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Self::Direct(socket) => socket.set_read_timeout(timeout),
+            Self::Chain(chain) => chain.set_read_timeout(timeout),
+        }
+    }
+
+    #[cfg(test)]
+    fn peek(&self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Direct(socket) => socket.peek(buffer),
+            Self::Chain(chain) => chain.peek(buffer),
+        }
+    }
+
+    #[cfg(windows)]
+    fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+        match self {
+            Self::Direct(socket) => {
+                use std::os::windows::io::AsRawSocket;
+                socket.as_raw_socket()
+            }
+            Self::Chain(chain) => chain.as_raw_socket(),
+        }
+    }
 }
 
 impl UdpFlow {
@@ -1113,8 +1180,36 @@ impl UdpFlow {
         Ok(Self {
             generation: next_udp_generation(),
             origin,
-            target,
-            socket,
+            target: Some(target),
+            socket: UdpTransport::Direct(socket),
+            activity: UdpActivity::new(Instant::now()),
+            stats,
+        })
+    }
+
+    fn connect_chain(
+        origin: SocketAddrV4,
+        target: SocketAddrV4,
+        policy: &crate::policy::Policy,
+        stats: Flow,
+    ) -> Result<Self, String> {
+        let socket = match policy.chain_udp(target) {
+            Ok(socket) => socket,
+            Err(error) => {
+                stats.failed();
+                return Err(error);
+            }
+        };
+        if let Err(error) = socket.set_nonblocking(true) {
+            stats.failed();
+            return Err(format!("configure chained UDP socket: {error}"));
+        }
+        stats.stage("relay");
+        Ok(Self {
+            generation: next_udp_generation(),
+            origin,
+            target: None,
+            socket: UdpTransport::Chain(socket),
             activity: UdpActivity::new(Instant::now()),
             stats,
         })

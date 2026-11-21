@@ -121,6 +121,7 @@ fn sanitized(s: &Value) -> Value {
         "direct_udp",
         "dns_tcp",
         "dns_udp",
+        "chain_udp",
         "rejected_tcp",
         "rejected_udp",
         "metadata_queries",

@@ -1,6 +1,6 @@
 use std::fs::File;
-use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
+use std::io::{self, Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -55,6 +55,132 @@ pub struct Policy {
     direct_domains: Vec<String>,
     direct_suffixes: Vec<String>,
     health_domain: String,
+}
+
+/// A nested SOCKS5 UDP relay. The first-hop relay carries an inner SOCKS5
+/// datagram addressed to the residential relay, so the residential proxy's
+/// UDP association remains behind the configured first hop.
+pub(crate) struct UdpChain {
+    socket: UdpSocket,
+    residential_relay: SocketAddrV4,
+    target: SocketAddrV4,
+    // Keep both TCP UDP-ASSOCIATE control channels alive for the lifetime of
+    // the UDP mapping. They are intentionally opaque after the handshake.
+    _first_control: TcpStream,
+    _residential_control: TcpStream,
+}
+
+impl UdpChain {
+    fn packet(destination: SocketAddrV4, payload: &[u8]) -> Vec<u8> {
+        let mut packet = Vec::with_capacity(10 + payload.len());
+        packet.extend_from_slice(&[0, 0, 0, 1]);
+        packet.extend_from_slice(&destination.ip().octets());
+        packet.extend_from_slice(&destination.port().to_be_bytes());
+        packet.extend_from_slice(payload);
+        packet
+    }
+
+    fn parse_packet(
+        bytes: &[u8],
+        expected_source: SocketAddrV4,
+        expected_destination: SocketAddrV4,
+    ) -> io::Result<&[u8]> {
+        if bytes.len() < 10 || bytes[..3] != [0, 0, 0] || bytes[3] != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid nested SOCKS5 UDP response",
+            ));
+        }
+        let source = SocketAddrV4::new(
+            Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]),
+            u16::from_be_bytes([bytes[8], bytes[9]]),
+        );
+        if source != expected_source {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected nested SOCKS5 UDP source",
+            ));
+        }
+        // The outer relay's payload is itself an inner SOCKS5 UDP response.
+        let inner = &bytes[10..];
+        if inner.len() < 10 || inner[..3] != [0, 0, 0] || inner[3] != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid residential SOCKS5 UDP response",
+            ));
+        }
+        let destination = SocketAddrV4::new(
+            Ipv4Addr::new(inner[4], inner[5], inner[6], inner[7]),
+            u16::from_be_bytes([inner[8], inner[9]]),
+        );
+        if destination != expected_destination {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected residential SOCKS5 UDP destination",
+            ));
+        }
+        Ok(&inner[10..])
+    }
+
+    pub(crate) fn send(&self, payload: &[u8]) -> io::Result<usize> {
+        if payload.len() > 65_487 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "nested SOCKS5 UDP payload is too large",
+            ));
+        }
+        let inner = Self::packet(self.target, payload);
+        let outer = Self::packet(self.residential_relay, &inner);
+        let sent = self.socket.send(&outer)?;
+        if sent == outer.len() {
+            Ok(payload.len())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "nested SOCKS5 UDP datagram was truncated",
+            ))
+        }
+    }
+
+    pub(crate) fn recv(&self, buffer: &mut [u8]) -> io::Result<usize> {
+        let mut packet = vec![0; 65_535];
+        let size = self.socket.recv(&mut packet)?;
+        let payload = Self::parse_packet(&packet[..size], self.residential_relay, self.target)?;
+        if payload.len() > buffer.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "nested SOCKS5 UDP payload exceeds ingress buffer",
+            ));
+        }
+        buffer[..payload.len()].copy_from_slice(payload);
+        Ok(payload.len())
+    }
+
+    pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.socket.set_nonblocking(nonblocking)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.socket.set_read_timeout(timeout)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn peek(&self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.socket.peek(buffer)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+        use std::os::windows::io::AsRawSocket;
+        self.socket.as_raw_socket()
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn as_raw_socket(&self) -> std::os::unix::io::RawFd {
+        use std::os::fd::AsRawFd;
+        self.socket.as_raw_fd()
+    }
 }
 
 impl Policy {
@@ -163,6 +289,78 @@ impl Policy {
             .set_write_timeout(None)
             .map_err(|_| "cannot configure chain socket")?;
         Ok(stream)
+    }
+
+    /// Establishes a nested SOCKS5 UDP association for a non-whitelisted UDP
+    /// destination. The first relay transports the residential relay's own
+    /// SOCKS5 UDP envelope, so neither hop is bypassed.
+    pub(crate) fn chain_udp(&self, dest: SocketAddrV4) -> Result<UdpChain, String> {
+        if dest == self.first_hop
+            || dest == self.residential.endpoint()
+            || dest == self.dns_upstream
+            || !valid_endpoint(dest, cfg!(test))
+        {
+            return Err("UDP chain destination is reserved or unsupported".into());
+        }
+        let deadline = Instant::now() + SETUP_TIMEOUT;
+        let mut first_control =
+            TcpStream::connect_timeout(&SocketAddr::V4(self.first_hop), remaining(deadline)?)
+                .map_err(|_| "cannot connect to first-hop SOCKS5 endpoint for UDP".to_string())?;
+        first_control
+            .set_nodelay(true)
+            .map_err(|_| "cannot configure first-hop UDP control socket".to_string())?;
+        negotiate_no_auth(&mut first_control, deadline)?;
+        let first_relay = udp_associate(&mut first_control, self.first_hop, deadline)?;
+
+        let mut residential_control =
+            TcpStream::connect_timeout(&SocketAddr::V4(self.first_hop), remaining(deadline)?)
+                .map_err(|_| "cannot connect to first-hop for residential UDP".to_string())?;
+        residential_control
+            .set_nodelay(true)
+            .map_err(|_| "cannot configure residential UDP control socket".to_string())?;
+        negotiate_no_auth(&mut residential_control, deadline)?;
+        connect(
+            &mut residential_control,
+            self.residential.endpoint(),
+            deadline,
+        )?;
+        send(&mut residential_control, &[5, 1, 2], deadline)?;
+        expect(
+            &mut residential_control,
+            &[5, 2],
+            deadline,
+            "residential UDP authentication method rejected",
+        )?;
+        let mut packet = AuthPacket([0; 513]);
+        let len = self.residential.auth_packet(&mut packet.0);
+        send(&mut residential_control, &packet.0[..len], deadline)?;
+        expect(
+            &mut residential_control,
+            &[1, 0],
+            deadline,
+            "residential UDP authentication rejected",
+        )?;
+        let residential_relay = udp_associate(
+            &mut residential_control,
+            self.residential.endpoint(),
+            deadline,
+        )?;
+
+        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .map_err(|error| format!("bind nested UDP socket: {error}"))?;
+        socket
+            .connect(SocketAddr::V4(first_relay))
+            .map_err(|error| format!("connect nested UDP relay: {error}"))?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|_| "cannot configure nested UDP socket".to_string())?;
+        Ok(UdpChain {
+            socket,
+            residential_relay,
+            target: dest,
+            _first_control: first_control,
+            _residential_control: residential_control,
+        })
     }
 
     pub fn allows_ip(&self, ip: Ipv4Addr) -> bool {
@@ -391,6 +589,69 @@ fn expect(
     Ok(())
 }
 
+fn negotiate_no_auth(stream: &mut TcpStream, deadline: Instant) -> Result<(), String> {
+    send(stream, &[5, 1, 0], deadline)?;
+    expect(
+        stream,
+        &[5, 0],
+        deadline,
+        "SOCKS5 UDP no-auth method rejected",
+    )
+}
+
+fn udp_associate(
+    stream: &mut TcpStream,
+    fallback_ip: SocketAddrV4,
+    deadline: Instant,
+) -> Result<SocketAddrV4, String> {
+    send(stream, &[5, 3, 0, 1, 0, 0, 0, 0, 0, 0], deadline)?;
+    let mut header = [0; 4];
+    receive(stream, &mut header, deadline)?;
+    if header[0] != 5 || header[1] != 0 || header[2] != 0 {
+        return Err("SOCKS5 UDP ASSOCIATE rejected or malformed".into());
+    }
+    let (address, port) = match header[3] {
+        1 => {
+            let mut bound = [0; 6];
+            receive(stream, &mut bound, deadline)?;
+            (
+                Ipv4Addr::new(bound[0], bound[1], bound[2], bound[3]),
+                u16::from_be_bytes([bound[4], bound[5]]),
+            )
+        }
+        4 => return Err("SOCKS5 UDP relay returned IPv6 address".into()),
+        3 => {
+            let mut length = [0];
+            receive(stream, &mut length, deadline)?;
+            if length[0] == 0 {
+                return Err("SOCKS5 UDP relay returned empty hostname".into());
+            }
+            let mut host = vec![0; usize::from(length[0]) + 2];
+            receive(stream, &mut host, deadline)?;
+            let address = std::str::from_utf8(&host[..host.len() - 2])
+                .ok()
+                .and_then(|value| value.parse::<Ipv4Addr>().ok())
+                .ok_or("SOCKS5 UDP relay returned non-literal hostname")?;
+            (
+                address,
+                u16::from_be_bytes([host[host.len() - 2], host[host.len() - 1]]),
+            )
+        }
+        _ => return Err("SOCKS5 UDP relay returned unsupported address type".into()),
+    };
+    if port == 0 {
+        return Err("SOCKS5 UDP relay returned zero port".into());
+    }
+    Ok(SocketAddrV4::new(
+        if address.is_unspecified() {
+            *fallback_ip.ip()
+        } else {
+            address
+        },
+        port,
+    ))
+}
+
 fn connect(stream: &mut TcpStream, dest: SocketAddrV4, deadline: Instant) -> Result<(), String> {
     let mut request = [5, 1, 0, 1, 0, 0, 0, 0, 0, 0];
     request[4..8].copy_from_slice(&dest.ip().octets());
@@ -421,7 +682,7 @@ fn connect(stream: &mut TcpStream, dest: SocketAddrV4, deadline: Instant) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Shutdown, TcpListener};
+    use std::net::{Shutdown, TcpListener, UdpSocket};
     use std::thread;
 
     fn endpoint(listener: &TcpListener) -> SocketAddrV4 {
@@ -453,7 +714,111 @@ mod tests {
         .unwrap()
     }
 
-    fn accept(listener: TcpListener) -> TcpStream {
+    #[test]
+    fn nested_udp_envelope_round_trips_and_rejects_wrong_source() {
+        let target = "203.0.113.9:443".parse().unwrap();
+        let relay = "198.51.100.7:53000".parse().unwrap();
+        let payload = b"udp-payload";
+        let inner = UdpChain::packet(target, payload);
+        let outer = UdpChain::packet(relay, &inner);
+        assert_eq!(
+            UdpChain::parse_packet(&outer, relay, target).unwrap(),
+            payload
+        );
+        let wrong = "198.51.100.8:53000".parse().unwrap();
+        assert!(UdpChain::parse_packet(&outer, wrong, target).is_err());
+    }
+
+    #[test]
+    fn nested_udp_association_relays_a_payload_through_both_control_channels() {
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let first_endpoint = endpoint(&first);
+        let residential_endpoint = endpoint(&TcpListener::bind("127.0.0.1:0").unwrap());
+        let first_relay = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let first_relay_endpoint = match first_relay.local_addr().unwrap() {
+            SocketAddr::V4(address) => address,
+            _ => unreachable!(),
+        };
+        let residential_relay = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let residential_relay_endpoint = match residential_relay.local_addr().unwrap() {
+            SocketAddr::V4(address) => address,
+            _ => unreachable!(),
+        };
+        let target = "203.0.113.9:443".parse().unwrap();
+        let policy = policy(first_endpoint, residential_endpoint);
+
+        let control = thread::spawn(move || {
+            let mut first_control = accept(&first);
+            assert_eq!(read::<3>(&mut first_control), [5, 1, 0]);
+            first_control.write_all(&[5, 0]).unwrap();
+            assert_eq!(read::<10>(&mut first_control)[..4], [5, 3, 0, 1]);
+            first_control
+                .write_all(&[
+                    5,
+                    0,
+                    0,
+                    1,
+                    first_relay_endpoint.ip().octets()[0],
+                    first_relay_endpoint.ip().octets()[1],
+                    first_relay_endpoint.ip().octets()[2],
+                    first_relay_endpoint.ip().octets()[3],
+                    first_relay_endpoint.port().to_be_bytes()[0],
+                    first_relay_endpoint.port().to_be_bytes()[1],
+                ])
+                .unwrap();
+
+            let mut residential_control = accept(&first);
+            assert_eq!(read::<3>(&mut residential_control), [5, 1, 0]);
+            residential_control.write_all(&[5, 0]).unwrap();
+            assert_eq!(read::<10>(&mut residential_control)[..4], [5, 1, 0, 1]);
+            success(&mut residential_control);
+            assert_eq!(read::<3>(&mut residential_control), [5, 1, 2]);
+            residential_control.write_all(&[5, 2]).unwrap();
+            assert_eq!(read::<2>(&mut residential_control), [1, 12]);
+            assert_eq!(&read::<12>(&mut residential_control), b"fixture-user");
+            assert_eq!(read::<1>(&mut residential_control), [16]);
+            assert_eq!(&read::<16>(&mut residential_control), b"fixture-password");
+            residential_control.write_all(&[1, 0]).unwrap();
+            assert_eq!(read::<10>(&mut residential_control)[..4], [5, 3, 0, 1]);
+            residential_control
+                .write_all(&[
+                    5,
+                    0,
+                    0,
+                    1,
+                    residential_relay_endpoint.ip().octets()[0],
+                    residential_relay_endpoint.ip().octets()[1],
+                    residential_relay_endpoint.ip().octets()[2],
+                    residential_relay_endpoint.ip().octets()[3],
+                    residential_relay_endpoint.port().to_be_bytes()[0],
+                    residential_relay_endpoint.port().to_be_bytes()[1],
+                ])
+                .unwrap();
+        });
+
+        let relay = thread::spawn(move || {
+            let mut request = [0; 65_535];
+            let (size, client) = first_relay.recv_from(&mut request).unwrap();
+            let payload = &request[10..size];
+            let response = UdpChain::packet(
+                residential_relay_endpoint,
+                &UdpChain::packet(target, &payload[10..]),
+            );
+            first_relay.send_to(&response, client).unwrap();
+        });
+
+        let chain = policy.chain_udp(target).unwrap();
+        chain.set_nonblocking(false).unwrap();
+        assert_eq!(chain.send(b"udp-payload").unwrap(), 11);
+        let mut response = [0; 64];
+        assert_eq!(chain.recv(&mut response).unwrap(), 11);
+        assert_eq!(&response[..11], b"udp-payload");
+        drop(chain);
+        relay.join().unwrap();
+        control.join().unwrap();
+    }
+
+    fn accept(listener: &TcpListener) -> TcpStream {
         let (stream, _) = listener.accept().unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
@@ -503,7 +868,7 @@ mod tests {
         let origin_endpoint = endpoint(&origin);
         let policy = policy(first_endpoint, residential_endpoint);
         let outer = thread::spawn(move || {
-            let mut stream = accept(first);
+            let mut stream = accept(&first);
             assert_eq!(read::<3>(&mut stream), [5, 1, 0]);
             stream.write_all(&[5, 0]).unwrap();
             request(&mut stream, residential_endpoint);
@@ -512,7 +877,7 @@ mod tests {
             relay(stream, target);
         });
         let inner = thread::spawn(move || {
-            let mut stream = accept(residential);
+            let mut stream = accept(&residential);
             assert_eq!(read::<3>(&mut stream), [5, 1, 2]);
             stream.write_all(&[5, 2]).unwrap();
             assert_eq!(read::<2>(&mut stream), [1, 12]);
@@ -526,7 +891,7 @@ mod tests {
             relay(stream, target);
         });
         let echo = thread::spawn(move || {
-            let mut stream = accept(origin);
+            let mut stream = accept(&origin);
             assert_eq!(read::<4>(&mut stream), *b"ping");
             stream.write_all(b"pong").unwrap();
         });
@@ -550,7 +915,7 @@ mod tests {
         let residential_endpoint = endpoint(&residential);
         let policy = policy(first_endpoint, residential_endpoint);
         let server = thread::spawn(move || {
-            let mut stream = accept(first);
+            let mut stream = accept(&first);
             assert_eq!(read::<3>(&mut stream), [5, 1, 0]);
             stream.write_all(&[5, 0]).unwrap();
             request(&mut stream, residential_endpoint);
@@ -572,7 +937,7 @@ mod tests {
         let first = TcpListener::bind("127.0.0.1:0").unwrap();
         let policy = policy(endpoint(&first), "127.0.0.1:1080".parse().unwrap());
         let server = thread::spawn(move || {
-            let mut stream = accept(first);
+            let mut stream = accept(&first);
             assert_eq!(read::<3>(&mut stream), [5, 1, 0]);
             stream.write_all(&[5, 0]).unwrap();
             request(&mut stream, "127.0.0.1:1080".parse().unwrap());
@@ -663,7 +1028,7 @@ mod tests {
     fn stalled_handshake_obeys_its_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut client = TcpStream::connect(endpoint(&listener)).unwrap();
-        let _server = accept(listener);
+        let _server = accept(&listener);
         let mut reply = [0; 2];
         assert!(
             receive(
