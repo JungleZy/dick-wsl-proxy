@@ -74,7 +74,7 @@ impl Ingress {
         // to the lease owner. A failed handshake must not leave a custody lease.
         let shared = Arc::new(Shared::new());
         let bridge = MetadataLane::start(plan, Arc::clone(&shared.stopping))?;
-        crate::lease::reserve(plan, &tcp, &udp)?;
+        crate::lease::reserve(plan, &tcp, &udp, None)?;
 
         *lock(&shared.bridge) = Some(bridge);
         let worker_shared = Arc::clone(&shared);

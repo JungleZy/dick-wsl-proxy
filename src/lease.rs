@@ -6,6 +6,7 @@ mod windows {
     use crate::plan::Plan;
     use socket2::Socket;
     use std::io::{Read, Write};
+    use std::net::SocketAddr;
     use std::os::windows::io::{AsRawSocket, FromRawSocket};
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -84,7 +85,12 @@ mod windows {
             )
         }
     }
-    pub fn reserve(plan: &Plan, tcp: &Socket, udp: &Socket) -> Result<(), String> {
+    pub fn reserve(
+        plan: &Plan,
+        tcp: &Socket,
+        udp: &Socket,
+        ipv6: Option<(&Socket, &Socket)>,
+    ) -> Result<(), String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let mut child = Command::new(exe)
             .arg("lease-worker")
@@ -97,7 +103,11 @@ mod windows {
             .map_err(|e| e.to_string())?;
         let result = (|| {
             let mut input = child.stdin.take().ok_or("lease_stdin_missing")?;
-            for sock in [tcp, udp] {
+            let mut sockets = vec![tcp, udp];
+            if let Some((tcp6, udp6)) = ipv6 {
+                sockets.extend([tcp6, udp6]);
+            }
+            for sock in sockets {
                 let mut info = ticket();
                 if unsafe { WSADuplicateSocketW(sock.as_raw_socket() as _, child.id(), &mut info) }
                     != 0
@@ -135,8 +145,9 @@ mod windows {
         if unsafe { WSAStartup(0x0202, &mut data) } != 0 {
             return Err("lease_winsock_start".into());
         }
-        let mut sockets = Vec::with_capacity(2);
-        for _ in 0..2 {
+        let socket_count = if plan.ipv6.is_some() { 4 } else { 2 };
+        let mut sockets = Vec::with_capacity(socket_count);
+        for index in 0..socket_count {
             let mut info = ticket();
             std::io::stdin()
                 .lock()
@@ -156,7 +167,17 @@ mod windows {
                 return Err(format!("lease_import:{}", unsafe { WSAGetLastError() }));
             }
             let s = unsafe { Socket::from_raw_socket(h as _) };
-            if s.local_addr().map_err(|e| e.to_string())?.as_socket_ipv4() != Some(plan.ingress) {
+            let actual = s
+                .local_addr()
+                .map_err(|e| e.to_string())?
+                .as_socket()
+                .ok_or("lease_socket_address_missing")?;
+            let expected = if index < 2 {
+                SocketAddr::V4(plan.ingress)
+            } else {
+                SocketAddr::V6(plan.ipv6.as_ref().ok_or("lease_ipv6_plan_missing")?.ingress)
+            };
+            if actual != expected {
                 return Err("lease_wrong_endpoint".into());
             }
             sockets.push(s);
@@ -191,7 +212,12 @@ pub use windows::{alive, release, reserve, worker};
 mod unsupported {
     use crate::plan::Plan;
     use socket2::Socket;
-    pub fn reserve(_: &Plan, _: &Socket, _: &Socket) -> Result<(), String> {
+    pub fn reserve(
+        _: &Plan,
+        _: &Socket,
+        _: &Socket,
+        _: Option<(&Socket, &Socket)>,
+    ) -> Result<(), String> {
         Err("Windows required".into())
     }
     pub fn worker(_: &Plan) -> Result<(), String> {
