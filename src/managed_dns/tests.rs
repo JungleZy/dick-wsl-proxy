@@ -1,7 +1,7 @@
 // Managed DNS wire, alias, ledger, and transport tests.
-use super::*;
 use super::ledger::read_alias_highwater;
 use super::wire::{a_address, put_name, word};
+use super::*;
 use std::fs;
 use std::io::{self, Read};
 use std::net::{TcpListener, TcpStream};
@@ -112,7 +112,7 @@ fn alias_capacity_is_atomic_and_aaaa_never_gets_an_alias() {
             Ipv4Addr::from(ALIAS_START + offset as u32),
             Alias {
                 real: Ipv4Addr::new(1, 1, 1, 1),
-                expires: now,
+                expires: now + Duration::from_secs(60),
             },
         );
     }
@@ -197,7 +197,7 @@ fn https_ipv4_hints_cannot_borrow_a_reserved_alias() {
 }
 
 #[test]
-fn aliases_never_cross_names_or_revive_after_expiry() {
+fn aliases_never_cross_names_and_reclaim_same_pair_after_expiry() {
     let mut table = Aliases::default();
     let now = Instant::now();
     let ip = Ipv4Addr::new(1, 1, 1, 1);
@@ -208,8 +208,11 @@ fn aliases_never_cross_names_or_revive_after_expiry() {
     let renewed = table
         .assign("first.example", &[ip], 60, now + Duration::from_secs(2))
         .unwrap()[0];
-    assert_ne!(first, renewed);
-    assert!(table.lookup(first, now + Duration::from_secs(2)).is_err());
+    assert_eq!(first, renewed);
+    assert_eq!(
+        table.lookup(first, now + Duration::from_secs(2)).unwrap(),
+        Some(ip)
+    );
     assert!(table.lookup(Ipv4Addr::new(198, 19, 255, 254), now).is_err());
 }
 

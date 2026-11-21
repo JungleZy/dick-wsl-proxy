@@ -42,6 +42,10 @@ struct Probe {
 struct Aliases {
     entries: HashMap<Ipv4Addr, Alias>,
     live: HashMap<String, HashMap<Ipv4Addr, Ipv4Addr>>,
+    // A session-local history lets the same name/IP pair reclaim its own
+    // expired alias without lending that alias to another name. The durable
+    // ledger still prevents reuse across controller sessions.
+    history: HashMap<(String, Ipv4Addr), Ipv4Addr>,
     ledger: AliasLedger,
 }
 
@@ -159,6 +163,21 @@ impl ManagedDns {
 }
 
 impl Aliases {
+    fn reap_expired(&mut self, now: Instant) {
+        let expired: HashSet<_> = self
+            .entries
+            .iter()
+            .filter_map(|(alias, entry)| (entry.expires <= now).then_some(*alias))
+            .collect();
+        for alias in &expired {
+            self.entries.remove(alias);
+        }
+        self.live.retain(|_, addresses| {
+            addresses.retain(|_, alias| !expired.contains(alias));
+            !addresses.is_empty()
+        });
+    }
+
     fn lookup(&self, ip: Ipv4Addr, now: Instant) -> Result<Option<Ipv4Addr>, String> {
         if !reserved(ip) {
             return Ok(None);
@@ -177,29 +196,35 @@ impl Aliases {
         ttl: u32,
         now: Instant,
     ) -> Result<Vec<Ipv4Addr>, String> {
+        self.reap_expired(now);
+        let name = name.to_owned();
         let missing: HashSet<_> = ips
             .iter()
             .filter(|ip| {
                 self.live
-                    .get(name)
+                    .get(&name)
                     .and_then(|addresses| addresses.get(*ip))
                     .and_then(|alias| self.entries.get(alias))
                     .is_none_or(|entry| entry.expires <= now)
             })
             .copied()
             .collect();
-        if missing.len() > MAX_ALIASES - self.entries.len() {
+        let fresh = missing
+            .iter()
+            .filter(|ip| !self.history.contains_key(&(name.clone(), **ip)))
+            .count();
+        if fresh > MAX_ALIASES - self.entries.len() {
             return Err("DNS session alias capacity exhausted; restart session explicitly".into());
         }
         // Reserve every new number durably before changing the session table.
-        // Expired numbers remain burned both in this session and on disk.
-        let mut fresh = self.ledger.allocate(missing.len())?.into_iter();
+        // Expired aliases are reclaimed only for the same name/IP pair.
+        let mut fresh = self.ledger.allocate(fresh)?.into_iter();
         let expires = now + Duration::from_secs(u64::from(ttl));
         let mut result = Vec::with_capacity(ips.len());
         for ip in ips {
             let previous = self
                 .live
-                .get(name)
+                .get(&name)
                 .and_then(|addresses| addresses.get(ip))
                 .copied();
             let alias = match previous {
@@ -211,18 +236,28 @@ impl Aliases {
                 {
                     alias
                 }
-                _ => {
-                    let alias = fresh
-                        .next()
-                        .expect("reserved every distinct missing DNS alias");
-                    self.entries.insert(alias, Alias { real: *ip, expires });
-                    self.live
-                        .entry(name.to_string())
-                        .or_default()
-                        .insert(*ip, alias);
-                    alias
-                }
+                _ => match self.history.get(&(name.clone(), *ip)).copied() {
+                    Some(alias) => alias,
+                    None => {
+                        let alias = fresh
+                            .next()
+                            .expect("reserved every distinct missing DNS alias");
+                        self.history.insert((name.clone(), *ip), alias);
+                        self.live
+                            .entry(name.clone())
+                            .or_default()
+                            .insert(*ip, alias);
+                        alias
+                    }
+                },
             };
+            if !self.entries.contains_key(&alias) {
+                self.entries.insert(alias, Alias { real: *ip, expires });
+                self.live
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(*ip, alias);
+            }
             self.entries
                 .get_mut(&alias)
                 .expect("assigned DNS alias exists")

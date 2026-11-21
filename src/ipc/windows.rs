@@ -37,14 +37,16 @@ mod inner {
         PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
     };
     use windows_sys::Win32::System::Threading::{
-        CREATE_NO_WINDOW, CreateEventW, CreateProcessW, GetCurrentProcess, INFINITE, OpenProcess,
-        OpenProcessToken, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-        QueryFullProcessImageNameW, ResetEvent, STARTF_USESTDHANDLES, STARTUPINFOW,
-        TerminateProcess, WaitForSingleObject,
+        CREATE_NO_WINDOW, CreateEventW, CreateProcessW, GetCurrentProcess, GetExitCodeProcess,
+        GetProcessId, INFINITE, OpenProcess, OpenProcessToken, PROCESS_INFORMATION,
+        PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, ResetEvent,
+        STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
     };
 
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
     const START_TIMEOUT: Duration = Duration::from_secs(15);
+    const START_COMPETITOR_GRACE: Duration = Duration::from_secs(2);
+    const DAEMON_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
     const FRAME_TIMEOUT: Duration = Duration::from_secs(3);
     const RESPONSE_TIMEOUT: Duration = Duration::from_secs(240);
 
@@ -76,7 +78,7 @@ mod inner {
         let wait = unsafe {
             WaitForSingleObject(
                 process,
-                START_TIMEOUT.as_millis().min(u32::MAX as u128) as u32,
+                DAEMON_CLEANUP_TIMEOUT.as_millis().min(u32::MAX as u128) as u32,
             )
         };
         if wait == WAIT_OBJECT_0 {
@@ -89,6 +91,30 @@ mod inner {
             ));
         }
         Err(terminate_error.unwrap_or_else(io::Error::last_os_error))
+    }
+
+    fn process_id(process: HANDLE) -> io::Result<u32> {
+        let pid = unsafe { GetProcessId(process) };
+        if pid == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(pid)
+        }
+    }
+
+    fn exited_code(process: HANDLE) -> io::Result<Option<u32>> {
+        let wait = unsafe { WaitForSingleObject(process, 0) };
+        if wait == WAIT_TIMEOUT {
+            return Ok(None);
+        }
+        if wait != WAIT_OBJECT_0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut code = 0;
+        if unsafe { GetExitCodeProcess(process, &mut code) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Some(code))
     }
 
     enum SpawnError {
@@ -367,6 +393,23 @@ mod inner {
         }
     }
 
+    fn cleanup_untrusted_server(
+        context: &str,
+        error: io::Error,
+        pipe: &Pipe,
+        child: Handle,
+    ) -> String {
+        let child_pid = process_id(child.0).ok();
+        let server_pid = pipe_process_id(pipe.handle.0, true).ok();
+        // Authentication can fail after the daemon has already accepted real
+        // requests. Never terminate the child when it is the named-pipe server,
+        // or when the peer PID cannot be established safely.
+        if server_pid.is_none() || server_pid == child_pid {
+            return report(context, error);
+        }
+        cleanup_started_daemon(context, error, child)
+    }
+
     fn verify_owner(process: HANDLE, sid: &str) -> io::Result<()> {
         if token_sid(process)? != sid {
             return Err(io::Error::new(
@@ -377,7 +420,7 @@ mod inner {
         Ok(())
     }
 
-    fn peer_process(pipe: HANDLE, server: bool) -> io::Result<Handle> {
+    fn pipe_process_id(pipe: HANDLE, server: bool) -> io::Result<u32> {
         let mut pid = 0;
         let success = unsafe {
             if server {
@@ -389,6 +432,17 @@ mod inner {
         if success == 0 {
             return Err(io::Error::last_os_error());
         }
+        if pid == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ipc_invalid_peer_pid",
+            ));
+        }
+        Ok(pid)
+    }
+
+    fn peer_process(pipe: HANDLE, server: bool) -> io::Result<Handle> {
+        let pid = pipe_process_id(pipe, server)?;
         Handle::checked(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) })
     }
 
@@ -654,18 +708,38 @@ mod inner {
             .spawn(&sid)
             .map_err(|error| error.report("ipc_daemon_start_failed"))?;
         let deadline = Instant::now() + START_TIMEOUT;
+        let mut child_exit: Option<(Instant, u32)> = None;
         loop {
             match open_pipe(&name, deadline) {
                 Ok(pipe) => match authenticate(&pipe, &executable, &sid) {
                     Ok(()) => return Ok(()),
                     Err(error) => {
-                        return Err(cleanup_started_daemon("ipc_untrusted_server", error, child));
+                        return Err(cleanup_untrusted_server(
+                            "ipc_untrusted_server",
+                            error,
+                            &pipe,
+                            child,
+                        ));
                     }
                 },
                 Err(error) if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => {
+                    if child_exit.is_none() {
+                        match exited_code(child.0) {
+                            Ok(Some(code)) => child_exit = Some((Instant::now(), code)),
+                            Ok(None) => {}
+                            Err(exit_error) => {
+                                return Err(report("ipc_daemon_exit_probe_failed", exit_error));
+                            }
+                        }
+                    }
+                    if let Some((exited, code)) = child_exit {
+                        if exited.elapsed() >= START_COMPETITOR_GRACE {
+                            return Err(format!("ipc_daemon_exited_before_pipe: exit_code={code}"));
+                        }
+                    }
                     if Instant::now() < deadline {
                         // A concurrent launcher may win first-instance ownership. Keep waiting
-                        // for its pipe; only terminate this child after a genuine startup timeout.
+                        // briefly for its pipe even if this child has already exited.
                         unsafe { WaitForSingleObject(child.0, 50) };
                         std::thread::sleep(Duration::from_millis(50));
                         continue;
@@ -676,9 +750,10 @@ mod inner {
                         Ok(pipe) => match authenticate(&pipe, &executable, &sid) {
                             Ok(()) => return Ok(()),
                             Err(error) => {
-                                return Err(cleanup_started_daemon(
+                                return Err(cleanup_untrusted_server(
                                     "ipc_untrusted_server",
                                     error,
+                                    &pipe,
                                     child,
                                 ));
                             }
@@ -686,8 +761,10 @@ mod inner {
                         Err(final_error)
                             if final_error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) =>
                         {
-                            if unsafe { WaitForSingleObject(child.0, 0) } == WAIT_OBJECT_0 {
-                                return Err(report("ipc_daemon_start_timeout", error));
+                            if let Some(code) = exited_code(child.0).ok().flatten() {
+                                return Err(format!(
+                                    "ipc_daemon_exited_before_pipe: exit_code={code}"
+                                ));
                             }
                             return Err(cleanup_started_daemon(
                                 "ipc_daemon_start_timeout",
@@ -702,7 +779,7 @@ mod inner {
                             return Err(report("ipc_daemon_start_timeout", final_error));
                         }
                         Err(final_error) => {
-                            if unsafe { WaitForSingleObject(child.0, 0) } == WAIT_OBJECT_0 {
+                            if exited_code(child.0).ok().flatten().is_some() {
                                 return Err(report("ipc_daemon_connect_failed", final_error));
                             }
                             return Err(cleanup_started_daemon(
@@ -722,7 +799,7 @@ mod inner {
                     return Err(report("ipc_daemon_start_timeout", error));
                 }
                 Err(error) => {
-                    if unsafe { WaitForSingleObject(child.0, 0) } == WAIT_OBJECT_0 {
+                    if exited_code(child.0).ok().flatten().is_some() {
                         return Err(report("ipc_daemon_connect_failed", error));
                     }
                     return Err(cleanup_started_daemon(

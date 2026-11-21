@@ -187,7 +187,7 @@ impl QueryBridge {
                     }
                     Err(error) => {
                         self.reopen_after =
-                            Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+                            Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
                         return Err(error);
                     }
                 }
@@ -201,8 +201,10 @@ impl QueryBridge {
                 .as_ref()
                 .is_err_and(|error| error.starts_with("query_transport_"))
             {
+                // Keep a short backoff after a transport failure so a transient
+                // WSL helper crash does not freeze the target for half a minute.
                 self.reopen_after =
-                    Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
                 if let Err(close_error) = self.close() {
                     return Err(format!("{}; {close_error}", result.unwrap_err()));
                 }

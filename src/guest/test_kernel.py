@@ -257,6 +257,11 @@ class ConntrackTests(unittest.TestCase):
         p = comprehensive_plan()
         value = comprehensive_entry()
         self.assertEqual(kernel.resolve(p, [value], "udp", p["guest"] + ":45000"), "93.184.216.34:443")
+        forwarded = comprehensive_entry(source="172.17.0.2")
+        self.assertEqual(
+            kernel.resolve(p, [forwarded], "udp", p["guest"] + ":45000"),
+            "93.184.216.34:443",
+        )
         for destination, port in (("127.0.0.1", 443), ("169.254.1.1", 443), ("224.0.0.1", 443), kernel.endpoint(p["ingress"])):
             forged = comprehensive_entry(destination, port)
             with self.subTest(destination=destination), self.assertRaises(kernel.Failure):
@@ -568,12 +573,18 @@ class FirewallTests(unittest.TestCase):
         self.assertEqual(guards[-1][-1], "DROP")
         established = [rule for rule in guards if "ESTABLISHED,RELATED" in rule]
         self.assertTrue(all("-p" in rule and rule[rule.index("-p") + 1] in ("tcp", "udp") for rule in established))
-        self.assertTrue(all("--ctorigsrc" in rule or ("--ctorigdst" in rule and "--ctorigdstport" in rule) for rule in established))
+        self.assertTrue(
+            all(
+                "--ctorigsrc" in rule or ("--ctorigdst" in rule and "--ctorigdstport" in rule)
+                for rule in established
+                if rule[1] != "FORWARD"
+            )
+        )
+        self.assertTrue(any(rule[1] == "FORWARD" and rule[-1] == "RETURN" for rule in established))
         snat = [rule for rule in hooks if "SNAT" in rule]
         self.assertEqual(len(snat), 2)
         for rule in snat:
-            self.assertEqual(rule[rule.index("--ctorigdst") + 1], p["system_dns"])
-            self.assertEqual(rule[rule.index("--ctorigdstport") + 1], "53")
+            self.assertEqual(rule[rule.index("-d") + 1], kernel.endpoint(p["ingress"])[0] + "/32")
             self.assertEqual(rule[rule.index("--to-source") + 1], p["guest"])
             self.assertIn("connmark", rule)
         with patch.object(kernel, "transaction") as transact:
@@ -598,7 +609,9 @@ class FirewallTests(unittest.TestCase):
         guards = kernel.ipv6_guards(p)
         ipv6 = {"filter": {"chains": {"OUTPUT": "ACCEPT"}, "rules": copy.deepcopy(guards)}}
         kernel.inspect_firewall(p, ipv6, True, ipv6=True)
-        self.assertTrue(all("::1/128" in rule and "cgroup" in rule for rule in guards))
+        output_guards = [rule for rule in guards if rule[1] == "OUTPUT"]
+        self.assertTrue(all("::1/128" in rule and "cgroup" in rule for rule in output_guards))
+        self.assertTrue(any(rule[1] == "FORWARD" and rule[-1] == "DROP" for rule in guards))
         ipv6["filter"]["rules"][0].remove("!")
         with self.assertRaises(kernel.Failure):
             kernel.inspect_firewall(p, ipv6, True, ipv6=True)

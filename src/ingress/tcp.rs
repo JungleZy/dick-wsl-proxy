@@ -143,6 +143,8 @@ pub(super) fn relay(
     shared: &Shared,
     flow: &Flow,
 ) -> io::Result<()> {
+    client.set_nodelay(true)?;
+    upstream.set_nodelay(true)?;
     client.set_nonblocking(true)?;
     upstream.set_nonblocking(true)?;
     let mut request = Pipe::new();
@@ -163,7 +165,11 @@ pub(super) fn relay(
             touched = now;
         }
         if request.eof || response.eof {
-            let since = half_closed.get_or_insert(now);
+            let since = if progressed {
+                half_closed.insert(now)
+            } else {
+                half_closed.get_or_insert(now)
+            };
             if now.duration_since(*since) >= HALF_CLOSE_TIMEOUT {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,

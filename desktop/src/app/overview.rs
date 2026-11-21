@@ -51,7 +51,7 @@ impl Desktop {
                     .gap_3()
                     .child(metric(
                         "当前目标",
-                        text(&self.status, "active_target", "未选择"),
+                        text(&self.status, "active_target", "无运行目标"),
                     ))
                     .child(metric(
                         "运行代数",

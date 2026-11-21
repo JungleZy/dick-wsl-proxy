@@ -32,6 +32,7 @@ const MAX_DNS_UDP: usize = 8;
 const BUFFER_SIZE: usize = 16 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const METADATA_WAIT_TIMEOUT: Duration = Duration::from_secs(13);
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const HALF_CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_ERROR_BYTES: usize = 512;
@@ -48,7 +49,10 @@ pub struct Ingress {
 }
 
 impl Ingress {
-    pub fn bind(plan: &Plan, runtime: Option<Arc<crate::managed::Runtime>>) -> Result<Self, String> {
+    pub fn bind(
+        plan: &Plan,
+        runtime: Option<Arc<crate::managed::Runtime>>,
+    ) -> Result<Self, String> {
         validate(plan)?;
         if plan.system_dns.is_some() != runtime.is_some() {
             return Err("M2 ingress requires exactly one matching policy runtime".into());
@@ -436,8 +440,13 @@ fn finish_destination(
     shared: &Shared,
 ) -> Result<SocketAddrV4, String> {
     let observation = pending.observation.and_then(|rx| {
-        rx.recv()
-            .map_err(|_| "query_transport_dispatch_closed".to_owned())
+        rx.recv_timeout(METADATA_WAIT_TIMEOUT)
+            .map_err(|error| match error {
+                std::sync::mpsc::RecvTimeoutError::Timeout => "query_transport_timeout".to_owned(),
+                std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                    "query_transport_dispatch_closed".to_owned()
+                }
+            })
     });
     finish_observation(plan, protocol, pending.started, observation, shared)
 }
@@ -475,8 +484,15 @@ fn destination_group(plan: &Plan, keys: &[Lookup], shared: &Shared) -> Destinati
     };
     let observations = receiver
         .and_then(|rx| {
-            rx.recv()
-                .map_err(|_| "query_transport_dispatch_closed".to_owned())
+            rx.recv_timeout(METADATA_WAIT_TIMEOUT)
+                .map_err(|error| match error {
+                    std::sync::mpsc::RecvTimeoutError::Timeout => {
+                        "query_transport_timeout".to_owned()
+                    }
+                    std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                        "query_transport_dispatch_closed".to_owned()
+                    }
+                })
         })
         .and_then(|observations| {
             if observations.len() == keys.len() {
@@ -983,6 +999,9 @@ fn serve_dns_tcp(
 ) -> Result<(), String> {
     let shared = &registration.shared;
     client
+        .set_nonblocking(false)
+        .map_err(|_| "configure TCP DNS blocking mode".to_string())?;
+    client
         .set_read_timeout(Some(TCP_IDLE_TIMEOUT))
         .map_err(|_| "configure TCP DNS read deadline".to_string())?;
     client
@@ -1104,7 +1123,7 @@ impl UdpFlow {
 
 fn next_udp_generation() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+    NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         value.checked_add(1)
     })
     .expect("UDP flow generation exhausted")

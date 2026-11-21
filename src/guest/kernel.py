@@ -153,7 +153,7 @@ def guard(p, check_resolver=True, write_tools=True):
             if ".." in path.split("/"):
                 executable = os.stat(entry.path + "/exe")
                 require((executable.st_dev, executable.st_ino) == (init.st_dev, init.st_ino), "workload_outside_distro_cgroup")
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             require(not os.path.exists(entry.path), "unverifiable_workload")
     for command in (("ip", "iptables-legacy-save", "iptables-legacy-restore") if write_tools else ("ip", "iptables-legacy-save")):
         require(shutil.which(command, path="/usr/sbin:/usr/bin:/sbin:/bin") is not None, "missing_prerequisite: " + command)
@@ -369,12 +369,21 @@ def m2_artifacts(p):
         # eligible, and its return address is always translated to this guest.
         dns = ["-p", protocol, "-m", protocol, "--dport", "53"]
         hooks.append(["-A", "OUTPUT", "-d", p["system_dns"] + "/32", *dns, *local, *fresh, *comment, "-j", chain])
-        hooks.append(["-A", "POSTROUTING", "-d", ingress + "/32", "-p", protocol, "-m", protocol, "--dport", str(ingress_port), "-m", "conntrack", "--ctdir", "ORIGINAL", "--ctstate", "DNAT", "--ctorigdst", p["system_dns"], "--ctorigdstport", "53", "-m", "connmark", "--mark", mark, *comment, "-j", "SNAT", "--to-source", p["guest"]])
+        # Forwarded bridge traffic has no local cgroup socket. Match only
+        # packets arriving from non-WSL-host interfaces, then SNAT them back
+        # to the guest address so the Windows ingress can use the same
+        # authenticated reply tuple as local workload traffic.
+        hooks.append(["-A", "PREROUTING", "!", "-i", "eth0", "!", "-i", "lo", "-p", protocol, "-m", protocol, *fresh, *comment, "-j", chain])
+        hooks.append(["-A", "POSTROUTING", "-d", ingress + "/32", "-p", protocol, "-m", protocol, "--dport", str(ingress_port), "-m", "conntrack", "--ctdir", "ORIGINAL", "--ctstate", "DNAT", "-m", "connmark", "--mark", mark, *comment, "-j", "SNAT", "--to-source", p["guest"]])
     guards = [
         ["-A", "OUTPUT", *local, "-m", "conntrack", "!", "--ctorigdst", "127.0.0.0/8", *comment, "-j", guard_chain],
         ["-A", "OUTPUT", "!", "-d", "127.0.0.0/8", *local, "-m", "conntrack", "--ctstate", "INVALID,UNTRACKED", *comment, "-j", guard_chain],
         ["-A", guard_chain, "-m", "conntrack", "--ctdir", "REPLY", *comment, "-j", "RETURN"],
     ]
+    for protocol in ("tcp", "udp"):
+        guards.append(["-A", "FORWARD", "-p", protocol, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-m", "connmark", "--mark", mark, *comment, "-j", "RETURN"])
+        guards.append(["-A", "FORWARD", "-d", ingress + "/32", "-p", protocol, "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "-m", "connmark", "--mark", mark, *comment, "-j", "RETURN"])
+    guards.append(["-A", "FORWARD", *comment, "-j", "DROP"])
     for dns_only in (False, True):
         for protocol in ("tcp", "udp"):
             # In xt_conntrack DNAT is a virtual state, not a --ctstatus value.
@@ -397,9 +406,13 @@ def ipv6_guards(p):
         return []
     comment = ["-m", "comment", "--comment", artifacts(p)[1]]
     base = ["-A", "OUTPUT", "-m", "cgroup", "--path", "/"]
+    # IPv6 has no authenticated ingress or SOCKS route yet. Drop forwarded
+    # namespaces as well as local external traffic so container IPv6 cannot
+    # silently bypass the managed policy.
     return [
         [*base, "-m", "conntrack", "--ctdir", "ORIGINAL", "!", "--ctorigdst", "::1/128", *comment, "-j", "DROP"],
         [*base, "!", "-d", "::1/128", "-m", "conntrack", "--ctstate", "INVALID,UNTRACKED", *comment, "-j", "DROP"],
+        ["-A", "FORWARD", *comment, "-j", "DROP"],
     ]
 
 
@@ -458,7 +471,7 @@ def rule_key(rule):
     # this closed vocabulary is accepted for an owned rule; unknown options,
     # duplicate constraints and negation cannot broaden a deletion predicate.
     require(len(rule) >= 2 and rule[0] == "-A", "invalid_owned_rule")
-    allowed = {"-s", "-d", "-p", "-m", "-j", "--dport", "--path", "--ctstate", "--ctdir", "--ctstatus", "--ctorigsrc", "--ctorigdst", "--ctorigdstport", "--mark", "--comment", "--set-xmark", "--to-destination", "--to-source"}
+    allowed = {"-s", "-d", "-i", "-p", "-m", "-j", "--dport", "--path", "--ctstate", "--ctdir", "--ctstatus", "--ctorigsrc", "--ctorigdst", "--ctorigdstport", "--mark", "--comment", "--set-xmark", "--to-destination", "--to-source"}
     result, seen = [], set()
     index = 2
     while index < len(rule):
@@ -468,8 +481,8 @@ def rule_key(rule):
         require(index < len(rule), "invalid_owned_negation")
         option = rule[index]
         require(option in allowed and index + 1 < len(rule), "unknown_owned_rule_option")
-        require(not negated or option in ("-s", "-d", "--ctorigsrc", "--ctorigdst"), "unsupported_owned_negation")
-        require(option == "-m" or option not in seen, "duplicate_owned_rule_option")
+        require(not negated or option in ("-s", "-d", "-i", "--ctorigsrc", "--ctorigdst"), "unsupported_owned_negation")
+        require(option in ("-m", "-i") or option not in seen, "duplicate_owned_rule_option")
         seen.add(option)
         value = rule[index + 1]
         if option in ("-s", "-d", "--ctorigsrc", "--ctorigdst"):
@@ -550,7 +563,14 @@ def install_rules(p, test=False):
     # target workload traffic; the journal can recover either partial phase.
     if p.get("system_dns") is not None:
         guard_chain = "WPM2G_" + f"{p['cookie']:08x}"
-        transaction("filter", [["-N", guard_chain], *(insert(rule) if rule[1] == "OUTPUT" else rule for rule in guards)], test)
+        forward = [rule for rule in guards if rule[1] == "FORWARD"]
+        other = [rule for rule in guards if rule[1] != "FORWARD"]
+        lines = [["-N", guard_chain], *(insert(rule) if rule[1] == "OUTPUT" else rule for rule in other)]
+        # Each -I ... 1 reverses insertion order. Add the desired forward
+        # order backwards so owned replies pass before the final drop, and
+        # place the whole gate ahead of pre-existing FORWARD accepts.
+        lines.extend(["-I", "FORWARD", "1", *rule[2:]] for rule in reversed(forward))
+        transaction("filter", lines, test)
         transaction("filter", [insert(rule) for rule in ipv6_guards(p)], test, ipv6=True)
     else:
         transaction("filter", [insert(rule) for rule in guards], test)
@@ -760,7 +780,9 @@ class Ownership:
         self.ingress = endpoint(p["ingress"])
         self.dns = p.get("system_dns")
         self.origins = frozenset(p["origins"])
-        # Only immutable plan predicates survive between fresh dumps.
+        # Only immutable plan predicates survive between fresh dumps. Managed
+        # bridge traffic is SNATed to the guest before it reaches Windows, so
+        # its original conntrack source may be a private container address.
 
     def owned(self, entry, authorized=None):
         original, reply = entry["original"], entry["reply"]
@@ -775,7 +797,21 @@ class Ownership:
             and original[0] == reply[0]
             and integer(entry["id"], 0, 0xffffffff)
             and original[0] in (6, 17)
-            and (original[1] == self.guest or (dns and entry["status"] & 0x90 == 0x90))
+            and (
+                original[1] == self.guest
+                or (
+                    self.dns is not None
+                    and (
+                        (original[3] == self.dns and original[4] == 53)
+                        or (
+                            original[3] != self.dns
+                            and original[4] != 53
+                            and unicast(original[1])
+                        )
+                    )
+                    and entry["status"] & 0x90 == 0x90
+                )
+            )
             and 1 <= original[2] <= 65535
             and (reply[1], reply[2]) == self.ingress
             and reply[3] == self.guest

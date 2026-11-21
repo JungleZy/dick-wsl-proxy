@@ -226,10 +226,12 @@ impl Desktop {
 
     fn status_bar(&self, cx: &Context<Self>) -> Div {
         let online_color = if self.status_valid { TEAL } else { RUST };
-        let idle_color = if self.status_valid && self.phase() == "idle" {
-            TEAL
-        } else {
-            MUTED
+        let (idle_label, idle_color) = match self.phase() {
+            "idle" => ("未接管", TEAL),
+            "forwarding_managed" => ("接管中", TEAL),
+            "forwarding_scoped" => ("诊断转发中", AMBER),
+            "recovery_required" => ("需要恢复", RUST),
+            _ => ("状态未知", MUTED),
         };
         let storage_color = if self.profile_exists { TEAL } else { MUTED };
         div()
@@ -256,8 +258,8 @@ impl Desktop {
             .child(
                 Button::new("status-idle")
                     .icon(design_icon("idle", 17., idle_color))
-                    .accessibility_label("未接管")
-                    .tooltip("未接管")
+                    .accessibility_label(idle_label)
+                    .tooltip(idle_label)
                     .text_color(rgb(idle_color))
                     .disabled(true)
                     .tab_stop(false)

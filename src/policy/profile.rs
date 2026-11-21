@@ -49,11 +49,24 @@ pub(crate) fn decode_policy(bytes: &[u8]) -> Result<Config, String> {
         Plain(Config),
         Desktop(Document),
     }
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
     match serde_json::from_slice::<Input>(bytes)
         .map_err(|_| "invalid policy JSON or unsupported policy field")?
     {
         Input::Plain(c) => Ok(c),
         Input::Desktop(d) if d.revision > 0 => Ok(d.profile),
         _ => Err("invalid desktop policy revision".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_policy;
+
+    #[test]
+    fn accepts_utf8_bom_from_legacy_windows_editors() {
+        let mut bytes = b"{\"first_hop\":\"127.0.0.1:7892\",\"credential\":\"demo\",\"dns_upstream\":\"223.5.5.5:443\",\"dns_tls_name\":\"dns.example\",\"direct_ips\":[],\"direct_domains\":[],\"direct_suffixes\":[]}".to_vec();
+        bytes.splice(0..0, [0xef, 0xbb, 0xbf]);
+        assert!(decode_policy(&bytes).is_ok());
     }
 }
