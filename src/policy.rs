@@ -1,6 +1,8 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream, UdpSocket,
+};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -40,8 +42,8 @@ impl Config {
 }
 
 struct Network {
-    address: u32,
-    mask: u32,
+    address: IpAddr,
+    mask: u128,
 }
 
 // Immutable, secret-bearing runtime state. Never serialize or derive Debug for this type.
@@ -281,13 +283,56 @@ impl Policy {
             deadline,
             "residential SOCKS5 authentication rejected",
         )?;
-        connect(&mut stream, dest, deadline)?;
+        connect_addr(&mut stream, SocketAddr::V4(dest), deadline)?;
         stream
             .set_read_timeout(None)
             .map_err(|_| "cannot configure chain socket")?;
         stream
             .set_write_timeout(None)
             .map_err(|_| "cannot configure chain socket")?;
+        Ok(stream)
+    }
+
+    /// Establishes the same authenticated chain for an IPv6 literal. The
+    /// transparent ingress still needs an IPv6 plan before this path can be
+    /// selected, but the proxy protocol itself now preserves IPv6 destinations.
+    #[allow(dead_code)] // Activated when the IPv6 transparent ingress plan lands.
+    pub fn chain_ipv6(&self, dest: SocketAddrV6) -> Result<TcpStream, String> {
+        if !valid_ipv6_endpoint(dest) {
+            return Err("IPv6 chain destination is reserved or unsupported".into());
+        }
+        let deadline = Instant::now() + SETUP_TIMEOUT;
+        let mut stream =
+            TcpStream::connect_timeout(&SocketAddr::V4(self.first_hop), remaining(deadline)?)
+                .map_err(|_| "cannot connect to first-hop SOCKS5 endpoint for IPv6".to_string())?;
+        stream
+            .set_nodelay(true)
+            .map_err(|_| "cannot configure IPv6 chain socket".to_string())?;
+        negotiate_no_auth(&mut stream, deadline)?;
+        connect(&mut stream, self.residential.endpoint(), deadline)?;
+        send(&mut stream, &[5, 1, 2], deadline)?;
+        expect(
+            &mut stream,
+            &[5, 2],
+            deadline,
+            "residential IPv6 authentication method rejected",
+        )?;
+        let mut packet = AuthPacket([0; 513]);
+        let len = self.residential.auth_packet(&mut packet.0);
+        send(&mut stream, &packet.0[..len], deadline)?;
+        expect(
+            &mut stream,
+            &[1, 0],
+            deadline,
+            "residential IPv6 authentication rejected",
+        )?;
+        connect_addr(&mut stream, SocketAddr::V6(dest), deadline)?;
+        stream
+            .set_read_timeout(None)
+            .map_err(|_| "cannot configure IPv6 chain socket")?;
+        stream
+            .set_write_timeout(None)
+            .map_err(|_| "cannot configure IPv6 chain socket")?;
         Ok(stream)
     }
 
@@ -365,9 +410,19 @@ impl Policy {
 
     pub fn allows_ip(&self, ip: Ipv4Addr) -> bool {
         let address = u32::from(ip);
-        self.direct_ips
-            .iter()
-            .any(|network| address & network.mask == network.address)
+        self.direct_ips.iter().any(|network| {
+            matches!(network.address, IpAddr::V4(network_ip)
+                    if u32::from(network_ip) as u128 & network.mask == address as u128 & network.mask)
+        })
+    }
+
+    #[allow(dead_code)] // Activated when IPv6 route selection reaches ingress.
+    pub fn allows_ipv6(&self, ip: Ipv6Addr) -> bool {
+        let address = u128::from(ip);
+        self.direct_ips.iter().any(|network| {
+            matches!(network.address, IpAddr::V6(network_ip)
+                if u128::from(network_ip) & network.mask == address & network.mask)
+        })
     }
 
     pub fn allows_domain(&self, name: &str) -> bool {
@@ -475,30 +530,58 @@ fn valid_endpoint(endpoint: SocketAddrV4, allow_loopback: bool) -> bool {
         && ip.octets()[0] < 240
 }
 
+#[allow(dead_code)] // Used by the pending IPv6 transparent ingress path.
+fn valid_ipv6_endpoint(endpoint: SocketAddrV6) -> bool {
+    let ip = endpoint.ip();
+    endpoint.port() != 0
+        && !ip.is_unspecified()
+        && !ip.is_loopback()
+        && !ip.is_multicast()
+        && !ip.is_unicast_link_local()
+}
+
 fn network(entry: &str) -> Result<Network, String> {
     let (ip, prefix) = match entry.split_once('/') {
         Some((ip, prefix)) => (
             ip,
             prefix
                 .parse::<u8>()
-                .map_err(|_| "invalid direct IPv4 CIDR prefix")?,
+                .map_err(|_| "invalid direct IP CIDR prefix")?,
         ),
-        None => (entry, 32),
+        None => (entry, if entry.contains(':') { 128 } else { 32 }),
     };
-    let address = u32::from(
-        ip.parse::<Ipv4Addr>()
-            .map_err(|_| "direct_ips accepts only literal IPv4 or CIDR")?,
-    );
-    if prefix > 32 {
-        return Err("invalid direct IPv4 CIDR prefix".into());
+    let address = ip
+        .parse::<IpAddr>()
+        .map_err(|_| "direct_ips accepts only literal IP addresses or CIDR")?;
+    let width = match address {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    if prefix > width {
+        return Err("invalid direct IP CIDR prefix".into());
     }
-    let mask = if prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - prefix)
+    let mask = match address {
+        IpAddr::V4(_) => {
+            if prefix == 0 {
+                0
+            } else {
+                u128::from(u32::MAX << u32::from(32 - prefix))
+            }
+        }
+        IpAddr::V6(_) => {
+            if prefix == 0 {
+                0
+            } else {
+                u128::MAX << u32::from(128 - prefix)
+            }
+        }
     };
-    if address & mask != address {
-        return Err("direct IPv4 CIDR must use its network address".into());
+    let value = match address {
+        IpAddr::V4(ip) => u32::from(ip) as u128,
+        IpAddr::V6(ip) => u128::from(ip),
+    };
+    if value & mask != value {
+        return Err("direct IP CIDR must use its network address".into());
     }
     Ok(Network { address, mask })
 }
@@ -653,9 +736,24 @@ fn udp_associate(
 }
 
 fn connect(stream: &mut TcpStream, dest: SocketAddrV4, deadline: Instant) -> Result<(), String> {
-    let mut request = [5, 1, 0, 1, 0, 0, 0, 0, 0, 0];
-    request[4..8].copy_from_slice(&dest.ip().octets());
-    request[8..10].copy_from_slice(&dest.port().to_be_bytes());
+    connect_addr(stream, SocketAddr::V4(dest), deadline)
+}
+
+fn connect_addr(stream: &mut TcpStream, dest: SocketAddr, deadline: Instant) -> Result<(), String> {
+    let mut request = Vec::with_capacity(22);
+    request.extend_from_slice(&[5, 1, 0]);
+    match dest {
+        SocketAddr::V4(dest) => {
+            request.push(1);
+            request.extend_from_slice(&dest.ip().octets());
+            request.extend_from_slice(&dest.port().to_be_bytes());
+        }
+        SocketAddr::V6(dest) => {
+            request.push(4);
+            request.extend_from_slice(&dest.ip().octets());
+            request.extend_from_slice(&dest.port().to_be_bytes());
+        }
+    }
     send(stream, &request, deadline)?;
     let mut header = [0; 4];
     receive(stream, &mut header, deadline)?;
@@ -712,6 +810,22 @@ mod tests {
             credential::fixture(residential),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn direct_ip_policy_accepts_ipv6_cidrs_without_changing_ipv4_matching() {
+        let first = "127.0.0.1:18080".parse().unwrap();
+        let residential = "198.51.100.9:1080".parse().unwrap();
+        let mut config = config(first);
+        config.direct_ips.push("2001:db8:1234::/48".into());
+        let policy = Policy::assemble(
+            Validated::new(config).unwrap(),
+            credential::fixture(residential),
+        )
+        .unwrap();
+        assert!(policy.allows_ipv6("2001:db8:1234::99".parse().unwrap()));
+        assert!(!policy.allows_ipv6("2001:db8:5678::99".parse().unwrap()));
+        assert!(policy.allows_ip("192.0.2.4".parse().unwrap()));
     }
 
     #[test]
@@ -986,7 +1100,6 @@ mod tests {
     #[test]
     fn rejects_ambiguous_networks_and_unsupported_endpoint_layouts() {
         for entry in [
-            "::1",
             "example.com",
             "192.0.2.1/24",
             "192.0.2.0/33",
@@ -994,6 +1107,7 @@ mod tests {
         ] {
             assert!(network(entry).is_err());
         }
+        assert!(network("2001:db8::/32").is_ok());
         assert!(network("0.0.0.0/0").is_ok());
         for endpoint in ["192.0.2.1:1080", "[::1]:1080", "127.0.0.1:0"] {
             let mut config = config("127.0.0.1:7892".parse().unwrap());
