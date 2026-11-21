@@ -164,6 +164,27 @@ class ValidationTests(unittest.TestCase):
 
 
 class ConntrackTests(unittest.TestCase):
+    def test_ipv6_mapping_resolves_only_through_the_recorded_ingress(self):
+        p = comprehensive_plan()
+        p["ipv6"] = {
+            "guest": "2001:db8:1::2",
+            "ingress": "[fe80::1%2]:43771",
+        }
+        value = {
+            "original": (17, "2001:db8:1::2", 44000, "2001:db8:2::9", 443),
+            "reply": (17, "fe80::1", 43771, "2001:db8:1::2", 45000),
+            "mark": p["cookie"],
+            "id": 1,
+            "zone": 0,
+            "tuple_zones": (0, 0),
+            "status": 0x188 | 0x20,
+        }
+        assert kernel.resolve6(p, [value], "udp", "[2001:db8:1::2%2]:45000") == "[2001:db8:2::9]:443"
+        forged = copy.deepcopy(value)
+        forged["reply"] = (17, "2001:db8::bad", 43771, "2001:db8:1::2", 45000)
+        with self.assertRaises(kernel.Failure):
+            kernel.resolve6(p, [forged], "udp", "[2001:db8:1::2]:45000")
+
     def test_nested_tuple_round_trip_and_opaque_id_bytes(self):
         value = entry(identifier=0x78563412)
         parsed = kernel.parse_entry(encoded_entry(value))
