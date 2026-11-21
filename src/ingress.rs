@@ -534,6 +534,9 @@ fn finish_observation(
             obs.origin
         })
         .and_then(|origin| {
+            let SocketAddr::V4(origin) = origin else {
+                return Err("IPv6 origin requires the IPv6 ingress path".into());
+            };
             let ip = *origin.ip();
             if shared.is_stopping()
                 || origin == plan.ingress

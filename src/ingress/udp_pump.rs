@@ -291,7 +291,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(index, origin)| Observation {
-                origin,
+                origin: origin.map(SocketAddr::V4),
                 started,
                 elapsed: Duration::ZERO,
                 batch: if index == 0 { count } else { 0 },

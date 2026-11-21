@@ -5,7 +5,7 @@ use crate::{
     query_bridge::{BatchOrigins, Lookup, MAX_LOOKUPS, QueryBridge},
 };
 use std::{
-    net::{SocketAddr, SocketAddrV4},
+    net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-type Origin = Result<SocketAddrV4, String>;
+type Origin = Result<SocketAddr, String>;
 pub(super) struct Observation {
     pub origin: Origin,
     pub started: Instant,
@@ -152,10 +152,7 @@ fn observe(
     (0..count).map(move |i| {
         let origin = match &results {
             Ok(batch) => match batch.origins[i] {
-                Some(SocketAddr::V4(origin)) => Ok(origin),
-                Some(SocketAddr::V6(_)) => {
-                    Err("query_lookup_ipv6_origin_requires_ipv6_ingress".to_owned())
-                }
+                Some(origin) => Ok(origin),
                 None => Err("query_lookup_mapping_missing_ambiguous_or_unowned".to_owned()),
             },
             Err(e) => Err(e.clone()),
@@ -177,6 +174,7 @@ fn observe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddrV4;
     #[test]
     fn queued_queries_share_a_fresh_observation_but_not_each_others_result() {
         let (send, recv) = mpsc::sync_channel(32);
