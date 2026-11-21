@@ -72,6 +72,18 @@ def endpoint(value):
     return address, int(port)
 
 
+def endpoint6(value):
+    require(isinstance(value, str) and value.startswith("[") and "]:" in value, "invalid_ipv6_endpoint")
+    address, port = value[1:].rsplit("]:", 1)
+    try:
+        parsed = ipaddress.IPv6Address(address.split("%", 1)[0])
+    except (ValueError, TypeError):
+        raise Failure("invalid_ipv6_endpoint")
+    require(not parsed.is_unspecified and not parsed.is_multicast and not parsed.is_loopback, "invalid_ipv6_endpoint")
+    require(decimal(port) and int(port) <= 65535, "invalid_ipv6_endpoint")
+    return str(parsed), int(port)
+
+
 def validate(request):
     fields = {"operation", "plan", "protocol", "peer"}
     require(isinstance(request, dict) and set(request) in (fields, fields | {"deadline"}), "invalid_request")
@@ -84,7 +96,12 @@ def validate(request):
     fields = {"target", "cgroup_ns", "cgroup_root", "boot_id", "guest", "ingress", "origins", "cookie"}
     allowed_plan = fields | {"system_dns", "ipv6"}
     require(isinstance(p, dict) and set(p) in (fields, fields | {"system_dns"}, allowed_plan, allowed_plan - {"system_dns"}), "invalid_plan")
-    require("ipv6" not in p, "ipv6_transparent_path_unavailable")
+    if "ipv6" in p:
+        ipv6 = p["ipv6"]
+        require(isinstance(ipv6, dict) and set(ipv6) == {"guest", "ingress"}, "invalid_ipv6_plan")
+        guest6 = endpoint6("[" + ipv6["guest"] + "]:1")[0]
+        ingress6 = endpoint6(ipv6["ingress"])
+        require(guest6 != ingress6[0] and ingress6[1] >= 1024, "invalid_ipv6_plan")
     require("system_dns" not in p or unicast(p["system_dns"]), "invalid_system_dns")
     target = p["target"]
     require(isinstance(target, dict) and set(target) == {"id", "name", "base_path", "version"}, "invalid_target")
@@ -102,8 +119,12 @@ def validate(request):
     require(all(address in (ingress[0], p["guest"]) and port >= 1024 and port != ingress[1] for address, port in origins), "nonlocal_or_nonbusiness_origin")
     if operation == "lookup":
         require(request["protocol"] in ("tcp", "udp"), "invalid_lookup_protocol")
-        peer = endpoint(request["peer"])
-        require(peer[0] == p["guest"], "invalid_lookup_peer")
+        if isinstance(request["peer"], str) and request["peer"].startswith("["):
+            peer = endpoint6(request["peer"])
+            require("ipv6" in p and peer[0] == endpoint6("[" + p["ipv6"]["guest"] + "]:1")[0], "invalid_lookup_peer")
+        else:
+            peer = endpoint(request["peer"])
+            require(peer[0] == p["guest"], "invalid_lookup_peer")
     else:
         require(request["protocol"] is None and request["peer"] is None, "unexpected_lookup_parameters")
     return p
@@ -884,6 +905,62 @@ def owned_entries(p, entries):
     return Ownership(p).entries(entries)
 
 
+class Ownership6:
+    def __init__(self, p):
+        ipv6 = p["ipv6"]
+        self.cookie = p["cookie"]
+        self.guest, _ = endpoint6("[" + ipv6["guest"] + "]:1")
+        self.ingress = endpoint6(ipv6["ingress"])
+
+    def owned(self, entry):
+        original, reply = entry["original"], entry["reply"]
+        if original is None or reply is None:
+            return False
+        return (
+            entry["mark"] == self.cookie
+            and entry["zone"] == 0
+            and entry["tuple_zones"] == (0, 0)
+            and entry["status"] & 0x128 == 0x128
+            and original[0] == reply[0]
+            and original[0] in (6, 17)
+            and original[1] == self.guest
+            and (reply[1], reply[2]) == self.ingress
+            and reply[3] == self.guest
+            and 1 <= original[2] <= 65535
+            and 1 <= reply[4] <= 65535
+        )
+
+    def entries(self, entries):
+        result, originals, replies = [], set(), set()
+        for entry in entries:
+            if entry["mark"] == self.cookie:
+                require(self.owned(entry), "instance_ipv6_mark_has_unproven_mapping")
+                original, reply = entry["original"], entry["reply"]
+                require(original not in originals and reply not in replies, "duplicate_ipv6_conntrack_mapping")
+                originals.add(original)
+                replies.add(reply)
+                result.append(entry)
+        return result
+
+
+def resolve6(p, entries, protocol, peer):
+    prepared = Ownership6(p)
+    entries = prepared.entries(entries)
+    _, port = endpoint6(peer)
+    number = 6 if protocol == "tcp" else 17
+    candidate = None
+    for entry in entries:
+        reply = entry["reply"]
+        if reply == (number, prepared.ingress[0], prepared.ingress[1], prepared.guest, port):
+            if candidate is not None:
+                raise Failure("mapping_missing_ambiguous_or_unowned")
+            candidate = entry
+    if candidate is None:
+        raise Failure("mapping_missing_ambiguous_or_unowned")
+    original = candidate["original"]
+    return f"[{original[3]}]:{original[4]}"
+
+
 def inspect_mappings(p, ct):
     entries = owned_entries(p, ct.dump())
     if p.get("system_dns") is not None:
@@ -1017,7 +1094,10 @@ def execute(request):
                     inspect_firewall(p, firewall(ipv6=True), False, ipv6=True)
                 require(not inspect_mappings(p, ct), "owned_conntrack_residual")
             else:
-                origin = resolve(p, ct.dump(), request["protocol"], request["peer"])
+                if isinstance(request["peer"], str) and request["peer"].startswith("["):
+                    origin = resolve6(p, ct.dump(ipv6=True), request["protocol"], request["peer"])
+                else:
+                    origin = resolve(p, ct.dump(), request["protocol"], request["peer"])
                 return {"ok": True, "operation": operation, "origin": origin}
             return {"ok": True, "operation": operation}
         except (OSError, Failure) as error:
