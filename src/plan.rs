@@ -1,6 +1,6 @@
 use crate::{host, kernel, probe::Snapshot};
 use serde::{Deserialize, Serialize};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::num::NonZeroU16;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -17,6 +17,17 @@ pub struct Plan {
     // Omitted for old M1 journals: their kernel rule tag is a digest of the plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_dns: Option<Ipv4Addr>,
+    /// Optional IPv6 ingress identity. Older journals and NAT-only targets
+    /// leave this absent until the transparent IPv6 path is verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv6: Option<Ipv6Plan>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Ipv6Plan {
+    pub guest: Ipv6Addr,
+    pub ingress: SocketAddrV6,
 }
 
 fn scope(
@@ -37,8 +48,9 @@ fn scope(
         || ingress.ip() == &guest
         || ingress.port() < 1024
         || (system_dns.is_none() && origins.is_empty())
-        || system_dns
-            .is_some_and(|ip| !origins.is_empty() || !crate::managed::valid_resolver(ip) || ip == guest)
+        || system_dns.is_some_and(|ip| {
+            !origins.is_empty() || !crate::managed::valid_resolver(ip) || ip == guest
+        })
         || origins.len() > 8
     {
         return Err("invalid_lab_scope".into());
@@ -58,6 +70,20 @@ fn scope(
 impl Plan {
     pub(crate) fn validate(&self) -> Result<(), String> {
         scope(self.guest, self.ingress, &self.origins, self.system_dns)?;
+        if let Some(ipv6) = &self.ipv6 {
+            if ipv6.guest.is_unspecified()
+                || ipv6.guest.is_loopback()
+                || ipv6.guest.is_multicast()
+                || ipv6.guest.is_unicast_link_local()
+                || ipv6.ingress.ip().is_unspecified()
+                || ipv6.ingress.ip().is_multicast()
+                || ipv6.ingress.ip().is_unicast_link_local()
+                || ipv6.ingress.port() < 1024
+                || ipv6.guest == *ipv6.ingress.ip()
+            {
+                return Err("invalid_ipv6_scope".into());
+            }
+        }
         kernel::validate(self)
     }
 
@@ -111,6 +137,7 @@ impl Plan {
             origins,
             cookie,
             system_dns,
+            ipv6: None,
         })
     }
 }

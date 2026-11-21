@@ -248,6 +248,7 @@ mod tests {
             ],
             cookie: 0x12345678,
             system_dns: None,
+            ipv6: None,
         }
     }
 

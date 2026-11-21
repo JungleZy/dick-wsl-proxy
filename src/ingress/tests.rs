@@ -369,6 +369,7 @@ fn unavailable_metadata_never_falls_back_to_an_enumerated_origin() {
         origins: vec![SocketAddrV4::new(guest, 443)],
         system_dns: None,
         cookie: 1,
+        ipv6: None,
     };
     let shared = Shared::new();
     let peer = SocketAddrV4::new(guest, 49152);

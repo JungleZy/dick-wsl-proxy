@@ -279,6 +279,7 @@ mod tests {
             origins,
             system_dns: None,
             cookie: 1,
+            ipv6: None,
         }
     }
 

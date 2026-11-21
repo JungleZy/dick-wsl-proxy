@@ -44,6 +44,7 @@ fn plan(cookie: u32) -> Plan {
         origins: vec![SocketAddrV4::new(Ipv4Addr::new(172, 20, 0, 2), 18080)],
         cookie,
         system_dns: None,
+        ipv6: None,
     }
 }
 
