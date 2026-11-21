@@ -77,7 +77,6 @@ impl Plan {
                 || ipv6.guest.is_unicast_link_local()
                 || ipv6.ingress.ip().is_unspecified()
                 || ipv6.ingress.ip().is_multicast()
-                || ipv6.ingress.ip().is_unicast_link_local()
                 || ipv6.ingress.port() < 1024
                 || ipv6.guest == *ipv6.ingress.ip()
             {
@@ -127,6 +126,7 @@ impl Plan {
         if cookie == 0 {
             return Err("zero_instance_mark_retry_start".into());
         }
+        let ipv6 = ipv6_scope(s, port);
         Ok(Self {
             target: target.clone(),
             cgroup_ns: s.cgroup_ns.clone(),
@@ -137,9 +137,63 @@ impl Plan {
             origins,
             cookie,
             system_dns,
-            ipv6: None,
+            ipv6,
         })
     }
+}
+
+fn ipv6_scope(snapshot: &Snapshot, port: NonZeroU16) -> Option<Ipv6Plan> {
+    let evidence = &snapshot.evidence;
+    let addresses = evidence
+        .get("baseline.addresses_v6")
+        .filter(|item| item.status == "ok")
+        .map(|item| item.value.as_str())?;
+    let guest = addresses.lines().find_map(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        let address = fields
+            .windows(2)
+            .find(|pair| pair[0] == "inet6" && pair[1].contains('/'))?
+            .get(1)?
+            .split_once('/')?
+            .0
+            .parse::<Ipv6Addr>()
+            .ok()?;
+        fields
+            .windows(2)
+            .any(|pair| pair == ["scope", "global"])
+            .then_some(address)
+    })?;
+    let routes = evidence
+        .get("baseline.routes_v6")
+        .filter(|item| item.status == "ok")
+        .map(|item| item.value.as_str())?;
+    let gateway = routes.lines().find_map(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        (fields.first() == Some(&"default"))
+            .then(|| {
+                fields
+                    .windows(2)
+                    .find(|pair| pair[0] == "via")?
+                    .get(1)?
+                    .parse()
+                    .ok()
+            })
+            .flatten()
+    })?;
+    let links = evidence
+        .get("baseline.links")
+        .filter(|item| item.status == "ok")
+        .map(|item| item.value.as_str())?;
+    let scope_id = links.lines().find_map(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        let index = fields.first()?.strip_suffix(':')?.parse::<u32>().ok()?;
+        let name = fields.get(1)?.strip_suffix(':')?;
+        (name == "eth0").then_some(index)
+    })?;
+    Some(Ipv6Plan {
+        guest,
+        ingress: SocketAddrV6::new(gateway, port.get(), 0, scope_id),
+    })
 }
 
 #[cfg(test)]
@@ -169,5 +223,53 @@ mod tests {
         let dns = Some(Ipv4Addr::new(10, 255, 255, 254));
         assert!(scope(guest, listener, &[], dns).is_ok());
         assert!(scope(guest, listener, &["172.28.4.5:41001".parse().unwrap()], dns).is_err());
+    }
+
+    #[test]
+    fn derives_ipv6_guest_and_scoped_gateway_when_a_default_route_exists() {
+        let mut evidence = std::collections::BTreeMap::new();
+        for (key, value) in [
+            (
+                "baseline.addresses_v6",
+                "1: lo    inet6 ::1/128 scope host\n2: eth0    inet6 2001:db8:1::2/64 scope global",
+            ),
+            (
+                "baseline.routes_v6",
+                "default via fe80::1 dev eth0 proto ra",
+            ),
+            (
+                "baseline.links",
+                "1: lo: <LOOPBACK>\n2: eth0: <BROADCAST,UP>",
+            ),
+        ] {
+            evidence.insert(
+                key.to_owned(),
+                crate::probe::Observation {
+                    status: "ok".into(),
+                    value: value.into(),
+                },
+            );
+        }
+        let snapshot = Snapshot {
+            registered_name: "fixture".into(),
+            guest_name: "fixture".into(),
+            cgroup_ns: String::new(),
+            cgroup_root: String::new(),
+            cgroup_path: String::new(),
+            cgroup_mount_root: String::new(),
+            identity_valid: true,
+            pid1: String::new(),
+            uid: Some(0),
+            cap_net_admin: true,
+            networking_mode: "nat".into(),
+            gateway: None,
+            blockers: Vec::new(),
+            baseline_fingerprints: Default::default(),
+            evidence,
+        };
+        let ipv6 = ipv6_scope(&snapshot, NonZeroU16::new(43531).unwrap()).unwrap();
+        assert_eq!(ipv6.guest, "2001:db8:1::2".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(ipv6.ingress.ip(), &"fe80::1".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(ipv6.ingress.scope_id(), 2);
     }
 }
