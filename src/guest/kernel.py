@@ -424,7 +424,50 @@ def m2_artifacts(p):
     return chain, tag, hooks, body, guards
 
 
+def ipv6_artifacts(p):
+    require("ipv6" in p, "ipv6_plan_missing")
+    guest, _ = endpoint6("[" + p["ipv6"]["guest"] + "]:1")
+    ingress, ingress_port = endpoint6(p["ipv6"]["ingress"])
+    cookie = f"{p['cookie']:08x}"
+    chain, guard_chain = "WPM2V_" + cookie, "WPM2VG_" + cookie
+    digest = plan_digest(p)[:16]
+    tag = "wsl-proxyctl-m2v6:" + cookie + ":" + digest
+    comment = ["-m", "comment", "--comment", tag]
+    mark = f"0x{p['cookie']:x}"
+    local = ["-m", "cgroup", "--path", "/"]
+    fresh = ["-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL"]
+    hooks, body = [], []
+    for protocol in ("tcp", "udp"):
+        body.append(["-A", chain, "-d", ingress + "/128", "-p", protocol, "-m", protocol, "--dport", str(ingress_port), *comment, "-j", "RETURN"])
+    for network in ("::/128", "::1/128", "fe80::/10", "ff00::/8"):
+        body.append(["-A", chain, "-d", network, *comment, "-j", "RETURN"])
+    body.extend([
+        ["-A", chain, "-m", "connmark", "--mark", "0x0", *comment, "-j", "CONNMARK", "--set-xmark", mark + "/0xffffffff"],
+        ["-A", chain, "-p", "tcp", "-m", "connmark", "--mark", mark, *comment, "-j", "DNAT", "--to-destination", f"[{ingress}]:{ingress_port}"],
+        ["-A", chain, "-p", "udp", "-m", "connmark", "--mark", mark, *comment, "-j", "DNAT", "--to-destination", f"[{ingress}]:{ingress_port}"],
+    ])
+    for protocol in ("tcp", "udp"):
+        hooks.append(["-A", "OUTPUT", "-s", guest + "/128", "!", "-d", "::1/128", "-p", protocol, *local, *fresh, *comment, "-j", chain])
+        hooks.append(["-A", "PREROUTING", "!", "-i", "eth0", "-p", protocol, "-m", protocol, *fresh, *comment, "-j", chain])
+        hooks.append(["-A", "POSTROUTING", "-d", ingress + "/128", "-p", protocol, "-m", protocol, "--dport", str(ingress_port), "-m", "conntrack", "--ctdir", "ORIGINAL", "--ctstate", "DNAT", "-m", "connmark", "--mark", mark, *comment, "-j", "SNAT", "--to-source", guest])
+    guards = [
+        ["-A", "OUTPUT", *local, "-m", "conntrack", "!", "--ctorigdst", "::1/128", *comment, "-j", guard_chain],
+        ["-A", "OUTPUT", "!", "-d", "::1/128", *local, "-m", "conntrack", "--ctstate", "INVALID,UNTRACKED", *comment, "-j", guard_chain],
+        ["-A", guard_chain, "-m", "conntrack", "--ctdir", "REPLY", *comment, "-j", "RETURN"],
+    ]
+    for protocol in ("tcp", "udp"):
+        guards.append(["-A", guard_chain, "-s", guest + "/128", "-p", protocol, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL", "--ctorigsrc", guest, *comment, "-j", "RETURN"])
+        guards.append(["-A", guard_chain, "-s", guest + "/128", "-d", ingress + "/128", "-p", protocol, "-m", protocol, "--dport", str(ingress_port), "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "--ctorigsrc", guest, "-m", "connmark", "--mark", mark, *comment, "-j", "RETURN"])
+        guards.append(["-A", "FORWARD", "-p", protocol, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-m", "connmark", "--mark", mark, *comment, "-j", "RETURN"])
+        guards.append(["-A", "FORWARD", "-d", ingress + "/128", "-p", protocol, "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "-m", "connmark", "--mark", mark, *comment, "-j", "RETURN"])
+    guards.append(["-A", "FORWARD", *comment, "-j", "DROP"])
+    guards.append(["-A", guard_chain, *comment, "-j", "DROP"])
+    return chain, guard_chain, tag, hooks, body, guards
+
+
 def ipv6_guards(p):
+    if p.get("ipv6") is not None:
+        return ipv6_artifacts(p)[5]
     if p.get("system_dns") is None:
         return []
     comment = ["-m", "comment", "--comment", artifacts(p)[1]]
@@ -526,9 +569,16 @@ def rule_key(rule):
 
 def inspect_firewall(p, tables, existing, ipv6=False):
     chain, tag, hooks, body, guards = artifacts(p)
+    if ipv6 and p.get("ipv6") is not None:
+        v6_chain, v6_guard, tag, hooks, body, guards = ipv6_artifacts(p)
+        chain = v6_chain
     cookie = f"{p['cookie']:08x}"
     reserved = {"WPM1_" + cookie, "WPM2_" + cookie, "WPM2G_" + cookie}
-    chains = {} if ipv6 else {chain: "nat"}
+    if ipv6 and p.get("ipv6") is not None:
+        reserved.update({v6_chain, v6_guard})
+        chains = {v6_chain: "nat", v6_guard: "filter"}
+    else:
+        chains = {} if ipv6 else {chain: "nat"}
     if not ipv6 and p.get("system_dns") is not None:
         chains["WPM2G_" + cookie] = "filter"
     expected = {"nat": [] if ipv6 else [rule_key(rule) for rule in hooks + body], "filter": [rule_key(rule) for rule in (ipv6_guards(p) if ipv6 else guards)]}
@@ -536,7 +586,7 @@ def inspect_firewall(p, tables, existing, ipv6=False):
     seen = {"nat": set(), "filter": set()}
     observed_chains = set()
     present = False
-    prefixes = tuple("wsl-proxyctl-" + mode + ":" + cookie + ":" for mode in ("m1", "m2"))
+    prefixes = tuple("wsl-proxyctl-" + mode + ":" + cookie + ":" for mode in ("m1", "m2", "m2v6"))
     for name, table in tables.items():
         for owned_chain in reserved.intersection(table["chains"]):
             require(existing and chains.get(owned_chain) == name and table["chains"][owned_chain] == "-", "instance_chain_collision")
@@ -557,12 +607,18 @@ def inspect_firewall(p, tables, existing, ipv6=False):
             require(not mark_mentions(rule, p["cookie"]), "instance_mark_rule_collision")
     if found["nat"]:
         require(present, "owned_chain_missing")
+    if ipv6 and p.get("ipv6") is not None and found["filter"]:
+        require(v6_guard in observed_chains, "owned_ipv6_guard_chain_missing")
     if not ipv6 and p.get("system_dns") is not None and found["filter"]:
         require("WPM2G_" + cookie in observed_chains, "owned_guard_chain_missing")
     return present, found
 
 
 def rules_complete(p, present, rules, ipv6_rules):
+    if p.get("ipv6") is not None:
+        chain, guard, _, hooks, body, guards = ipv6_artifacts(p)
+        same = lambda left, right: sorted(rule_key(rule) for rule in left) == sorted(rule_key(rule) for rule in right)
+        return present and same(rules["nat"], hooks + body) and same(rules["filter"], guards)
     _, _, hooks, body, guards = artifacts(p)
     same = lambda left, right: sorted(rule_key(rule) for rule in left) == sorted(rule_key(rule) for rule in right)
     return present and same(rules["nat"], hooks + body) and same(rules["filter"], guards) and (p.get("system_dns") is None or same(ipv6_rules["filter"], ipv6_guards(p)))
@@ -574,7 +630,7 @@ def transaction(table, lines, test=False, ipv6=False):
         arguments.append("--test")
     # This is xtables-restore input, not shell syntax: it treats shlex's single
     # quotes around `!` as data. All rules are typed/canonicalized before rendering.
-    require(all(re.fullmatch(r"[A-Za-z0-9_:./!,=+-]+", token) for line in lines for token in line), "unsafe_restore_token")
+    require(all(re.fullmatch(r"[A-Za-z0-9_:\[\]./%!,=+-]+", token) for line in lines for token in line), "unsafe_restore_token")
     document = "*" + table + "\n" + "\n".join(" ".join(line) for line in lines) + "\nCOMMIT\n"
     run(arguments, document)
 
@@ -594,7 +650,21 @@ def install_rules(p, test=False):
         # place the whole gate ahead of pre-existing FORWARD accepts.
         lines.extend(["-I", "FORWARD", "1", *rule[2:]] for rule in reversed(forward))
         transaction("filter", lines, test)
-        transaction("filter", [insert(rule) for rule in ipv6_guards(p)], test, ipv6=True)
+        if p.get("ipv6") is not None:
+            v6_chain, v6_guard, _, v6_hooks, v6_body, v6_guards = ipv6_artifacts(p)
+            v6_forward = [rule for rule in v6_guards if rule[1] == "FORWARD"]
+            v6_other = [rule for rule in v6_guards if rule[1] != "FORWARD"]
+            v6_lines = [["-N", v6_guard], *v6_other]
+            v6_lines.extend(["-I", "FORWARD", "1", *rule[2:]] for rule in reversed(v6_forward))
+            transaction("filter", v6_lines, test, ipv6=True)
+            transaction(
+                "nat",
+                [["-N", v6_chain], *v6_body, *(insert(rule) if rule[1] == "OUTPUT" else rule for rule in v6_hooks)],
+                test,
+                ipv6=True,
+            )
+        else:
+            transaction("filter", [insert(rule) for rule in ipv6_guards(p)], test, ipv6=True)
     else:
         transaction("filter", [insert(rule) for rule in guards], test)
     # -N fails on a concurrent name collision; never flush an existing chain.
@@ -963,11 +1033,17 @@ def resolve6(p, entries, protocol, peer):
 
 def inspect_mappings(p, ct):
     entries = owned_entries(p, ct.dump())
-    if p.get("system_dns") is not None:
+    if p.get("system_dns") is not None and p.get("ipv6") is None:
         # M2 never creates IPv6 NAT. A matching IPv6 connmark is foreign, not
         # permission to delete anything in the shared conntrack namespace.
         require(not any(entry["mark"] == p["cookie"] for entry in ct.dump(ipv6=True)), "instance_ipv6_connmark_collision")
     return entries
+
+
+def inspect_ipv6_mappings(p, ct):
+    if p.get("ipv6") is None:
+        return []
+    return Ownership6(p).entries(ct.dump(ipv6=True))
 
 
 class MappingIndex:
@@ -1040,9 +1116,10 @@ def execute(request):
         try:
             if operation in ("precheck", "install"):
                 inspect_firewall(p, firewall(), False)
-                if p.get("system_dns") is not None:
+                if p.get("system_dns") is not None or p.get("ipv6") is not None:
                     inspect_firewall(p, firewall(ipv6=True), False, ipv6=True)
                 require(not inspect_mappings(p, ct), "instance_connmark_collision")
+                require(not inspect_ipv6_mappings(p, ct), "instance_ipv6_connmark_collision")
                 # --test checks extension support without committing any table.
                 install_rules(p, test=True)
                 if operation == "install":
@@ -1054,16 +1131,17 @@ def execute(request):
             elif operation in ("remove", "inspect"):
                 present, rules = inspect_firewall(p, firewall(), True)
                 ipv6_rules = None
-                if p.get("system_dns") is not None:
+                if p.get("system_dns") is not None or p.get("ipv6") is not None:
                     _, ipv6_rules = inspect_firewall(p, firewall(ipv6=True), True, ipv6=True)
                 # Complete both families and every owned tuple before any delete.
                 entries = inspect_mappings(p, ct)
+                ipv6_entries = inspect_ipv6_mappings(p, ct)
                 if operation == "inspect":
                     ownership = {
                         "identity_matches": identity_matches,
                         "rules_present": present or any(rules.values()) or bool(ipv6_rules and any(ipv6_rules.values())),
                         "rules_complete": rules_complete(p, present, rules, ipv6_rules),
-                        "mappings_present": bool(entries),
+                        "mappings_present": bool(entries or ipv6_entries),
                     }
                     require(identity_matches or not (ownership["rules_present"] or ownership["mappings_present"]), "stale_identity_has_owned_artifacts")
                     if not ownership["rules_present"] and not ownership["mappings_present"]:
@@ -1078,21 +1156,50 @@ def execute(request):
                     if p.get("system_dns") is not None:
                         deletions.append(["-X", "WPM2G_" + f"{p['cookie']:08x}"])
                     transaction("filter", deletions)
-                if ipv6_rules and ipv6_rules["filter"]:
-                    transaction("filter", [["-D", *rule[1:]] for rule in ipv6_rules["filter"]], ipv6=True)
+                if ipv6_rules:
+                    if p.get("ipv6") is not None:
+                        v6_chain, v6_guard, _, _, _, _ = ipv6_artifacts(p)
+                        if ipv6_rules["nat"]:
+                            transaction(
+                                "nat",
+                                [["-D", *rule[1:]] for rule in ipv6_rules["nat"]]
+                                + [["-X", v6_chain]],
+                                ipv6=True,
+                            )
+                        if ipv6_rules["filter"]:
+                            transaction(
+                                "filter",
+                                [["-D", *rule[1:]] for rule in ipv6_rules["filter"]]
+                                + [["-X", v6_guard]],
+                                ipv6=True,
+                            )
+                    elif ipv6_rules["filter"]:
+                        transaction(
+                            "filter",
+                            [["-D", *rule[1:]] for rule in ipv6_rules["filter"]],
+                            ipv6=True,
+                        )
                 # Table commits synchronize old readers before exact tuple cleanup.
                 for _ in range(4):
                     entries = inspect_mappings(p, ct)
-                    if not entries:
+                    ipv6_entries = inspect_ipv6_mappings(p, ct)
+                    if not entries and not ipv6_entries:
                         break
                     for entry in entries:
+                        ct.delete(entry)
+                    for entry in ipv6_entries:
+                        ct.delete(entry)
+                    for entry in ipv6_entries:
                         ct.delete(entry)
                 else:
                     raise Failure("owned_conntrack_residual")
                 inspect_firewall(p, firewall(), False)
-                if p.get("system_dns") is not None:
+                if p.get("system_dns") is not None or p.get("ipv6") is not None:
                     inspect_firewall(p, firewall(ipv6=True), False, ipv6=True)
-                require(not inspect_mappings(p, ct), "owned_conntrack_residual")
+                require(
+                    not inspect_mappings(p, ct) and not inspect_ipv6_mappings(p, ct),
+                    "owned_conntrack_residual",
+                )
             else:
                 if isinstance(request["peer"], str) and request["peer"].startswith("["):
                     origin = resolve6(p, ct.dump(ipv6=True), request["protocol"], request["peer"])

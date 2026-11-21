@@ -456,6 +456,21 @@ class FirewallTests(unittest.TestCase):
             kernel.transaction("filter", [["-I", "OUTPUT", "!", "-d", "127.0.0.0/8", "-j", "DROP"]], test=True)
         self.assertEqual(run.call_args.args[1], "*filter\n-I OUTPUT ! -d 127.0.0.0/8 -j DROP\nCOMMIT\n")
 
+    def test_ipv6_artifacts_include_nat_and_forward_gate(self):
+        p = comprehensive_plan()
+        p["ipv6"] = {
+            "guest": "2001:db8:1::2",
+            "ingress": "[fe80::1%2]:43771",
+        }
+        chain, guard, _, hooks, body, guards = kernel.ipv6_artifacts(p)
+        self.assertTrue(chain.startswith("WPM2V_"))
+        self.assertTrue(guard.startswith("WPM2VG_"))
+        self.assertTrue(any(rule[1] == "PREROUTING" for rule in hooks))
+        self.assertTrue(any("DNAT" in rule for rule in body))
+        self.assertTrue(any(rule[1] == "FORWARD" and rule[-1] == "DROP" for rule in guards))
+        for rule in hooks + body + guards:
+            kernel.rule_key(rule)
+
     def snapshot(self, p=None):
         return snapshot(p)
 
