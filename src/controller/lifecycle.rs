@@ -1,6 +1,6 @@
 //! Serialize changes under the Windows controller lock. The operation log records
 //! ordering; only authenticated kernel evidence and the owner journal authorize cleanup.
-use super::{journal, Controller};
+use super::{Controller, journal};
 use crate::{
     host, kernel, lease,
     managed::Runtime,
@@ -11,7 +11,13 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 fn registered(p: &Plan) -> Result<(), String> {
-    if host::distributions()?.iter().any(|d| d == &p.target) {
+    // A WSL restart or storage move can refresh the display name/base path
+    // while retaining the registry GUID. Guest-side stale-context checks still
+    // decide whether any tagged rules are removable.
+    if host::distributions()?
+        .iter()
+        .any(|d| d.id.eq_ignore_ascii_case(&p.target.id))
+    {
         Ok(())
     } else {
         Err("journal_distribution_no_longer_matches_registration".into())
@@ -104,7 +110,9 @@ impl Controller {
             .runtime
             .as_deref()
             .ok_or("switch_requires_live_managed_owner")?;
-        if journal::load()?.as_ref() != Some(p) || !self.readiness.as_ref().is_some_and(Result::is_ok) {
+        if journal::load()?.as_ref() != Some(p)
+            || !self.readiness.as_ref().is_some_and(Result::is_ok)
+        {
             return Err("active_owner_unverified".into());
         }
         ingress.health()?;

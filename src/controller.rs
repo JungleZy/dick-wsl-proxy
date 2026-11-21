@@ -157,7 +157,10 @@ impl Controller {
         if self.live.as_ref().is_some_and(|(l, _)| *l != p) {
             return Err("journal_ownership_changed".into());
         }
-        if !host::distributions()?.iter().any(|d| d == &p.target) {
+        if !host::distributions()?
+            .iter()
+            .any(|d| d.id.eq_ignore_ascii_case(&p.target.id))
+        {
             return Err("journal_distribution_no_longer_matches_registration".into());
         }
         // Revoke even an armed install that has not committed a rule yet. A stale
