@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
+use std::net::{
+    Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, TcpStream, UdpSocket,
+};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc::Receiver};
 use std::thread::{self, JoinHandle};
@@ -262,7 +264,7 @@ impl Shared {
         self.request_stop();
     }
 
-    fn record_metadata(&self, protocol: &str, result: &Result<SocketAddrV4, String>) {
+    fn record_metadata_result<T>(&self, protocol: &str, result: &Result<T, String>) {
         let mut counters = lock(&self.counters);
         counters.metadata_queries = counters.metadata_queries.saturating_add(1);
         match result {
@@ -282,6 +284,15 @@ impl Shared {
                 }
             }
         }
+    }
+
+    fn record_metadata(&self, protocol: &str, result: &Result<SocketAddrV4, String>) {
+        self.record_metadata_result(protocol, result);
+    }
+
+    #[allow(dead_code)] // Used by the pending IPv6 transparent ingress worker.
+    fn record_metadata_v6(&self, protocol: &str, result: &Result<SocketAddrV6, String>) {
+        self.record_metadata_result(protocol, result);
     }
 
     fn record_error(&self, protocol: &str, mut error: String) {
@@ -473,6 +484,17 @@ impl DestinationGroup {
         };
         finish_observation(plan, "udp", self.started, observation, shared)
     }
+
+    #[allow(dead_code)] // Used by the pending IPv6 transparent ingress worker.
+    fn next_v6(&mut self, plan: &Plan, shared: &Shared) -> Result<SocketAddrV6, String> {
+        let observation = match &mut self.observations {
+            Ok(observations) => observations
+                .next()
+                .ok_or_else(|| "query_transport_incomplete_group".to_owned()),
+            Err(error) => Err(error.clone()),
+        };
+        finish_observation_v6(plan, "udp", self.started, observation, shared)
+    }
 }
 
 fn destination_group(plan: &Plan, keys: &[Lookup], shared: &Shared) -> DestinationGroup {
@@ -552,6 +574,48 @@ fn finish_observation(
             }
         });
     shared.record_metadata(protocol, &result);
+    result
+}
+
+#[allow(dead_code)] // Used by the pending IPv6 transparent ingress worker.
+fn finish_observation_v6(
+    plan: &Plan,
+    protocol: &str,
+    started: Instant,
+    observation: Result<Observation, String>,
+    shared: &Shared,
+) -> Result<SocketAddrV6, String> {
+    let result = observation
+        .and_then(|obs| {
+            lock(&shared.timing).observe(
+                obs.started.saturating_duration_since(started),
+                obs.elapsed,
+                obs.batch,
+                obs.guest_us,
+            );
+            obs.origin
+        })
+        .and_then(|origin| {
+            let SocketAddr::V6(origin) = origin else {
+                return Err("IPv4 origin requires the IPv4 ingress path".into());
+            };
+            let Some(ipv6) = &plan.ipv6 else {
+                return Err("IPv6 ingress identity is unavailable".into());
+            };
+            if shared.is_stopping()
+                || origin == ipv6.ingress
+                || origin.port() == 0
+                || origin.ip().is_unspecified()
+                || origin.ip().is_multicast()
+                || origin.ip().is_loopback()
+                || origin.ip().is_unicast_link_local()
+            {
+                Err("IPv6 origin lookup is no longer authorized".into())
+            } else {
+                Ok(origin)
+            }
+        });
+    shared.record_metadata_v6(protocol, &result);
     result
 }
 
