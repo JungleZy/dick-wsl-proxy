@@ -1,5 +1,5 @@
 use crate::plan::Plan;
-use std::net::SocketAddrV4;
+use std::net::SocketAddr;
 
 #[cfg(any(windows, test))]
 use serde::{Deserialize, Serialize};
@@ -26,7 +26,7 @@ use bootstrap::BOOTSTRAP;
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 pub(crate) struct Lookup {
     pub protocol: &'static str,
-    pub peer: SocketAddrV4,
+    pub peer: SocketAddr,
 }
 
 /// Guest durations per physical batch, measured with a monotonic clock.
@@ -36,7 +36,7 @@ pub(crate) struct Lookup {
 /// Neither includes JSON/stdio transit, host queueing, or helper startup.
 #[derive(Debug)]
 pub struct BatchOrigins {
-    pub origins: Vec<Option<SocketAddrV4>>,
+    pub origins: Vec<Option<SocketAddr>>,
     pub kernel_read_us: u64,
     pub decode_lookup_us: u64,
 }
@@ -55,7 +55,7 @@ enum Response {
     Ready {},
     Origins {
         id: u64,
-        origins: Vec<Option<SocketAddrV4>>,
+        origins: Vec<Option<SocketAddr>>,
         kernel_read_us: u64,
         decode_lookup_us: u64,
     },
@@ -114,18 +114,30 @@ fn read_response(reader: &mut impl BufRead, buffer: &mut Vec<u8>) -> Result<Resp
 }
 
 #[cfg(any(windows, test))]
-fn origin_allowed(plan: &Plan, origin: SocketAddrV4) -> bool {
-    if plan.system_dns.is_none() {
-        return plan.origins.contains(&origin);
+fn origin_allowed(plan: &Plan, origin: SocketAddr) -> bool {
+    match origin {
+        SocketAddr::V4(origin) => {
+            if plan.system_dns.is_none() {
+                return plan.origins.contains(&origin);
+            }
+            let [first, second, _, _] = origin.ip().octets();
+            plan.origins.is_empty()
+                && first != 0
+                && first != 127
+                && first < 224
+                && !(first == 169 && second == 254)
+                && origin.port() != 0
+                && origin != plan.ingress
+        }
+        SocketAddr::V6(origin) => plan.ipv6.as_ref().is_some_and(|ipv6| {
+            !origin.ip().is_unspecified()
+                && !origin.ip().is_loopback()
+                && !origin.ip().is_multicast()
+                && !origin.ip().is_unicast_link_local()
+                && origin.port() != 0
+                && origin != ipv6.ingress
+        }),
     }
-    let [first, second, _, _] = origin.ip().octets();
-    plan.origins.is_empty()
-        && first != 0
-        && first != 127
-        && first < 224
-        && !(first == 169 && second == 254)
-        && origin.port() != 0
-        && origin != plan.ingress
 }
 
 /// A bounded, ordered, read-only stdio batch, never a guest service or listener.
@@ -166,7 +178,14 @@ impl QueryBridge {
                 || lookups.len() > MAX_LOOKUPS
                 || lookups.iter().any(|key| {
                     !matches!(key.protocol, "tcp" | "udp")
-                        || key.peer.ip() != &self.plan.guest
+                        || !match key.peer {
+                            SocketAddr::V4(peer) => peer.ip() == &self.plan.guest,
+                            SocketAddr::V6(peer) => self
+                                .plan
+                                .ipv6
+                                .as_ref()
+                                .is_some_and(|ipv6| peer.ip() == &ipv6.guest),
+                        }
                         || key.peer.port() == 0
                 })
             {

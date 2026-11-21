@@ -1,6 +1,7 @@
 use super::{
     BTreeMap, DestinationGroup, Ipv4Addr, Lookup, MAX_UDP, POLL_INTERVAL, Plan, Route, Shared,
-    SocketAddrV4, TcpListener, UDP_BATCH, UdpFlow, UdpSocket, record_udp_retirement, route,
+    SocketAddr, SocketAddrV4, TcpListener, UDP_BATCH, UdpFlow, UdpSocket, record_udp_retirement,
+    route,
 };
 use std::{
     io,
@@ -37,7 +38,7 @@ impl UdpPump {
     pub(super) fn keys(&self) -> impl Iterator<Item = Lookup> + '_ {
         self.pending.iter().map(|reply| Lookup {
             protocol: "udp",
-            peer: reply.peer,
+            peer: SocketAddr::V4(reply.peer),
         })
     }
 

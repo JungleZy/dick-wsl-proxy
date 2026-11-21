@@ -427,7 +427,12 @@ fn submit_destination(
         lock(&shared.bridge)
             .as_ref()
             .ok_or_else(|| "query_transport_closed: metadata bridge is closed".to_owned())
-            .and_then(|lane| lane.submit(Lookup { protocol, peer }))
+            .and_then(|lane| {
+                lane.submit(Lookup {
+                    protocol,
+                    peer: SocketAddr::V4(peer),
+                })
+            })
     };
     PendingDestination {
         started,
@@ -473,10 +478,12 @@ impl DestinationGroup {
 fn destination_group(plan: &Plan, keys: &[Lookup], shared: &Shared) -> DestinationGroup {
     let started = Instant::now();
     let receiver = if shared.is_stopping()
-        || keys
-            .iter()
-            .any(|key| key.peer.ip() != &plan.guest || key.peer.port() == 0)
-    {
+        || keys.iter().any(|key| {
+            !matches!(
+                key.peer,
+                SocketAddr::V4(peer) if peer.ip() == &plan.guest && peer.port() != 0
+            )
+        }) {
         Err("unauthorized ingress peer or stopped ingress".into())
     } else {
         lock(&shared.bridge)
@@ -743,7 +750,7 @@ fn run(
             pending.push((slot, size, peer));
             keys.push(Lookup {
                 protocol: "udp",
-                peer,
+                peer: SocketAddr::V4(peer),
             });
         }
         let mut observations =

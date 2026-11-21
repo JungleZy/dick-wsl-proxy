@@ -397,7 +397,7 @@ fn unavailable_metadata_never_falls_back_to_an_enumerated_origin() {
             &plan,
             &[Lookup {
                 protocol: "udp",
-                peer,
+                peer: SocketAddr::V4(peer),
             }],
             &shared,
         );

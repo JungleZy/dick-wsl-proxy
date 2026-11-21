@@ -5,7 +5,7 @@ use crate::{
     query_bridge::{BatchOrigins, Lookup, MAX_LOOKUPS, QueryBridge},
 };
 use std::{
-    net::SocketAddrV4,
+    net::{SocketAddr, SocketAddrV4},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -151,8 +151,13 @@ fn observe(
     let elapsed = started.elapsed();
     (0..count).map(move |i| {
         let origin = match &results {
-            Ok(batch) => batch.origins[i]
-                .ok_or_else(|| "query_lookup_mapping_missing_ambiguous_or_unowned".to_owned()),
+            Ok(batch) => match batch.origins[i] {
+                Some(SocketAddr::V4(origin)) => Ok(origin),
+                Some(SocketAddr::V6(_)) => {
+                    Err("query_lookup_ipv6_origin_requires_ipv6_ingress".to_owned())
+                }
+                None => Err("query_lookup_mapping_missing_ambiguous_or_unowned".to_owned()),
+            },
             Err(e) => Err(e.clone()),
         };
         Observation {
@@ -181,7 +186,7 @@ mod tests {
             send.send(Job::One(
                 Lookup {
                     protocol: "tcp",
-                    peer: SocketAddrV4::new([127, 0, 0, 1].into(), 9000 + i as u16),
+                    peer: SocketAddr::V4(SocketAddrV4::new([127, 0, 0, 1].into(), 9000 + i as u16)),
                 },
                 tx,
             ))
@@ -219,7 +224,7 @@ mod tests {
         let (last, r2) = mpsc::sync_channel(1);
         let key = |p| Lookup {
             protocol: "udp",
-            peer: SocketAddrV4::new([127, 0, 0, 1].into(), p),
+            peer: SocketAddr::V4(SocketAddrV4::new([127, 0, 0, 1].into(), p)),
         };
         send.send(Job::One(key(1), first)).unwrap();
         send.send(Job::Group(vec![key(2), key(3)], group)).unwrap();
