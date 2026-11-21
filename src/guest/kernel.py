@@ -500,9 +500,8 @@ def ipv6_guards(p):
         return []
     comment = ["-m", "comment", "--comment", artifacts(p)[1]]
     base = ["-A", "OUTPUT", "-m", "cgroup", "--path", "/"]
-    # IPv6 has no authenticated ingress or SOCKS route yet. Drop forwarded
-    # namespaces as well as local external traffic so container IPv6 cannot
-    # silently bypass the managed policy.
+    # Without an IPv6 plan, drop forwarded namespaces and local external
+    # traffic so container IPv6 cannot silently bypass the managed policy.
     return [
         [*base, "-m", "conntrack", "--ctdir", "ORIGINAL", "!", "--ctorigdst", "::1/128", *comment, "-j", "DROP"],
         [*base, "!", "-d", "::1/128", "-m", "conntrack", "--ctstate", "INVALID,UNTRACKED", *comment, "-j", "DROP"],

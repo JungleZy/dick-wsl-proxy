@@ -623,7 +623,6 @@ fn valid_endpoint(endpoint: SocketAddrV4, allow_loopback: bool) -> bool {
         && ip.octets()[0] < 240
 }
 
-#[allow(dead_code)] // Used by the pending IPv6 transparent ingress path.
 fn valid_ipv6_endpoint(endpoint: SocketAddrV6) -> bool {
     let ip = endpoint.ip();
     endpoint.port() != 0
