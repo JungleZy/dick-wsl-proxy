@@ -412,10 +412,7 @@ fn destination_v6(
     )
 }
 
-fn route_v6(
-    runtime: &crate::managed::Runtime,
-    origin: SocketAddrV6,
-) -> Result<bool, String> {
+fn route_v6(runtime: &crate::managed::Runtime, origin: SocketAddrV6) -> Result<bool, String> {
     let direct = runtime.policy.allows_ipv6(*origin.ip());
     if origin.port() == 53 && !direct {
         return Err("alternate plaintext IPv6 DNS destination rejected".into());
