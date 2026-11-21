@@ -142,6 +142,9 @@ fn parse_response(output: &str, operation: &str) -> Result<Response, String> {
 }
 
 pub(crate) fn validate(p: &Plan) -> Result<(), String> {
+    if p.ipv6.is_some() {
+        return Err("ipv6_transparent_path_unavailable".into());
+    }
     let target = &p.target;
     if !uuid(&target.id, true)
         || target.version != 2

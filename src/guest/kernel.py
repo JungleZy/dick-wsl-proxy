@@ -82,7 +82,9 @@ def validate(request):
         require(integer(request["deadline"], 1, 0xffffffffffffffff), "invalid_grant_deadline")
     p = request["plan"]
     fields = {"target", "cgroup_ns", "cgroup_root", "boot_id", "guest", "ingress", "origins", "cookie"}
-    require(isinstance(p, dict) and set(p) in (fields, fields | {"system_dns"}), "invalid_plan")
+    allowed_plan = fields | {"system_dns", "ipv6"}
+    require(isinstance(p, dict) and set(p) in (fields, fields | {"system_dns"}, allowed_plan, allowed_plan - {"system_dns"}), "invalid_plan")
+    require("ipv6" not in p, "ipv6_transparent_path_unavailable")
     require("system_dns" not in p or unicast(p["system_dns"]), "invalid_system_dns")
     target = p["target"]
     require(isinstance(target, dict) and set(target) == {"id", "name", "base_path", "version"}, "invalid_target")
