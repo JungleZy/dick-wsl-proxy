@@ -3,6 +3,7 @@
 
 use std::mem::size_of;
 use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
@@ -23,12 +24,26 @@ const TRAY_TIMER: usize = 1;
 const OPEN_COMMAND: usize = 1;
 const EXIT_COMMAND: usize = 2;
 const MAIN_TITLE: &str = "WSL Proxy";
+static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn start() {
     thread::Builder::new()
         .name("wsl-proxy-tray".into())
         .spawn(|| unsafe { run() })
         .ok();
+}
+
+pub(crate) fn consume_exit_request() -> bool {
+    EXIT_REQUESTED.swap(false, Ordering::AcqRel)
+}
+
+pub(crate) fn hide_main_window() {
+    unsafe {
+        let hwnd = FindWindowW(null(), wide(MAIN_TITLE).as_ptr());
+        if !hwnd.is_null() {
+            ShowWindow(hwnd, windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE);
+        }
+    }
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> isize {
@@ -133,6 +148,7 @@ unsafe fn show_menu(hwnd: HWND) {
         EXIT_COMMAND => {
             let main = FindWindowW(null(), wide(MAIN_TITLE).as_ptr());
             if !main.is_null() {
+                EXIT_REQUESTED.store(true, Ordering::Release);
                 PostMessageW(main, windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE, 0, 0);
             }
         }

@@ -69,6 +69,14 @@ pub fn run() {
             options.window_min_size = Some(size(px(800.), px(620.)));
             let opened = gpui_kit::open_window(options, cx, |window, cx| {
                 window.set_window_title(TITLE);
+                window.on_window_should_close(cx, |_window, _cx| {
+                    if tray::consume_exit_request() {
+                        true
+                    } else {
+                        tray::hide_main_window();
+                        false
+                    }
+                });
                 cx.new(|cx| Desktop::new(window, cx))
             });
             if let Err(error) = opened {
