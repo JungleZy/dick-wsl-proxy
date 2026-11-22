@@ -326,7 +326,9 @@ impl Desktop {
         }
         self.environment_editor = Some(EnvironmentEditor::Create);
         self.environment_edit_target = None;
+        self.environment_selected = None;
         self.environment_detail = None;
+        self.environment_started = None;
         self.environment_zsh = true;
         self.environment_chrome = false;
         self.environment_chinese = true;
@@ -350,6 +352,7 @@ impl Desktop {
         }
         self.environment_editor = Some(EnvironmentEditor::Edit);
         self.environment_edit_target = Some(name.clone());
+        self.environment_selected = Some(name.clone());
         self.environment_detail = None;
         self.fields
             .environment_name
@@ -364,6 +367,9 @@ impl Desktop {
     }
 
     pub(crate) fn environment_view(&mut self, name: String, cx: &mut Context<Self>) {
+        self.environment_selected = Some(name.clone());
+        self.environment_editor = None;
+        self.environment_edit_target = None;
         self.send(
             Kind::EnvironmentView,
             json!({"command":"environment_view","name":name}),
@@ -419,6 +425,9 @@ impl Desktop {
                 )
             }
         };
+        if kind == Kind::EnvironmentCreate {
+            self.environment_started = Some(std::time::Instant::now());
+        }
         self.send(kind, request, cx);
     }
 
@@ -438,7 +447,6 @@ impl Desktop {
     pub(crate) fn environment_cancel(&mut self, cx: &mut Context<Self>) {
         self.environment_editor = None;
         self.environment_edit_target = None;
-        self.environment_detail = None;
         cx.notify();
     }
 

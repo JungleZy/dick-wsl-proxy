@@ -144,7 +144,9 @@ impl Desktop {
             export_path: None,
             environment_editor: None,
             environment_edit_target: None,
+            environment_selected: None,
             environment_detail: None,
+            environment_started: None,
             environment_zsh: true,
             environment_chrome: false,
             environment_chinese: true,
@@ -215,6 +217,9 @@ impl Desktop {
                 }
             } else if reply.kind.mutation() {
                 self.busy = None;
+                if reply.kind == Kind::EnvironmentCreate {
+                    self.environment_started = None;
+                }
             } else {
                 self.reading = false;
             }
@@ -298,6 +303,8 @@ impl Desktop {
                     }
                     Kind::EnvironmentCreate => {
                         self.environment_detail = value.get("environment").cloned();
+                        self.environment_selected =
+                            value["environment"]["name"].as_str().map(str::to_owned);
                         self.distributions = value["distributions"]
                             .as_array()
                             .cloned()
@@ -308,6 +315,8 @@ impl Desktop {
                     }
                     Kind::EnvironmentEdit => {
                         self.environment_detail = value.get("environment").cloned();
+                        self.environment_selected =
+                            value["environment"]["name"].as_str().map(str::to_owned);
                         self.environment_editor = None;
                         self.environment_edit_target = None;
                         self.notice = "环境设置已更新。".into();
@@ -336,6 +345,9 @@ impl Desktop {
         if self.last_poll.elapsed() >= STATUS_POLL_INTERVAL {
             self.last_poll = Instant::now();
             self.send(Kind::Status, json!({"command":"status"}), cx);
+        }
+        if self.busy == Some(Kind::EnvironmentCreate) {
+            cx.notify();
         }
     }
 

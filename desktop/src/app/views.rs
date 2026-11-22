@@ -7,10 +7,11 @@ use gpui_kit::component::{
     checkbox::Checkbox,
 };
 use gpui_kit::{prelude::*, *};
-use serde_json::json;
+use serde_json::{Value, json};
+use std::time::Duration;
 
 use super::backend::Kind;
-use super::components::{app_icon, badge, design_icon, icon, text};
+use super::components::{app_icon, badge, design_icon, icon, status_dot, text};
 use super::model::{EnvironmentEditor, LogFilter, Page, UiAction};
 use super::state::Desktop;
 use super::theme::{
@@ -279,28 +280,335 @@ impl Desktop {
             )
     }
 
+    fn environment_progress(&self) -> Option<Div> {
+        if self.busy != Some(Kind::EnvironmentCreate) {
+            return None;
+        }
+        let elapsed = self
+            .environment_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+        let (percent, stage, detail) = if elapsed < Duration::from_secs(2) {
+            (8, "校验输入", "正在检查名称、rootfs 和安装目录")
+        } else if elapsed < Duration::from_secs(12) {
+            (32, "导入 rootfs", "正在调用 wsl.exe 导入发行版")
+        } else if elapsed < Duration::from_secs(35) {
+            (58, "安装基础组件", "正在更新软件源并安装所选工具")
+        } else if elapsed < Duration::from_secs(60) {
+            (
+                78,
+                "配置中文输入法",
+                "正在写入 locale、fcitx5 和自动启动配置",
+            )
+        } else {
+            (92, "检查环境", "正在读取发行版能力并刷新环境列表")
+        };
+        let steps = [
+            ("校验输入", percent >= 8),
+            ("导入 rootfs", percent >= 32),
+            ("安装基础组件", percent >= 58),
+            ("配置中文输入法", percent >= 78),
+            ("检查环境", percent >= 92),
+        ];
+        let mut step_view = div().flex().flex_col().gap_1();
+        for (name, done) in steps {
+            step_view = step_view.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(status_dot(if done { TEAL } else { RULE }))
+                    .child(
+                        div()
+                            .text_base()
+                            .text_color(rgb(if done { INK } else { MUTED }))
+                            .child(name),
+                    ),
+            );
+        }
+        Some(card(
+            "创建进度",
+            "后台正在执行环境导入和基本设置",
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(div().text_base().child(stage))
+                        .child(
+                            div()
+                                .font_family(super::theme::MONO_FONT)
+                                .text_base()
+                                .text_color(rgb(BLUE))
+                                .child(format!("{percent}%")),
+                        ),
+                )
+                .child(
+                    div()
+                        .h(px(8.))
+                        .w_full()
+                        .bg(rgb(SURFACE_SOFT))
+                        .rounded_full()
+                        .child(
+                            div()
+                                .h(px(8.))
+                                .w(px(percent as f32 * 2.4))
+                                .bg(rgb(BLUE))
+                                .rounded_full(),
+                        ),
+                )
+                .child(div().text_base().text_color(rgb(MUTED)).child(detail))
+                .child(step_view),
+        ))
+    }
+
+    fn environment_editor_card(&self, creating: bool, locked: bool, cx: &Context<Self>) -> Div {
+        let mut body = div().flex().flex_col().gap_3().child(self.field(
+            "环境名称",
+            if creating {
+                "只允许字母、数字、点、下划线和短横线。"
+            } else {
+                "编辑操作针对当前环境。"
+            },
+            &self.fields.environment_name,
+            false,
+        ));
+        if creating {
+            body = body
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_end()
+                        .gap_2()
+                        .child(self.field(
+                            "rootfs tar",
+                            "选择发行版 rootfs 的 .tar 或 .tar.gz。",
+                            &self.fields.environment_source,
+                            false,
+                        ))
+                        .child(self.button(
+                            "env-pick-source",
+                            "选择文件",
+                            UiAction::EnvironmentPickSource,
+                            locked,
+                            cx,
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_end()
+                        .gap_2()
+                        .child(self.field(
+                            "安装目录",
+                            "目录必须不存在，wsl.exe 会创建它。",
+                            &self.fields.environment_install,
+                            false,
+                        ))
+                        .child(self.button(
+                            "env-pick-install",
+                            "选择目录",
+                            UiAction::EnvironmentPickInstall,
+                            locked,
+                            cx,
+                        )),
+                );
+        }
+        body = body.child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_4()
+                .child(
+                    Checkbox::new("env-install-zsh")
+                        .label("安装 zsh")
+                        .checked(self.environment_zsh)
+                        .disabled(locked)
+                        .on_click(cx.listener(|this, checked, _, cx| {
+                            this.environment_zsh = *checked;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Checkbox::new("env-install-chrome")
+                        .label("安装 Chrome")
+                        .checked(self.environment_chrome)
+                        .disabled(locked)
+                        .on_click(cx.listener(|this, checked, _, cx| {
+                            this.environment_chrome = *checked;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Checkbox::new("env-install-chinese")
+                        .label("中文环境和输入法")
+                        .checked(self.environment_chinese)
+                        .disabled(locked)
+                        .on_click(cx.listener(|this, checked, _, cx| {
+                            this.environment_chinese = *checked;
+                            cx.notify();
+                        })),
+                ),
+        );
+        body = body.child(
+            div()
+                .flex()
+                .gap_2()
+                .child(
+                    self.button(
+                        "env-submit",
+                        if creating {
+                            "创建并设置"
+                        } else {
+                            "保存设置"
+                        },
+                        UiAction::EnvironmentSubmit,
+                        locked,
+                        cx,
+                    )
+                    .primary(),
+                )
+                .child(self.button(
+                    "env-cancel",
+                    "取消",
+                    UiAction::EnvironmentCancel,
+                    locked,
+                    cx,
+                )),
+        );
+        if let Some(progress) = self.environment_progress() {
+            body = body.child(progress);
+        }
+        card(
+            if creating {
+                "新增 WSL 环境"
+            } else {
+                "编辑 WSL 环境"
+            },
+            "填写设置后确认，取消会返回环境详情。",
+            body,
+        )
+    }
+
+    fn environment_detail_card(&self, detail: &Value, locked: bool, cx: &Context<Self>) -> Div {
+        let features = &detail["features"];
+        let name = text(detail, "name", "未命名");
+        let edit_name = name.clone();
+        let backup_name = name.clone();
+        card(
+            "环境详情",
+            "已选环境的注册信息和基本设置",
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            Button::new("environment-detail-edit")
+                                .label("编辑设置")
+                                .small()
+                                .disabled(locked)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.environment_edit(edit_name.clone(), window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("environment-detail-backup")
+                                .label("备份环境")
+                                .small()
+                                .disabled(locked)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.environment_backup(backup_name.clone(), cx)
+                                })),
+                        ),
+                )
+                .child(key_value("名称", name))
+                .child(key_value("安装位置", text(detail, "base_path", "未读取")))
+                .child(key_value(
+                    "版本",
+                    format!("WSL {}", detail["version"].as_u64().unwrap_or_default()),
+                ))
+                .child(key_value(
+                    "zsh",
+                    if features["zsh"].as_bool().unwrap_or(false) {
+                        "已安装"
+                    } else {
+                        "未安装"
+                    },
+                ))
+                .child(key_value(
+                    "Chrome",
+                    if features["chrome"].as_bool().unwrap_or(false) {
+                        "已安装"
+                    } else {
+                        "未安装"
+                    },
+                ))
+                .child(key_value(
+                    "中文输入法",
+                    if features["input_method"].as_bool().unwrap_or(false) {
+                        "已配置 fcitx5"
+                    } else {
+                        "未配置"
+                    },
+                ))
+                .child(key_value("Locale", text(features, "locale", "未读取")))
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_end()
+                        .gap_2()
+                        .child(self.field(
+                            "备份文件",
+                            "目标文件不能已存在。",
+                            &self.fields.environment_backup,
+                            false,
+                        ))
+                        .child(self.button(
+                            "env-pick-backup",
+                            "选择位置",
+                            UiAction::EnvironmentPickBackup,
+                            locked,
+                            cx,
+                        )),
+                ),
+        )
+    }
+
     fn environment_page(&self, cx: &Context<Self>) -> Div {
         let locked = self.locked();
+        let selected = self.environment_selected.as_deref();
         let mut rows = div().flex().flex_col().gap_2();
         for (index, distro) in self.distributions.iter().enumerate() {
             let id = text(distro, "id", "");
             let name = text(distro, "name", "未命名发行版");
             let version = distro["version"].as_u64().unwrap_or_default();
-            let selected = self.selected.as_deref() == Some(id.as_str());
+            let target = self.selected.as_deref() == Some(id.as_str());
             let witness = self.witness.as_deref() == Some(id.as_str());
-            let row_background = if selected {
+            let active = selected == Some(name.as_str()) || selected == Some(id.as_str());
+            let row_name = name.clone();
+            let target_id = id.clone();
+            let witness_id = id.clone();
+            let row_background = if active {
                 super::theme::TARGET_BG
+            } else if target {
+                super::theme::BLUE_SOFT
             } else if witness {
                 SUCCESS_BG
             } else {
                 SURFACE_SOFT
             };
-            let target_id = id.clone();
-            let witness_id = id.clone();
-            let view_name = name.clone();
-            let edit_name = name.clone();
-            let backup_name = name.clone();
-            let role = if selected {
+            let role = if target {
                 badge("当前目标", BLUE, super::theme::TARGET_BG)
             } else if witness {
                 badge("见证环境", TEAL, SUCCESS_BG)
@@ -309,105 +617,61 @@ impl Desktop {
             };
             rows = rows.child(
                 div()
+                    .id(("environment-row", index))
                     .flex()
-                    .flex_col()
+                    .items_center()
                     .gap_2()
                     .p_2()
                     .bg(rgb(row_background))
                     .border_1()
-                    .border_color(rgb(RULE))
+                    .border_color(rgb(if active { BLUE } else { RULE }))
                     .rounded_md()
-                    .hover(|style| style.bg(rgb(super::theme::BLUE_SOFT)))
+                    .hover(|style| style.bg(rgb(BLUE_SOFT)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.environment_view(row_name.clone(), cx);
+                    }))
+                    .child(icon("icons/folder.svg"))
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(icon("icons/folder.svg"))
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().text_base().truncate().child(name))
                             .child(
                                 div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(div().text_base().truncate().child(name))
-                                    .child(
-                                        div()
-                                            .text_base()
-                                            .text_color(rgb(MUTED))
-                                            .child(format!("WSL {version}")),
-                                    ),
-                            )
-                            .child(role),
+                                    .text_base()
+                                    .text_color(rgb(MUTED))
+                                    .child(format!("WSL {version}")),
+                            ),
+                    )
+                    .child(role)
+                    .child(
+                        Button::new(("environment-target", index))
+                            .label(if target { "目标" } else { "设为目标" })
+                            .small()
+                            .disabled(locked || version != 2)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.selected = Some(target_id.clone());
+                                if this.witness == this.selected {
+                                    this.witness = None;
+                                }
+                                this.preflight = None;
+                                this.preflight_key = None;
+                                this.dirty = this.draft_is_dirty(cx);
+                                cx.notify();
+                            })),
                     )
                     .child(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .flex_wrap()
-                            .gap_1()
-                            .child(
-                                Button::new(("env-target", index))
-                                    .label(if selected {
-                                        "目标已选"
-                                    } else {
-                                        "设为目标"
-                                    })
-                                    .small()
-                                    .disabled(locked || version != 2)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.selected = Some(target_id.clone());
-                                        if this.witness == this.selected {
-                                            this.witness = None;
-                                        }
-                                        this.preflight = None;
-                                        this.preflight_key = None;
-                                        this.dirty = this.draft_is_dirty(cx);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new(("env-witness", index))
-                                    .label(if witness {
-                                        "见证已选"
-                                    } else {
-                                        "设为见证"
-                                    })
-                                    .small()
-                                    .disabled(locked || version != 2 || selected)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.witness = Some(witness_id.clone());
-                                        this.preflight = None;
-                                        this.preflight_key = None;
-                                        this.dirty = this.draft_is_dirty(cx);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new(("env-view", index))
-                                    .label("查看")
-                                    .small()
-                                    .disabled(locked || version != 2)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.environment_view(view_name.clone(), cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new(("env-edit", index))
-                                    .label("编辑")
-                                    .small()
-                                    .disabled(locked || version != 2)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.environment_edit(edit_name.clone(), window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new(("env-backup", index))
-                                    .label("备份")
-                                    .small()
-                                    .disabled(locked || version != 2)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.environment_backup(backup_name.clone(), cx);
-                                    })),
-                            ),
+                        Button::new(("environment-witness", index))
+                            .label(if witness { "见证" } else { "设为见证" })
+                            .small()
+                            .disabled(locked || version != 2 || target)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.witness = Some(witness_id.clone());
+                                this.preflight = None;
+                                this.preflight_key = None;
+                                this.dirty = this.draft_is_dirty(cx);
+                                cx.notify();
+                            })),
                     ),
             );
         }
@@ -422,13 +686,23 @@ impl Desktop {
                     .child("没有发现 WSL2 发行版，请刷新列表。"),
             );
         }
-        let selection = card(
-            "WSL 环境",
-            "选择目标与见证，配置入口端口。",
+        let left = card(
+            "所有环境",
+            "点击环境查看详情，新增环境固定显示在列表顶部。",
             div()
                 .flex()
                 .flex_col()
                 .gap_3()
+                .child(
+                    self.button(
+                        "environment-create-top",
+                        "新增环境",
+                        UiAction::EnvironmentCreate,
+                        locked,
+                        cx,
+                    )
+                    .primary(),
+                )
                 .child(rows)
                 .child(self.field(
                     "Windows 入口端口",
@@ -440,10 +714,16 @@ impl Desktop {
                     div()
                         .flex()
                         .gap_2()
-                        .child(self.button("env-list", "刷新列表", UiAction::List, locked, cx))
+                        .child(self.button(
+                            "environment-list",
+                            "刷新列表",
+                            UiAction::List,
+                            locked,
+                            cx,
+                        ))
                         .child(
                             self.button(
-                                "env-preflight",
+                                "environment-preflight",
                                 "运行预检",
                                 UiAction::Preflight,
                                 locked,
@@ -453,298 +733,41 @@ impl Desktop {
                         ),
                 ),
         );
-        let management = card(
-            "环境管理",
-            "新增、查看、编辑和备份 WSL 环境。",
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    self.button(
-                        "env-create",
-                        "新增环境",
-                        UiAction::EnvironmentCreate,
-                        locked,
-                        cx,
-                    )
-                    .primary(),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .text_base()
-                        .text_color(rgb(MUTED))
-                        .child("创建会导入 rootfs tar，并按勾选项安装基本工具。"),
-                ),
-        );
-        let editor = self.environment_editor.map(|mode| {
-            let creating = matches!(mode, EnvironmentEditor::Create);
-            let mut body = div().flex().flex_col().gap_3().child(self.field(
-                "环境名称",
-                if creating {
-                    "只允许字母、数字、点、下划线和短横线。"
-                } else {
-                    "编辑操作针对当前环境。"
-                },
-                &self.fields.environment_name,
-                false,
-            ));
-            if creating {
-                body = body
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .items_end()
-                            .gap_2()
-                            .child(self.field(
-                                "rootfs tar",
-                                "选择发行版 rootfs 的 .tar 或 .tar.gz。",
-                                &self.fields.environment_source,
-                                false,
-                            ))
-                            .child(self.button(
-                                "env-pick-source",
-                                "选择文件",
-                                UiAction::EnvironmentPickSource,
-                                locked,
-                                cx,
-                            )),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .items_end()
-                            .gap_2()
-                            .child(self.field(
-                                "安装目录",
-                                "目录必须不存在，wsl.exe 会创建它。",
-                                &self.fields.environment_install,
-                                false,
-                            ))
-                            .child(self.button(
-                                "env-pick-install",
-                                "选择目录",
-                                UiAction::EnvironmentPickInstall,
-                                locked,
-                                cx,
-                            )),
-                    );
-            }
-            body = body.child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_4()
-                    .child(
-                        Checkbox::new("env-install-zsh")
-                            .label("安装 zsh")
-                            .checked(self.environment_zsh)
-                            .disabled(locked)
-                            .on_click(cx.listener(|this, checked, _, cx| {
-                                this.environment_zsh = *checked;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Checkbox::new("env-install-chrome")
-                            .label("安装 Chrome")
-                            .checked(self.environment_chrome)
-                            .disabled(locked)
-                            .on_click(cx.listener(|this, checked, _, cx| {
-                                this.environment_chrome = *checked;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Checkbox::new("env-install-chinese")
-                            .label("中文环境和输入法")
-                            .checked(self.environment_chinese)
-                            .disabled(locked)
-                            .on_click(cx.listener(|this, checked, _, cx| {
-                                this.environment_chinese = *checked;
-                                cx.notify();
-                            })),
-                    ),
-            );
-            body = body.child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        self.button(
-                            "env-submit",
-                            if creating {
-                                "创建并设置"
-                            } else {
-                                "保存设置"
-                            },
-                            UiAction::EnvironmentSubmit,
-                            locked,
-                            cx,
-                        )
-                        .primary(),
-                    )
-                    .child(self.button(
-                        "env-cancel",
-                        "取消",
-                        UiAction::EnvironmentCancel,
-                        locked,
-                        cx,
-                    )),
-            );
-            card(
-                if creating {
-                    "新增 WSL 环境"
-                } else {
-                    "编辑 WSL 环境"
-                },
-                "安装完成后可以在查看面板确认能力。",
-                body,
-            )
-        });
-        let backup = card(
-            "备份环境",
-            "先选择一个新的 .tar 文件路径，再点击环境列表中的备份。",
-            div()
-                .flex()
-                .flex_wrap()
-                .items_end()
-                .gap_2()
-                .child(self.field(
-                    "备份文件",
-                    "目标文件不能已存在。",
-                    &self.fields.environment_backup,
-                    false,
-                ))
-                .child(self.button(
-                    "env-pick-backup",
-                    "选择位置",
-                    UiAction::EnvironmentPickBackup,
-                    locked,
-                    cx,
-                )),
-        );
-        let details = self.environment_detail.as_ref().map(|detail| {
-            let features = &detail["features"];
+        let right_main = if let Some(editor) = self.environment_editor {
+            self.environment_editor_card(matches!(editor, EnvironmentEditor::Create), locked, cx)
+        } else if let Some(detail) = self.environment_detail.as_ref() {
+            self.environment_detail_card(detail, locked, cx)
+        } else {
             card(
                 "环境详情",
-                "最近一次查看结果。",
+                "点击左侧环境，或在列表顶部新增环境。",
                 div()
-                    .flex()
-                    .flex_col()
-                    .child(key_value("名称", text(detail, "name", "未命名")))
-                    .child(key_value("安装位置", text(detail, "base_path", "未读取")))
-                    .child(key_value(
-                        "版本",
-                        format!("WSL {}", detail["version"].as_u64().unwrap_or_default()),
-                    ))
-                    .child(key_value(
-                        "zsh",
-                        if features["zsh"].as_bool().unwrap_or(false) {
-                            "已安装"
-                        } else {
-                            "未安装"
-                        },
-                    ))
-                    .child(key_value(
-                        "Chrome",
-                        if features["chrome"].as_bool().unwrap_or(false) {
-                            "已安装"
-                        } else {
-                            "未安装"
-                        },
-                    ))
-                    .child(key_value(
-                        "中文输入法",
-                        if features["input_method"].as_bool().unwrap_or(false) {
-                            "已配置 fcitx5"
-                        } else {
-                            "未配置"
-                        },
-                    ))
-                    .child(key_value("Locale", text(features, "locale", "未读取"))),
+                    .p_4()
+                    .bg(rgb(SURFACE_SOFT))
+                    .rounded_md()
+                    .text_base()
+                    .text_color(rgb(MUTED))
+                    .child("这里会显示安装位置、WSL 版本、zsh、Chrome、中文输入法和 Locale。"),
             )
-        });
-        let baseline = card(
-            "环境基线",
-            "启动前检查的只读能力。",
-            div()
-                .flex()
-                .gap_3()
-                .child(metric("网络模式", "NAT"))
-                .child(metric(
-                    "cgroup",
-                    if self.status_valid {
-                        "已观测"
-                    } else {
-                        "待检查"
-                    },
-                ))
-                .child(metric(
-                    "NAT 表",
-                    if self.status_valid {
-                        "已观测"
-                    } else {
-                        "待检查"
-                    },
-                )),
-        );
-        let preflight = card(
-            "预检",
-            "目标身份、cgroup、NAT 表和入口端口。",
-            self.preflight_panel(),
-        );
-        let ports = card(
-            "端口占用",
-            "当前入口端口的可用性。",
-            div()
-                .flex()
-                .flex_col()
-                .child(key_value(
-                    "TCP",
-                    if self.status_valid {
-                        "待确认"
-                    } else {
-                        "未检查"
-                    },
-                ))
-                .child(key_value(
-                    "UDP",
-                    if self.status_valid {
-                        "待确认"
-                    } else {
-                        "未检查"
-                    },
-                )),
-        );
-        div()
+        };
+        let right = div()
             .flex()
             .flex_col()
             .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .items_start()
-                    .flex_wrap()
-                    .gap_3()
-                    .child(selection.flex_1().min_w(px(420.)))
-                    .child(preflight.flex_1().min_w(px(420.))),
-            )
-            .child(management)
-            .children(editor)
-            .child(backup)
-            .children(details)
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_3()
-                    .child(baseline.flex_1())
-                    .child(ports.flex_1()),
-            )
+            .flex_1()
+            .min_w_0()
+            .child(right_main)
+            .child(card(
+                "预检",
+                "目标身份、cgroup、NAT 表和入口端口。",
+                self.preflight_panel(),
+            ));
+        div()
+            .flex()
+            .items_start()
+            .gap_3()
+            .child(left.w(px(390.)).flex_shrink_0())
+            .child(right)
     }
 
     fn page_content(&self, cx: &Context<Self>) -> Div {
