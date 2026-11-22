@@ -901,13 +901,7 @@ impl Desktop {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(div().text_xl().child("设置"))
-                    .child(
-                        div()
-                            .text_base()
-                            .text_color(rgb(MUTED))
-                            .child("代理链路、入口和桌面行为"),
-                    ),
+                    .child(div().text_xl().child("设置")),
             )
             .child(
                 div()
@@ -928,7 +922,7 @@ impl Desktop {
             );
         let residential = card(
             "住宅代理",
-            "出站代理和认证信息",
+            "",
             div()
                 .flex()
                 .flex_col()
@@ -952,7 +946,7 @@ impl Desktop {
         );
         let routing = card(
             "网络入口",
-            "本机第一跳与接管端口",
+            "",
             div()
                 .flex()
                 .flex_wrap()
@@ -962,7 +956,7 @@ impl Desktop {
         );
         let dns = card(
             "受管 DNS",
-            "DoH 上游与启动探测",
+            "",
             div()
                 .flex()
                 .flex_col()
@@ -981,7 +975,7 @@ impl Desktop {
         );
         let runtime = card(
             "桌面运行",
-            "启动和本机存储状态",
+            "",
             div()
                 .flex()
                 .flex_col()
@@ -1007,23 +1001,6 @@ impl Desktop {
                 ))
                 .child(key_value("Revision", self.revision.as_str().unwrap_or("0"))),
         );
-        let footer = div()
-            .flex()
-            .items_center()
-            .gap_3()
-            .child(
-                div().flex_1().text_base().text_color(rgb(MUTED)).child(
-                    self.profile_path
-                        .clone()
-                        .unwrap_or_else(|| "等待配置路径".into()),
-                ),
-            )
-            .child(
-                div()
-                    .text_base()
-                    .text_color(rgb(if self.error { RUST } else { MUTED }))
-                    .child(self.notice.clone()),
-            );
         div()
             .flex()
             .flex_col()
@@ -1039,7 +1016,14 @@ impl Desktop {
                     .child(dns.flex_1().min_w(px(460.))),
             )
             .child(runtime)
-            .child(footer)
+            .child(if self.error {
+                div()
+                    .text_base()
+                    .text_color(rgb(RUST))
+                    .child(self.notice.clone())
+            } else {
+                div()
+            })
     }
 }
 
