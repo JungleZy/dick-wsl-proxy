@@ -107,6 +107,15 @@ impl Runtime {
                 return Err(format!("{label}_dns_not_verified_through_upstream"));
             }
         }
+        // A healthy DNS path only proves the managed DNS terminator. Verify that
+        // the selected residential chain can create both SOCKS5 UDP associations
+        // before claiming that ordinary non-whitelisted UDP is covered. The
+        // documentation endpoint is carried only in the association setup, so
+        // this probe emits no application datagram.
+        self.policy
+            .chain_udp(SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 1), 443))
+            .map(|_| ())
+            .map_err(|error| format!("nonwhite_udp_chain_unavailable:{error}"))?;
         let host = self.policy.health_domain();
         if self.policy.allows_domain(host) {
             return Err("health_domain_is_direct_not_chain".into());
