@@ -36,7 +36,10 @@ const MAX_DNS_UDP: usize = 8;
 const BUFFER_SIZE: usize = 16 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const METADATA_WAIT_TIMEOUT: Duration = Duration::from_secs(13);
+// A conntrack snapshot is a per-packet authorization check. A stalled WSL
+// helper must fail the affected flow quickly instead of freezing the UDP loop
+// for the helper's full transport deadline.
+const METADATA_WAIT_TIMEOUT: Duration = Duration::from_secs(4);
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const HALF_CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_ERROR_BYTES: usize = 512;
