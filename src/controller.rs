@@ -126,8 +126,21 @@ impl Controller {
             });
         }
         if let Some(runtime) = &runtime {
+            let chain_tcp_before = sockets.chain_tcp_attempts();
             match runtime.verify(&p) {
-                Ok(ok) => self.readiness = Some(Ok(ok)),
+                Ok(ok) if sockets.chain_tcp_attempts() > chain_tcp_before => {
+                    self.readiness = Some(Ok(ok))
+                }
+                Ok(_) => {
+                    let forwarding = sockets.diagnostics();
+                    let shutdown = sockets.stop().err();
+                    self.live = Some((p, sockets));
+                    let reason = format!(
+                        "managed_readiness_failed:https_probe_not_observed_on_chain; ingress_stop:{shutdown:?}; forwarding:{forwarding}"
+                    );
+                    self.readiness = Some(Err(reason.clone()));
+                    return Err(reason);
+                }
                 Err(e) => {
                     let forwarding = sockets.diagnostics();
                     let shutdown = sockets.stop().err();

@@ -232,6 +232,10 @@ impl Ingress {
             "traffic": traffic,
         })
     }
+
+    pub(crate) fn chain_tcp_attempts(&self) -> u64 {
+        lock(&self.shared.counters).chain_tcp
+    }
 }
 
 impl Drop for Ingress {
