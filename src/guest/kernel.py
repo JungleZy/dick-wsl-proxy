@@ -794,9 +794,12 @@ def parse_tuple_values(values, ipv6=False):
     )
 
 
-def encode_tuple(value):
+def encode_tuple(value, ipv6=False):
     protocol, source, sport, destination, dport = value
-    addresses = attribute(1, socket.inet_aton(source)) + attribute(2, socket.inet_aton(destination))
+    if ipv6:
+        addresses = attribute(3, ipaddress.IPv6Address(source).packed) + attribute(4, ipaddress.IPv6Address(destination).packed)
+    else:
+        addresses = attribute(1, socket.inet_aton(source)) + attribute(2, socket.inet_aton(destination))
     transport = attribute(1, bytes([protocol])) + attribute(2, struct.pack("!H", sport)) + attribute(3, struct.pack("!H", dport))
     return attribute(1, addresses, True) + attribute(2, transport, True)
 
@@ -880,11 +883,11 @@ class Conntrack:
     def dump(self, ipv6=False):
         return [parse_entry(payload) for payload in self.request(CT_GET, ROOT | MATCH, ipv6=ipv6)]
 
-    def delete(self, entry):
+    def delete(self, entry, ipv6=False):
         require(integer(entry["id"], 0, 0xffffffff) and integer(entry["mark"], 1, 0xffffffff) and entry["zone"] == 0 and entry["tuple_zones"] == (0, 0), "unproven_delete_identity")
-        original = attribute(CTA_ORIG, encode_tuple(entry["original"]), True)
+        original = attribute(CTA_ORIG, encode_tuple(entry["original"], ipv6), True)
         try:
-            replies = self.request(CT_GET, ACK, original)
+            replies = self.request(CT_GET, ACK, original, ipv6=ipv6)
         except OSError as error:
             if error.errno == errno.ENOENT:
                 return
@@ -896,13 +899,13 @@ class Conntrack:
         require(all(current[key] == entry[key] for key in ("original", "reply", "mark", "zone", "tuple_zones")), "mapping_ownership_changed_before_delete")
         # The kernel enforces original tuple + ID. Its delete operation does
         # not compare the reply tuple or mark, so revalidate those explicitly.
-        payload = original + attribute(CTA_REPLY, encode_tuple(entry["reply"]), True)
+        payload = original + attribute(CTA_REPLY, encode_tuple(entry["reply"], ipv6), True)
         payload += attribute(CTA_ID, struct.pack("!I", entry["id"]))
         payload += attribute(CTA_MARK, struct.pack("!I", entry["mark"]))
         # Omission selects the proven default zone without requiring optional
         # kernel support for an explicit CTA_ZONE attribute containing zero.
         try:
-            self.request(CT_DELETE, ACK, payload)
+            self.request(CT_DELETE, ACK, payload, ipv6=ipv6)
         except OSError as error:
             if error.errno != errno.ENOENT:
                 raise
@@ -1263,9 +1266,7 @@ def execute(request):
                     for entry in entries:
                         ct.delete(entry)
                     for entry in ipv6_entries:
-                        ct.delete(entry)
-                    for entry in ipv6_entries:
-                        ct.delete(entry)
+                        ct.delete(entry, ipv6=True)
                 else:
                     raise Failure("owned_conntrack_residual")
                 inspect_firewall(p, firewall(), False)

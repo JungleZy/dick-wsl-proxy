@@ -296,6 +296,30 @@ class ConntrackTests(unittest.TestCase):
         self.assertNotIn(kernel.CTA_ZONE, values)
         self.assertEqual(send.call_args_list[0].args[0], kernel.CT_GET)
 
+    def test_ipv6_delete_uses_ipv6_conntrack_family_and_tuples(self):
+        value = {
+            "original": (17, "2001:db8:1::2", 44000, "2001:db8:2::9", 443),
+            "reply": (17, "fe80::1", 43771, "2001:db8:1::2", 45000),
+            "mark": plan()["cookie"],
+            "id": 0x78563412,
+            "zone": 0,
+            "tuple_zones": (0, 0),
+            "status": 0x188 | 0x20,
+        }
+        payload = bytes([kernel.socket.AF_INET6, 0, 0, 0])
+        payload += kernel.attribute(kernel.CTA_ORIG, kernel.encode_tuple(value["original"], True), True)
+        payload += kernel.attribute(kernel.CTA_REPLY, kernel.encode_tuple(value["reply"], True), True)
+        payload += kernel.attribute(kernel.CTA_MARK, struct.pack("!I", value["mark"]))
+        payload += kernel.attribute(kernel.CTA_STATUS, struct.pack("!I", value["status"]))
+        payload += kernel.attribute(kernel.CTA_ID, struct.pack("!I", value["id"]))
+        ct = object.__new__(kernel.Conntrack)
+        with patch.object(ct, "request", side_effect=[[payload], []]) as send:
+            ct.delete(value, ipv6=True)
+        self.assertTrue(send.call_args_list[0].kwargs["ipv6"])
+        self.assertTrue(send.call_args_list[1].kwargs["ipv6"])
+        delete_values = kernel.attributes(send.call_args_list[1].args[2])
+        self.assertEqual(kernel.parse_tuple(delete_values[kernel.CTA_ORIG], ipv6=True), value["original"])
+
     def test_reused_tuple_and_changed_mark_are_not_deleted(self):
         value = entry()
         ct = object.__new__(kernel.Conntrack)
