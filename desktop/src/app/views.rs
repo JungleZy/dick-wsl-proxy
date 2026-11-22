@@ -712,12 +712,6 @@ impl Desktop {
                     .primary(),
                 )
                 .child(rows)
-                .child(self.field(
-                    "Windows 入口端口",
-                    "范围 1024–65535。",
-                    &self.fields.port,
-                    false,
-                ))
                 .child(
                     div()
                         .flex()
@@ -962,6 +956,16 @@ impl Desktop {
                 false,
             ),
         );
+        let ingress = card(
+            "Windows 入口",
+            "接管流量监听的本机端口",
+            self.field(
+                "入口端口",
+                "范围 1024–65535，修改后保存配置。",
+                &self.fields.port,
+                false,
+            ),
+        );
         let dns = card(
             "DNS 保护",
             "DoH 上游与 TLS",
@@ -1038,6 +1042,7 @@ impl Desktop {
                     .child(host.flex_1().min_w(px(320.)))
                     .child(dns.flex_1().min_w(px(320.))),
             )
+            .child(ingress)
             .child(
                 div()
                     .flex()
