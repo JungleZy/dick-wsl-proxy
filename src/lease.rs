@@ -95,7 +95,7 @@ mod windows {
         let mut child = Command::new(exe)
             .arg("lease-worker")
             .arg(plan.cookie.to_string())
-            .creation_flags(CREATE_NO_WINDOW)
+            .creation_flags(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

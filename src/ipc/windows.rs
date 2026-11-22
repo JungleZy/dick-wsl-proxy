@@ -37,7 +37,8 @@ mod inner {
         PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
     };
     use windows_sys::Win32::System::Threading::{
-        CREATE_NO_WINDOW, CreateEventW, CreateProcessW, GetCurrentProcess, GetExitCodeProcess,
+        CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CreateEventW, CreateProcessW,
+        GetCurrentProcess, GetExitCodeProcess,
         GetProcessId, INFINITE, OpenProcess, OpenProcessToken, PROCESS_INFORMATION,
         PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, ResetEvent,
         STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
@@ -353,7 +354,7 @@ mod inner {
                     null(),
                     null(),
                     0,
-                    CREATE_NO_WINDOW,
+                    CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB,
                     null(),
                     directory.as_ptr(),
                     &startup,
