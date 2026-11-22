@@ -608,7 +608,10 @@ def inspect_firewall(p, tables, existing, ipv6=False):
         chains = {} if ipv6 else {chain: "nat"}
     if not ipv6 and p.get("system_dns") is not None:
         chains["WPM2G_" + cookie] = "filter"
-    expected = {"nat": [] if ipv6 else [rule_key(rule) for rule in hooks + body], "filter": [rule_key(rule) for rule in (ipv6_guards(p) if ipv6 else guards)]}
+    expected = {
+        "nat": [rule_key(rule) for rule in hooks + body] if (not ipv6 or p.get("ipv6") is not None) else [],
+        "filter": [rule_key(rule) for rule in (ipv6_guards(p) if ipv6 else guards)],
+    }
     found = {"nat": [], "filter": []}
     seen = {"nat": set(), "filter": set()}
     observed_chains = set()
@@ -642,12 +645,19 @@ def inspect_firewall(p, tables, existing, ipv6=False):
 
 
 def rules_complete(p, present, rules, ipv6_rules):
-    if p.get("ipv6") is not None:
-        chain, guard, _, hooks, body, guards = ipv6_artifacts(p)
-        same = lambda left, right: sorted(rule_key(rule) for rule in left) == sorted(rule_key(rule) for rule in right)
-        return present and same(rules["nat"], hooks + body) and same(rules["filter"], guards)
-    _, _, hooks, body, guards = artifacts(p)
     same = lambda left, right: sorted(rule_key(rule) for rule in left) == sorted(rule_key(rule) for rule in right)
+    if p.get("ipv6") is not None:
+        _, _, hooks, body, guards = artifacts(p)
+        _, _, _, v6_hooks, v6_body, v6_guards = ipv6_artifacts(p)
+        return (
+            present
+            and ipv6_rules is not None
+            and same(rules["nat"], hooks + body)
+            and same(rules["filter"], guards)
+            and same(ipv6_rules["nat"], v6_hooks + v6_body)
+            and same(ipv6_rules["filter"], v6_guards)
+        )
+    _, _, hooks, body, guards = artifacts(p)
     return present and same(rules["nat"], hooks + body) and same(rules["filter"], guards) and (p.get("system_dns") is None or same(ipv6_rules["filter"], ipv6_guards(p)))
 
 

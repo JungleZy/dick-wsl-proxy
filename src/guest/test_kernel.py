@@ -97,6 +97,14 @@ def ipv6_snapshot(p):
     return {"filter": {"chains": {"OUTPUT": "ACCEPT"}, "rules": copy.deepcopy(kernel.ipv6_guards(p))}}
 
 
+def ipv6_full_snapshot(p):
+    chain, guard, _, hooks, body, guards = kernel.ipv6_artifacts(p)
+    return {
+        "nat": {"chains": {"OUTPUT": "ACCEPT", chain: "-"}, "rules": copy.deepcopy(hooks + body)},
+        "filter": {"chains": {"OUTPUT": "ACCEPT", guard: "-"}, "rules": copy.deepcopy(guards)},
+    }
+
+
 class ValidationTests(unittest.TestCase):
     def test_registered_metacharacters_are_data(self):
         self.assertEqual(kernel.validate(request())["target"]["name"], plan()["target"]["name"])
@@ -801,6 +809,19 @@ class InspectionTests(unittest.TestCase):
             value = self.observe(p, tables)
             self.assertTrue(value["rules_present"])
             self.assertFalse(value["rules_complete"])
+
+    def test_ipv6_rules_complete_checks_both_nat_families(self):
+        p = comprehensive_plan()
+        p["ipv6"] = {
+            "guest": "2001:db8:1::2",
+            "ingress": "[fe80::1%2]:43771",
+        }
+        value = self.observe(p, [snapshot(p), ipv6_full_snapshot(p)])
+        self.assertTrue(value["rules_complete"])
+        partial = ipv6_full_snapshot(p)
+        partial["nat"]["rules"].pop()
+        value = self.observe(p, [snapshot(p), partial])
+        self.assertFalse(value["rules_complete"])
 
     def test_absence_and_live_connmark_are_independently_observed(self):
         for p, values in ((plan(), [entry()]), (comprehensive_plan(), [comprehensive_entry()])):
