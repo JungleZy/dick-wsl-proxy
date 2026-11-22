@@ -79,7 +79,13 @@ def endpoint6(value):
         parsed = ipaddress.IPv6Address(address.split("%", 1)[0])
     except (ValueError, TypeError):
         raise Failure("invalid_ipv6_endpoint")
-    require(not parsed.is_unspecified and not parsed.is_multicast and not parsed.is_loopback, "invalid_ipv6_endpoint")
+    require(
+        not parsed.is_unspecified
+        and not parsed.is_multicast
+        and not parsed.is_loopback
+        and parsed.ipv4_mapped is None,
+        "invalid_ipv6_endpoint",
+    )
     require(decimal(port) and int(port) <= 65535, "invalid_ipv6_endpoint")
     return str(parsed), int(port)
 
@@ -467,7 +473,7 @@ def ipv6_artifacts(p):
     hooks, body = [], []
     for protocol in ("tcp", "udp"):
         body.append(["-A", chain, "-d", ingress + "/128", "-p", protocol, "-m", protocol, "--dport", str(ingress_port), *comment, "-j", "RETURN"])
-    for network in ("::/128", "::1/128", "fe80::/10", "ff00::/8"):
+    for network in ("::/128", "::1/128", "::ffff:0:0/96", "fe80::/10", "ff00::/8"):
         body.append(["-A", chain, "-d", network, *comment, "-j", "RETURN"])
     body.extend([
         ["-A", chain, "-m", "connmark", "--mark", "0x0", *comment, "-j", "CONNMARK", "--set-xmark", mark + "/0xffffffff"],
@@ -1058,7 +1064,12 @@ def unicast6(value):
         address = ipaddress.IPv6Address(value)
     except (ValueError, TypeError):
         return False
-    return not address.is_unspecified and not address.is_loopback and not address.is_multicast
+    return (
+        not address.is_unspecified
+        and not address.is_loopback
+        and not address.is_multicast
+        and address.ipv4_mapped is None
+    )
 
 
 def resolve6(p, entries, protocol, peer):

@@ -133,6 +133,7 @@ fn origin_allowed(plan: &Plan, origin: SocketAddr) -> bool {
             !origin.ip().is_unspecified()
                 && !origin.ip().is_loopback()
                 && !origin.ip().is_multicast()
+                && origin.ip().to_ipv4_mapped().is_none()
                 && !origin.ip().is_unicast_link_local()
                 && origin.port() != 0
                 && origin != ipv6.ingress

@@ -35,6 +35,10 @@ fn original_destination_bounds_remain_explicit_in_both_modes() {
         "[2001:db8:2::9]:443".parse().unwrap()
     ));
     assert!(!origin_allowed(&plan, "[fe80::1%2]:443".parse().unwrap()));
+    assert!(!origin_allowed(
+        &plan,
+        "[::ffff:192.0.2.1]:443".parse().unwrap()
+    ));
     for endpoint in [
         "127.0.0.1:443",
         "0.0.0.0:443",

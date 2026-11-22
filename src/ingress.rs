@@ -689,6 +689,7 @@ fn finish_observation_v6(
                 || origin.ip().is_unspecified()
                 || origin.ip().is_multicast()
                 || origin.ip().is_loopback()
+                || origin.ip().to_ipv4_mapped().is_some()
                 || origin.ip().is_unicast_link_local()
             {
                 Err("IPv6 origin lookup is no longer authorized".into())

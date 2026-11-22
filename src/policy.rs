@@ -630,6 +630,7 @@ fn valid_ipv6_endpoint(endpoint: SocketAddrV6) -> bool {
         && !ip.is_unspecified()
         && !ip.is_loopback()
         && !ip.is_multicast()
+        && ip.to_ipv4_mapped().is_none()
         && !ip.is_unicast_link_local()
 }
 

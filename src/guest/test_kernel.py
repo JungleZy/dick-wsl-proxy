@@ -172,6 +172,10 @@ class ValidationTests(unittest.TestCase):
 
 
 class ConntrackTests(unittest.TestCase):
+    def test_ipv4_mapped_ipv6_endpoints_are_rejected(self):
+        with self.assertRaises(kernel.Failure):
+            kernel.endpoint6("[::ffff:192.0.2.1]:443")
+
     def test_ipv6_mapping_resolves_only_through_the_recorded_ingress(self):
         p = comprehensive_plan()
         p["ipv6"] = {

@@ -205,7 +205,11 @@ fn unicast(ip: Ipv4Addr) -> bool {
 }
 
 fn global_unicast(ip: Ipv6Addr) -> bool {
-    !ip.is_unspecified() && !ip.is_loopback() && !ip.is_multicast() && !ip.is_unicast_link_local()
+    !ip.is_unspecified()
+        && !ip.is_loopback()
+        && !ip.is_multicast()
+        && ip.to_ipv4_mapped().is_none()
+        && !ip.is_unicast_link_local()
 }
 
 fn valid_ipv6_ingress(address: std::net::SocketAddrV6) -> bool {
@@ -215,6 +219,7 @@ fn valid_ipv6_ingress(address: std::net::SocketAddrV6) -> bool {
         && !address.ip().is_unspecified()
         && !address.ip().is_multicast()
         && !address.ip().is_loopback()
+        && address.ip().to_ipv4_mapped().is_none()
 }
 
 fn decimal(value: &str) -> bool {
