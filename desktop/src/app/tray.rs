@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
     Shell_NotifyIconW,
@@ -14,12 +15,11 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, EnumWindows, GetCursorPos, GetMessageW, GetWindowThreadProcessId,
-    IDI_APPLICATION, LoadIconW, MF_STRING,
-    PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, ShowWindow, TrackPopupMenu,
-    TranslateMessage, WNDCLASSW, HWND_MESSAGE, SW_RESTORE, TPM_LEFTALIGN, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_TIMER,
+    HWND_MESSAGE, IDI_APPLICATION, LoadIconW, MF_STRING, PostMessageW, PostQuitMessage,
+    RegisterClassW, SW_RESTORE, SetForegroundWindow, ShowWindow, TPM_LEFTALIGN, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_DESTROY, WM_LBUTTONDBLCLK,
+    WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
 };
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const TRAY_TIMER: usize = 1;
@@ -47,7 +47,12 @@ pub(crate) fn hide_main_window() {
     }
 }
 
-unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> isize {
+unsafe extern "system" fn window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> isize {
     match message {
         TRAY_MESSAGE => {
             match lparam as u32 {
@@ -152,7 +157,12 @@ unsafe fn show_menu(hwnd: HWND) {
             let main = find_main_window();
             if !main.is_null() {
                 EXIT_REQUESTED.store(true, Ordering::Release);
-                PostMessageW(main, windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE, 0, 0);
+                PostMessageW(
+                    main,
+                    windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+                    0,
+                    0,
+                );
             }
         }
         _ => {}

@@ -377,11 +377,7 @@ impl Desktop {
     fn environment_editor_card(&self, creating: bool, locked: bool, cx: &Context<Self>) -> Div {
         let mut body = div().flex().flex_col().gap_3().child(self.field(
             "环境名称",
-            if creating {
-                ""
-            } else {
-                ""
-            },
+            "",
             &self.fields.environment_name,
             false,
         ));
@@ -393,12 +389,7 @@ impl Desktop {
                         .flex_wrap()
                         .items_end()
                         .gap_2()
-                        .child(self.field(
-                            "rootfs tar",
-                            "",
-                            &self.fields.environment_source,
-                            false,
-                        ))
+                        .child(self.field("rootfs tar", "", &self.fields.environment_source, false))
                         .child(self.button(
                             "env-pick-source",
                             "选择文件",
@@ -413,12 +404,7 @@ impl Desktop {
                         .flex_wrap()
                         .items_end()
                         .gap_2()
-                        .child(self.field(
-                            "安装目录",
-                            "",
-                            &self.fields.environment_install,
-                            false,
-                        ))
+                        .child(self.field("安装目录", "", &self.fields.environment_install, false))
                         .child(self.button(
                             "env-pick-install",
                             "选择目录",
