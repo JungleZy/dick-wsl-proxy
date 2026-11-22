@@ -38,10 +38,10 @@ mod inner {
     };
     use windows_sys::Win32::System::Threading::{
         CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CreateEventW, CreateProcessW,
-        GetCurrentProcess, GetExitCodeProcess,
-        GetProcessId, INFINITE, OpenProcess, OpenProcessToken, PROCESS_INFORMATION,
-        PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, ResetEvent,
-        STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+        GetCurrentProcess, GetExitCodeProcess, GetProcessId, INFINITE, OpenProcess,
+        OpenProcessToken, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW, ResetEvent, STARTF_USESTDHANDLES, STARTUPINFOW,
+        TerminateProcess, WaitForSingleObject,
     };
 
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
