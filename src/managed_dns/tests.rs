@@ -377,6 +377,31 @@ fn durable_aliases_do_not_reuse_old_session_or_crash_reserved_numbers() {
 }
 
 #[test]
+fn durable_aliases_reuse_the_same_name_and_ip_after_a_new_session() {
+    let owner = AliasLedger::default();
+    let path = owner.path.as_ref().unwrap().clone();
+    let now = Instant::now();
+    let ip = Ipv4Addr::new(1, 1, 1, 1);
+    let mut first = Aliases {
+        ledger: AliasLedger::at(path.clone()),
+        ..Aliases::default()
+    };
+    let old = first.assign("same.example", &[ip], 1, now).unwrap()[0];
+    assert_eq!(read_alias_highwater(&path).unwrap(), ALIAS_BLOCK);
+    drop(first);
+
+    let mut second = Aliases {
+        ledger: AliasLedger::at(path.clone()),
+        ..Aliases::default()
+    };
+    let reused = second
+        .assign("same.example", &[ip], 60, now + Duration::from_secs(2))
+        .unwrap()[0];
+    assert_eq!(reused, old);
+    assert_eq!(read_alias_highwater(&path).unwrap(), ALIAS_BLOCK);
+}
+
+#[test]
 fn durable_alias_exhaustion_is_atomic_and_never_resets() {
     let owner = AliasLedger::default();
     let path = owner.path.as_ref().unwrap().clone();

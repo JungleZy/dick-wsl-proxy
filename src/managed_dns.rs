@@ -24,7 +24,8 @@ use ledger::AliasLedger;
 /// Session-local DNS through the authenticated proxy chain. Ordinary IN queries,
 /// including AAAA, pass through; IPv6 blocking belongs to the Target kernel rules.
 /// Only proven whitelisted A answers with DO=0 get aliases; these carry no AD or
-/// DNSSEC records. A durable high-water ledger prevents alias reuse across runs.
+/// DNSSEC records. A durable digest ledger prevents alias reuse across different
+/// name/IP pairs while allowing the same pair to reclaim its prior alias.
 pub struct ManagedDns {
     policy: Arc<crate::policy::Policy>,
     tls: TlsConnector,
@@ -209,16 +210,28 @@ impl Aliases {
             })
             .copied()
             .collect();
-        let fresh = missing
-            .iter()
-            .filter(|ip| !self.history.contains_key(&(name.clone(), **ip)))
-            .count();
-        if fresh > MAX_ALIASES - self.entries.len() {
+        let mut new_pairs = Vec::new();
+        for ip in &missing {
+            if self.history.contains_key(&(name.clone(), *ip)) {
+                continue;
+            }
+            let key = AliasLedger::key(&name, *ip);
+            if self.ledger.lookup(key)?.is_none() {
+                new_pairs.push((*ip, key));
+            }
+        }
+        if new_pairs.len() > MAX_ALIASES.saturating_sub(self.entries.len()) {
             return Err("DNS session alias capacity exhausted; restart session explicitly".into());
         }
         // Reserve every new number durably before changing the session table.
         // Expired aliases are reclaimed only for the same name/IP pair.
-        let mut fresh = self.ledger.allocate(fresh)?.into_iter();
+        let allocated = self.ledger.allocate(new_pairs.len())?;
+        self.ledger.record(
+            new_pairs
+                .iter()
+                .zip(allocated)
+                .map(|((_, key), alias)| (*key, alias)),
+        )?;
         let expires = now + Duration::from_secs(u64::from(ttl));
         let mut result = Vec::with_capacity(ips.len());
         for ip in ips {
@@ -239,9 +252,10 @@ impl Aliases {
                 _ => match self.history.get(&(name.clone(), *ip)).copied() {
                     Some(alias) => alias,
                     None => {
-                        let alias = fresh
-                            .next()
-                            .expect("reserved every distinct missing DNS alias");
+                        let alias = self
+                            .ledger
+                            .lookup(AliasLedger::key(&name, *ip))?
+                            .ok_or("DNS alias mapping missing after durable reservation")?;
                         self.history.insert((name.clone(), *ip), alias);
                         self.live
                             .entry(name.clone())
