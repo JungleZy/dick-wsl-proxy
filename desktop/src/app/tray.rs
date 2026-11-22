@@ -13,17 +13,18 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, IDI_APPLICATION, LoadIconW, MF_STRING,
+    DispatchMessageW, EnumWindows, GetCursorPos, GetMessageW, GetWindowThreadProcessId,
+    IDI_APPLICATION, LoadIconW, MF_STRING,
     PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, ShowWindow, TrackPopupMenu,
     TranslateMessage, WNDCLASSW, HWND_MESSAGE, SW_RESTORE, TPM_LEFTALIGN, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_TIMER,
 };
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const TRAY_TIMER: usize = 1;
 const OPEN_COMMAND: usize = 1;
 const EXIT_COMMAND: usize = 2;
-const MAIN_TITLE: &str = "WSL Proxy";
 static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn start() {
@@ -39,7 +40,7 @@ pub(crate) fn consume_exit_request() -> bool {
 
 pub(crate) fn hide_main_window() {
     unsafe {
-        let hwnd = FindWindowW(null(), wide(MAIN_TITLE).as_ptr());
+        let hwnd = find_main_window();
         if !hwnd.is_null() {
             ShowWindow(hwnd, windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE);
         }
@@ -57,7 +58,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             0
         }
         WM_TIMER => {
-            if FindWindowW(null(), wide(MAIN_TITLE).as_ptr()).is_null() {
+            if find_main_window().is_null() {
                 DestroyWindow(hwnd);
             }
             0
@@ -74,7 +75,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
 
 unsafe fn run() {
     let class_name = wide("WSLProxyLabTrayWindow");
+    let instance = GetModuleHandleW(null());
     let class = WNDCLASSW {
+        hInstance: instance,
         lpfnWndProc: Some(window_proc),
         lpszClassName: class_name.as_ptr(),
         ..Default::default()
@@ -93,7 +96,7 @@ unsafe fn run() {
         0,
         HWND_MESSAGE,
         null_mut(),
-        null_mut(),
+        instance,
         null(),
     );
     if hwnd.is_null() {
@@ -113,7 +116,7 @@ unsafe fn run() {
 }
 
 unsafe fn show_main_window() {
-    let hwnd = FindWindowW(null(), wide(MAIN_TITLE).as_ptr());
+    let hwnd = find_main_window();
     if !hwnd.is_null() {
         ShowWindow(hwnd, SW_RESTORE);
         SetForegroundWindow(hwnd);
@@ -146,7 +149,7 @@ unsafe fn show_menu(hwnd: HWND) {
     match command as usize {
         OPEN_COMMAND => show_main_window(),
         EXIT_COMMAND => {
-            let main = FindWindowW(null(), wide(MAIN_TITLE).as_ptr());
+            let main = find_main_window();
             if !main.is_null() {
                 EXIT_REQUESTED.store(true, Ordering::Release);
                 PostMessageW(main, windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE, 0, 0);
@@ -154,6 +157,33 @@ unsafe fn show_menu(hwnd: HWND) {
         }
         _ => {}
     }
+}
+
+unsafe fn find_main_window() -> HWND {
+    struct Search {
+        pid: u32,
+        hwnd: HWND,
+    }
+    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> i32 {
+        let search = &mut *(lparam as *mut Search);
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid == search.pid {
+            search.hwnd = hwnd;
+            0
+        } else {
+            1
+        }
+    }
+    let mut search = Search {
+        pid: windows_sys::Win32::System::Threading::GetCurrentProcessId(),
+        hwnd: null_mut(),
+    };
+    EnumWindows(
+        Some(callback),
+        (&mut search as *mut Search).cast::<core::ffi::c_void>() as LPARAM,
+    );
+    search.hwnd
 }
 
 fn wide(value: &str) -> Vec<u16> {

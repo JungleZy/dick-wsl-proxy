@@ -378,9 +378,9 @@ impl Desktop {
         let mut body = div().flex().flex_col().gap_3().child(self.field(
             "环境名称",
             if creating {
-                "只允许字母、数字、点、下划线和短横线。"
+                ""
             } else {
-                "编辑操作针对当前环境。"
+                ""
             },
             &self.fields.environment_name,
             false,
@@ -395,7 +395,7 @@ impl Desktop {
                         .gap_2()
                         .child(self.field(
                             "rootfs tar",
-                            "选择发行版 rootfs 的 .tar 或 .tar.gz。",
+                            "",
                             &self.fields.environment_source,
                             false,
                         ))
@@ -415,7 +415,7 @@ impl Desktop {
                         .gap_2()
                         .child(self.field(
                             "安装目录",
-                            "目录必须不存在，wsl.exe 会创建它。",
+                            "",
                             &self.fields.environment_install,
                             false,
                         ))
@@ -499,7 +499,7 @@ impl Desktop {
             } else {
                 "编辑 WSL 环境"
             },
-            "填写设置后确认，取消会返回环境详情。",
+            "环境配置",
             body,
         )
     }
@@ -511,7 +511,7 @@ impl Desktop {
         let backup_name = name.clone();
         card(
             "环境详情",
-            "已选环境的注册信息和基本设置",
+            "环境状态",
             div()
                 .flex()
                 .flex_col()
@@ -696,7 +696,7 @@ impl Desktop {
         }
         let left = card(
             "所有环境",
-            "点击环境查看详情，新增环境固定显示在列表顶部。",
+            "WSL2 发行版",
             div()
                 .flex()
                 .flex_col()
@@ -742,14 +742,14 @@ impl Desktop {
         } else {
             card(
                 "环境详情",
-                "点击左侧环境，或在列表顶部新增环境。",
+                "选择一个环境",
                 div()
                     .p_4()
                     .bg(rgb(SURFACE_SOFT))
                     .rounded_md()
                     .text_base()
                     .text_color(rgb(MUTED))
-                    .child("这里会显示安装位置、WSL 版本、zsh、Chrome、中文输入法和 Locale。"),
+                    .child("请选择左侧环境。"),
             )
         };
         let right = div()
