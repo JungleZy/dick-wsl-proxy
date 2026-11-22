@@ -166,11 +166,14 @@ pub(super) fn relay(
         }
         if request.eof || response.eof {
             let since = if progressed {
-                half_closed.insert(now)
+                // A half-closed stream may continue carrying a long response.
+                // Bound only the quiet period after EOF, not total response time.
+                half_closed = Some(now);
+                now
             } else {
-                half_closed.get_or_insert(now)
+                *half_closed.get_or_insert(now)
             };
-            if now.duration_since(*since) >= HALF_CLOSE_TIMEOUT {
+            if now.duration_since(since) >= HALF_CLOSE_TIMEOUT {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "TCP half-close deadline",
