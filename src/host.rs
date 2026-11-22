@@ -23,8 +23,8 @@ pub enum LockError {
 
 #[cfg(windows)]
 pub use windows::{
-    acquire, distributions, guest_script, guest_script_with_timeout, state_dir, wsl_command,
-    wsl_executable,
+    acquire, distributions, guest_script, guest_script_with_timeout, ipv6_scope_id, state_dir,
+    wsl_command, wsl_executable,
 };
 
 #[cfg(not(windows))]
@@ -65,6 +65,11 @@ pub fn acquire() -> Result<ControllerLock, LockError> {
     Err(LockError::Other(
         "unsupported_platform: Windows host required".into(),
     ))
+}
+
+#[cfg(not(windows))]
+pub fn ipv6_scope_id(_: std::net::Ipv6Addr) -> Result<Option<u32>, String> {
+    Ok(None)
 }
 
 #[cfg(any(windows, test))]
@@ -358,6 +363,30 @@ mod windows {
 
     pub fn state_dir() -> Result<PathBuf, String> {
         Ok(local_app_data()?.join("WSLProxyLab"))
+    }
+
+    pub fn ipv6_scope_id(address: std::net::Ipv6Addr) -> Result<Option<u32>, String> {
+        use windows_sys::Win32::NetworkManagement::IpHelper::GetBestInterfaceEx;
+        use windows_sys::Win32::Networking::WinSock::{
+            AF_INET6, IN6_ADDR, IN6_ADDR_0, SOCKADDR_IN6,
+        };
+
+        let destination = SOCKADDR_IN6 {
+            sin6_family: AF_INET6,
+            sin6_addr: IN6_ADDR {
+                u: IN6_ADDR_0 {
+                    Byte: address.octets(),
+                },
+            },
+            ..Default::default()
+        };
+        let mut index = 0;
+        let result =
+            unsafe { GetBestInterfaceEx((&destination as *const SOCKADDR_IN6).cast(), &mut index) };
+        if result != 0 {
+            return Err(format!("ipv6_scope_lookup_failed:{result}"));
+        }
+        Ok((index != 0).then_some(index))
     }
 
     pub fn acquire() -> Result<ControllerLock, LockError> {

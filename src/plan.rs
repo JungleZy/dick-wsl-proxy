@@ -129,7 +129,19 @@ impl Plan {
         // Scoped mode has an explicit IPv4 destination list and no IPv6
         // destination list. Keep the optional IPv6 transparent path coupled
         // to managed mode until both families share the same policy runtime.
-        let ipv6 = system_dns.is_some().then(|| ipv6_scope(s, port)).flatten();
+        let ipv6 = system_dns
+            .is_some()
+            .then(|| ipv6_scope(s, port))
+            .flatten()
+            .and_then(|mut ipv6| {
+                if ipv6.ingress.ip().is_unicast_link_local() {
+                    let scope = crate::host::ipv6_scope_id(*ipv6.ingress.ip())
+                        .ok()
+                        .flatten()?;
+                    ipv6.ingress.set_scope_id(scope);
+                }
+                Some(ipv6)
+            });
         Ok(Self {
             target: target.clone(),
             cgroup_ns: s.cgroup_ns.clone(),
