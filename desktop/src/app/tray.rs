@@ -15,10 +15,11 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, EnumWindows, GetCursorPos, GetMessageW, GetWindowThreadProcessId,
-    HWND_MESSAGE, IDI_APPLICATION, LoadIconW, MF_STRING, PostMessageW, PostQuitMessage,
-    RegisterClassW, SW_RESTORE, SetForegroundWindow, ShowWindow, TPM_LEFTALIGN, TPM_RETURNCMD,
+    IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTSIZE, LoadIconW, LoadImageW, MF_STRING, PostMessageW,
+    PostQuitMessage, RegisterClassW, SW_HIDE, SW_RESTORE, SetForegroundWindow, ShowWindow,
+    TPM_LEFTALIGN, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_DESTROY, WM_LBUTTONDBLCLK,
-    WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
+    WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 
 const TRAY_MESSAGE: u32 = WM_APP + 1;
@@ -91,7 +92,7 @@ unsafe fn run() {
         return;
     }
     let hwnd = CreateWindowExW(
-        0,
+        WS_OVERLAPPED,
         class_name.as_ptr(),
         class_name.as_ptr(),
         0,
@@ -99,7 +100,7 @@ unsafe fn run() {
         0,
         0,
         0,
-        HWND_MESSAGE,
+        null_mut(),
         null_mut(),
         instance,
         null(),
@@ -107,6 +108,7 @@ unsafe fn run() {
     if hwnd.is_null() {
         return;
     }
+    ShowWindow(hwnd, SW_HIDE);
     let mut data = notify_data(hwnd);
     if Shell_NotifyIconW(NIM_ADD, &mut data) == 0 {
         DestroyWindow(hwnd);
@@ -207,7 +209,14 @@ unsafe fn notify_data(hwnd: HWND) -> NOTIFYICONDATAW {
     data.uID = 1;
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     data.uCallbackMessage = TRAY_MESSAGE;
-    data.hIcon = LoadIconW(null_mut(), IDI_APPLICATION);
+    let resource = 1usize as *const u16;
+    let application = GetModuleHandleW(null());
+    let icon = LoadImageW(application, resource, IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
+    data.hIcon = if icon.is_null() {
+        LoadIconW(null_mut(), IDI_APPLICATION)
+    } else {
+        icon
+    };
     let tip = wide("WSL Proxy");
     let length = tip.len().min(data.szTip.len());
     data.szTip[..length].copy_from_slice(&tip[..length]);
