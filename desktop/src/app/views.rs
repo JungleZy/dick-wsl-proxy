@@ -15,8 +15,8 @@ use super::components::{app_icon, badge, design_icon, icon, status_dot, text};
 use super::model::{EnvironmentEditor, LogFilter, Page, UiAction};
 use super::state::Desktop;
 use super::theme::{
-    AMBER, BLUE, BLUE_SOFT, INK, MUTED, PAPER, RULE, RUST, SIDEBAR_BG, SUCCESS_BG, SURFACE,
-    SURFACE_SOFT, TEAL, WARNING_BG,
+    AMBER, BLUE, BLUE_SOFT, INK, MONO_FONT, MUTED, PAPER, RULE, RUST, SIDEBAR_BG, SUCCESS_BG,
+    SURFACE, SURFACE_SOFT, TEAL, WARNING_BG,
 };
 
 pub(crate) fn card_header(title: &'static str, caption: &'static str) -> Div {
@@ -277,6 +277,14 @@ impl Desktop {
                     .tab_stop(false)
                     .ghost()
                     .compact(),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .font_family(MONO_FONT)
+                    .text_base()
+                    .text_color(rgb(MUTED))
+                    .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
             )
     }
 
@@ -1006,6 +1014,17 @@ impl Desktop {
                 .child(key_value("关闭窗口", "保持后台运行"))
                 .child(key_value("语言", "简体中文")),
         );
+        let startup = card(
+            "启动",
+            "登录 Windows 后自动打开桌面控制台",
+            Checkbox::new("settings-autostart")
+                .label("开机自动启动")
+                .checked(self.autostart_enabled)
+                .disabled(self.locked())
+                .on_click(cx.listener(|this, checked, _, cx| {
+                    this.set_autostart(*checked, cx);
+                })),
+        );
         div()
             .flex()
             .flex_col()
@@ -1027,6 +1046,7 @@ impl Desktop {
                     .child(storage.flex_1().min_w(px(320.)))
                     .child(window.flex_1().min_w(px(320.))),
             )
+            .child(startup)
             .child(
                 div()
                     .flex()

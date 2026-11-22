@@ -8,6 +8,8 @@ publish.workspace = true
 gpui-kit = { version = "=0.10.0" }
 serde_json.workspace = true
 wsl-proxyctl = { path = ".." }
+winreg = "0.55"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]
 embed-resource = "3.0.2"

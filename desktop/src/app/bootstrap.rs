@@ -140,6 +140,7 @@ impl Desktop {
             preflight_key: None,
             notice: "正在连接后台；关闭窗口不会停止接管。".into(),
             error: false,
+            autostart_enabled: super::autostart::enabled().unwrap_or(false),
             confirmation: None,
             export_path: None,
             environment_editor: None,

@@ -45,6 +45,7 @@ pub(crate) struct Desktop {
     pub(crate) preflight_key: Option<(String, String, u16)>,
     pub(crate) notice: String,
     pub(crate) error: bool,
+    pub(crate) autostart_enabled: bool,
     pub(crate) confirmation: Option<Confirmation>,
     pub(crate) export_path: Option<String>,
     pub(crate) environment_editor: Option<EnvironmentEditor>,

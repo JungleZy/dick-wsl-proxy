@@ -11,6 +11,22 @@ use super::state::Desktop;
 use std::path::Path;
 
 impl Desktop {
+    pub(crate) fn set_autostart(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        match super::autostart::set_enabled(enabled) {
+            Ok(()) => {
+                self.autostart_enabled = enabled;
+                self.notice = if enabled {
+                    "已启用开机自动启动。".into()
+                } else {
+                    "已关闭开机自动启动。".into()
+                };
+                self.error = false;
+                cx.notify();
+            }
+            Err(error) => self.fail(format!("开机自启设置失败：{error}"), cx),
+        }
+    }
+
     pub(crate) fn fail(&mut self, error: impl Into<String>, cx: &mut Context<Self>) {
         self.notice = error.into();
         self.error = true;

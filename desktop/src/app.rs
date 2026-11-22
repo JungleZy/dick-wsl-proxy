@@ -3,16 +3,19 @@ use gpui_kit::component::{Theme, ThemeMode, TitleBar};
 use gpui_kit::{prelude::*, *};
 
 mod actions;
+mod autostart;
 mod backend;
 mod bootstrap;
 mod chrome;
 mod components;
 mod diagnostics;
+mod instance;
 mod model;
 mod overview;
 mod policy;
 mod state;
 mod theme;
+mod tray;
 mod views;
 
 use state::Desktop;
@@ -22,6 +25,9 @@ use theme::{
 };
 
 pub fn run() {
+    let Some(_instance) = instance::acquire() else {
+        return;
+    };
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(|cx: &mut App| {
@@ -67,6 +73,8 @@ pub fn run() {
             });
             if let Err(error) = opened {
                 eprintln!("无法打开 WSL 代理控制台：{error}");
+            } else {
+                tray::start();
             }
             cx.activate(true);
         });
