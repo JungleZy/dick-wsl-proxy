@@ -1,5 +1,6 @@
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::net::Ipv4Addr;
 
 const SCRIPT: &str = include_str!("guest/probe.sh");
@@ -36,6 +37,162 @@ pub struct Snapshot {
 pub fn inspect(distro: &crate::host::Distro) -> Result<Snapshot, String> {
     let output = crate::host::guest_script(distro, SCRIPT)?;
     snapshot(&distro.name, parse(&output)?)
+}
+
+/// Verify the kernel's caller-cgroup namespace interpretation with real local
+/// sockets from both registered WSL distributions. The temporary rule is
+/// inserted only in the target's shared network namespace and is removed
+/// before this function returns.
+pub fn verify_cgroup_isolation(
+    target: &crate::host::Distro,
+    witness: &crate::host::Distro,
+) -> Result<(), String> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    target.id.hash(&mut hasher);
+    witness.id.hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    let digest = hasher.finish();
+    let token = format!("{:08x}", digest as u32);
+    let chain = format!("WPL_ISO_{token}");
+    let tag = format!("wsl-proxyctl-isolation:{token}");
+    let port = 49152 + ((digest & 0x03ff) as u16);
+    let setup = isolation_setup_script(&chain, &tag, port);
+    let cleanup = isolation_cleanup_script(&chain, &tag, port);
+    let counter = isolation_counter_script(&chain);
+    let socket_probe = isolation_socket_probe(port);
+
+    let ready = crate::host::guest_script(target, &setup)
+        .map_err(|error| format!("isolation_cgroup_test_setup_failed:{error}"))?;
+    if ready.trim() != "ready" {
+        let _ = crate::host::guest_script(target, &cleanup);
+        return Err("isolation_cgroup_test_setup_invalid_response".into());
+    }
+
+    let result = (|| {
+        let baseline = read_isolation_counter(target, &counter)?;
+        crate::host::guest_script(target, &socket_probe)
+            .map_err(|error| format!("isolation_target_socket_probe_failed:{error}"))?;
+        let target_count = read_isolation_counter(target, &counter)?;
+        if target_count <= baseline {
+            return Err("isolation_target_cgroup_rule_not_matched".into());
+        }
+        crate::host::guest_script(witness, &socket_probe)
+            .map_err(|error| format!("isolation_witness_socket_probe_failed:{error}"))?;
+        let witness_count = read_isolation_counter(target, &counter)?;
+        if witness_count != target_count {
+            return Err("isolation_witness_matched_target_cgroup_rule".into());
+        }
+        Ok(())
+    })();
+    let cleanup_result = crate::host::guest_script(target, &cleanup)
+        .map(|_| ())
+        .map_err(|error| format!("isolation_cgroup_test_cleanup_failed:{error}"));
+    match (result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(cleanup_error)) => Err(format!("{error};{cleanup_error}")),
+    }
+}
+
+fn read_isolation_counter(target: &crate::host::Distro, script: &str) -> Result<u64, String> {
+    let output = crate::host::guest_script(target, script)
+        .map_err(|error| format!("isolation_cgroup_counter_failed:{error}"))?;
+    output
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "isolation_cgroup_counter_invalid".into())
+}
+
+fn isolation_setup_script(chain: &str, tag: &str, port: u16) -> String {
+    format!(
+        r#"set -eu
+LC_ALL=C
+export LC_ALL
+chain='{chain}'
+tag='{tag}'
+port='{port}'
+created=0
+hook=0
+cleanup_on_error() {{
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        set +e
+        if [ "$hook" -eq 1 ]; then
+            iptables-legacy -D OUTPUT -d 127.0.0.1/32 -p tcp -m tcp --dport "$port" -m cgroup --path / -m comment --comment "$tag" -j "$chain"
+        fi
+        if [ "$created" -eq 1 ]; then
+            iptables-legacy -F "$chain"
+            iptables-legacy -X "$chain"
+        fi
+    fi
+    exit "$status"
+}}
+trap cleanup_on_error EXIT
+if iptables-legacy -L "$chain" >/dev/null 2>&1; then
+    echo 'isolation_test_chain_collision' >&2
+    exit 41
+fi
+iptables-legacy -N "$chain"
+created=1
+iptables-legacy -A "$chain" -m comment --comment "$tag" -j ACCEPT
+iptables-legacy -I OUTPUT 1 -d 127.0.0.1/32 -p tcp -m tcp --dport "$port" -m cgroup --path / -m comment --comment "$tag" -j "$chain"
+hook=1
+trap - EXIT
+printf 'ready\n'
+"#
+    )
+}
+
+fn isolation_cleanup_script(chain: &str, tag: &str, port: u16) -> String {
+    format!(
+        r#"set +e
+LC_ALL=C
+export LC_ALL
+chain='{chain}'
+tag='{tag}'
+port='{port}'
+iptables-legacy -D OUTPUT -d 127.0.0.1/32 -p tcp -m tcp --dport "$port" -m cgroup --path / -m comment --comment "$tag" -j "$chain"
+remove_hook=$?
+iptables-legacy -F "$chain"
+flush_chain=$?
+iptables-legacy -X "$chain"
+remove_chain=$?
+if [ "$remove_hook" -ne 0 ] || [ "$flush_chain" -ne 0 ] || [ "$remove_chain" -ne 0 ]; then
+    exit 42
+fi
+"#
+    )
+}
+
+fn isolation_counter_script(chain: &str) -> String {
+    format!(
+        r#"set -eu
+value=$(iptables-legacy -L '{chain}' -v -n -x | awk 'NR >= 3 && $1 ~ /^[0-9]+$/ {{ print $1; exit }}')
+case "$value" in
+    ''|*[!0-9]*) exit 43 ;;
+esac
+printf '%s\n' "$value"
+"#
+    )
+}
+
+fn isolation_socket_probe(port: u16) -> String {
+    format!(
+        r#"set -eu
+/usr/bin/python3 -I - <<'WPL_ISOLATION_SOCKET'
+import socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.settimeout(0.5)
+try:
+    sock.connect(("127.0.0.1", {port}))
+except OSError:
+    pass
+finally:
+    sock.close()
+WPL_ISOLATION_SOCKET
+"#
+    )
 }
 
 fn parse(output: &str) -> Result<BTreeMap<String, Observation>, String> {
@@ -373,6 +530,21 @@ fn snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cgroup_isolation_scripts_are_local_and_exactly_tagged() {
+        let setup =
+            isolation_setup_script("WPL_ISO_1234abcd", "wsl-proxyctl-isolation:1234abcd", 49153);
+        assert!(setup.contains("-d 127.0.0.1/32"));
+        assert!(setup.contains("--path /"));
+        assert!(setup.contains("wsl-proxyctl-isolation:1234abcd"));
+        let cleanup =
+            isolation_cleanup_script("WPL_ISO_1234abcd", "wsl-proxyctl-isolation:1234abcd", 49153);
+        assert!(cleanup.contains("-D OUTPUT"));
+        assert!(cleanup.contains("-X \"$chain\""));
+        let counter = isolation_counter_script("WPL_ISO_1234abcd");
+        assert!(counter.contains("iptables-legacy -L 'WPL_ISO_1234abcd'"));
+    }
 
     #[test]
     fn records_preserve_empty_success_and_failure() {

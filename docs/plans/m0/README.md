@@ -14,7 +14,9 @@ $ctl = 'D:\WSL\ProxyLab\m0-1pRyLo\wsl-proxyctl.exe'
 $LASTEXITCODE
 ```
 
-`list` 读当前 Windows 用户的发行版注册表，不启动发行版。`preflight` 接受注册名称或注册 GUID；通过 `wsl.exe --distribution-id` 在明确指定的目标、对照中以 Linux root 执行内置只读脚本，可能唤醒这两个发行版。不会探测未选择的其他注册项，不读取住宅凭据，也不自动安装工具。`--port` 是待检查的 **Windows** 入口端口（默认 43531）；分别独占绑定 TCP 和 UDP 后释放，不监听、不转发。这是即时可用性检查，不是为下一阶段预留端口。
+`list` 读当前 Windows 用户的发行版注册表，不启动发行版。`preflight` 接受注册名称或注册 GUID；通过 `wsl.exe --distribution-id` 在明确指定的目标、对照中以 Linux root 执行内置探测，可能唤醒这两个发行版。不会探测未选择的其他注册项，不读取住宅凭据，也不自动安装工具。`--port` 是待检查的 **Windows** 入口端口（默认 43531）；分别独占绑定 TCP 和 UDP 后释放，不监听、不转发。这是即时可用性检查，不是为下一阶段预留端口。
+
+预检在目标和对照身份、cgroup 边界及工具能力均通过后，会临时安装一条带唯一标记的 `xt_cgroup --path /` 计数规则。目标和对照分别发起本地回环连接，要求只有目标命中，随后精确删除规则。匹配结果或清理结果无法确认时，预检阻断并保留恢复所需的错误信息。
 
 `session` 持有当前用户唯一控制锁，逐行接收 JSON 命令，例如 `{"command":"status"}`；EOF 正常退出。独立子命令也先取得同一把锁。锁文件位于当前用户 LocalAppData 下的 `WSLProxyLab\controller.lock`，锁由打开的文件句柄维持，进程退出自动释放；不通过删除文件强行解锁。
 

@@ -210,6 +210,13 @@ fn preflight<'a>(
         (Some(p), _) if !p.available() => blockers.push("host_port_unavailable".into()),
         _ => (),
     }
+    if blockers.is_empty()
+        && let Some(witness) = witness.as_ref()
+        && let Err(error) =
+            probe::verify_cgroup_isolation(target.distribution, witness.distribution)
+    {
+        blockers.push(format!("isolation_cgroup_match_unverified:{error}"));
+    }
     let passed = blockers.is_empty();
     Ok(Preflight {
         schema_version: 1,
@@ -421,7 +428,10 @@ pub(crate) fn dispatch_result(
     Ok((0, response))
 }
 
-pub(crate) fn dispatch(request: Command, controller: &mut controller::Controller) -> Result<u8, Failure> {
+pub(crate) fn dispatch(
+    request: Command,
+    controller: &mut controller::Controller,
+) -> Result<u8, Failure> {
     let (rc, response) = dispatch_result(request, controller)?;
     emit(&response)?;
     Ok(rc)
