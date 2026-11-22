@@ -1,6 +1,6 @@
 use super::{Aliases, MAX_DNS, MAX_RECORDS, MAX_TTL};
 use std::collections::HashSet;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -28,7 +28,7 @@ pub(super) struct Message {
     pub(super) answers: Vec<Record>,
     pub(super) dnssec: bool,
     pub(super) udp_size: usize,
-    pub(super) has_reserved_a: bool,
+    pub(super) has_reserved_alias: bool,
 }
 
 pub(super) fn word(wire: &[u8], at: usize) -> Result<u16, String> {
@@ -113,7 +113,7 @@ impl Message {
         {
             return Err("DNS upstream response does not match the question".into());
         }
-        if message.has_reserved_a {
+        if message.has_reserved_alias {
             return Err("upstream DNS returned a reserved session alias".into());
         }
         Ok(message)
@@ -140,7 +140,7 @@ impl Message {
         let mut seen_opt = false;
         let mut dnssec = false;
         let mut udp_size = 512;
-        let mut has_reserved_a = false;
+        let mut has_reserved_alias = false;
         for (section, count) in counts.into_iter().enumerate() {
             for _ in 0..count {
                 let owner = name(wire, &mut cursor)?;
@@ -188,9 +188,16 @@ impl Message {
                     let octets: [u8; 4] = wire[start..end]
                         .try_into()
                         .map_err(|_| "invalid DNS A data")?;
-                    has_reserved_a |= reserved(Ipv4Addr::from(octets));
+                    has_reserved_alias |= reserved(Ipv4Addr::from(octets));
+                } else if kind == 28 {
+                    let octets: [u8; 16] = wire[start..end]
+                        .try_into()
+                        .map_err(|_| "invalid DNS AAAA data")?;
+                    has_reserved_alias |= Ipv6Addr::from(octets)
+                        .to_ipv4_mapped()
+                        .is_some_and(reserved);
                 }
-                validate_rdata(wire, kind, start, end, &mut has_reserved_a)?;
+                validate_rdata(wire, kind, start, end, &mut has_reserved_alias)?;
                 if section == 0 {
                     answers.push(Record {
                         name: owner,
@@ -217,7 +224,7 @@ impl Message {
             answers,
             dnssec,
             udp_size,
-            has_reserved_a,
+            has_reserved_alias,
         })
     }
 }
@@ -227,7 +234,7 @@ fn validate_rdata(
     kind: u16,
     start: usize,
     end: usize,
-    reserved_ip: &mut bool,
+    reserved_alias: &mut bool,
 ) -> Result<(), String> {
     let mut at = start;
     match kind {
@@ -291,9 +298,18 @@ fn validate_rdata(
                         return Err("invalid DNS IPv4 hint".into());
                     }
                     for address in wire[at..next].as_chunks::<4>().0 {
-                        *reserved_ip |= reserved(Ipv4Addr::new(
+                        *reserved_alias |= reserved(Ipv4Addr::new(
                             address[0], address[1], address[2], address[3],
                         ));
+                    }
+                } else if key == 6 {
+                    if size == 0 || size % 16 != 0 {
+                        return Err("invalid DNS IPv6 hint".into());
+                    }
+                    for address in wire[at..next].as_chunks::<16>().0 {
+                        *reserved_alias |= Ipv6Addr::from(*address)
+                            .to_ipv4_mapped()
+                            .is_some_and(reserved);
                     }
                 }
                 at = next;

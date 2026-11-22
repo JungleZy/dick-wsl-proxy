@@ -197,6 +197,35 @@ fn https_ipv4_hints_cannot_borrow_a_reserved_alias() {
 }
 
 #[test]
+fn mapped_aaaa_cannot_borrow_a_reserved_alias() {
+    let mut wire = query("other.example");
+    let length = wire.len();
+    wire[length - 4..length - 2].copy_from_slice(&28u16.to_be_bytes());
+    let mut upstream = wire.clone();
+    upstream[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+    upstream[7] = 1;
+    upstream.extend_from_slice(&[0xc0, 12, 0, 28, 0, 1, 0, 0, 0, 60, 0, 16]);
+    upstream.extend_from_slice(&Ipv4Addr::new(198, 18, 0, 1).to_ipv6_mapped().octets());
+    let parsed = Message::query(&wire).unwrap();
+    assert!(Message::response(&upstream, &parsed).is_err());
+}
+
+#[test]
+fn https_ipv6_hints_cannot_borrow_a_reserved_alias() {
+    let mut wire = query("other.example");
+    let length = wire.len();
+    wire[length - 4..length - 2].copy_from_slice(&65u16.to_be_bytes());
+    let mut upstream = wire.clone();
+    upstream[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+    upstream[7] = 1;
+    upstream.extend_from_slice(&[0xc0, 12, 0, 65, 0, 1, 0, 0, 0, 60, 0, 23]);
+    upstream.extend_from_slice(&[0, 1, 0, 0, 6, 0, 16]);
+    upstream.extend_from_slice(&Ipv4Addr::new(198, 18, 0, 1).to_ipv6_mapped().octets());
+    let parsed = Message::query(&wire).unwrap();
+    assert!(Message::response(&upstream, &parsed).is_err());
+}
+
+#[test]
 fn aliases_never_cross_names_and_reclaim_same_pair_after_expiry() {
     let mut table = Aliases::default();
     let now = Instant::now();
