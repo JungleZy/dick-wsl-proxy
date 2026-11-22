@@ -369,12 +369,12 @@ impl Desktop {
         self.environment_editor = Some(EnvironmentEditor::Edit);
         self.environment_edit_target = Some(name.clone());
         self.environment_selected = Some(name.clone());
-        self.environment_detail = None;
         self.fields
             .environment_name
             .set_value(name.clone(), window, cx);
         self.fields.environment_source.set_value("", window, cx);
         self.fields.environment_install.set_value("", window, cx);
+        self.fields.environment_backup.set_value("", window, cx);
         self.send(
             Kind::EnvironmentView,
             json!({"command":"environment_view","name":name}),
@@ -382,10 +382,24 @@ impl Desktop {
         );
     }
 
-    pub(crate) fn environment_view(&mut self, name: String, cx: &mut Context<Self>) {
+    pub(crate) fn environment_view(
+        &mut self,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.locked() {
+            return;
+        }
+        if self.environment_editor.is_some() {
+            self.fail("请先取消或保存当前环境表单。", cx);
+            return;
+        }
         self.environment_selected = Some(name.clone());
         self.environment_editor = None;
         self.environment_edit_target = None;
+        self.environment_detail = None;
+        self.fields.environment_backup.set_value("", window, cx);
         self.send(
             Kind::EnvironmentView,
             json!({"command":"environment_view","name":name}),
@@ -394,6 +408,9 @@ impl Desktop {
     }
 
     pub(crate) fn environment_submit(&mut self, cx: &mut Context<Self>) {
+        if self.locked() {
+            return;
+        }
         let name = Self::field_value(&self.fields.environment_name, cx);
         if name.is_empty() {
             self.fail("请填写环境名称。", cx);
@@ -448,6 +465,9 @@ impl Desktop {
     }
 
     pub(crate) fn environment_backup(&mut self, name: String, cx: &mut Context<Self>) {
+        if self.locked() {
+            return;
+        }
         let path = Self::field_value(&self.fields.environment_backup, cx);
         if path.is_empty() {
             self.fail("请填写备份文件路径。", cx);
@@ -463,6 +483,8 @@ impl Desktop {
     pub(crate) fn environment_cancel(&mut self, cx: &mut Context<Self>) {
         self.environment_editor = None;
         self.environment_edit_target = None;
+        self.error = false;
+        self.notice = "已取消编辑。".into();
         cx.notify();
     }
 

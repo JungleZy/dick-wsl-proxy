@@ -74,11 +74,19 @@ pub(crate) fn key_value(label: &'static str, value: impl Into<SharedString>) -> 
         .child(
             div()
                 .w(px(112.))
+                .flex_shrink_0()
                 .text_base()
                 .text_color(rgb(MUTED))
                 .child(label),
         )
-        .child(div().flex_1().text_base().child(value.into()))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_base()
+                .truncate()
+                .child(value.into()),
+        )
 }
 
 pub(crate) fn chart_card(
@@ -87,6 +95,26 @@ pub(crate) fn chart_card(
     body: impl IntoElement,
 ) -> Div {
     card(title, caption, body)
+}
+
+fn environment_feature(label: &'static str, installed: bool, detail: &'static str) -> Div {
+    let (status, color, background) = if installed {
+        ("已就绪", TEAL, SUCCESS_BG)
+    } else {
+        ("未安装", MUTED, SURFACE_SOFT)
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .flex_1()
+        .min_w(px(120.))
+        .p_2()
+        .bg(rgb(SURFACE_SOFT))
+        .rounded_md()
+        .child(div().text_base().child(label))
+        .child(div().text_base().text_color(rgb(MUTED)).child(detail))
+        .child(badge(status, color, background))
 }
 
 fn titlebar_button(
@@ -365,7 +393,7 @@ impl Desktop {
                         .child(
                             div()
                                 .h(px(8.))
-                                .w(px(percent as f32 * 2.4))
+                                .w(relative(percent as f32 / 100.))
                                 .bg(rgb(BLUE))
                                 .rounded_full(),
                         ),
@@ -376,84 +404,138 @@ impl Desktop {
     }
 
     fn environment_editor_card(&self, creating: bool, locked: bool, cx: &Context<Self>) -> Div {
-        let mut body = div().flex().flex_col().gap_3().child(self.field(
-            "环境名称",
-            "",
-            &self.fields.environment_name,
-            false,
-        ));
+        let mut body = div().flex().flex_col().gap_3();
+        if creating {
+            body = body.child(self.field(
+                "环境名称",
+                "只允许字母、数字、点、下划线和短横线。",
+                &self.fields.environment_name,
+                false,
+            ));
+        } else {
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .bg(rgb(SURFACE_SOFT))
+                    .rounded_md()
+                    .child(div().text_base().text_color(rgb(MUTED)).child("环境名称"))
+                    .child(
+                        div().text_base().font_family(MONO_FONT).child(
+                            self.environment_edit_target
+                                .clone()
+                                .unwrap_or_else(|| "未命名环境".into()),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .text_base()
+                            .text_color(rgb(MUTED))
+                            .child("发行版名称不可在此修改。"),
+                    ),
+            );
+        }
         if creating {
             body = body
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .items_end()
-                        .gap_2()
-                        .child(self.field("rootfs tar", "", &self.fields.environment_source, false))
-                        .child(self.button(
-                            "env-pick-source",
-                            "选择文件",
-                            UiAction::EnvironmentPickSource,
-                            locked,
-                            cx,
-                        )),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .items_end()
-                        .gap_2()
-                        .child(self.field("安装目录", "", &self.fields.environment_install, false))
-                        .child(self.button(
-                            "env-pick-install",
-                            "选择目录",
-                            UiAction::EnvironmentPickInstall,
-                            locked,
-                            cx,
-                        )),
-                );
+                .child(self.field_with_action(
+                    "rootfs tar",
+                    "选择发行版 rootfs 的 .tar 或 .tar.gz。",
+                    &self.fields.environment_source,
+                    UiAction::EnvironmentPickSource,
+                    "env-pick-source",
+                    "选择文件",
+                    locked,
+                    cx,
+                ))
+                .child(self.field_with_action(
+                    "安装目录",
+                    "目录必须不存在，wsl.exe 会创建它。",
+                    &self.fields.environment_install,
+                    UiAction::EnvironmentPickInstall,
+                    "env-pick-install",
+                    "选择目录",
+                    locked,
+                    cx,
+                ));
         }
         body = body.child(
             div()
                 .flex()
-                .flex_wrap()
-                .gap_4()
+                .flex_col()
+                .gap_2()
+                .child(div().text_base().child("安装组件"))
                 .child(
-                    Checkbox::new("env-install-zsh")
-                        .label("安装 zsh")
-                        .checked(self.environment_zsh)
-                        .disabled(locked)
-                        .on_click(cx.listener(|this, checked, _, cx| {
-                            this.environment_zsh = *checked;
-                            cx.notify();
-                        })),
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(150.))
+                                .p_2()
+                                .bg(rgb(SURFACE_SOFT))
+                                .rounded_md()
+                                .child(
+                                    Checkbox::new("env-install-zsh")
+                                        .label("安装 zsh")
+                                        .checked(self.environment_zsh)
+                                        .disabled(locked || (!creating && self.environment_zsh))
+                                        .on_click(cx.listener(|this, checked, _, cx| {
+                                            this.environment_zsh = *checked;
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(150.))
+                                .p_2()
+                                .bg(rgb(SURFACE_SOFT))
+                                .rounded_md()
+                                .child(
+                                    Checkbox::new("env-install-chrome")
+                                        .label("安装 Chrome")
+                                        .checked(self.environment_chrome)
+                                        .disabled(locked || (!creating && self.environment_chrome))
+                                        .on_click(cx.listener(|this, checked, _, cx| {
+                                            this.environment_chrome = *checked;
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(150.))
+                                .p_2()
+                                .bg(rgb(SURFACE_SOFT))
+                                .rounded_md()
+                                .child(
+                                    Checkbox::new("env-install-chinese")
+                                        .label("中文环境和输入法")
+                                        .checked(self.environment_chinese)
+                                        .disabled(locked || (!creating && self.environment_chinese))
+                                        .on_click(cx.listener(|this, checked, _, cx| {
+                                            this.environment_chinese = *checked;
+                                            cx.notify();
+                                        })),
+                                ),
+                        ),
                 )
-                .child(
-                    Checkbox::new("env-install-chrome")
-                        .label("安装 Chrome")
-                        .checked(self.environment_chrome)
-                        .disabled(locked)
-                        .on_click(cx.listener(|this, checked, _, cx| {
-                            this.environment_chrome = *checked;
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    Checkbox::new("env-install-chinese")
-                        .label("中文环境和输入法")
-                        .checked(self.environment_chinese)
-                        .disabled(locked)
-                        .on_click(cx.listener(|this, checked, _, cx| {
-                            this.environment_chinese = *checked;
-                            cx.notify();
-                        })),
-                ),
+                .child(div().text_base().text_color(rgb(MUTED)).child(if creating {
+                    "创建时安装，编辑时只支持补装缺少的组件。"
+                } else {
+                    "已安装的组件不会被卸载，取消勾选不会删除现有配置。"
+                })),
         );
         body = body.child(
             div()
                 .flex()
+                .justify_end()
                 .gap_2()
                 .child(
                     self.button(
@@ -486,7 +568,11 @@ impl Desktop {
             } else {
                 "编辑 WSL 环境"
             },
-            "环境配置",
+            if creating {
+                "导入 rootfs 并完成基础设置"
+            } else {
+                "补装基础组件"
+            },
             body,
         )
     }
@@ -496,92 +582,182 @@ impl Desktop {
         let name = text(detail, "name", "未命名");
         let edit_name = name.clone();
         let backup_name = name.clone();
-        card(
-            "环境详情",
-            "环境状态",
-            div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .child(
-                            Button::new("environment-detail-edit")
-                                .label("编辑设置")
-                                .small()
-                                .disabled(locked)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.environment_edit(edit_name.clone(), window, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("environment-detail-backup")
-                                .label("备份环境")
-                                .small()
-                                .disabled(locked)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.environment_backup(backup_name.clone(), cx)
-                                })),
-                        ),
-                )
-                .child(key_value("名称", name))
-                .child(key_value("安装位置", text(detail, "base_path", "未读取")))
-                .child(key_value(
-                    "版本",
-                    format!("WSL {}", detail["version"].as_u64().unwrap_or_default()),
-                ))
-                .child(key_value(
-                    "zsh",
-                    if features["zsh"].as_bool().unwrap_or(false) {
-                        "已安装"
-                    } else {
-                        "未安装"
-                    },
-                ))
-                .child(key_value(
-                    "Chrome",
-                    if features["chrome"].as_bool().unwrap_or(false) {
-                        "已安装"
-                    } else {
-                        "未安装"
-                    },
-                ))
-                .child(key_value(
-                    "中文输入法",
-                    if features["input_method"].as_bool().unwrap_or(false) {
-                        "已配置 fcitx5"
-                    } else {
-                        "未配置"
-                    },
-                ))
-                .child(key_value("Locale", text(features, "locale", "未读取")))
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .items_end()
-                        .gap_2()
-                        .child(self.field(
-                            "备份文件",
-                            "目标文件不能已存在。",
-                            &self.fields.environment_backup,
-                            false,
-                        ))
-                        .child(self.button(
-                            "env-pick-backup",
-                            "选择位置",
-                            UiAction::EnvironmentPickBackup,
-                            locked,
-                            cx,
-                        )),
-                ),
-        )
+        let id = text(detail, "id", "");
+        let role = if self.selected.as_deref() == Some(id.as_str()) {
+            badge("当前目标", BLUE, super::theme::TARGET_BG)
+        } else if self.witness.as_deref() == Some(id.as_str()) {
+            badge("见证环境", TEAL, SUCCESS_BG)
+        } else {
+            badge("未分配", MUTED, SURFACE_SOFT)
+        };
+        let base_path = text(detail, "base_path", "未读取");
+        let version = detail["version"].as_u64().unwrap_or_default();
+        let feature_grid = div()
+            .flex()
+            .flex_wrap()
+            .gap_2()
+            .child(environment_feature(
+                "zsh",
+                features["zsh"].as_bool().unwrap_or(false),
+                "终端工具",
+            ))
+            .child(environment_feature(
+                "Chrome",
+                features["chrome"].as_bool().unwrap_or(false),
+                "图形浏览器",
+            ))
+            .child(environment_feature(
+                "中文输入法",
+                features["input_method"].as_bool().unwrap_or(false),
+                "fcitx5",
+            ));
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_3()
+            .bg(rgb(SURFACE))
+            .border_1()
+            .border_color(rgb(RULE))
+            .rounded_md()
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .justify_between()
+                    .gap_3()
+                    .child(card_header("环境详情", "发行版能力与管理操作"))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                Button::new("environment-detail-edit")
+                                    .label("编辑设置")
+                                    .small()
+                                    .disabled(locked)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.environment_edit(edit_name.clone(), window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("environment-detail-backup")
+                                    .label("备份环境")
+                                    .small()
+                                    .outline()
+                                    .disabled(locked)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.environment_backup(backup_name.clone(), cx)
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_3()
+                    .bg(rgb(SURFACE_SOFT))
+                    .rounded_md()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(icon("icons/folder.svg"))
+                                    .child(div().text_base().child(name)),
+                            )
+                            .child(role),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(72.))
+                                    .text_base()
+                                    .text_color(rgb(MUTED))
+                                    .child("安装位置"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .font_family(MONO_FONT)
+                                    .text_base()
+                                    .truncate()
+                                    .child(base_path),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(72.))
+                                    .text_base()
+                                    .text_color(rgb(MUTED))
+                                    .child("版本"),
+                            )
+                            .child(
+                                div()
+                                    .font_family(MONO_FONT)
+                                    .text_base()
+                                    .child(format!("WSL {version}")),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(div().text_base().child("环境能力"))
+                    .child(
+                        div()
+                            .text_base()
+                            .text_color(rgb(MUTED))
+                            .child(format!("Locale · {}", text(features, "locale", "未读取"))),
+                    ),
+            )
+            .child(feature_grid)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .border_t_1()
+                    .border_color(rgb(RULE))
+                    .pt_3()
+                    .child(div().text_base().child("导出备份"))
+                    .child(self.field_with_action(
+                        "备份文件",
+                        "目标文件不能已存在。",
+                        &self.fields.environment_backup,
+                        UiAction::EnvironmentPickBackup,
+                        "env-pick-backup",
+                        "选择位置",
+                        locked,
+                        cx,
+                    )),
+            )
     }
 
-    fn environment_page(&self, cx: &Context<Self>) -> Div {
+    fn environment_page(&self, window: &Window, cx: &Context<Self>) -> Div {
         let locked = self.locked();
+        let controls_locked = locked || self.environment_editor.is_some();
         let selected = self.environment_selected.as_deref();
         let mut rows = div().flex().flex_col().gap_2();
         for (index, distro) in self.distributions.iter().enumerate() {
@@ -592,6 +768,7 @@ impl Desktop {
             let witness = self.witness.as_deref() == Some(id.as_str());
             let active = selected == Some(name.as_str()) || selected == Some(id.as_str());
             let row_name = name.clone();
+            let view_name = row_name.clone();
             let target_id = id.clone();
             let witness_id = id.clone();
             let row_background = if active {
@@ -603,7 +780,9 @@ impl Desktop {
             } else {
                 SURFACE_SOFT
             };
-            let role = if target {
+            let role = if version != 2 {
+                badge("WSL 1 不支持", RUST, super::theme::DANGER_BG)
+            } else if target {
                 badge("当前目标", BLUE, super::theme::TARGET_BG)
             } else if witness {
                 badge("见证环境", TEAL, SUCCESS_BG)
@@ -614,114 +793,238 @@ impl Desktop {
                 div()
                     .id(("environment-row", index))
                     .flex()
-                    .items_center()
+                    .flex_col()
                     .gap_2()
-                    .p_2()
+                    .p_3()
                     .bg(rgb(row_background))
                     .border_1()
                     .border_color(rgb(if active { BLUE } else { RULE }))
                     .rounded_md()
                     .hover(|style| style.bg(rgb(BLUE_SOFT)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.environment_view(row_name.clone(), cx);
-                    }))
-                    .child(icon("icons/folder.svg"))
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(div().text_base().truncate().child(name))
+                            .flex()
+                            .items_start()
+                            .gap_2()
+                            .child(div().pt_1().flex_shrink_0().child(icon("icons/folder.svg")))
                             .child(
                                 div()
-                                    .text_base()
-                                    .text_color(rgb(MUTED))
-                                    .child(format!("WSL {version}")),
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .id(("environment-view", index))
+                                    .role(Role::Button)
+                                    .aria_label("查看环境详情")
+                                    .tab_stop(true)
+                                    .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.environment_view(view_name.clone(), window, cx);
+                                    }))
+                                    .on_key_down(cx.listener(
+                                        move |this, event: &KeyDownEvent, window, cx| {
+                                            if matches!(
+                                                event.keystroke.key.as_str(),
+                                                "enter" | "space"
+                                            ) {
+                                                this.environment_view(row_name.clone(), window, cx);
+                                            }
+                                        },
+                                    ))
+                                    .child(div().text_base().truncate().child(name))
+                                    .child(
+                                        div()
+                                            .text_base()
+                                            .font_family(MONO_FONT)
+                                            .text_color(rgb(MUTED))
+                                            .truncate()
+                                            .child(format!("{id} · WSL {version}")),
+                                    ),
+                            )
+                            .child(role),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(div().text_base().text_color(rgb(MUTED)).child(if active {
+                                "已选中 · 点击名称刷新详情"
+                            } else {
+                                "点击名称查看详情"
+                            }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .justify_end()
+                                    .gap_2()
+                                    .child(
+                                        Button::new(("environment-target", index))
+                                            .label(if target {
+                                                "当前目标"
+                                            } else {
+                                                "设为目标"
+                                            })
+                                            .small()
+                                            .selected(target)
+                                            .disabled(controls_locked || version != 2)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.selected = Some(target_id.clone());
+                                                if this.witness == this.selected {
+                                                    this.witness = None;
+                                                }
+                                                this.preflight = None;
+                                                this.preflight_key = None;
+                                                this.dirty = this.draft_is_dirty(cx);
+                                                this.notice =
+                                                    "目标已更新，请保存选择后再启动接管。".into();
+                                                this.error = false;
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new(("environment-witness", index))
+                                            .label(if witness {
+                                                "当前见证"
+                                            } else {
+                                                "设为见证"
+                                            })
+                                            .small()
+                                            .selected(witness)
+                                            .disabled(controls_locked || version != 2 || target)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.witness = Some(witness_id.clone());
+                                                this.preflight = None;
+                                                this.preflight_key = None;
+                                                this.dirty = this.draft_is_dirty(cx);
+                                                this.notice =
+                                                    "见证已更新，请保存选择后再运行预检。".into();
+                                                this.error = false;
+                                                cx.notify();
+                                            })),
+                                    ),
                             ),
-                    )
-                    .child(role)
-                    .child(
-                        Button::new(("environment-target", index))
-                            .label(if target { "目标" } else { "设为目标" })
-                            .small()
-                            .disabled(locked || version != 2)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.selected = Some(target_id.clone());
-                                if this.witness == this.selected {
-                                    this.witness = None;
-                                }
-                                this.preflight = None;
-                                this.preflight_key = None;
-                                this.dirty = this.draft_is_dirty(cx);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new(("environment-witness", index))
-                            .label(if witness { "见证" } else { "设为见证" })
-                            .small()
-                            .disabled(locked || version != 2 || target)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.witness = Some(witness_id.clone());
-                                this.preflight = None;
-                                this.preflight_key = None;
-                                this.dirty = this.draft_is_dirty(cx);
-                                cx.notify();
-                            })),
                     ),
             );
         }
         if self.distributions.is_empty() {
             rows = rows.child(
                 div()
-                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_2()
+                    .p_4()
                     .bg(rgb(SURFACE_SOFT))
                     .rounded_md()
-                    .text_base()
-                    .text_color(rgb(MUTED))
-                    .child("没有发现 WSL2 发行版，请刷新列表。"),
+                    .child(design_icon("environment", 24., MUTED))
+                    .child(div().text_base().child("没有发现 WSL2 发行版"))
+                    .child(
+                        div()
+                            .text_base()
+                            .text_color(rgb(MUTED))
+                            .child("刷新列表后重新读取系统注册信息。"),
+                    ),
             );
         }
-        let left = card(
-            "所有环境",
-            "WSL2 发行版",
-            div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(
-                    self.button(
-                        "environment-create-top",
-                        "新增环境",
-                        UiAction::EnvironmentCreate,
-                        locked,
-                        cx,
-                    )
-                    .primary(),
-                )
-                .child(rows)
-                .child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .child(self.button(
-                            "environment-list",
-                            "刷新列表",
-                            UiAction::List,
-                            locked,
+        let save_label = if self.dirty {
+            "保存选择"
+        } else {
+            "已保存"
+        };
+        let save_button = self
+            .button(
+                "environment-save",
+                save_label,
+                UiAction::Save,
+                controls_locked || !self.dirty || self.profile_path.is_none(),
+                cx,
+            )
+            .small();
+        let left = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_3()
+            .bg(rgb(SURFACE))
+            .border_1()
+            .border_color(rgb(RULE))
+            .rounded_md()
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .justify_between()
+                    .gap_3()
+                    .child(card_header("WSL 环境", "选择目标、见证和查看详情"))
+                    .child(
+                        self.button(
+                            "environment-create-top",
+                            "新增环境",
+                            UiAction::EnvironmentCreate,
+                            controls_locked,
                             cx,
-                        ))
-                        .child(
-                            self.button(
-                                "environment-preflight",
-                                "运行预检",
-                                UiAction::Preflight,
-                                locked,
-                                cx,
-                            )
-                            .primary(),
-                        ),
-                ),
-        );
+                        )
+                        .small()
+                        .primary(),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(badge(
+                        format!("{} 个发行版", self.distributions.len()),
+                        MUTED,
+                        SURFACE_SOFT,
+                    ))
+                    .child(if self.dirty {
+                        badge("有未保存更改", AMBER, WARNING_BG)
+                    } else if self.profile_path.is_some() {
+                        badge("选择已保存", TEAL, SUCCESS_BG)
+                    } else {
+                        badge("等待配置库", MUTED, SURFACE_SOFT)
+                    }),
+            )
+            .child(rows)
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        self.button(
+                            "environment-list",
+                            if self.reading {
+                                "读取中…"
+                            } else {
+                                "刷新列表"
+                            },
+                            UiAction::List,
+                            controls_locked,
+                            cx,
+                        )
+                        .outline()
+                        .small(),
+                    )
+                    .child(save_button)
+                    .child(
+                        self.button(
+                            "environment-preflight",
+                            "运行预检",
+                            UiAction::Preflight,
+                            controls_locked,
+                            cx,
+                        )
+                        .small()
+                        .primary(),
+                    ),
+            );
         let right_main = if let Some(editor) = self.environment_editor {
             self.environment_editor_card(matches!(editor, EnvironmentEditor::Create), locked, cx)
         } else if let Some(detail) = self.environment_detail.as_ref() {
@@ -731,11 +1034,16 @@ impl Desktop {
                 "环境详情",
                 "选择一个环境",
                 div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_2()
                     .p_4()
                     .bg(rgb(SURFACE_SOFT))
                     .rounded_md()
                     .text_base()
                     .text_color(rgb(MUTED))
+                    .child(design_icon("environment", 24., MUTED))
                     .child("请选择左侧环境。"),
             )
         };
@@ -746,23 +1054,81 @@ impl Desktop {
             .flex_1()
             .min_w_0()
             .child(right_main)
-            .child(card(
-                "预检",
-                "目标身份、cgroup、NAT 表和入口端口。",
-                self.preflight_panel(),
-            ));
+            .child(self.preflight_panel());
+        let stacked = window.viewport_size().width < px(980.);
+        let columns = if stacked {
+            div().flex().flex_col().gap_3().child(left).child(right)
+        } else {
+            div()
+                .flex()
+                .items_start()
+                .gap_3()
+                .child(left.w(px(390.)).flex_shrink_0())
+                .child(right)
+        };
+        let (notice_color, notice_background) = if self.error {
+            (RUST, super::theme::DANGER_BG)
+        } else if self.busy.is_some() || self.reading {
+            (BLUE, BLUE_SOFT)
+        } else {
+            (TEAL, SUCCESS_BG)
+        };
+        let page_status = if self.error {
+            "需要处理"
+        } else if locked {
+            "操作进行中"
+        } else {
+            "可操作"
+        };
         div()
             .flex()
-            .items_start()
+            .flex_col()
             .gap_3()
-            .child(left.w(px(390.)).flex_shrink_0())
-            .child(right)
+            .child(
+                div()
+                    .flex()
+                    .items_end()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_xl().child("环境"))
+                            .child(
+                                div()
+                                    .text_base()
+                                    .text_color(rgb(MUTED))
+                                    .child("管理 WSL2 发行版、目标角色和预检。"),
+                            ),
+                    )
+                    .child(badge(page_status, notice_color, notice_background)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .p_2()
+                    .bg(rgb(notice_background))
+                    .rounded_md()
+                    .child(status_dot(notice_color))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_base()
+                            .text_color(rgb(notice_color))
+                            .child(self.notice.clone()),
+                    ),
+            )
+            .child(columns)
     }
 
-    fn page_content(&self, cx: &Context<Self>) -> Div {
+    fn page_content(&self, window: &Window, cx: &Context<Self>) -> Div {
         match self.page {
             Page::Overview => self.overview(cx),
-            Page::Environment => self.environment_page(cx),
+            Page::Environment => self.environment_page(window, cx),
             Page::Policy => self.policy_page(cx),
             Page::Connection => self.diagnostics(cx),
             Page::Logs => self.logs_page(cx),
@@ -1053,7 +1419,7 @@ impl Render for Desktop {
                                 .min_h_0()
                                 .overflow_y_scroll()
                                 .p_3()
-                                .child(self.page_content(cx)),
+                                .child(self.page_content(window, cx)),
                         ),
                     ),
             )

@@ -481,13 +481,15 @@ impl Desktop {
 
     pub(crate) fn preflight_panel(&self) -> Div {
         let Some(result) = &self.preflight else {
-            return div()
-                .p_3()
-                .bg(rgb(SURFACE_SOFT))
-                .rounded_md()
-                .text_base()
-                .text_color(rgb(MUTED))
-                .child("选择目标和见证后运行预检。启动前会再次检查。");
+            return panel("预检", "目标身份、cgroup、NAT 表和入口端口。").child(
+                div()
+                    .p_3()
+                    .bg(rgb(SURFACE_SOFT))
+                    .rounded_md()
+                    .text_base()
+                    .text_color(rgb(MUTED))
+                    .child("选择目标和见证后运行预检。启动前会再次检查。"),
+            );
         };
         let passed = result["passed"] == true;
         let (label, color, background) = if passed {
@@ -511,7 +513,7 @@ impl Desktop {
             }
         }
         panel(
-            "预检结果",
+            "预检",
             if passed {
                 "通过 · 仍需确认启动"
             } else {

@@ -277,7 +277,12 @@ impl Desktop {
                     }
                     Kind::Save => {
                         self.accept_profile(&value, window, cx);
-                        self.notice = "策略已保存；不会立即改变当前接管。".into();
+                        self.notice = if self.page == Page::Environment {
+                            "环境选择已保存；不会立即改变当前接管。"
+                        } else {
+                            "策略已保存；不会立即改变当前接管。"
+                        }
+                        .into();
                     }
                     Kind::Preflight => {
                         let passed = value["passed"] == true;

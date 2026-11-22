@@ -1,7 +1,7 @@
 //! 页面共享的交互壳层：按钮分发、字段包装和策略路径摘要。
 
 use gpui_kit::component::{
-    Disableable,
+    Disableable, Sizable as _,
     button::Button,
     input::{Input, Textarea},
 };
@@ -88,6 +88,52 @@ impl Desktop {
                     .child(label),
             )
             .child(input)
+            .child(div().text_base().text_color(rgb(MUTED)).child(hint))
+    }
+
+    pub(crate) fn field_with_action(
+        &self,
+        label: &'static str,
+        hint: &'static str,
+        state: &Field,
+        action: UiAction,
+        button_id: &'static str,
+        button_label: &'static str,
+        disabled: bool,
+        cx: &Context<Desktop>,
+    ) -> Div {
+        let input = match state {
+            Field::Single(state) => Input::new(state).disabled(self.locked()).into_any_element(),
+            Field::Multi(state) => Textarea::new(state)
+                .h(px(32.))
+                .disabled(self.locked())
+                .into_any_element(),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .flex_1()
+            .min_w_0()
+            .child(
+                div()
+                    .text_base()
+                    .font_weight(FontWeight::NORMAL)
+                    .text_color(rgb(INK))
+                    .child(label),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().min_w_0().child(input))
+                    .child(
+                        self.button(button_id, button_label, action, disabled, cx)
+                            .small()
+                            .flex_shrink_0(),
+                    ),
+            )
             .child(div().text_base().text_color(rgb(MUTED)).child(hint))
     }
 }
