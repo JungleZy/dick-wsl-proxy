@@ -226,6 +226,28 @@ pub(crate) fn load(name: &str) -> Result<Residential, String> {
     }
 }
 
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn store_settings(
+    name: &str,
+    settings: &crate::desktop_store::ResidentialSettings,
+) -> Result<(), String> {
+    let target = target_name(name)?;
+    let text = format!(
+        "ip={}\nport={}\nusername={}\npassword={}\n",
+        settings.ip, settings.port, settings.username, settings.password
+    );
+    let residential = parse_env(text.as_bytes())?;
+    #[cfg(windows)]
+    {
+        windows::replace(target, residential)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (target, residential);
+        Err("Windows Credential Manager is available only on Windows".into())
+    }
+}
+
 #[cfg(windows)]
 mod windows {
     use super::*;
@@ -235,14 +257,7 @@ mod windows {
     };
 
     pub(super) fn store(mut target: Vec<u16>, mut residential: Residential) -> Result<(), String> {
-        let credential = CREDENTIALW {
-            Type: CRED_TYPE_GENERIC,
-            TargetName: target.as_mut_ptr(),
-            CredentialBlobSize: residential.blob.0.len() as u32,
-            CredentialBlob: residential.blob.0.as_mut_ptr(),
-            Persist: CRED_PERSIST_LOCAL_MACHINE,
-            ..Default::default()
-        };
+        let credential = credential(&mut target, &mut residential);
         use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, GetLastError};
         let mut existing = std::ptr::null_mut();
         if unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut existing) } != 0 {
@@ -256,6 +271,30 @@ mod windows {
         if unsafe { GetLastError() } != ERROR_NOT_FOUND {
             return Err("Windows Credential Manager could not check credential name".into());
         }
+        write(credential)
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
+    pub(super) fn replace(
+        mut target: Vec<u16>,
+        mut residential: Residential,
+    ) -> Result<(), String> {
+        write(credential(&mut target, &mut residential))
+    }
+
+    fn credential<'a>(target: &'a mut [u16], residential: &'a mut Residential) -> CREDENTIALW {
+        let credential = CREDENTIALW {
+            Type: CRED_TYPE_GENERIC,
+            TargetName: target.as_mut_ptr(),
+            CredentialBlobSize: residential.blob.0.len() as u32,
+            CredentialBlob: residential.blob.0.as_mut_ptr(),
+            Persist: CRED_PERSIST_LOCAL_MACHINE,
+            ..Default::default()
+        };
+        credential
+    }
+
+    fn write(credential: CREDENTIALW) -> Result<(), String> {
         if unsafe { CredWriteW(&credential, 0) } == 0 {
             return Err("Windows Credential Manager could not store credential".into());
         }

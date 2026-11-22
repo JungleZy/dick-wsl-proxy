@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 const DEFAULT_CREDENTIAL_NAME: &str = "desktop-residence";
 const MAX_TEXT: usize = 256 * 1024;
 
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ResidentialSettings {
     pub(crate) ip: String,
@@ -71,6 +71,38 @@ fn default_residential() -> ResidentialSettings {
         }
     }
     ResidentialSettings::default()
+}
+
+fn prepare_residential(
+    mut residential: ResidentialSettings,
+) -> Result<ResidentialSettings, String> {
+    if residential.ip.is_empty() {
+        residential = default_residential();
+    }
+    #[cfg(not(test))]
+    if !residential.ip.is_empty() {
+        if residential.password.is_empty() {
+            if let Ok(existing) = credential::load(DEFAULT_CREDENTIAL_NAME) {
+                residential = credential::settings(&existing);
+            }
+        } else {
+            credential::store_settings(DEFAULT_CREDENTIAL_NAME, &residential)
+                .map_err(|error| format!("desktop_store_credential:{error}"))?;
+        }
+    }
+    Ok(residential)
+}
+
+#[cfg(not(test))]
+fn persisted_residential(residential: &ResidentialSettings) -> ResidentialSettings {
+    let mut persisted = residential.clone();
+    persisted.password.clear();
+    persisted
+}
+
+#[cfg(test)]
+fn persisted_residential(residential: &ResidentialSettings) -> ResidentialSettings {
+    residential.clone()
 }
 
 fn open(path: &Path) -> Result<Connection, String> {
@@ -144,27 +176,20 @@ fn read_optional(connection: &Connection) -> Result<Option<Record>, String> {
 pub(crate) fn ensure(path: &Path) -> Result<Record, String> {
     let connection = open(path)?;
     if let Some(record) = read_optional(&connection)? {
-        if record.residential.ip.is_empty() {
-            let residential = default_residential();
-            if !residential.ip.is_empty() {
-                connection
-                    .execute(
-                        "UPDATE desktop_state SET residential_ip=?1, residential_port=?2, residential_username=?3, residential_password=?4 WHERE id=1",
-                        params![
-                            residential.ip,
-                            residential.port,
-                            residential.username,
-                            residential.password
-                        ],
-                    )
-                    .map_err(|e| format!("desktop_store_env_hydrate:{e}"))?;
-                return Ok(Record {
-                    residential,
-                    ..record
-                });
-            }
+        let residential = prepare_residential(record.residential.clone())?;
+        let persisted = persisted_residential(&residential);
+        if persisted != record.residential {
+            connection
+                .execute(
+                    "UPDATE desktop_state SET residential_ip=?1, residential_port=?2, residential_username=?3, residential_password=?4 WHERE id=1",
+                    params![persisted.ip, persisted.port, persisted.username, persisted.password],
+                )
+                .map_err(|e| format!("desktop_store_residential_migrate:{e}"))?;
         }
-        return Ok(record);
+        return Ok(Record {
+            residential,
+            ..record
+        });
     }
     let legacy_path = path.with_file_name("desktop-policy.json");
     if let Ok(bytes) = fs::read(&legacy_path) {
@@ -180,7 +205,8 @@ pub(crate) fn ensure(path: &Path) -> Result<Record, String> {
             && legacy.profile.validate_draft().is_ok()
             && legacy.desktop.validate().is_ok()
         {
-            let residential = default_residential();
+            let residential = prepare_residential(ResidentialSettings::default())?;
+            let persisted = persisted_residential(&residential);
             let profile_json = serde_json::to_string(&legacy.profile).map_err(|e| e.to_string())?;
             let desktop_json = serde_json::to_string(&legacy.desktop).map_err(|e| e.to_string())?;
             connection
@@ -190,10 +216,10 @@ pub(crate) fn ensure(path: &Path) -> Result<Record, String> {
                             legacy.revision,
                             profile_json,
                             desktop_json,
-                            residential.ip,
-                            residential.port,
-                            residential.username,
-                            residential.password
+                            persisted.ip,
+                            persisted.port,
+                            persisted.username,
+                            persisted.password
                         ],
                     )
                     .map_err(|e| format!("desktop_store_legacy_migrate:{e}"))?;
@@ -207,7 +233,8 @@ pub(crate) fn ensure(path: &Path) -> Result<Record, String> {
     }
     let profile = default_profile()?;
     let desktop = Preferences::default();
-    let residential = default_residential();
+    let residential = prepare_residential(ResidentialSettings::default())?;
+    let persisted = persisted_residential(&residential);
     profile.validate_draft()?;
     desktop.validate()?;
     let profile_json = serde_json::to_string(&profile).map_err(|e| e.to_string())?;
@@ -215,7 +242,7 @@ pub(crate) fn ensure(path: &Path) -> Result<Record, String> {
     connection
         .execute(
             "INSERT OR REPLACE INTO desktop_state (id, revision, profile_json, desktop_json, residential_ip, residential_port, residential_username, residential_password) VALUES (1, 0, ?1, ?2, ?3, ?4, ?5, ?6)",
-            params![profile_json, desktop_json, residential.ip, residential.port, residential.username, residential.password],
+            params![profile_json, desktop_json, persisted.ip, persisted.port, persisted.username, persisted.password],
         )
         .map_err(|e| format!("desktop_store_default:{e}"))?;
     Ok(Record {
@@ -227,8 +254,7 @@ pub(crate) fn ensure(path: &Path) -> Result<Record, String> {
 }
 
 pub(crate) fn load(path: &Path) -> Result<Record, String> {
-    let connection = open(path)?;
-    read_optional(&connection)?.ok_or_else(|| "desktop_store_missing".into())
+    ensure(path)
 }
 
 pub(crate) fn revision(path: &Path) -> Result<u64, String> {
@@ -250,7 +276,8 @@ pub(crate) fn save(
     {
         return Err("stale_profile_revision: reload the saved profile".into());
     }
-    let residential = residential.unwrap_or(current.residential);
+    let residential = prepare_residential(residential.unwrap_or(current.residential))?;
+    let persisted = persisted_residential(&residential);
     let credential = credential::from_settings(&residential)?;
     let _ = credential.endpoint();
     let profile_json = serde_json::to_string(&profile).map_err(|e| e.to_string())?;
@@ -269,7 +296,7 @@ pub(crate) fn save(
     let changed = transaction
         .execute(
             "UPDATE desktop_state SET revision=?1, profile_json=?2, desktop_json=?3, residential_ip=?4, residential_port=?5, residential_username=?6, residential_password=?7 WHERE id=1 AND revision=?8",
-            params![next, profile_json, desktop_json, residential.ip, residential.port, residential.username, residential.password, current.revision],
+            params![next, profile_json, desktop_json, persisted.ip, persisted.port, persisted.username, persisted.password, current.revision],
         )
         .map_err(|e| format!("desktop_store_save:{e}"))?;
     if changed != 1 {
