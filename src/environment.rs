@@ -191,6 +191,16 @@ fn distro_view(distro: &Distro, features: Value) -> Value {
     })
 }
 
+fn rollback_import(name: &str, setup_error: String) -> String {
+    let args = vec!["--unregister".into(), name.into()];
+    match host::wsl_command(&args, None, IMPORT_DEADLINE) {
+        Ok(_) => format!("environment_setup_failed:{setup_error};environment_import_rolled_back"),
+        Err(cleanup_error) => format!(
+            "environment_setup_failed:{setup_error};environment_cleanup_failed:{cleanup_error}"
+        ),
+    }
+}
+
 pub(crate) fn view(key: &str) -> Result<Value, String> {
     let distro = locate(key)?;
     let features = feature_view(&distro)?;
@@ -229,11 +239,14 @@ pub(crate) fn create(
         "2".into(),
     ];
     host::wsl_command(&args, None, IMPORT_DEADLINE)?;
-    let distro = locate(name)?;
+    let distro = match locate(name) {
+        Ok(distro) => distro,
+        Err(error) => return Err(rollback_import(name, error)),
+    };
     if let Err(error) =
         host::guest_script_with_timeout(&distro, &setup_script(options), CONFIGURE_DEADLINE)
     {
-        return Err(format!("environment_setup_failed:{error}:{}", distro.name));
+        return Err(rollback_import(&distro.name, error));
     }
     view(name)
 }
