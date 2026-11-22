@@ -5,6 +5,7 @@ use gpui_kit::component::{
     Disableable as _, Sizable as _, TitleBar,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
+    input::{Input, Textarea},
 };
 use gpui_kit::{prelude::*, *};
 use serde_json::{Value, json};
@@ -12,7 +13,7 @@ use std::time::Duration;
 
 use super::backend::Kind;
 use super::components::{app_icon, badge, design_icon, icon, status_dot, text};
-use super::model::{EnvironmentEditor, LogFilter, Page, UiAction};
+use super::model::{EnvironmentEditor, Field, LogFilter, Page, UiAction};
 use super::state::Desktop;
 use super::theme::{
     AMBER, BLUE, BLUE_SOFT, INK, MONO_FONT, MUTED, PAPER, RULE, RUST, SIDEBAR_BG, SUCCESS_BG,
@@ -857,6 +858,24 @@ impl Desktop {
         )
     }
 
+    fn compact_setting(&self, label: &'static str, field: &Field) -> Div {
+        let input = match field {
+            Field::Single(state) => Input::new(state).disabled(self.locked()).into_any_element(),
+            Field::Multi(state) => Textarea::new(state)
+                .h(px(96.))
+                .disabled(self.locked())
+                .into_any_element(),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .flex_1()
+            .min_w_0()
+            .child(div().text_base().text_color(rgb(MUTED)).child(label))
+            .child(input)
+    }
+
     fn settings_page(&self, cx: &Context<Self>) -> Div {
         let has_residential_default = self.residential["ip"]
             .as_str()
@@ -868,17 +887,48 @@ impl Desktop {
         } else if self.profile_exists {
             ("已保存", TEAL, SUCCESS_BG)
         } else if has_residential_default {
-            (
-                "默认配置已读取",
-                super::theme::AMBER,
-                super::theme::WARNING_BG,
-            )
+            ("默认配置已读取", AMBER, WARNING_BG)
         } else {
             ("尚未初始化", MUTED, SURFACE_SOFT)
         };
+        let header = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_xl().child("设置"))
+                    .child(
+                        div()
+                            .text_base()
+                            .text_color(rgb(MUTED))
+                            .child("代理链路、入口和桌面行为"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(badge(save_label, save_color, save_background))
+                    .child(
+                        self.button(
+                            "settings-save-top",
+                            "保存设置",
+                            UiAction::Save,
+                            self.locked() || self.profile_path.is_none(),
+                            cx,
+                        )
+                        .primary(),
+                    ),
+            );
         let residential = card(
-            "住宅 SOCKS5",
-            "个人配置直接填写，保存到 SQLite",
+            "住宅代理",
+            "出站代理和认证信息",
             div()
                 .flex()
                 .flex_col()
@@ -888,105 +938,67 @@ impl Desktop {
                         .flex()
                         .flex_wrap()
                         .gap_3()
-                        .child(
-                            self.field(
-                                "服务器 IPv4",
-                                "住宅出口服务器地址。",
-                                &self.fields.residential_ip,
-                                false,
-                            )
-                            .min_w(px(320.)),
-                        )
-                        .child(
-                            self.field(
-                                "服务器端口",
-                                "范围 1–65535。",
-                                &self.fields.residential_port,
-                                false,
-                            )
-                            .min_w(px(320.)),
-                        ),
+                        .child(self.compact_setting("服务器 IPv4", &self.fields.residential_ip))
+                        .child(self.compact_setting("服务器端口", &self.fields.residential_port)),
                 )
                 .child(
                     div()
                         .flex()
                         .flex_wrap()
                         .gap_3()
-                        .child(
-                            self.field(
-                                "用户名",
-                                "SOCKS5 认证用户名。",
-                                &self.fields.residential_username,
-                                false,
-                            )
-                            .min_w(px(320.)),
-                        )
-                        .child(
-                            self.field(
-                                "密码",
-                                "SOCKS5 认证密码。",
-                                &self.fields.residential_password,
-                                false,
-                            )
-                            .min_w(px(320.)),
-                        ),
+                        .child(self.compact_setting("用户名", &self.fields.residential_username))
+                        .child(self.compact_setting("密码", &self.fields.residential_password)),
                 ),
         );
-        let host = card(
-            "宿主 SOCKS5",
-            "第一跳连接",
-            self.field(
-                "代理地址",
-                "填写 IPv4:端口。",
-                &self.fields.first_hop,
-                false,
-            ),
-        );
-        let ingress = card(
-            "Windows 入口",
-            "接管流量监听的本机端口",
-            self.field(
-                "入口端口",
-                "范围 1024–65535，修改后保存配置。",
-                &self.fields.port,
-                false,
-            ),
+        let routing = card(
+            "网络入口",
+            "本机第一跳与接管端口",
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_3()
+                .child(self.compact_setting("宿主 SOCKS5", &self.fields.first_hop))
+                .child(self.compact_setting("Windows 入口端口", &self.fields.port)),
         );
         let dns = card(
-            "DNS 保护",
-            "DoH 上游与 TLS",
+            "受管 DNS",
+            "DoH 上游与启动探测",
             div()
                 .flex()
                 .flex_col()
                 .gap_3()
-                .child(self.field(
-                    "DoH 上游 IPv4:端口",
-                    "固定地址，通过代理链访问 HTTPS。",
-                    &self.fields.dns_upstream,
-                    false,
-                ))
-                .child(self.field(
-                    "DoH TLS 主机名",
-                    "用于 SNI 和证书校验。",
-                    &self.fields.dns_tls_name,
-                    false,
-                ))
-                .child(self.field(
-                    "健康检查域名",
-                    "启动时验证链路。",
-                    &self.fields.health_domain,
-                    false,
-                )),
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_3()
+                        .child(
+                            self.compact_setting("DoH 上游 IPv4:端口", &self.fields.dns_upstream),
+                        )
+                        .child(self.compact_setting("TLS 主机名", &self.fields.dns_tls_name)),
+                )
+                .child(self.compact_setting("健康检查域名", &self.fields.health_domain)),
         );
-        let storage = card(
-            "存储",
-            "本机配置和运行数据",
+        let runtime = card(
+            "桌面运行",
+            "启动和本机存储状态",
             div()
                 .flex()
                 .flex_col()
+                .gap_2()
+                .child(
+                    Checkbox::new("settings-autostart")
+                        .label("开机自动启动")
+                        .checked(self.autostart_enabled)
+                        .disabled(self.locked())
+                        .on_click(cx.listener(|this, checked, _, cx| {
+                            this.set_autostart(*checked, cx);
+                        })),
+                )
+                .child(key_value("关闭窗口", "隐藏到托盘"))
                 .child(key_value("配置库", "SQLite"))
                 .child(key_value(
-                    "状态",
+                    "配置状态",
                     if self.profile_exists {
                         "已加载"
                     } else {
@@ -995,84 +1007,39 @@ impl Desktop {
                 ))
                 .child(key_value("Revision", self.revision.as_str().unwrap_or("0"))),
         );
-        let window = card(
-            "窗口",
-            "桌面行为",
-            div()
-                .flex()
-                .flex_col()
-                .child(key_value("关闭窗口", "保持后台运行"))
-                .child(key_value("语言", "简体中文")),
-        );
-        let startup = card(
-            "启动",
-            "登录 Windows 后自动打开桌面控制台",
-            Checkbox::new("settings-autostart")
-                .label("开机自动启动")
-                .checked(self.autostart_enabled)
-                .disabled(self.locked())
-                .on_click(cx.listener(|this, checked, _, cx| {
-                    this.set_autostart(*checked, cx);
-                })),
-        );
+        let footer = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(
+                div().flex_1().text_base().text_color(rgb(MUTED)).child(
+                    self.profile_path
+                        .clone()
+                        .unwrap_or_else(|| "等待配置路径".into()),
+                ),
+            )
+            .child(
+                div()
+                    .text_base()
+                    .text_color(rgb(if self.error { RUST } else { MUTED }))
+                    .child(self.notice.clone()),
+            );
         div()
             .flex()
             .flex_col()
             .gap_3()
+            .child(header)
             .child(residential)
             .child(
                 div()
                     .flex()
                     .flex_wrap()
                     .gap_3()
-                    .child(host.flex_1().min_w(px(320.)))
-                    .child(dns.flex_1().min_w(px(320.))),
+                    .child(routing.flex_1().min_w(px(360.)))
+                    .child(dns.flex_1().min_w(px(460.))),
             )
-            .child(ingress)
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_3()
-                    .child(storage.flex_1().min_w(px(320.)))
-                    .child(window.flex_1().min_w(px(320.))),
-            )
-            .child(startup)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        self.button(
-                            "settings-save",
-                            "保存到 SQLite",
-                            UiAction::Save,
-                            self.locked() || self.profile_path.is_none(),
-                            cx,
-                        )
-                        .primary(),
-                    )
-                    .child(badge(save_label, save_color, save_background))
-                    .child(
-                        div().text_base().text_color(rgb(MUTED)).child(
-                            self.profile_path
-                                .clone()
-                                .unwrap_or_else(|| "等待后台返回配置路径。".into()),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_base()
-                            .text_color(rgb(if self.error {
-                                super::theme::RUST
-                            } else {
-                                MUTED
-                            }))
-                            .child(self.notice.clone()),
-                    ),
-            )
+            .child(runtime)
+            .child(footer)
     }
 }
 
