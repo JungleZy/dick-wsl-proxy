@@ -38,6 +38,7 @@ pub(crate) fn from_settings(
     parse_env(text.as_bytes())
 }
 
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) fn settings(residential: &Residential) -> crate::desktop_store::ResidentialSettings {
     let bytes = &residential.blob.0;
     let user_len = bytes[11] as usize;
@@ -49,10 +50,6 @@ pub(crate) fn settings(residential: &Residential) -> crate::desktop_store::Resid
         password: String::from_utf8_lossy(&bytes[13 + user_len..13 + user_len + pass_len])
             .into_owned(),
     }
-}
-
-pub(crate) fn parse_env_bytes(bytes: &[u8]) -> Result<Residential, String> {
-    parse_env(bytes)
 }
 
 impl Residential {
@@ -283,15 +280,14 @@ mod windows {
     }
 
     fn credential<'a>(target: &'a mut [u16], residential: &'a mut Residential) -> CREDENTIALW {
-        let credential = CREDENTIALW {
+        CREDENTIALW {
             Type: CRED_TYPE_GENERIC,
             TargetName: target.as_mut_ptr(),
             CredentialBlobSize: residential.blob.0.len() as u32,
             CredentialBlob: residential.blob.0.as_mut_ptr(),
             Persist: CRED_PERSIST_LOCAL_MACHINE,
             ..Default::default()
-        };
-        credential
+        }
     }
 
     fn write(credential: CREDENTIALW) -> Result<(), String> {

@@ -25,7 +25,7 @@
 3. 在同一会话逐行提交，例如：
 
    ```jsonl
-   {"command":"start","target":"WSLProxyLab-Target","witness":"WSLProxyLab-Control","port":43781,"profile":"D:\\WSL\\ProxyLab\\policy.json"}
+   {"command":"start","target":"WSLProxyLab-Target","port":43781,"profile":"D:\\WSL\\ProxyLab\\policy.json"}
    {"command":"status"}
    {"command":"stop"}
    ```

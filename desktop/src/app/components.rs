@@ -4,7 +4,7 @@ use gpui_kit::component::Sizable as _;
 use gpui_kit::{prelude::*, *};
 use serde_json::Value;
 
-use super::theme::{BLUE, INK, MUTED, RULE, SURFACE, SURFACE_SOFT};
+use super::theme::{BLUE, INK, MUTED, RULE, SURFACE, SURFACE_SOFT, app_rgb as rgb};
 
 pub(crate) fn text(value: &Value, key: &str, fallback: &str) -> String {
     value[key].as_str().unwrap_or(fallback).to_owned()
@@ -45,6 +45,17 @@ pub(crate) fn badge(label: impl Into<SharedString>, color: u32, background: u32)
 }
 
 pub(crate) fn panel(title: &'static str, caption: impl Into<SharedString>) -> Div {
+    let caption = caption.into();
+    let mut header = div().flex().flex_col().gap_1().child(
+        div()
+            .text_base()
+            .font_weight(FontWeight::NORMAL)
+            .text_color(rgb(INK))
+            .child(title),
+    );
+    if !caption.is_empty() {
+        header = header.child(div().text_base().text_color(rgb(MUTED)).child(caption));
+    }
     div()
         .flex()
         .flex_col()
@@ -54,25 +65,7 @@ pub(crate) fn panel(title: &'static str, caption: impl Into<SharedString>) -> Di
         .border_1()
         .border_color(rgb(RULE))
         .rounded_md()
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .text_base()
-                        .font_weight(FontWeight::NORMAL)
-                        .text_color(rgb(INK))
-                        .child(title),
-                )
-                .child(
-                    div()
-                        .text_base()
-                        .text_color(rgb(MUTED))
-                        .child(caption.into()),
-                ),
-        )
+        .child(header)
 }
 
 pub(crate) fn fact(label: &'static str, value: impl Into<SharedString>, color: u32) -> Div {
@@ -128,10 +121,25 @@ pub(crate) fn design_icon(name: &'static str, size: f32, color: u32) -> gpui_kit
         "connection" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M3 11h3l2-5 3 9 2-5h4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>"#,
         "logs" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M5 3h10v14H5zM8 7h4M8 10h4M8 13h3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#,
         "settings" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><circle cx="10" cy="10" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 2v3M10 15v3M2 10h3M15 10h3M4.3 4.3l2.1 2.1M13.6 13.6l2.1 2.1M15.7 4.3l-2.1 2.1M6.4 13.6l-2.1 2.1" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>"#,
+        "sun" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><circle cx="10" cy="10" r="3.2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 2v2M10 16v2M2 10h2M16 10h2M4.3 4.3l1.4 1.4M14.3 14.3l1.4 1.4M15.7 4.3l-1.4 1.4M5.7 14.3l-1.4 1.4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>"#,
+        "moon" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M15.8 13.8A6.5 6.5 0 0 1 6.2 4.2 6.5 6.5 0 1 0 15.8 13.8Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>"#,
         "online" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><circle cx="10" cy="10" r="5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10 2v3M10 15v3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>"#,
         "idle" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M10 2l6 2v5c0 4-2.5 7-6 9-3.5-2-6-5-6-9V4l6-2z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>"#,
         "storage" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><ellipse cx="10" cy="4" rx="6" ry="2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M4 4v6c0 1 2.7 2 6 2s6-1 6-2V4M4 10v6c0 1 2.7 2 6 2s6-1 6-2v-6" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>"#,
+        "target" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><circle cx="10" cy="10" r="6" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="10" cy="10" r="2" fill="currentColor"/><path d="M10 2v3M10 15v3M2 10h3M15 10h3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>"#,
+        "select" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><rect x="3.5" y="3.5" width="13" height="13" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="m6.5 10 2.3 2.3 4.8-5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>"#,
+        "witness" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M2 10s3-5 8-5 8 5 8 5-3 5-8 5-8-5-8-5Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="10" cy="10" r="2" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>"#,
+        "archive" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M3 5h14v11H3zM4 3h12l1 2H3l1-2Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M7 9h6M7 12h6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>"#,
+        "trash" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M4 6h12M8 6V4h4v2M6 6l.8 11h6.4L14 6M8.5 9v5M11.5 9v5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#,
+        "info" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 9v5M10 6.5v.1" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>"#,
+        "plus" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M10 4v12M4 10h12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>"#,
+        "refresh" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M16 8a6 6 0 0 0-10.8-2L4 8M4 5v3h3M4 12a6 6 0 0 0 10.8 2L16 12m0 3v-3h-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#,
+        "save" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M4 3h10l2 2v12H4zM7 3v5h6V3M7 17v-5h6v5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>"#,
+        "folder" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M3 5h5l2 2h7v8H3z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>"#,
+        "close" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="m5 5 10 10M15 5 5 15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>"#,
+        "check" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="m4 10 4 4 8-8" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>"#,
         "play" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M8 5.5v9l7-4.5-7-4.5z" fill="currentColor"/></svg>"#,
+        "edit" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="m4 14.8-.6 2.8 2.8-.6L15.8 7.4 12.6 4.2 4 14.8Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="m11.4 5.4 3.2 3.2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>"#,
         _ => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>"#,
     };
     gpui_kit::component::Icon::default()

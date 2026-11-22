@@ -733,10 +733,10 @@ mod inner {
                             }
                         }
                     }
-                    if let Some((exited, code)) = child_exit {
-                        if exited.elapsed() >= START_COMPETITOR_GRACE {
-                            return Err(format!("ipc_daemon_exited_before_pipe: exit_code={code}"));
-                        }
+                    if let Some((exited, code)) = child_exit
+                        && exited.elapsed() >= START_COMPETITOR_GRACE
+                    {
+                        return Err(format!("ipc_daemon_exited_before_pipe: exit_code={code}"));
                     }
                     if Instant::now() < deadline {
                         // A concurrent launcher may win first-instance ownership. Keep waiting

@@ -1,4 +1,4 @@
-use crate::{controller, credential, host, managed, plan, ports, probe, transition};
+use crate::{controller, credential, host, managed, managed_dns, plan, ports, probe, transition};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
@@ -13,11 +13,9 @@ pub(crate) enum Command {
     List,
     /// Report live state (or a recorded instance requiring recovery).
     Status,
-    /// Inspect only the named target and optional isolation witness (WSL may start them).
+    /// Inspect only the named target (WSL may start it).
     Preflight {
         target: String,
-        #[arg(long)]
-        witness: Option<String>,
         #[arg(long, default_value = "43531")]
         #[serde(default = "default_port")]
         port: NonZeroU16,
@@ -25,8 +23,6 @@ pub(crate) enum Command {
     /// Enable the single-target policy including protected system DNS.
     Start {
         target: String,
-        #[arg(long)]
-        witness: String,
         #[arg(long, default_value = "43531")]
         #[serde(default = "default_port")]
         port: NonZeroU16,
@@ -38,8 +34,6 @@ pub(crate) enum Command {
     /// M1 diagnostic only: local test tuples without a proxy policy or DNS interception.
     StartScoped {
         target: String,
-        #[arg(long)]
-        witness: String,
         #[arg(long, default_value = "43531")]
         #[serde(default = "default_port")]
         port: NonZeroU16,
@@ -74,6 +68,11 @@ pub(crate) enum Command {
     Stop {
         #[arg(long)]
         expected_generation: Option<u64>,
+    },
+    /// Reset the durable DNS alias ledger after an explicit idle-state confirmation.
+    ResetDnsAliases {
+        #[arg(long)]
+        confirm: bool,
     },
     /// Installer-only: hold the current-user controller lock while idle until release or EOF.
     #[serde(skip)]
@@ -158,7 +157,6 @@ struct Preflight<'a> {
     schema_version: u8,
     controller: serde_json::Value,
     target: Observation<'a>,
-    witness: Option<Observation<'a>>,
     ingress: Option<ports::PortCheck>,
     ingress_reserved_by_current_owner: bool,
     blockers: Vec<String>,
@@ -168,33 +166,14 @@ struct Preflight<'a> {
 fn preflight<'a>(
     all: &'a [host::Distro],
     key: &str,
-    witness: Option<&str>,
     port: NonZeroU16,
     controller: serde_json::Value,
     owned_ingress: Option<SocketAddrV4>,
 ) -> Result<Preflight<'a>, Failure> {
     let target = find(all, key)?;
-    let reference = witness.map(|k| find(all, k)).transpose()?;
-    if reference.is_some_and(|w| w.id.eq_ignore_ascii_case(&target.id)) {
-        return Err(Failure::new(
-            "same_distribution",
-            "Target and witness must be different registrations",
-        ));
-    }
     let target = observe(target)?;
-    let witness = reference.map(observe).transpose()?;
     let s = &target.snapshot;
     let mut blockers = s.blockers.clone();
-    match witness.as_ref().map(|w| &w.snapshot) {
-        None => blockers.push("isolation_witness_missing".into()),
-        Some(w) if !s.identity_valid || !w.identity_valid => {
-            blockers.push("isolation_identity_unverified".into())
-        }
-        Some(w) if s.cgroup_root == w.cgroup_root || s.cgroup_ns == w.cgroup_ns => {
-            blockers.push("shared_cgroup_boundary".into())
-        }
-        Some(_) => (),
-    }
     let address = s
         .gateway
         .filter(|ip| {
@@ -210,19 +189,11 @@ fn preflight<'a>(
         (Some(p), _) if !p.available() => blockers.push("host_port_unavailable".into()),
         _ => (),
     }
-    if blockers.is_empty()
-        && let Some(witness) = witness.as_ref()
-        && let Err(error) =
-            probe::verify_cgroup_isolation(target.distribution, witness.distribution)
-    {
-        blockers.push(format!("isolation_cgroup_match_unverified:{error}"));
-    }
     let passed = blockers.is_empty();
     Ok(Preflight {
         schema_version: 1,
         controller,
         target,
-        witness,
         ingress,
         ingress_reserved_by_current_owner: reserved,
         blockers,
@@ -239,20 +210,15 @@ pub(crate) fn dispatch_result(
     let response = match request {
         Command::List => serde_json::json!(registry()?),
         Command::Status => controller.status().map_err(error)?,
-        Command::Preflight {
-            target,
-            witness,
-            port,
-        } => {
+        Command::Preflight { target, port } => {
             let all = registry()?;
             let state = controller.status().map_err(error)?;
-            // Switching back to the same port must not test-bind over the daemon's own
-            // exclusive sockets. Only the current, authenticated owner qualifies as witness.
+            // Switching to a new target must not test-bind over the daemon's own exclusive
+            // sockets. The active controller target is the only owner that can reserve them.
             let reserved = if state["phase"] == "forwarding_managed" {
                 let active = state["active_target"].as_str();
-                let other = find(&all, &target)?;
-                let proof = witness.as_deref().map(|w| find(&all, w)).transpose()?;
-                if proof.is_some_and(|w| Some(w.name.as_str()) == active && w.id != other.id) {
+                let candidate = find(&all, &target)?;
+                if active.is_some_and(|name| name != candidate.name) {
                     let generation = state["operation_generation"]
                         .as_u64()
                         .ok_or_else(|| error("missing_operation_generation".into()))?;
@@ -269,7 +235,7 @@ pub(crate) fn dispatch_result(
             } else {
                 None
             };
-            let result = preflight(&all, &target, witness.as_deref(), port, state, reserved)?;
+            let result = preflight(&all, &target, port, state, reserved)?;
             return Ok((if result.passed { 0 } else { 2 }, serde_json::json!(result)));
         }
         Command::ImportCredential { name, env_file } => {
@@ -287,6 +253,23 @@ pub(crate) fn dispatch_result(
             }
             credential::remove(&name).map_err(error)?;
             serde_json::json!({"credential_removed":true})
+        }
+        Command::ResetDnsAliases { confirm } => {
+            if !confirm {
+                return Err(Failure::new(
+                    "confirmation_required",
+                    "Pass --confirm after stopping the target and allowing cached DNS aliases to expire",
+                ));
+            }
+            let state = controller.status().map_err(error)?;
+            if state["phase"] != "idle" {
+                return Err(Failure::new(
+                    "target_already_owned",
+                    "Stop the target and confirm idle state before resetting DNS aliases",
+                ));
+            }
+            managed_dns::reset_aliases().map_err(error)?;
+            serde_json::json!({"dns_aliases_reset":true})
         }
         Command::Switch {
             target,
@@ -309,7 +292,6 @@ pub(crate) fn dispatch_result(
             let result = preflight(
                 &all,
                 &target,
-                Some(&source.target.id),
                 port,
                 controller.status().map_err(error)?,
                 Some(source.ingress),
@@ -337,28 +319,19 @@ pub(crate) fn dispatch_result(
             controller.status().map_err(error)?
         }
         request @ (Command::Start { .. } | Command::StartScoped { .. }) => {
-            let (target, witness, port, origins, profile, expected_generation) = match request {
+            let (target, port, origins, profile, expected_generation) = match request {
                 Command::Start {
                     target,
-                    witness,
                     port,
                     profile,
                     expected_generation,
-                } => (
-                    target,
-                    witness,
-                    port,
-                    Vec::new(),
-                    Some(profile),
-                    expected_generation,
-                ),
+                } => (target, port, Vec::new(), Some(profile), expected_generation),
                 Command::StartScoped {
                     target,
-                    witness,
                     port,
                     origins,
                     expected_generation,
-                } => (target, witness, port, origins, None, expected_generation),
+                } => (target, port, origins, None, expected_generation),
                 _ => unreachable!(),
             };
             if controller::lifecycle::checked(expected_generation)
@@ -376,7 +349,6 @@ pub(crate) fn dispatch_result(
             let result = preflight(
                 &all,
                 &target,
-                Some(&witness),
                 port,
                 controller.status().map_err(error)?,
                 None,

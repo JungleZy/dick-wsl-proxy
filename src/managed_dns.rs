@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::io::{BufReader, Write};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
@@ -20,6 +20,10 @@ mod wire;
 use wire::{Message, finish_answer, reserved};
 mod ledger;
 use ledger::AliasLedger;
+
+pub fn reset_aliases() -> Result<(), String> {
+    AliasLedger::reset()
+}
 
 /// Session-local DNS through the authenticated proxy chain. Ordinary IN queries,
 /// including AAAA, pass through; IPv6 blocking belongs to the Target kernel rules.
@@ -265,8 +269,8 @@ impl Aliases {
                     }
                 },
             };
-            if !self.entries.contains_key(&alias) {
-                self.entries.insert(alias, Alias { real: *ip, expires });
+            if let Entry::Vacant(entry) = self.entries.entry(alias) {
+                entry.insert(Alias { real: *ip, expires });
                 self.live
                     .entry(name.clone())
                     .or_default()

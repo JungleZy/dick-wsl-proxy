@@ -6,7 +6,9 @@ use gpui_kit::{prelude::*, *};
 use super::components::badge;
 use super::model::UiAction;
 use super::state::Desktop;
-use super::theme::{MUTED, RULE, RUST, SUCCESS_BG, SURFACE, SURFACE_SOFT, TEAL, WARNING_BG};
+use super::theme::{
+    MUTED, RULE, RUST, SUCCESS_BG, SURFACE, SURFACE_SOFT, TEAL, WARNING_BG, app_rgb as rgb,
+};
 use super::views::card_header;
 
 impl Desktop {

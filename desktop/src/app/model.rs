@@ -1,9 +1,14 @@
 //! 定义页面、输入字段、确认请求和 UI 操作等跨视图数据模型。
 use gpui_kit::Entity;
 use gpui_kit::component::input::{InputState, TextareaState};
+use gpui_kit::component::select::{SearchableVec, SelectGroup, SelectState};
 use serde_json::Value;
 
 use super::backend::Kind;
+
+pub(crate) type TimezoneSelectState = SelectState<SearchableVec<SelectGroup<&'static str>>>;
+pub(crate) type EnvironmentDistributionSelectState =
+    SelectState<SearchableVec<SelectGroup<&'static str>>>;
 
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Page {
@@ -74,9 +79,12 @@ pub(crate) struct Fields {
     pub(crate) direct_suffixes: Field,
     pub(crate) port: Field,
     pub(crate) environment_name: Field,
-    pub(crate) environment_source: Field,
+    pub(crate) environment_distribution: Field,
     pub(crate) environment_install: Field,
     pub(crate) environment_backup: Field,
+    pub(crate) environment_username: Field,
+    pub(crate) environment_password: Field,
+    pub(crate) environment_timezone: Field,
 }
 pub(crate) struct Confirmation {
     pub(crate) kind: Kind,
@@ -84,10 +92,15 @@ pub(crate) struct Confirmation {
     pub(crate) generation: u64,
     pub(crate) message: String,
 }
+pub(crate) struct PendingPrepare {
+    pub(crate) kind: Kind,
+    pub(crate) generation: u64,
+    pub(crate) target: String,
+    pub(crate) port: u16,
+}
 #[derive(Clone)]
 pub(crate) enum UiAction {
     List,
-    Preflight,
     Save,
     Probe,
     Prepare(Kind),
@@ -95,8 +108,6 @@ pub(crate) enum UiAction {
     EnvironmentCreate,
     EnvironmentSubmit,
     EnvironmentCancel,
-    EnvironmentPickSource,
     EnvironmentPickInstall,
-    EnvironmentPickBackup,
     LogFilter(LogFilter),
 }

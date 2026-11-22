@@ -3,16 +3,64 @@
 use gpui_kit::component::{
     Disableable, Sizable as _,
     button::Button,
-    input::{Input, Textarea},
+    input::{Input, InputContentType, Textarea},
+    tooltip::Tooltip,
 };
 use gpui_kit::{prelude::*, *};
 use serde_json::json;
 
 use super::backend::Kind;
+use super::components::design_icon;
 use super::model::{Field, UiAction};
 use super::state::Desktop;
-use super::theme::{INK, MUTED};
+use super::theme::{INK, MUTED, app_rgb as rgb};
 impl Desktop {
+    pub(crate) fn field_label(
+        &self,
+        label: &'static str,
+        tooltip_id: &'static str,
+        tooltip_text: &'static str,
+    ) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .text_base()
+                    .font_weight(FontWeight::NORMAL)
+                    .text_color(rgb(INK))
+                    .child(label),
+            )
+            .child(
+                div()
+                    .id(tooltip_id)
+                    .child(design_icon("info", 14., MUTED))
+                    .tooltip(move |window, cx| Tooltip::new(tooltip_text).build(window, cx)),
+            )
+    }
+
+    pub(crate) fn compact_field(
+        &self,
+        label: &'static str,
+        tooltip_id: &'static str,
+        tooltip_text: &'static str,
+        state: &Field,
+    ) -> Div {
+        let input = match state {
+            Field::Single(state) => Input::new(state).disabled(self.locked()).into_any_element(),
+            Field::Multi(state) => Textarea::new(state)
+                .disabled(self.locked())
+                .into_any_element(),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(self.field_label(label, tooltip_id, tooltip_text))
+            .child(input)
+    }
+
     pub(crate) fn button(
         &self,
         id: &'static str,
@@ -27,19 +75,8 @@ impl Desktop {
             .on_click(
                 cx.listener(move |this, _, window, cx| match action.clone() {
                     UiAction::List => this.send(Kind::List, json!({"command":"list"}), cx),
-                    UiAction::Preflight => this.preflight(cx),
                     UiAction::Save => this.save(cx),
-                    UiAction::Probe => {
-                        if this.phase() == "forwarding_managed" {
-                            if let Some(generation) = this.generation() {
-                                this.send(
-                                Kind::Probe,
-                                json!({"command":"probe_exit","expected_generation":generation}),
-                                cx,
-                            );
-                            }
-                        }
-                    }
+                    UiAction::Probe => this.probe(cx),
                     UiAction::Prepare(kind) => this.prepare(kind, window, cx),
                     UiAction::Reveal => {
                         if let Some(path) = &this.export_path {
@@ -49,9 +86,7 @@ impl Desktop {
                     UiAction::EnvironmentCreate => this.environment_create(window, cx),
                     UiAction::EnvironmentSubmit => this.environment_submit(cx),
                     UiAction::EnvironmentCancel => this.environment_cancel(cx),
-                    UiAction::EnvironmentPickSource => this.environment_pick_source(window, cx),
                     UiAction::EnvironmentPickInstall => this.environment_pick_install(window, cx),
-                    UiAction::EnvironmentPickBackup => this.environment_pick_backup(window, cx),
                     UiAction::LogFilter(filter) => {
                         this.log_filter = filter;
                         cx.notify();
@@ -91,6 +126,31 @@ impl Desktop {
             .child(div().text_base().text_color(rgb(MUTED)).child(hint))
     }
 
+    pub(crate) fn compact_secret_field(
+        &self,
+        label: &'static str,
+        tooltip_id: &'static str,
+        tooltip_text: &'static str,
+        state: &Field,
+    ) -> Div {
+        let input = match state {
+            Field::Single(state) => Input::new(state)
+                .mask_toggle()
+                .content_type(InputContentType::NewPassword)
+                .disabled(self.locked())
+                .into_any_element(),
+            Field::Multi(state) => Textarea::new(state)
+                .disabled(self.locked())
+                .into_any_element(),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(self.field_label(label, tooltip_id, tooltip_text))
+            .child(input)
+    }
+
     pub(crate) fn field_with_action(
         &self,
         label: &'static str,
@@ -113,8 +173,6 @@ impl Desktop {
             .flex()
             .flex_col()
             .gap_2()
-            .flex_1()
-            .min_w_0()
             .child(
                 div()
                     .text_base()
@@ -130,6 +188,7 @@ impl Desktop {
                     .child(div().flex_1().min_w_0().child(input))
                     .child(
                         self.button(button_id, button_label, action, disabled, cx)
+                            .icon(design_icon("folder", 15., MUTED))
                             .small()
                             .flex_shrink_0(),
                     ),

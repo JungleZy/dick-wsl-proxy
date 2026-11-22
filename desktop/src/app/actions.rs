@@ -6,11 +6,37 @@ use serde_json::{Value, json};
 
 use super::backend::Kind;
 use super::components::text;
-use super::model::{Confirmation, EnvironmentEditor, Field};
+use super::model::{Confirmation, EnvironmentEditor, Field, PendingPrepare};
 use super::state::Desktop;
 use std::path::Path;
 
+fn valid_environment_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 impl Desktop {
+    pub(crate) fn environment_install_path(base: &str, name: &str) -> String {
+        let base_path = std::path::PathBuf::from(base);
+        let already_named = base_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case(name));
+        let path = if already_named {
+            base_path
+        } else {
+            base_path.join(name)
+        };
+        path.to_string_lossy().into_owned()
+    }
+
     pub(crate) fn set_autostart(&mut self, enabled: bool, cx: &mut Context<Self>) {
         match super::autostart::set_enabled(enabled) {
             Ok(()) => {
@@ -28,7 +54,7 @@ impl Desktop {
     }
 
     pub(crate) fn fail(&mut self, error: impl Into<String>, cx: &mut Context<Self>) {
-        self.notice = error.into();
+        self.notice = super::backend::humanize_error(&error.into());
         self.error = true;
         cx.notify();
     }
@@ -77,7 +103,6 @@ impl Desktop {
     }
     pub(crate) fn draft_is_dirty(&self, cx: &App) -> bool {
         if self.selected != self.saved_selected
-            || self.witness != self.saved_witness
             || Self::field_value(&self.fields.port, cx) != self.saved_port
         {
             return true;
@@ -117,27 +142,9 @@ impl Desktop {
             .filter(|port| *port >= 1024)
             .ok_or("端口需为 1024–65535 的整数。")
     }
-    pub(crate) fn selection(&self, cx: &App) -> Result<(String, String, u16), String> {
+    pub(crate) fn selection(&self, cx: &App) -> Result<(String, u16), String> {
         let target = self.selected.clone().ok_or("请选择目标 WSL。")?;
-        if self.phase() == "forwarding_managed" {
-            let owner = self.status["active_target"]
-                .as_str()
-                .and_then(|name| {
-                    self.distributions
-                        .iter()
-                        .find(|d| d["name"].as_str() == Some(name))
-                })
-                .and_then(|d| d["id"].as_str())
-                .ok_or("当前目标无法核对，请刷新列表。")?;
-            if owner != target {
-                return Ok((target, owner.to_owned(), self.port(cx)?));
-            }
-        }
-        let witness = self.witness.clone().ok_or("请选择不同的对照 WSL。")?;
-        if target == witness {
-            return Err("目标和对照不能相同。".into());
-        }
-        Ok((target, witness, self.port(cx)?))
+        Ok((target, self.port(cx)?))
     }
     pub(crate) fn draft(&self, cx: &App) -> Value {
         let mut profile = self.profile.as_object().cloned().unwrap_or_default();
@@ -187,22 +194,6 @@ impl Desktop {
             .ok_or("住宅服务器端口需为 1–65535 的整数。")
     }
 
-    pub(crate) fn preflight(&mut self, cx: &mut Context<Self>) {
-        self.preflight = None;
-        self.preflight_key = None;
-        match self.selection(cx) {
-            Ok((target, witness, port)) => {
-                self.preflight_key = Some((target.clone(), witness.clone(), port));
-                self.send(
-                    Kind::Preflight,
-                    json!({"command":"preflight","target":target,"witness":witness,"port":port}),
-                    cx,
-                );
-            }
-            Err(error) => self.fail(error, cx),
-        }
-    }
-
     fn open_confirmation_dialog(&self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(confirmation) = self.confirmation.as_ref() else {
             return;
@@ -240,6 +231,49 @@ impl Desktop {
         });
     }
 
+    pub(crate) fn open_prepare_confirmation(
+        &mut self,
+        pending: PendingPrepare,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let PendingPrepare {
+            kind,
+            generation,
+            target,
+            port,
+        } = pending;
+        let command = if kind == Kind::Start {
+            "start"
+        } else {
+            "switch"
+        };
+        let request = json!({
+            "command":command,
+            "target":target,
+            "port":port,
+            "profile":self.profile_path,
+            "profile_revision":self.revision,
+            "expected_generation":generation
+        });
+        let message = if kind == Kind::Switch {
+            format!(
+                "将从 {} 切换到 {target}。旧目标会先恢复直连；现有 TCP 连接需要重连。",
+                text(&self.status, "active_target", "当前目标")
+            )
+        } else {
+            format!("将接管 {target} 的 TCP 和系统 DNS。非直连例外流量经代理链。")
+        };
+        self.confirmation = Some(Confirmation {
+            kind,
+            generation,
+            request,
+            message,
+        });
+        self.open_confirmation_dialog(window, cx);
+        cx.notify();
+    }
+
     pub(crate) fn prepare(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
         if self.locked() {
             return;
@@ -265,45 +299,26 @@ impl Desktop {
             self.fail("请先保存策略和目标选择。未保存内容不会生效。", cx);
             return;
         }
-        let (target, witness, port) = match self.selection(cx) {
+        self.pending_prepare = None;
+        let (target, port) = match self.selection(cx) {
             Ok(value) => value,
             Err(error) => {
                 self.fail(error, cx);
                 return;
             }
         };
-        if self.preflight_key.as_ref() != Some(&(target.clone(), witness.clone(), port))
-            || self.preflight.as_ref().is_none_or(|p| p["passed"] != true)
-        {
-            self.fail("请先为当前目标运行预检。", cx);
-            return;
-        }
-        let command = if kind == Kind::Start {
-            "start"
-        } else {
-            "switch"
-        };
-        let mut request = json!({"command":command,"target":target,"port":port,"profile":self.profile_path,"profile_revision":self.revision,"expected_generation":generation});
-        if kind == Kind::Start {
-            request["witness"] = json!(witness);
-        }
-        self.confirmation = Some(Confirmation {
+        self.preflight = None;
+        self.pending_prepare = Some(PendingPrepare {
             kind,
             generation,
-            request,
-            message: if kind == Kind::Switch {
-                format!(
-                    "将从 {} 切换到 {target}。旧目标会先恢复直连；现有 TCP 连接需要重连。",
-                    text(&self.status, "active_target", "当前目标")
-                )
-            } else {
-                format!(
-                    "将接管 {target} 的 TCP 和系统 DNS。非直连例外流量经代理链；对照 WSL 仅用于隔离检查。"
-                )
-            },
+            target: target.clone(),
+            port,
         });
-        self.open_confirmation_dialog(window, cx);
-        cx.notify();
+        self.send(
+            Kind::Preflight,
+            json!({"command":"preflight","target":target,"port":port}),
+            cx,
+        );
     }
 
     pub(crate) fn confirm(&mut self, cx: &mut Context<Self>) {
@@ -315,6 +330,22 @@ impl Desktop {
             return;
         }
         self.send(confirmation.kind, confirmation.request, cx);
+    }
+
+    pub(crate) fn probe(&mut self, cx: &mut Context<Self>) {
+        if self.phase() != "forwarding_managed" {
+            self.fail("只有接管中的目标才能检测公网出口。", cx);
+            return;
+        }
+        let Some(generation) = self.generation() else {
+            self.fail("后台状态未确认，请先刷新。", cx);
+            return;
+        };
+        self.send(
+            Kind::Probe,
+            json!({"command":"probe_exit","expected_generation":generation}),
+            cx,
+        );
     }
 
     pub(crate) fn save(&mut self, cx: &mut Context<Self>) {
@@ -333,7 +364,7 @@ impl Desktop {
             }
         };
         self.send(Kind::Save, json!({"command":"profile_save","profile":self.draft(cx),"residential":residential,"expected_revision":self.revision,
-            "desktop":{"target":self.selected,"witness":self.witness,"port":port}}), cx);
+            "desktop":{"target":self.selected,"port":port}}), cx);
     }
 
     pub(crate) fn environment_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -345,14 +376,28 @@ impl Desktop {
         self.environment_selected = None;
         self.environment_detail = None;
         self.environment_started = None;
+        self.environment_backup_target = None;
+        self.backup_result_path = None;
         self.environment_zsh = true;
         self.environment_chrome = false;
         self.environment_chinese = true;
         self.fields.environment_name.set_value("", window, cx);
-        self.fields.environment_source.set_value("", window, cx);
+        self.fields
+            .environment_distribution
+            .set_value("Ubuntu-24.04", window, cx);
+        self.environment_distribution_select
+            .update(cx, |state, cx| {
+                state.set_selected_value(&"Ubuntu-24.04", window, cx);
+            });
         self.fields.environment_install.set_value("", window, cx);
         self.fields.environment_backup.set_value("", window, cx);
-        self.notice = "填写 rootfs tar 和安装目录，然后创建环境。".into();
+        self.fields
+            .environment_username
+            .set_value("dev", window, cx);
+        self.fields.environment_password.set_value("", window, cx);
+        self.fields.environment_timezone.set_value("", window, cx);
+        self.environment_backup_target = None;
+        self.notice = "选择发行版、安装目录和默认用户，然后创建环境。".into();
         self.error = false;
         cx.notify();
     }
@@ -372,9 +417,14 @@ impl Desktop {
         self.fields
             .environment_name
             .set_value(name.clone(), window, cx);
-        self.fields.environment_source.set_value("", window, cx);
+        self.fields
+            .environment_distribution
+            .set_value("Ubuntu-24.04", window, cx);
         self.fields.environment_install.set_value("", window, cx);
         self.fields.environment_backup.set_value("", window, cx);
+        self.fields.environment_username.set_value("", window, cx);
+        self.fields.environment_password.set_value("", window, cx);
+        self.fields.environment_timezone.set_value("", window, cx);
         self.send(
             Kind::EnvironmentView,
             json!({"command":"environment_view","name":name}),
@@ -400,6 +450,8 @@ impl Desktop {
         self.environment_edit_target = None;
         self.environment_detail = None;
         self.fields.environment_backup.set_value("", window, cx);
+        self.fields.environment_timezone.set_value("", window, cx);
+        self.environment_backup_target = None;
         self.send(
             Kind::EnvironmentView,
             json!({"command":"environment_view","name":name}),
@@ -412,8 +464,11 @@ impl Desktop {
             return;
         }
         let name = Self::field_value(&self.fields.environment_name, cx);
-        if name.is_empty() {
-            self.fail("请填写环境名称。", cx);
+        if !valid_environment_name(&name) {
+            self.fail(
+                "环境名称只能使用字母、数字、点、下划线和短横线，且必须以字母或数字开头。",
+                cx,
+            );
             return;
         }
         let Some(editor) = self.environment_editor else {
@@ -422,10 +477,21 @@ impl Desktop {
         };
         let (kind, request) = match editor {
             EnvironmentEditor::Create => {
-                let source = Self::field_value(&self.fields.environment_source, cx);
-                let install = Self::field_value(&self.fields.environment_install, cx);
-                if source.is_empty() || install.is_empty() {
-                    self.fail("新增环境需要 rootfs tar 和安装目录。", cx);
+                let distribution = Self::field_value(&self.fields.environment_distribution, cx);
+                let install_base = Self::field_value(&self.fields.environment_install, cx);
+                let install = Self::environment_install_path(&install_base, &name);
+                let username = Self::field_value(&self.fields.environment_username, cx);
+                let password = Self::field_value(&self.fields.environment_password, cx);
+                if distribution.is_empty() || install_base.is_empty() {
+                    self.fail("新增环境需要发行版和安装目录。", cx);
+                    return;
+                }
+                if std::path::Path::new(&install).exists() {
+                    self.fail("实际环境目录已存在，请选择其他父目录或环境名称。", cx);
+                    return;
+                }
+                if username.is_empty() || password.is_empty() {
+                    self.fail("新增环境需要默认用户名和密码。", cx);
                     return;
                 }
                 (
@@ -433,8 +499,10 @@ impl Desktop {
                     json!({
                         "command":"environment_create",
                         "name":name,
-                        "source_path":source,
+                        "distribution":distribution,
                         "install_path":install,
+                        "username":username,
+                        "password":password,
                         "install_zsh":self.environment_zsh,
                         "install_chrome":self.environment_chrome,
                         "install_chinese":self.environment_chinese
@@ -458,26 +526,134 @@ impl Desktop {
                 )
             }
         };
-        if kind == Kind::EnvironmentCreate {
+        if matches!(kind, Kind::EnvironmentCreate | Kind::EnvironmentEdit) {
             self.environment_started = Some(std::time::Instant::now());
         }
         self.send(kind, request, cx);
     }
 
-    pub(crate) fn environment_backup(&mut self, name: String, cx: &mut Context<Self>) {
+    pub(crate) fn environment_timezone_save(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.locked() {
+            return false;
+        }
+        let Some(name) = self.environment_selected.clone().or_else(|| {
+            self.environment_detail
+                .as_ref()?
+                .get("name")?
+                .as_str()
+                .map(str::to_owned)
+        }) else {
+            self.fail("请先选择一个环境。", cx);
+            return false;
+        };
+        let timezone = Self::field_value(&self.fields.environment_timezone, cx);
+        if timezone.is_empty() {
+            self.fail("请填写时区，例如 Asia/Shanghai。", cx);
+            return false;
+        }
+        self.environment_started = Some(std::time::Instant::now());
+        self.send(
+            Kind::EnvironmentEdit,
+            json!({
+                "command":"environment_edit",
+                "name":name,
+                "install_zsh":false,
+                "install_chrome":false,
+                "install_chinese":false,
+                "timezone":timezone
+            }),
+            cx,
+        );
+        true
+    }
+
+    pub(crate) fn environment_backup(
+        &mut self,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.locked() {
             return;
         }
+        self.environment_backup_target = Some(name);
+        self.fields.environment_backup.set_value("", window, cx);
+        self.backup_dialog_open = true;
+        self.open_backup_dialog(window, cx);
+    }
+
+    pub(crate) fn environment_backup_submit(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.locked() {
+            return false;
+        }
+        let Some(name) = self.environment_backup_target.clone() else {
+            self.fail("请先选择一个环境。", cx);
+            return false;
+        };
         let path = Self::field_value(&self.fields.environment_backup, cx);
         if path.is_empty() {
             self.fail("请填写备份文件路径。", cx);
-            return;
+            return false;
         }
         self.send(
             Kind::EnvironmentBackup,
             json!({"command":"environment_backup","name":name,"backup_path":path}),
             cx,
         );
+        true
+    }
+
+    pub(crate) fn environment_delete(
+        &mut self,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.locked() {
+            return;
+        }
+        let view = cx.entity().clone();
+        let confirm_name = name.clone();
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let ok_view = view.clone();
+            let cancel_view = view.clone();
+            dialog
+                .confirm()
+                .title(
+                    div()
+                        .text_base()
+                        .font_weight(FontWeight::NORMAL)
+                        .child("删除环境"),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("删除")
+                        .cancel_text("取消"),
+                )
+                .description(div().text_base().child(format!(
+                    "将注销 WSL 环境 {name}，环境内的文件和配置都会被删除。"
+                )))
+                .on_ok({
+                    let confirm_name = confirm_name.clone();
+                    move |_, _, cx| {
+                        ok_view.update(cx, |this, cx| {
+                            this.send(
+                                Kind::EnvironmentDelete,
+                                json!({
+                                    "command":"environment_delete",
+                                    "name":confirm_name.clone()
+                                }),
+                                cx,
+                            );
+                        });
+                        true
+                    }
+                })
+                .on_cancel(move |_, _, cx| {
+                    cancel_view.update(cx, |_this, cx| cx.notify());
+                    true
+                })
+        });
     }
 
     pub(crate) fn environment_cancel(&mut self, cx: &mut Context<Self>) {
@@ -486,33 +662,6 @@ impl Desktop {
         self.error = false;
         self.notice = "已取消编辑。".into();
         cx.notify();
-    }
-
-    pub(crate) fn environment_pick_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let picker = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("选择 WSL rootfs tar".into()),
-        });
-        cx.spawn_in(window, async move |view, cx| match picker.await {
-            Ok(Ok(Some(paths))) => {
-                if let Some(path) = paths.first() {
-                    let path = path.to_string_lossy().into_owned();
-                    let _ = view.update_in(cx, |this, window, cx| {
-                        this.fields.environment_source.set_value(path, window, cx);
-                        cx.notify();
-                    });
-                }
-            }
-            Ok(Ok(None)) => {}
-            _ => {
-                let _ = view.update_in(cx, |this, _, cx| {
-                    this.fail("无法打开文件选择器，请直接填写绝对路径。", cx)
-                });
-            }
-        })
-        .detach();
     }
 
     pub(crate) fn environment_pick_install(&mut self, window: &mut Window, cx: &mut Context<Self>) {

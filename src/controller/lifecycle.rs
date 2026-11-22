@@ -23,9 +23,31 @@ fn registered(p: &Plan) -> Result<(), String> {
         Err("journal_distribution_no_longer_matches_registration".into())
     }
 }
+
+fn registration_present(p: &Plan) -> Result<bool, String> {
+    Ok(host::distributions()?
+        .iter()
+        .any(|d| d.id.eq_ignore_ascii_case(&p.target.id)))
+}
+
 fn inspect(p: &Plan) -> Result<kernel::Ownership, String> {
     registered(p)?;
     kernel::inspect(p)
+}
+
+/// `old_restored` is written only after `retire` has verified the old plan is
+/// gone. Rechecking an unregistered old distribution would turn that durable
+/// proof into an unrecoverable stop failure.
+fn verify_restored(p: &Plan) -> Result<(), String> {
+    verify_restored_if(p, registration_present(p)?, verify_gone)
+}
+
+fn verify_restored_if(
+    p: &Plan,
+    registered: bool,
+    verify: impl FnOnce(&Plan) -> Result<(), String>,
+) -> Result<(), String> {
+    if registered { verify(p) } else { Ok(()) }
 }
 pub(crate) fn verify_gone(p: &Plan) -> Result<(), String> {
     if !inspect(p)?.clean() || lease::alive(p)? {
@@ -195,16 +217,53 @@ impl Controller {
                 if self.live.is_some() || journal::load()?.is_some() {
                     return Err("unexpected_owner_in_restored_gap".into());
                 }
-                verify_gone(pending.old.as_ref().ok_or("missing_old_owner")?)?;
+                verify_restored(pending.old.as_ref().ok_or("missing_old_owner")?)?;
             }
             Stage::StartingNew => {
                 if let Some(old) = &pending.old {
-                    verify_gone(old)?;
+                    verify_restored(old)?;
                 }
                 self.retire(pending.new.as_ref().ok_or("missing_new_owner")?)?;
             }
         }
         transition::finish(&record)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, SocketAddrV4};
+
+    fn plan() -> Plan {
+        Plan {
+            target: host::Distro {
+                id: "{01234567-89ab-cdef-0123-456789abcdef}".into(),
+                name: "old".into(),
+                base_path: "C:\\old".into(),
+                version: 2,
+            },
+            cgroup_ns: "cgroup:[1]".into(),
+            cgroup_root: "1:1".into(),
+            boot_id: "01234567-89ab-cdef-0123-456789abcdef".into(),
+            guest: Ipv4Addr::new(172, 28, 1, 2),
+            ingress: SocketAddrV4::new(Ipv4Addr::new(172, 28, 1, 1), 43531),
+            origins: Vec::new(),
+            cookie: 1,
+            system_dns: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            ipv6: None,
+        }
+    }
+
+    #[test]
+    fn restored_old_plan_does_not_require_a_deleted_registration() {
+        let mut called = false;
+        let result = verify_restored_if(&plan(), false, |_| {
+            called = true;
+            Err("should not inspect an unregistered old target".into())
+        });
+        assert!(result.is_ok());
+        assert!(!called);
     }
 }

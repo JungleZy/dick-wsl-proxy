@@ -9,7 +9,7 @@
 在 PowerShell 执行 `wsl-proxyctl.exe session`。下例使用 M2 及更新控制器的显式诊断命令 `start_scoped`；本页归档的原始 M1 EXE 对应命令为 `start`。当前 `start` 必须提供策略文件并同时接管 DNS，不能降级成局部直连。
 
 ```jsonl
-{"command":"start_scoped","target":"WSLProxyLab-Target","witness":"WSLProxyLab-Control","port":43771,"origins":["172.28.80.1:43772","172.28.83.138:43772"]}
+{"command":"start_scoped","target":"WSLProxyLab-Target","port":43771,"origins":["172.28.80.1:43772","172.28.83.138:43772"]}
 {"command":"status"}
 {"command":"stop"}
 ```

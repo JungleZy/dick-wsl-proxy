@@ -165,10 +165,10 @@ fn accept_tcp(
                 .spawn(move || {
                     let result = forward_tcp(plan, client, peer, shared.clone(), runtime);
                     lock(&active).remove(&peer);
-                    if let Err(error) = result {
-                        if !shared.is_stopping() {
-                            shared.record_error("tcp", error);
-                        }
+                    if let Err(error) = result
+                        && !shared.is_stopping()
+                    {
+                        shared.record_error("tcp", error);
                     }
                 })
                 .map_err(|e| format!("start IPv6 TCP forwarding worker: {e}"))?,
@@ -414,8 +414,29 @@ fn destination_v6(
 
 fn route_v6(runtime: &crate::managed::Runtime, origin: SocketAddrV6) -> Result<bool, String> {
     let direct = runtime.policy.allows_ipv6(*origin.ip());
-    if origin.port() == 53 && !direct {
-        return Err("alternate plaintext IPv6 DNS destination rejected".into());
+    route_v6_decision(origin, direct)
+}
+
+fn route_v6_decision(origin: SocketAddrV6, direct: bool) -> Result<bool, String> {
+    if origin.port() == 53 {
+        Err("alternate plaintext IPv6 DNS destination rejected".into())
+    } else {
+        Ok(!direct)
     }
-    Ok(!direct)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::route_v6_decision;
+    use std::net::{Ipv6Addr, SocketAddrV6};
+
+    #[test]
+    fn rejects_ipv6_plaintext_dns_even_when_the_address_is_allowlisted() {
+        let address = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 53, 0, 0);
+        assert!(route_v6_decision(address, true).is_err());
+        assert_eq!(
+            route_v6_decision(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 443, 0, 0), true),
+            Ok(false)
+        );
+    }
 }

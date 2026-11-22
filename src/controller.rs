@@ -92,6 +92,16 @@ impl Controller {
         if p.system_dns.is_some() != runtime.is_some() {
             return Err("policy_mode_mismatch".into());
         }
+        // IPv4 domain exceptions use per-name synthetic addresses. IPv6 has no
+        // equivalent alias space, so refuse this combination instead of
+        // silently routing an allowlisted AAAA answer through the chain.
+        if p.ipv6.is_some()
+            && runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.policy.has_domain_allowlist())
+        {
+            return Err("ipv6_domain_allowlist_unsupported".into());
+        }
         if self.live.is_some() || journal::load()?.is_some() {
             return Err("recover_or_stop_existing_target_first".into());
         }

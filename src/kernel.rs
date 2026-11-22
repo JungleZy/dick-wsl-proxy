@@ -187,14 +187,13 @@ pub(crate) fn validate(p: &Plan) -> Result<(), String> {
             return Err("kernel_invalid_original_endpoint".into());
         }
     }
-    if let Some(ipv6) = &p.ipv6 {
-        if p.system_dns.is_none()
+    if let Some(ipv6) = &p.ipv6
+        && (p.system_dns.is_none()
             || !global_unicast(ipv6.guest)
             || !valid_ipv6_ingress(ipv6.ingress)
-            || ipv6.guest == *ipv6.ingress.ip()
-        {
-            return Err("kernel_invalid_ipv6_endpoints".into());
-        }
+            || ipv6.guest == *ipv6.ingress.ip())
+    {
+        return Err("kernel_invalid_ipv6_endpoints".into());
     }
     Ok(())
 }

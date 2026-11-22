@@ -48,38 +48,20 @@ fn default_profile() -> Result<Config, String> {
     .map_err(|_| "desktop_store_default_profile_invalid".into())
 }
 
-fn env_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Ok(current) = std::env::current_dir() {
-        candidates.extend(current.ancestors().map(|root| root.join(".env")));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        candidates.extend(
-            exe.ancestors()
-                .flat_map(|root| [root.join(".env"), root.join("..\\.env")]),
-        );
-    }
-    candidates
+#[cfg(test)]
+fn prepare_residential(residential: ResidentialSettings) -> Result<ResidentialSettings, String> {
+    Ok(residential)
 }
 
-fn default_residential() -> ResidentialSettings {
-    for candidate in env_candidates() {
-        if let Ok(bytes) = fs::read(&candidate)
-            && let Ok(value) = credential::parse_env_bytes(&bytes)
-        {
-            return credential::settings(&value);
-        }
-    }
-    ResidentialSettings::default()
-}
-
+#[cfg(not(test))]
 fn prepare_residential(
     mut residential: ResidentialSettings,
 ) -> Result<ResidentialSettings, String> {
-    if residential.ip.is_empty() {
-        residential = default_residential();
+    if residential.ip.is_empty()
+        && let Ok(existing) = credential::load(DEFAULT_CREDENTIAL_NAME)
+    {
+        residential = credential::settings(&existing);
     }
-    #[cfg(not(test))]
     if !residential.ip.is_empty() {
         if residential.password.is_empty() {
             if let Ok(existing) = credential::load(DEFAULT_CREDENTIAL_NAME) {

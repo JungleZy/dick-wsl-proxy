@@ -3,12 +3,13 @@ use gpui_kit::component::{Disableable, button::Button, scroll::ScrollableElement
 use gpui_kit::{prelude::*, *};
 use serde_json::json;
 
-use super::backend::Kind;
+use super::backend::{self, Kind};
 use super::components::{badge, bytes, fact, panel, rate, text};
 use super::model::UiAction;
 use super::state::Desktop;
 use super::theme::{
     BLUE, DANGER_BG, INK, MONO_FONT, MUTED, RUST, SUCCESS_BG, SURFACE, SURFACE_SOFT, TEAL,
+    app_rgb as rgb,
 };
 
 fn connection_row() -> Div {
@@ -272,12 +273,10 @@ impl Desktop {
                 ),
             );
         if let Some(error) = forwarding["last_error"].as_str() {
-            result = result.child(
-                div()
-                    .text_base()
-                    .text_color(rgb(RUST))
-                    .child(format!("最后转发错误（后台报告）：{error}")),
-            );
+            result = result.child(div().text_base().text_color(rgb(RUST)).child(format!(
+                "最后转发错误（后台报告）：{}",
+                backend::humanize_error(error)
+            )));
         }
         result = result.child(
             div()

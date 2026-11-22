@@ -3,7 +3,7 @@
 
 use std::mem::size_of;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
@@ -16,7 +16,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, EnumWindows, GetClassNameW, GetCursorPos, GetMessageW,
     GetWindowThreadProcessId, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTSIZE, LoadIconW, LoadImageW,
-    MF_STRING, PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE, SW_RESTORE,
+    MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE, SW_RESTORE,
     SetForegroundWindow, ShowWindow, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
     TranslateMessage, WM_APP, WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
     WS_OVERLAPPED,
@@ -25,8 +25,26 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const TRAY_TIMER: usize = 1;
 const OPEN_COMMAND: usize = 1;
-const EXIT_COMMAND: usize = 2;
+const REFRESH_COMMAND: usize = 2;
+const START_COMMAND: usize = 3;
+const STOP_COMMAND: usize = 4;
+const PROBE_COMMAND: usize = 5;
+const EXIT_COMMAND: usize = 6;
 static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy)]
+pub(crate) enum TrayAction {
+    Refresh,
+    Start,
+    Stop,
+    Probe,
+}
+
+const ACTION_REFRESH: u8 = 1;
+const ACTION_START: u8 = 2;
+const ACTION_STOP: u8 = 3;
+const ACTION_PROBE: u8 = 4;
+static ACTION: AtomicU8 = AtomicU8::new(0);
 
 pub(crate) fn start() {
     thread::Builder::new()
@@ -37,6 +55,26 @@ pub(crate) fn start() {
 
 pub(crate) fn consume_exit_request() -> bool {
     EXIT_REQUESTED.swap(false, Ordering::AcqRel)
+}
+
+pub(crate) fn consume_action() -> Option<TrayAction> {
+    match ACTION.swap(0, Ordering::AcqRel) {
+        ACTION_REFRESH => Some(TrayAction::Refresh),
+        ACTION_START => Some(TrayAction::Start),
+        ACTION_STOP => Some(TrayAction::Stop),
+        ACTION_PROBE => Some(TrayAction::Probe),
+        _ => None,
+    }
+}
+
+fn request_action(action: TrayAction) {
+    let value = match action {
+        TrayAction::Refresh => ACTION_REFRESH,
+        TrayAction::Start => ACTION_START,
+        TrayAction::Stop => ACTION_STOP,
+        TrayAction::Probe => ACTION_PROBE,
+    };
+    ACTION.store(value, Ordering::Release);
 }
 
 pub(crate) fn hide_main_window() {
@@ -136,8 +174,17 @@ unsafe fn show_menu(hwnd: HWND) {
         return;
     }
     let open = wide("打开 WSL Proxy");
+    let refresh = wide("刷新后台状态");
+    let start = wide("启动接管");
+    let stop = wide("停止并恢复直连");
+    let probe = wide("检测公网出口");
     let exit = wide("退出");
     AppendMenuW(menu, MF_STRING, OPEN_COMMAND, open.as_ptr());
+    AppendMenuW(menu, MF_STRING, REFRESH_COMMAND, refresh.as_ptr());
+    AppendMenuW(menu, MF_STRING, START_COMMAND, start.as_ptr());
+    AppendMenuW(menu, MF_STRING, STOP_COMMAND, stop.as_ptr());
+    AppendMenuW(menu, MF_STRING, PROBE_COMMAND, probe.as_ptr());
+    AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_STRING, EXIT_COMMAND, exit.as_ptr());
     let mut point = POINT::default();
     GetCursorPos(&mut point);
@@ -155,6 +202,22 @@ unsafe fn show_menu(hwnd: HWND) {
     PostMessageW(hwnd, 0, 0, 0);
     match command as usize {
         OPEN_COMMAND => show_main_window(),
+        REFRESH_COMMAND => {
+            show_main_window();
+            request_action(TrayAction::Refresh);
+        }
+        START_COMMAND => {
+            show_main_window();
+            request_action(TrayAction::Start);
+        }
+        STOP_COMMAND => {
+            show_main_window();
+            request_action(TrayAction::Stop);
+        }
+        PROBE_COMMAND => {
+            show_main_window();
+            request_action(TrayAction::Probe);
+        }
         EXIT_COMMAND => {
             let main = find_main_window(hwnd);
             if !main.is_null() {

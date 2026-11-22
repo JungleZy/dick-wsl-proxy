@@ -15,6 +15,7 @@ use super::{ALIAS_BLOCK, ALIAS_SPACE, ALIAS_START};
 const MAP_MAGIC: &[u8; 4] = b"WDM1";
 const MAP_RECORD_BYTES: usize = 36;
 const MAX_MAP_BYTES: usize = 4 + MAP_RECORD_BYTES * ALIAS_SPACE as usize;
+type AliasMaps = (HashMap<[u8; 32], u32>, HashMap<u32, [u8; 32]>);
 #[cfg_attr(not(test), derive(Default))]
 pub(super) struct AliasLedger {
     pub(super) path: Option<PathBuf>,
@@ -234,12 +235,59 @@ impl AliasLedger {
         self.next += count;
         Ok(result)
     }
+
+    pub(super) fn reset() -> Result<(), String> {
+        let directory = crate::host::state_dir()?;
+        let highwater = directory.join("dns-alias.highwater");
+        let mapping = directory.join("dns-alias.map");
+        let pending = directory.join("dns-alias.pending");
+        Self::reset_paths(&highwater, &mapping, &pending)
+    }
+
+    #[cfg(test)]
+    pub(super) fn reset_at(highwater: &Path) -> Result<(), String> {
+        let mapping = highwater.with_extension("map");
+        let pending = highwater.with_extension("pending");
+        Self::reset_paths(highwater, &mapping, &pending)
+    }
+
+    fn reset_paths(highwater: &Path, mapping: &Path, pending: &Path) -> Result<(), String> {
+        match fs::symlink_metadata(pending) {
+            Ok(_) => {
+                return Err(
+                    "DNS alias ledger has an uncertain pending commit; manual recovery required"
+                        .into(),
+                );
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("inspect DNS alias pending commit: {error}")),
+        }
+        for (path, label) in [(highwater, "high-water"), (mapping, "mapping")] {
+            let metadata = match fs::symlink_metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("inspect DNS alias {label}: {error}")),
+            };
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if metadata.file_attributes()
+                    & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+                    != 0
+                {
+                    return Err(format!("DNS alias {label} is a reparse point"));
+                }
+            }
+            if !metadata.is_file() {
+                return Err(format!("DNS alias {label} is not a regular file"));
+            }
+            fs::remove_file(path).map_err(|error| format!("remove DNS alias {label}: {error}"))?;
+        }
+        Ok(())
+    }
 }
 
-fn read_alias_map(
-    path: &Path,
-    high: u32,
-) -> Result<(HashMap<[u8; 32], u32>, HashMap<u32, [u8; 32]>), String> {
+fn read_alias_map(path: &Path, high: u32) -> Result<AliasMaps, String> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -254,12 +302,14 @@ fn read_alias_map(
     if bytes.len() > MAX_MAP_BYTES || bytes.len() < MAP_MAGIC.len() || &bytes[..4] != MAP_MAGIC {
         return Err("corrupt DNS alias mapping; automatic reset is forbidden".into());
     }
-    if (bytes.len() - MAP_MAGIC.len()) % MAP_RECORD_BYTES != 0 {
+    if !(bytes.len() - MAP_MAGIC.len()).is_multiple_of(MAP_RECORD_BYTES) {
         return Err("truncated DNS alias mapping; automatic reset is forbidden".into());
     }
     let mut assignments = HashMap::new();
     let mut used = HashMap::new();
-    for record in bytes[MAP_MAGIC.len()..].chunks_exact(MAP_RECORD_BYTES) {
+    let (records, remainder) = bytes[MAP_MAGIC.len()..].as_chunks::<MAP_RECORD_BYTES>();
+    debug_assert!(remainder.is_empty());
+    for record in records {
         let key: [u8; 32] = record[..32]
             .try_into()
             .map_err(|_| "invalid DNS alias mapping key")?;

@@ -534,6 +534,10 @@ impl Policy {
             })
     }
 
+    pub(crate) fn has_domain_allowlist(&self) -> bool {
+        !self.direct_domains.is_empty() || !self.direct_suffixes.is_empty()
+    }
+
     /// Ingress must reject these before either a direct or a chained client connection.
     /// Only the DNS owner is permitted to pass dns_upstream directly to chain().
     pub fn is_reserved_endpoint(&self, dest: SocketAddrV4) -> bool {
@@ -1208,6 +1212,7 @@ mod tests {
         assert!(!policy.allows_ip("192.0.2.5".parse().unwrap()));
         assert!(policy.allows_ip("198.51.100.255".parse().unwrap()));
         assert!(!policy.allows_ip("198.51.101.1".parse().unwrap()));
+        assert!(policy.has_domain_allowlist());
         assert!(policy.is_reserved_endpoint(policy.dns_upstream()));
         assert!(policy.chain(policy.first_hop).is_err());
         assert!(policy.chain(policy.residential.endpoint()).is_err());

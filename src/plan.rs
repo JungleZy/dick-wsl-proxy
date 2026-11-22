@@ -70,18 +70,17 @@ fn scope(
 impl Plan {
     pub(crate) fn validate(&self) -> Result<(), String> {
         scope(self.guest, self.ingress, &self.origins, self.system_dns)?;
-        if let Some(ipv6) = &self.ipv6 {
-            if ipv6.guest.is_unspecified()
+        if let Some(ipv6) = &self.ipv6
+            && (ipv6.guest.is_unspecified()
                 || ipv6.guest.is_loopback()
                 || ipv6.guest.is_multicast()
                 || ipv6.guest.is_unicast_link_local()
                 || ipv6.ingress.ip().is_unspecified()
                 || ipv6.ingress.ip().is_multicast()
                 || ipv6.ingress.port() < 1024
-                || ipv6.guest == *ipv6.ingress.ip()
-            {
-                return Err("invalid_ipv6_scope".into());
-            }
+                || ipv6.guest == *ipv6.ingress.ip())
+        {
+            return Err("invalid_ipv6_scope".into());
         }
         kernel::validate(self)
     }

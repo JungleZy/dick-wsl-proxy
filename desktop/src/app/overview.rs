@@ -1,18 +1,15 @@
-//! 首页监控页和环境预检摘要。
+//! 首页监控页和接管摘要。
 
 use gpui_kit::component::button::ButtonVariants as _;
-use gpui_kit::component::chart::{BarChart, LineChart};
+use gpui_kit::component::chart::{AreaChart, BarChart, LineChart};
 use gpui_kit::component::plot::shape::BarAlignment;
 use gpui_kit::{prelude::*, *};
-use serde_json::Value;
 
-use super::backend::Kind;
-use super::components::{badge, design_icon, panel, status_dot, text};
+use super::backend::{self, Kind};
+use super::components::{design_icon, status_dot, text};
 use super::model::UiAction;
 use super::state::Desktop;
-use super::theme::{
-    AMBER, BLUE, DANGER_BG, MUTED, RULE, RUST, SUCCESS_BG, SURFACE, SURFACE_SOFT, TEAL,
-};
+use super::theme::{AMBER, BLUE, MUTED, RULE, RUST, SURFACE, SURFACE_SOFT, TEAL, app_rgb as rgb};
 use super::views::{card, card_header, chart_card, key_value, metric};
 
 impl Desktop {
@@ -91,10 +88,14 @@ impl Desktop {
                         "未接管"
                     },
                 ))
-                .child(key_value(
-                    "最近错误",
-                    text(&self.status["forwarding"], "last_error", "—"),
-                )),
+                .child(key_value("最近错误", {
+                    let error = text(&self.status["forwarding"], "last_error", "—");
+                    if error == "—" {
+                        error
+                    } else {
+                        backend::humanize_error(&error)
+                    }
+                })),
         );
         let path = card(
             "保护路径",
@@ -131,7 +132,7 @@ impl Desktop {
                     div()
                         .text_base()
                         .text_color(rgb(MUTED))
-                        .child("保存规则后需要重新预检"),
+                        .child("启动接管前会自动预检"),
                 )
                 .child(
                     div()
@@ -223,18 +224,7 @@ impl Desktop {
             .map(|(index, sample)| {
                 (
                     format!("{:02}", index.saturating_mul(24) / denominator),
-                    sample.tx,
-                )
-            })
-            .collect::<Vec<_>>();
-        let received_data = self
-            .traffic_history
-            .iter()
-            .enumerate()
-            .map(|(index, sample)| {
-                (
-                    format!("{:02}", index.saturating_mul(24) / denominator),
-                    sample.rx,
+                    *sample,
                 )
             })
             .collect::<Vec<_>>();
@@ -246,30 +236,21 @@ impl Desktop {
                 .flex_col()
                 .gap_2()
                 .child(
-                    div()
-                        .relative()
-                        .h(px(150.))
-                        .child(
-                            LineChart::new(data)
-                                .id("traffic-trend")
-                                .x(|point| point.0.clone())
-                                .y(|point| point.1)
-                                .stroke(rgb(BLUE))
-                                .dot(),
-                        )
-                        .child(
-                            div().absolute().inset_0().child(
-                                LineChart::new(received_data)
-                                    .id("traffic-trend-received")
-                                    .x(|point| point.0.clone())
-                                    .y(|point| point.1)
-                                    .stroke(rgb(TEAL))
-                                    .dot()
-                                    .interactive(false)
-                                    .x_axis(false)
-                                    .grid(false),
-                            ),
-                        ),
+                    div().relative().h(px(150.)).child(
+                        AreaChart::new(data)
+                            .id("traffic-trend")
+                            .x(|point| point.0.clone())
+                            .y(|point| point.1.tx)
+                            .stroke(rgb(BLUE))
+                            .fill(rgb(BLUE).opacity(0.14))
+                            .name("入口流量")
+                            .y(|point| point.1.rx)
+                            .stroke(rgb(TEAL))
+                            .fill(rgb(TEAL).opacity(0.12))
+                            .name("转发流量")
+                            .x_tick_count(7)
+                            .tooltip_value(|_, _, value| format!("{value:.1}").into()),
+                    ),
                 )
                 .child(
                     div()
@@ -337,7 +318,9 @@ impl Desktop {
                     .band(|point| point.0.clone())
                     .value(|point| point.1)
                     .alignment(BarAlignment::Left)
+                    .name("流量占比")
                     .label(|point| format!("{:.0}%", point.1))
+                    .tooltip_value(|_, value| format!("{value:.0}%").into())
                     .fill(|point, _, _, _| match point.0.as_str() {
                         "直连" => rgb(BLUE),
                         "住宅链路" => rgb(TEAL),
@@ -361,7 +344,7 @@ impl Desktop {
                     .rounded_md()
                     .text_base()
                     .text_color(rgb(MUTED))
-                    .child("暂无 DNS 检查结果，运行预检后开始采样。"),
+                    .child("暂无 DNS 检查结果，启动接管后开始采样。"),
             );
         }
         chart_card(
@@ -394,7 +377,10 @@ impl Desktop {
                         .x(|point| point.0.clone())
                         .y(|point| point.1)
                         .stroke(rgb(TEAL))
-                        .dot(),
+                        .name("DoH 延迟")
+                        .dot()
+                        .x_tick_count(4)
+                        .tooltip_value(|_, value| format!("{value:.0} ms").into()),
                     ),
                 ),
         )
@@ -477,49 +463,5 @@ impl Desktop {
         } else {
             "DNS 状态未确认".into()
         }
-    }
-
-    pub(crate) fn preflight_panel(&self) -> Div {
-        let Some(result) = &self.preflight else {
-            return panel("预检", "目标身份、cgroup、NAT 表和入口端口。").child(
-                div()
-                    .p_3()
-                    .bg(rgb(SURFACE_SOFT))
-                    .rounded_md()
-                    .text_base()
-                    .text_color(rgb(MUTED))
-                    .child("选择目标和见证后运行预检。启动前会再次检查。"),
-            );
-        };
-        let passed = result["passed"] == true;
-        let (label, color, background) = if passed {
-            ("通过", TEAL, SUCCESS_BG)
-        } else {
-            ("有阻断", RUST, DANGER_BG)
-        };
-        let mut body = div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(badge(label, color, background));
-        if let Some(blockers) = result["blockers"].as_array() {
-            for blocker in blockers.iter().filter_map(Value::as_str) {
-                body = body.child(
-                    div()
-                        .text_base()
-                        .text_color(rgb(RUST))
-                        .child(blocker.to_owned()),
-                );
-            }
-        }
-        panel(
-            "预检",
-            if passed {
-                "通过 · 仍需确认启动"
-            } else {
-                "未通过 · 未启动"
-            },
-        )
-        .child(body)
     }
 }

@@ -5,14 +5,18 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub(crate) struct Preferences {
     pub(crate) target: Option<String>,
-    pub(crate) witness: Option<String>,
+    // Kept only so profiles written by older desktop builds can still be read.
+    // It is never serialized or used by the single-target workflow.
+    #[serde(default, skip_serializing)]
+    #[serde(rename = "witness")]
+    _legacy_witness: Option<String>,
     pub(crate) port: u16,
 }
 impl Default for Preferences {
     fn default() -> Self {
         Self {
             target: None,
-            witness: None,
+            _legacy_witness: None,
             port: 43531,
         }
     }
@@ -20,15 +24,12 @@ impl Default for Preferences {
 impl Preferences {
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.port < 1024
-            || [self.target.as_deref(), self.witness.as_deref()]
+            || [self.target.as_deref()]
                 .into_iter()
                 .flatten()
                 .any(|n| n.is_empty() || n.len() > 256 || n.chars().any(char::is_control))
         {
             return Err("invalid_desktop_preferences".into());
-        }
-        if self.target.is_some() && self.target == self.witness {
-            return Err("same_distribution".into());
         }
         Ok(())
     }
@@ -61,12 +62,22 @@ pub(crate) fn decode_policy(bytes: &[u8]) -> Result<Config, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_policy;
+    use super::{Preferences, decode_policy};
 
     #[test]
     fn accepts_utf8_bom_from_legacy_windows_editors() {
         let mut bytes = b"{\"first_hop\":\"127.0.0.1:7892\",\"credential\":\"demo\",\"dns_upstream\":\"223.5.5.5:443\",\"dns_tls_name\":\"dns.example\",\"direct_ips\":[],\"direct_domains\":[],\"direct_suffixes\":[]}".to_vec();
         bytes.splice(0..0, [0xef, 0xbb, 0xbf]);
         assert!(decode_policy(&bytes).is_ok());
+    }
+
+    #[test]
+    fn legacy_witness_preference_is_read_but_not_written() {
+        let preferences: Preferences =
+            serde_json::from_str(r#"{"target":"Target","witness":"Control","port":43531}"#)
+                .unwrap();
+        let value = serde_json::to_value(preferences).unwrap();
+        assert_eq!(value["target"], "Target");
+        assert!(value.get("witness").is_none());
     }
 }

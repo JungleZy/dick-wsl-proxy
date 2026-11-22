@@ -419,6 +419,23 @@ fn durable_alias_exhaustion_is_atomic_and_never_resets() {
 }
 
 #[test]
+fn explicit_idle_reset_removes_the_ledger_but_preserves_uncertain_commits() {
+    let owner = AliasLedger::default();
+    let path = owner.path.as_ref().unwrap().clone();
+    write_highwater(&path, ALIAS_BLOCK);
+    fs::write(path.with_extension("map"), b"WDM1").unwrap();
+    AliasLedger::reset_at(&path).unwrap();
+    assert!(!path.exists());
+    assert!(!path.with_extension("map").exists());
+
+    write_highwater(&path, ALIAS_BLOCK);
+    fs::write(path.with_extension("pending"), b"uncertain").unwrap();
+    assert!(AliasLedger::reset_at(&path).is_err());
+    assert!(path.exists());
+    assert!(path.with_extension("pending").exists());
+}
+
+#[test]
 fn corrupt_or_uncertain_ledger_and_file_errors_fail_closed() {
     let owner = AliasLedger::default();
     let path = owner.path.as_ref().unwrap().clone();

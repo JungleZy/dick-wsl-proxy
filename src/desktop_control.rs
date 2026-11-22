@@ -25,8 +25,10 @@ struct SqliteSave {
 #[serde(deny_unknown_fields)]
 struct EnvironmentCreate {
     name: String,
-    source_path: String,
+    distribution: String,
     install_path: String,
+    username: String,
+    password: String,
     #[serde(default)]
     install_zsh: bool,
     #[serde(default)]
@@ -45,6 +47,8 @@ struct EnvironmentEdit {
     install_chrome: bool,
     #[serde(default)]
     install_chinese: bool,
+    #[serde(default)]
+    timezone: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -60,11 +64,27 @@ struct EnvironmentBackup {
     backup_path: String,
 }
 
-fn environment_options(zsh: bool, chrome: bool, chinese: bool) -> InstallOptions {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvironmentDelete {
+    name: String,
+}
+
+fn environment_options(
+    zsh: bool,
+    chrome: bool,
+    chinese: bool,
+    username: Option<String>,
+    password: Option<String>,
+    timezone: Option<String>,
+) -> InstallOptions {
     InstallOptions {
         zsh,
         chrome,
         chinese,
+        username,
+        password,
+        timezone,
     }
 }
 
@@ -199,9 +219,16 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                 .map_err(|_| bad("invalid_environment_fields".into()))?;
                 let environment = environment::create(
                     &req.name,
-                    &req.source_path,
+                    &req.distribution,
                     &req.install_path,
-                    environment_options(req.install_zsh, req.install_chrome, req.install_chinese),
+                    environment_options(
+                        req.install_zsh,
+                        req.install_chrome,
+                        req.install_chinese,
+                        Some(req.username.clone()),
+                        Some(req.password.clone()),
+                        None,
+                    ),
                 )
                 .map_err(bad)?;
                 json!({"environment":environment,"distributions":host::distributions().map_err(bad)?})
@@ -218,7 +245,14 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                 .map_err(|_| bad("invalid_environment_fields".into()))?;
                 let environment = environment::edit(
                     &req.name,
-                    environment_options(req.install_zsh, req.install_chrome, req.install_chinese),
+                    environment_options(
+                        req.install_zsh,
+                        req.install_chrome,
+                        req.install_chinese,
+                        None,
+                        None,
+                        req.timezone,
+                    ),
                 )
                 .map_err(bad)?;
                 json!({"environment":environment})
@@ -235,6 +269,22 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                 .map_err(|_| bad("invalid_environment_fields".into()))?;
                 let backup = environment::backup(&req.name, &req.backup_path).map_err(bad)?;
                 json!({"backup":backup})
+            }
+            "environment_delete" => {
+                require_idle(controller)?;
+                let request = request
+                    .as_object_mut()
+                    .ok_or_else(|| bad("invalid_environment_fields".into()))?;
+                request.remove("command");
+                let req = serde_json::from_value::<EnvironmentDelete>(Value::Object(
+                    std::mem::take(request),
+                ))
+                .map_err(|_| bad("invalid_environment_fields".into()))?;
+                let environment = environment::remove(&req.name).map_err(bad)?;
+                json!({
+                    "environment":environment,
+                    "distributions":host::distributions().map_err(bad)?
+                })
             }
             "export_diagnostics" => export(controller).map_err(bad)?,
             "probe_exit" => {
