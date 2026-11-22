@@ -8,7 +8,7 @@
 
 **流量怎么走？** 命中 IP、CIDR、域名或域名后缀白名单的业务连接由 Windows 直连。其余 IPv4 TCP 连接先经过宿主机已有的 SOCKS5 代理，再经过住宅 SOCKS5 出口；任一跳失败都不会改走直连。目标发行版的系统 DNS（UDP/TCP 53）始终经双跳访问指定的 DNS-over-HTTPS 上游，白名单不豁免 DNS 查询。
 
-**适用范围。** Windows x64 原生桌面控制台与 CLI，后端按 WSL2 NAT 验证，不是通用 VPN。它不代理 IPv6，拒绝非白名单的普通 UDP（含 QUIC）。同一 Windows 账户一次只接管一个发行版；切换前先确认旧目标已恢复，不迁移既有 TCP 连接。
+**适用范围。** Windows x64 原生桌面控制台与 CLI，后端按 WSL2 NAT 验证，不是通用 VPN。目标具备全局 IPv6 地址和默认路由时启用受管 IPv6，否则阻断目标外部 IPv6。非白名单普通 UDP（含 QUIC）要求住宅代理支持 UDP Associate，否则启动失败并保持阻断。同一 Windows 账户一次只接管一个发行版；切换前先确认旧目标已恢复，不迁移既有 TCP 连接。
 
 **图形界面。** 将 `wsl-proxy-desktop.exe` 与配套 `wsl-proxyctl.exe` 放在同目录，打开前者。选目标及对照、保存策略并明确启动；关闭窗口不等于停止代理。重新打开可连接已有后台，恢复原网须选择“停止并恢复直连”。见 [M4 使用说明和验收边界](docs/plans/m4/README.md)。
 
@@ -23,7 +23,7 @@
 
 **Where does traffic go?** Windows connects directly for application traffic matching an allowlisted IP, CIDR, domain, or domain suffix. Other IPv4 TCP connections use the host’s existing SOCKS5 proxy and then a residential SOCKS5 proxy. If either hop fails, the connection fails rather than going direct. The target’s system DNS (UDP/TCP port 53) uses the same two hops to reach the configured DNS-over-HTTPS upstream, even for allowlisted domains.
 
-**Supported scope.** The Windows x64 native desktop and CLI share the controller tested on WSL2 NAT. It is not a general-purpose VPN. IPv6 is not proxied; non-allowlisted application UDP (including QUIC) is rejected. Only one distribution per account can be active. Switching restores the old target before enabling the new one; existing TCP connections do not migrate.
+**Supported scope.** The Windows x64 native desktop and CLI share the controller tested on WSL2 NAT. It is not a general-purpose VPN. A target with a global IPv6 address and default route uses managed IPv6 interception, while external IPv6 is blocked when those prerequisites are absent. Non-allowlisted application UDP, including QUIC, requires residential UDP Associate support, otherwise startup fails closed. Only one distribution per account can be active. Switching restores the old target before enabling the new one; existing TCP connections do not migrate.
 
 **Desktop.** Keep `wsl-proxy-desktop.exe` and the matching `wsl-proxyctl.exe` together and launch the desktop executable. Closing the window disconnects the UI, not the proxy; reopen to reconnect, or explicitly stop to restore routing. See the [M4 operator guide](docs/plans/m4/README.md).
 

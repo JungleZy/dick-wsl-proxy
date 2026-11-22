@@ -8123,7 +8123,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "wsl-proxy-desktop"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "embed-resource",
  "gpui-kit",
@@ -8135,7 +8135,7 @@ dependencies = [
 
 [[package]]
 name = "wsl-proxyctl"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "clap",
  "native-tls",
