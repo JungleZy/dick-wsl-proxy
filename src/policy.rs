@@ -448,7 +448,7 @@ impl Policy {
             .set_nodelay(true)
             .map_err(|_| "cannot configure first-hop UDP control socket".to_string())?;
         negotiate_no_auth(&mut first_control, deadline)?;
-        let first_relay = udp_associate(&mut first_control, self.first_hop, deadline)?;
+        let first_relay = udp_associate(&mut first_control, self.first_hop, deadline, "first-hop")?;
 
         let mut residential_control =
             TcpStream::connect_timeout(&SocketAddr::V4(self.first_hop), remaining(deadline)?)
@@ -482,6 +482,7 @@ impl Policy {
             &mut residential_control,
             self.residential.endpoint(),
             deadline,
+            "residential",
         )?;
 
         let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
@@ -778,12 +779,21 @@ fn udp_associate(
     stream: &mut TcpStream,
     fallback_ip: SocketAddrV4,
     deadline: Instant,
+    label: &str,
 ) -> Result<SocketAddrV4, String> {
     send(stream, &[5, 3, 0, 1, 0, 0, 0, 0, 0, 0], deadline)?;
     let mut header = [0; 4];
     receive(stream, &mut header, deadline)?;
-    if header[0] != 5 || header[1] != 0 || header[2] != 0 {
-        return Err("SOCKS5 UDP ASSOCIATE rejected or malformed".into());
+    if header[0] != 5 || header[2] != 0 {
+        return Err(format!(
+            "{label} SOCKS5 UDP ASSOCIATE returned a malformed response"
+        ));
+    }
+    if header[1] != 0 {
+        return Err(format!(
+            "{label} SOCKS5 UDP ASSOCIATE rejected with reply code 0x{:02x}",
+            header[1]
+        ));
     }
     let (address, port) = match header[3] {
         1 => {
