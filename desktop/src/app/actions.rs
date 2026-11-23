@@ -146,6 +146,15 @@ impl Desktop {
         let target = self.selected.clone().ok_or("请选择目标 WSL。")?;
         Ok((target, self.port(cx)?))
     }
+
+    fn environment_display_name(&self, target: &str) -> String {
+        self.distributions
+            .iter()
+            .find(|distro| distro["id"].as_str() == Some(target))
+            .and_then(|distro| distro["name"].as_str())
+            .unwrap_or(target)
+            .to_owned()
+    }
     pub(crate) fn draft(&self, cx: &App) -> Value {
         let mut profile = self.profile.as_object().cloned().unwrap_or_default();
         for (field, key, array) in [
@@ -194,7 +203,7 @@ impl Desktop {
             .ok_or("住宅服务器端口需为 1–65535 的整数。")
     }
 
-    fn open_confirmation_dialog(&self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_confirmation_dialog(&self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(confirmation) = self.confirmation.as_ref() else {
             return;
         };
@@ -234,7 +243,6 @@ impl Desktop {
     pub(crate) fn open_prepare_confirmation(
         &mut self,
         pending: PendingPrepare,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let PendingPrepare {
@@ -256,13 +264,16 @@ impl Desktop {
             "profile_revision":self.revision,
             "expected_generation":generation
         });
+        let target_name = self.environment_display_name(&target);
         let message = if kind == Kind::Switch {
+            let active_target = text(&self.status, "active_target", "当前目标");
+            let active_target_name = self.environment_display_name(&active_target);
             format!(
-                "将从 {} 切换到 {target}。旧目标会先恢复直连；现有 TCP 连接需要重连。",
-                text(&self.status, "active_target", "当前目标")
+                "将从 {} 切换到 {target_name}。旧目标会先恢复直连；现有 TCP 连接需要重连。",
+                active_target_name
             )
         } else {
-            format!("将接管 {target} 的 TCP 和系统 DNS。非直连例外流量经代理链。")
+            format!("将接管 {target_name} 的 TCP 和系统 DNS。非直连例外流量经代理链。")
         };
         self.confirmation = Some(Confirmation {
             kind,
@@ -270,7 +281,7 @@ impl Desktop {
             request,
             message,
         });
-        self.open_confirmation_dialog(window, cx);
+        self.confirmation_pending = true;
         cx.notify();
     }
 
@@ -325,6 +336,7 @@ impl Desktop {
         let Some(confirmation) = self.confirmation.take() else {
             return;
         };
+        self.confirmation_pending = false;
         if self.generation() != Some(confirmation.generation) {
             self.fail("确认期间后台状态已变化，请刷新后重试。", cx);
             return;
@@ -379,7 +391,7 @@ impl Desktop {
         self.environment_backup_target = None;
         self.backup_result_path = None;
         self.environment_zsh = true;
-        self.environment_chrome = false;
+        self.environment_chrome = true;
         self.environment_chinese = true;
         self.fields.environment_name.set_value("", window, cx);
         self.fields
@@ -459,6 +471,24 @@ impl Desktop {
         );
     }
 
+    pub(crate) fn open_target_environment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.environment_editor.is_some() || self.locked() {
+            return;
+        }
+        let Some(target) = self.selected.clone() else {
+            return;
+        };
+        let detail_is_target = self
+            .environment_detail
+            .as_ref()
+            .and_then(|detail| detail["id"].as_str())
+            == Some(target.as_str());
+        if detail_is_target {
+            return;
+        }
+        self.environment_view(target, window, cx);
+    }
+
     pub(crate) fn environment_submit(&mut self, cx: &mut Context<Self>) {
         if self.locked() {
             return;
@@ -526,6 +556,7 @@ impl Desktop {
                 )
             }
         };
+        self.environment_timezone_only = false;
         if matches!(kind, Kind::EnvironmentCreate | Kind::EnvironmentEdit) {
             self.environment_started = Some(std::time::Instant::now());
         }
@@ -551,6 +582,7 @@ impl Desktop {
             self.fail("请填写时区，例如 Asia/Shanghai。", cx);
             return false;
         }
+        self.environment_timezone_only = true;
         self.environment_started = Some(std::time::Instant::now());
         self.send(
             Kind::EnvironmentEdit,

@@ -1,8 +1,9 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::lock;
 
@@ -11,13 +12,104 @@ const RECENT_LIMIT: usize = 128;
 const RECENT_TTL: Duration = Duration::from_secs(300);
 
 /// Byte counts are application transport bytes, excluding proxy handshakes and
-/// kernel/IP headers. No payload, DNS question, credential, or peer identity is retained.
+/// kernel/IP headers. No payload, DNS question, or credential is retained. Rows
+/// carry the observed destination address; with a [`FlowSink`] installed, each
+/// finished row is also handed to the desktop store, which keeps it on disk.
 pub(super) struct FlowStats {
     next_id: AtomicU64,
     tx: AtomicU64,
     rx: AtomicU64,
     records: Mutex<Records>,
     sample: Mutex<Sample>,
+    /// Distinguishes this ingress run's flow ids, which restart at 1 on every bind.
+    session: u64,
+    target: Option<Arc<str>>,
+    sink: Option<FlowSink>,
+}
+
+/// A flow's final state, sent once when the flow ends.
+pub(crate) struct FinishedFlow {
+    pub(crate) session: u64,
+    pub(crate) flow_id: u64,
+    pub(crate) target: Option<Arc<str>>,
+    pub(crate) protocol: &'static str,
+    pub(crate) destination: Option<SocketAddr>,
+    pub(crate) route: Option<&'static str>,
+    pub(crate) reason: Option<&'static str>,
+    pub(crate) status: &'static str,
+    pub(crate) stage: &'static str,
+    pub(crate) failure_stage: Option<&'static str>,
+    pub(crate) tx_bytes: u64,
+    pub(crate) rx_bytes: u64,
+    pub(crate) started_unix_ms: u64,
+    pub(crate) ended_unix_ms: u64,
+}
+
+pub(crate) enum FlowEvent {
+    Finished(FinishedFlow),
+    /// Acknowledged after every event queued before it has been handled.
+    Flush(mpsc::Sender<()>),
+}
+
+/// Bounded hand-off from forwarding threads to a persistence thread. Offering a
+/// finished flow never blocks: when the queue is full the row is counted and dropped.
+#[derive(Clone)]
+pub(crate) struct FlowSink {
+    sender: SyncSender<FlowEvent>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl FlowSink {
+    pub(crate) fn new(capacity: usize) -> (Self, Receiver<FlowEvent>) {
+        let (sender, receiver) = mpsc::sync_channel(capacity);
+        (
+            Self {
+                sender,
+                dropped: Arc::new(AtomicU64::new(0)),
+            },
+            receiver,
+        )
+    }
+
+    fn offer(&self, flow: FinishedFlow) {
+        match self.sender.try_send(FlowEvent::Finished(flow)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Rows that could not be queued because the persistence thread fell behind or exited.
+    pub(crate) fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Waits until every row queued so far has been handled, or `timeout` passes.
+    pub(crate) fn flush(&self, timeout: Duration) -> bool {
+        let (done, wait) = mpsc::channel();
+        self.sender.send(FlowEvent::Flush(done)).is_ok() && wait.recv_timeout(timeout).is_ok()
+    }
+}
+
+fn unix_ms(at: SystemTime) -> u64 {
+    at.duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default()
+}
+
+/// Wall-clock milliseconds, strictly increasing within this process.
+fn next_session() -> u64 {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = unix_ms(SystemTime::now());
+    let mut last = LAST.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(last.saturating_add(1));
+        match LAST.compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(actual) => last = actual,
+        }
+    }
 }
 
 struct Records {
@@ -55,8 +147,17 @@ pub(super) struct Flow {
 }
 
 impl FlowStats {
+    #[cfg(test)]
     pub(super) fn new() -> Self {
+        Self::recording(None, None)
+    }
+
+    /// Like [`FlowStats::new`], but every finished flow is also offered to `sink`.
+    pub(super) fn recording(target: Option<Arc<str>>, sink: Option<FlowSink>) -> Self {
         Self {
+            session: next_session(),
+            target,
+            sink,
             next_id: AtomicU64::new(1),
             tx: AtomicU64::new(0),
             rx: AtomicU64::new(0),
@@ -123,6 +224,8 @@ impl FlowStats {
             })
         };
         let connections = serde_json::json!({
+            "session": self.session,
+            "persisted": self.sink.is_some(),
             "active_limit": ACTIVE_LIMIT,
             "recent_limit": RECENT_LIMIT,
             "recent_ttl_seconds": RECENT_TTL.as_secs(),
@@ -166,11 +269,46 @@ impl Records {
     }
 }
 
-pub(super) struct FailureMarker(Arc<Record>);
+pub(super) struct FailureMarker {
+    stats: Arc<FlowStats>,
+    record: Arc<Record>,
+}
 
 impl FailureMarker {
+    /// The flow has usually been dropped (and offered as completed) by now, so the
+    /// failed state is offered again; the store keeps one row per session and flow id.
     pub(super) fn failed(self) {
-        self.0.failed();
+        self.record.failed();
+        let finished = self
+            .stats
+            .finished(&self.record, &lock(&self.record.details));
+        if let (Some(sink), Some(finished)) = (&self.stats.sink, finished) {
+            sink.offer(finished);
+        }
+    }
+}
+
+impl FlowStats {
+    fn finished(&self, record: &Record, details: &Details) -> Option<FinishedFlow> {
+        self.sink.as_ref()?;
+        let ended = SystemTime::now();
+        let started = ended.checked_sub(record.started.elapsed()).unwrap_or(ended);
+        Some(FinishedFlow {
+            session: self.session,
+            flow_id: record.id,
+            target: self.target.clone(),
+            protocol: record.protocol,
+            destination: details.destination,
+            route: details.route,
+            reason: details.reason,
+            status: details.status,
+            stage: details.stage,
+            failure_stage: details.failure_stage,
+            tx_bytes: record.tx.load(Ordering::Relaxed),
+            rx_bytes: record.rx.load(Ordering::Relaxed),
+            started_unix_ms: unix_ms(started),
+            ended_unix_ms: unix_ms(ended),
+        })
     }
 }
 
@@ -214,7 +352,10 @@ impl Flow {
     // spawn consumes its closure even on failure, so retain only the existing
     // record (not another flow owner) to report that failure after closure drop.
     pub(super) fn failure_marker(&self) -> FailureMarker {
-        FailureMarker(Arc::clone(&self.record))
+        FailureMarker {
+            stats: Arc::clone(&self.stats),
+            record: Arc::clone(&self.record),
+        }
     }
 
     pub(super) fn stopped(&self) {
@@ -246,21 +387,28 @@ impl Drop for Flow {
         if std::thread::panicking() {
             self.failed();
         }
-        {
+        let finished = {
             let mut details = lock(&self.record.details);
             if details.status == "active" {
                 details.status = "completed";
             }
+            self.stats.finished(&self.record, &details)
+        };
+        {
+            let mut records = lock(&self.stats.records);
+            records.active.retain(|record| record.id != self.record.id);
+            records.prune();
+            if records.recent.len() == RECENT_LIMIT {
+                records.recent.pop_front();
+            }
+            records
+                .recent
+                .push_back((Instant::now(), Arc::clone(&self.record)));
         }
-        let mut records = lock(&self.stats.records);
-        records.active.retain(|record| record.id != self.record.id);
-        records.prune();
-        if records.recent.len() == RECENT_LIMIT {
-            records.recent.pop_front();
+        // Offered after both locks are released; the hand-off itself never blocks.
+        if let (Some(sink), Some(finished)) = (&self.stats.sink, finished) {
+            sink.offer(finished);
         }
-        records
-            .recent
-            .push_back((Instant::now(), Arc::clone(&self.record)));
     }
 }
 
@@ -346,5 +494,96 @@ mod tests {
         assert_eq!(rows["recent"][0]["failure_stage"], "metadata");
         lock(&stats.records).recent[0].0 = Instant::now() - RECENT_TTL;
         assert!(stats.snapshot().0["recent"].as_array().unwrap().is_empty());
+    }
+
+    fn finished(events: &Receiver<FlowEvent>) -> Vec<FinishedFlow> {
+        events
+            .try_iter()
+            .filter_map(|event| match event {
+                FlowEvent::Finished(flow) => Some(flow),
+                FlowEvent::Flush(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn finished_flows_are_offered_once_with_their_final_state() {
+        let (sink, events) = FlowSink::new(8);
+        let stats = Arc::new(FlowStats::recording(Some("Test-Target".into()), Some(sink)));
+        let flow = stats.begin("tcp");
+        flow.destination(SocketAddr::from(([192, 0, 2, 7], 443)));
+        flow.selected("chain", "default_chain");
+        flow.stage("relay");
+        flow.tx(10);
+        flow.rx(20);
+        assert!(
+            finished(&events).is_empty(),
+            "active flows are not persisted"
+        );
+        drop(flow);
+        let rows = finished(&events);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        let (snapshot, _) = stats.snapshot();
+        assert_eq!(snapshot["session"], row.session);
+        assert_eq!(snapshot["persisted"], true);
+        assert_eq!(row.flow_id, 1);
+        assert_eq!(row.target.as_deref(), Some("Test-Target"));
+        assert_eq!(
+            row.destination,
+            Some(SocketAddr::from(([192, 0, 2, 7], 443)))
+        );
+        assert_eq!(
+            (row.route, row.reason),
+            (Some("chain"), Some("default_chain"))
+        );
+        assert_eq!((row.status, row.stage), ("completed", "relay"));
+        assert_eq!((row.tx_bytes, row.rx_bytes), (10, 20));
+        assert!(row.started_unix_ms <= row.ended_unix_ms);
+    }
+
+    #[test]
+    fn a_full_sink_drops_and_counts_instead_of_blocking() {
+        let (sink, events) = FlowSink::new(1);
+        let stats = Arc::new(FlowStats::recording(None, Some(sink.clone())));
+        for _ in 0..3 {
+            drop(stats.begin("udp"));
+        }
+        assert_eq!(finished(&events).len(), 1);
+        assert_eq!(sink.dropped(), 2);
+        drop(events);
+        drop(stats.begin("udp"));
+        assert_eq!(
+            sink.dropped(),
+            3,
+            "a stopped recorder never blocks forwarding"
+        );
+    }
+
+    #[test]
+    fn a_spawn_failure_after_drop_is_offered_again_as_failed() {
+        let (sink, events) = FlowSink::new(8);
+        let stats = Arc::new(FlowStats::recording(None, Some(sink)));
+        let flow = stats.begin("tcp");
+        let marker = flow.failure_marker();
+        drop(flow);
+        marker.failed();
+        let rows = finished(&events);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            (rows[0].session, rows[0].flow_id),
+            (rows[1].session, rows[1].flow_id)
+        );
+        assert_eq!(rows[0].status, "completed");
+        assert_eq!(rows[1].status, "failed");
+        assert_eq!(rows[1].failure_stage, Some("metadata"));
+    }
+
+    #[test]
+    fn sessions_are_distinct_and_unrecorded_stats_offer_nothing() {
+        let first = FlowStats::new();
+        let second = FlowStats::new();
+        assert!(second.session > first.session);
+        assert_eq!(first.snapshot().0["persisted"], false);
     }
 }

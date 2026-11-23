@@ -1,0 +1,5 @@
+# Link the C runtime statically for Windows MSVC builds so the EXEs do not need the
+# Visual C++ Redistributable (VCRUNTIME140.dll) on the user's machine.
+# A RUSTFLAGS environment variable replaces this setting; keep it unset for release builds.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

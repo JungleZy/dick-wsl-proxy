@@ -7,14 +7,15 @@ use super::components::badge;
 use super::model::UiAction;
 use super::state::Desktop;
 use super::theme::{
-    MUTED, RULE, RUST, SUCCESS_BG, SURFACE, SURFACE_SOFT, TEAL, WARNING_BG, app_rgb as rgb,
+    MONO_FONT, MUTED, RULE, RUST, SUCCESS_BG, SURFACE, SURFACE_SOFT, TEAL, WARNING_BG,
+    app_rgb as rgb,
 };
-use super::views::card_header;
+use super::views::{card, card_header, key_value};
 
 impl Desktop {
     pub(crate) fn policy_page(&self, cx: &Context<Self>) -> Div {
         let locked = self.locked();
-        let (save_message, save_color, save_background) = if self.error {
+        let (save_message, save_color, save_background) = if self.save_error {
             ("保存失败", RUST, WARNING_BG)
         } else if self.dirty {
             ("草稿未保存", RUST, WARNING_BG)
@@ -23,10 +24,20 @@ impl Desktop {
         } else {
             ("尚未保存", MUTED, SURFACE_SOFT)
         };
+        let rule_field =
+            |label: &'static str, hint: &'static str, state: &super::model::Field| -> Div {
+                self.field(label, hint, state, true)
+                    .min_w(px(340.))
+                    .p_3()
+                    .bg(rgb(SURFACE_SOFT))
+                    .rounded_md()
+            };
         let exceptions = div()
             .flex()
             .flex_col()
             .gap_3()
+            .flex_1()
+            .min_w(px(520.))
             .p_3()
             .bg(rgb(SURFACE))
             .border_1()
@@ -62,54 +73,93 @@ impl Desktop {
                     .flex()
                     .flex_wrap()
                     .gap_3()
+                    .child(rule_field(
+                        "IPv4 / CIDR",
+                        "例如 192.0.2.0/24。",
+                        &self.fields.direct_ips,
+                    ))
+                    .child(rule_field(
+                        "精确域名",
+                        "每行一个域名，不填写 URL。",
+                        &self.fields.direct_domains,
+                    ))
+                    .child(rule_field(
+                        "域名后缀",
+                        "按域名边界匹配。",
+                        &self.fields.direct_suffixes,
+                    )),
+            );
+
+        let matching = card(
+            "匹配逻辑",
+            "命中任一条直连例外后，业务连接绕过代理链。",
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(key_value("IPv4 / CIDR", "按地址和网段匹配"))
+                .child(key_value("精确域名", "完全匹配后直连"))
+                .child(key_value("域名后缀", "按域名边界匹配")),
+        )
+        .flex_1()
+        .min_w(px(260.));
+
+        let notice = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_3()
+            .p_3()
+            .bg(rgb(SURFACE_SOFT))
+            .rounded_md()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .flex_1()
+                    .min_w(px(300.))
+                    .child(div().text_sm().text_color(rgb(MUTED)).child("配置文件"))
                     .child(
-                        self.field(
-                            "IPv4 / CIDR",
-                            "例如 192.0.2.0/24。",
-                            &self.fields.direct_ips,
-                            true,
-                        )
-                        .min_w(px(260.)),
-                    )
+                        div().font_family(MONO_FONT).truncate().child(
+                            self.profile_path
+                                .clone()
+                                .unwrap_or_else(|| "等待 SQLite 配置路径。".into()),
+                        ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .flex_1()
+                    .min_w(px(300.))
+                    .child(div().text_sm().text_color(rgb(MUTED)).child("后台提示"))
                     .child(
-                        self.field(
-                            "精确域名",
-                            "每行一个域名，不填写 URL。",
-                            &self.fields.direct_domains,
-                            true,
-                        )
-                        .min_w(px(260.)),
-                    )
-                    .child(
-                        self.field(
-                            "域名后缀",
-                            "按域名边界匹配。",
-                            &self.fields.direct_suffixes,
-                            true,
-                        )
-                        .min_w(px(260.)),
+                        div()
+                            .text_color(rgb(if self.error { RUST } else { MUTED }))
+                            .truncate()
+                            .child(self.notice.clone()),
                     ),
             );
 
-        div().flex().flex_col().gap_3().child(exceptions).child(
-            div()
-                .flex()
-                .items_center()
-                .gap_3()
-                .child(
-                    div().text_base().text_color(rgb(MUTED)).child(
-                        self.profile_path
-                            .clone()
-                            .unwrap_or_else(|| "等待 SQLite 配置路径。".into()),
-                    ),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .text_base()
-                        .text_color(rgb(if self.error { RUST } else { MUTED }))
-                        .child(self.notice.clone()),
-                ),
-        )
+        div()
+            .flex()
+            .flex_col()
+            .h_full()
+            .min_h_0()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .flex_1()
+                    .min_h_0()
+                    .gap_3()
+                    .child(exceptions)
+                    .child(matching),
+            )
+            .child(notice)
     }
 }

@@ -535,3 +535,51 @@ fn stop_drains_workers_and_reports_prior_failure_once() {
     assert!(ingress.worker.is_none());
     ingress.stop().unwrap();
 }
+
+#[test]
+fn finished_flows_reach_sqlite_through_the_sink_and_flush_waits_for_them() {
+    let path = std::env::temp_dir().join(format!(
+        "wpl-flow-sink-{}-{}.sqlite",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let (sink, events) = FlowSink::new(64);
+    let recorder = crate::desktop_store::spawn_connection_recorder(path.clone(), events).unwrap();
+    let stats = Arc::new(FlowStats::recording(
+        Some("Test-Target".into()),
+        Some(sink.clone()),
+    ));
+    let ok = stats.begin("tcp");
+    ok.destination(SocketAddr::from(([192, 0, 2, 10], 443)));
+    ok.selected("chain", "default_chain");
+    ok.stage("relay");
+    ok.tx(7);
+    drop(ok);
+    stats.begin("udp").failed();
+    let still_active = stats.begin("tcp");
+    assert!(sink.flush(Duration::from_secs(10)));
+    let rows = crate::desktop_store::connection_records(&path, None, None, None, 50).unwrap();
+    assert_eq!(rows["total"], 2, "only finished flows are persisted");
+    assert_eq!(rows["failed_total"], 1);
+    let completed = &rows["records"][1];
+    assert_eq!(completed["destination"], "192.0.2.10:443");
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["target"], "Test-Target");
+    assert_eq!(completed["tx_bytes"], 7);
+    assert_eq!(rows["records"][0]["route"], "reject");
+    assert_eq!(sink.dropped(), 0);
+    drop(still_active);
+    drop(stats);
+    drop(sink);
+    recorder.join().unwrap();
+    assert_eq!(
+        crate::desktop_store::connection_records(&path, None, None, None, 50).unwrap()["total"],
+        3,
+        "the recorder drains the queue before it exits"
+    );
+    let _ = std::fs::remove_file(path);
+}

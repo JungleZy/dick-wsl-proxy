@@ -7,7 +7,10 @@ use serde_json::{Value, json};
 pub(crate) enum Kind {
     Bootstrap,
     Status,
+    /// Background read of persisted connection records: never locks the UI or touches the notice.
+    Connections,
     List,
+    Logs,
     Preflight,
     Save,
     Start,
@@ -42,6 +45,8 @@ impl Kind {
             Self::Bootstrap => "连接后台",
             Self::Status => "刷新状态",
             Self::List => "刷新列表",
+            Self::Connections => "读取连接记录",
+            Self::Logs => "刷新日志",
             Self::Preflight => "启动前检查",
             Self::Save => "保存策略",
             Self::Start => "启动接管",
@@ -107,6 +112,15 @@ fn humanize_code(code: &str, message: &str) -> String {
         "environment_distribution_download_failed" => {
             "下载发行版失败，请检查网络和 WSL 状态后重试。".into()
         }
+        "environment_wsl_update_required" => {
+            "当前 WSL 版本不支持按名称和位置安装发行版，请在 Windows 终端运行 wsl --update 后重试。"
+                .into()
+        }
+        "environment_distribution_install_failed" => {
+            "安装微软发行版失败，请检查网络、权限和 WSL 状态后重试。".into()
+        }
+        "environment_not_registered" => "发行版安装完成但没有注册成功，请检查 WSL 状态。".into(),
+        "environment_not_wsl2" => "安装的发行版不是 WSL 2，无法继续初始化。".into(),
         "environment_distribution_not_registered" => {
             "发行版下载完成但没有注册成功，请检查 WSL 状态后重试。".into()
         }
@@ -145,10 +159,25 @@ fn humanize_code(code: &str, message: &str) -> String {
             "开机自启设置失败，请检查系统权限。".into()
         }
         "stale_profile_revision" => "配置已被其他操作更新，请刷新后重试。".into(),
+        "udp_chain_unavailable" => UDP_CHAIN_UNAVAILABLE.into(),
+        "managed_install_unverified" => {
+            "接管规则安装结果未确认，当前状态需要恢复；请先停止并恢复直连后重试。".into()
+        }
+        "managed_readiness_failed" => {
+            if message.contains("target_https_probe_failed") {
+                "目标 HTTPS 健康探测失败，当前状态需要恢复；请先停止并恢复直连后重试。".into()
+            } else if message.contains("_dns_") || message.contains("dns_") {
+                "系统 DNS 就绪探测失败，当前状态需要恢复；请先停止并恢复直连后重试。".into()
+            } else {
+                "接管就绪探测未通过，当前状态需要恢复；请先停止并恢复直连后重试。".into()
+            }
+        }
         "unsupported_platform" => "当前系统不支持此操作。".into(),
         _ => humanize_detail(message),
     }
 }
+
+const UDP_CHAIN_UNAVAILABLE: &str = "住宅出口没有通过 UDP 探测，非白名单 UDP（含 QUIC）已阻断，不会直连；下次启动或切换目标时重新探测。";
 
 fn humanize_detail(detail: &str) -> String {
     let detail = detail.trim();
@@ -162,6 +191,10 @@ fn humanize_detail(detail: &str) -> String {
         return detail.to_owned();
     }
     let lower = detail.to_ascii_lowercase();
+    // IPv6 flows wrap the code in a longer message, so match it anywhere.
+    if lower.contains("udp_chain_unavailable") {
+        return UDP_CHAIN_UNAVAILABLE.into();
+    }
     if lower.contains("already exists") {
         return "目标环境或目录已经存在，请换一个名称或路径。".into();
     }
@@ -194,10 +227,13 @@ pub(crate) fn worker() -> (Sender<Job>, Receiver<Reply>) {
         for job in jobs {
             let result = if job.kind == Kind::Bootstrap {
                 wsl_proxyctl::ipc::ensure_daemon().and_then(|()| {
+                    let logs = request(&json!({"command":"runtime_logs","limit":500}))
+                        .unwrap_or_else(|_| json!({"logs":[],"total":0,"has_more":false}));
                     Ok(json!({
                         "distributions": request(&json!({"command":"list"}))?,
                         "profile": request(&json!({"command":"profile_get"}))?,
-                        "status": request(&json!({"command":"status"}))?
+                        "status": request(&json!({"command":"status"}))?,
+                        "logs": logs
                     }))
                 })
             } else {
@@ -207,7 +243,17 @@ pub(crate) fn worker() -> (Sender<Job>, Receiver<Reply>) {
             let status = job
                 .kind
                 .mutation()
-                .then(|| request(&json!({"command":"status"})));
+                .then(|| {
+                    (!matches!(
+                        job.kind,
+                        Kind::EnvironmentCreate
+                            | Kind::EnvironmentEdit
+                            | Kind::EnvironmentBackup
+                            | Kind::EnvironmentDelete
+                    ))
+                    .then(|| request(&json!({"command":"status"})))
+                })
+                .flatten();
             if replies
                 .send(Reply {
                     kind: job.kind,
@@ -242,10 +288,47 @@ mod tests {
     }
 
     #[test]
+    fn asks_for_a_wsl_update_when_install_arguments_are_rejected() {
+        assert_eq!(
+            humanize_error(
+                "desktop_request_failed · environment_wsl_update_required:wsl_exit_failed: 1: Invalid command line argument: --location;environment_import_rolled_back"
+            ),
+            "当前 WSL 版本不支持按名称和位置安装发行版，请在 Windows 终端运行 wsl --update 后重试。"
+        );
+    }
+
+    #[test]
+    fn explains_blocked_udp_from_ipv4_and_ipv6_flow_errors() {
+        let expected = super::UDP_CHAIN_UNAVAILABLE;
+        assert_eq!(
+            humanize_error(
+                "udp_chain_unavailable: chained UDP failed its readiness probe; non-whitelisted UDP is refused until the next start or switch"
+            ),
+            expected
+        );
+        assert_eq!(
+            humanize_error(
+                "IPv6 UDP chain setup failed: udp_chain_unavailable: chained UDP failed its readiness probe"
+            ),
+            expected
+        );
+    }
+
+    #[test]
     fn hides_unrecognized_internal_error_details() {
         assert_eq!(
             humanize_error("transition_commit: os error 5"),
             "操作失败，请检查当前状态后重试。"
+        );
+    }
+
+    #[test]
+    fn explains_recovery_required_readiness_failures_without_raw_details() {
+        assert_eq!(
+            humanize_error(
+                "controller_error:managed_readiness_failed:target_https_probe_failed; forwarding:{\"last_error\":\"secret\"}"
+            ),
+            "目标 HTTPS 健康探测失败，当前状态需要恢复；请先停止并恢复直连后重试。"
         );
     }
 }

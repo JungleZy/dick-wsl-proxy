@@ -667,6 +667,16 @@ class FirewallTests(unittest.TestCase):
         self.assertIn("--ctorigdst", guards[0])
         self.assertIn("!", guards[0])
         self.assertEqual(guards[-1][-1], "DROP")
+        # Apart from conntrack replies, a guard RETURN lets a packet leave
+        # directly. Only proven TCP/UDP tuples may do so; ICMP and other
+        # protocols must reach the final DROP on both address families.
+        v6_plan = dict(p, ipv6={"guest": "2001:db8:1::2", "ingress": "[fe80::1%2]:43771"})
+        _, v6_guard_chain, _, _, _, v6_guards = kernel.ipv6_artifacts(v6_plan)
+        for chain_name, family in (("WPM2G_12345678", guards), (v6_guard_chain, v6_guards)):
+            exits = [rule for rule in family if rule[1] == chain_name and rule[-1] == "RETURN" and "REPLY" not in rule]
+            self.assertTrue(exits)
+            self.assertTrue(all("-p" in rule and rule[rule.index("-p") + 1] in ("tcp", "udp") for rule in exits))
+            self.assertEqual([rule[-1] for rule in family if rule[1] == chain_name][-1], "DROP")
         established = [rule for rule in guards if "ESTABLISHED,RELATED" in rule]
         self.assertTrue(all("-p" in rule and rule[rule.index("-p") + 1] in ("tcp", "udp") for rule in established))
         self.assertTrue(

@@ -115,7 +115,9 @@ function Get-Package([string] $Root, [switch] $Installed) {
     $manifestPath = Join-Path $Root 'release.json'
     $manifest = Read-Json $manifestPath
     Assert-Fields $manifest @('schema_version', 'product', 'version', 'target', 'architecture', 'kind', 'files', 'payload', 'verification', 'licenses')
-    if ($manifest.schema_version -ne 1 -or $manifest.product -cne $script:Product -or $manifest.target -cne 'x86_64-pc-windows-gnu' -or $manifest.architecture -cne 'x64') { throw 'Unsupported release manifest identity/platform.' }
+    # New packages are MSVC builds. Installed copies of earlier GNU-built releases stay readable so they can be upgraded or uninstalled.
+    $supportedTarget = $manifest.target -ceq 'x86_64-pc-windows-msvc' -or ($Installed -and $manifest.target -ceq 'x86_64-pc-windows-gnu')
+    if ($manifest.schema_version -ne 1 -or $manifest.product -cne $script:Product -or -not $supportedTarget -or $manifest.architecture -cne 'x64') { throw 'Unsupported release manifest identity/platform.' }
     $null = Get-Version $manifest.version
     if ($manifest.kind -ceq 'qa-vintage-not-published') {
         if ($manifest.version -cne '0.1.0') { throw 'QA vintage packages are supported only for the genuine 0.1.0 fixture, never as a published release.' }

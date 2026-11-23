@@ -168,7 +168,58 @@ fn locate(key: &str) -> Result<Distro, String> {
     Ok(distro)
 }
 
+/// `wsl_conf_set <section> <key> <value>` sets one key in /etc/wsl.conf (or
+/// `$wsl_conf`) and keeps every other section, key and comment. The first change
+/// in a run saves the previous file as `<conf>.wsl-proxy-backup`.
+const WSL_CONF_SET: &str = r#"wsl_conf_backed_up=0
+wsl_conf_set() {
+    conf=${wsl_conf:-/etc/wsl.conf}
+    if [ -f "$conf" ] && [ "$wsl_conf_backed_up" = 0 ]; then
+        cp -p "$conf" "$conf.wsl-proxy-backup"
+        wsl_conf_backed_up=1
+    fi
+    [ -f "$conf" ] || : > "$conf"
+    awk -v section="$1" -v key="$2" -v value="$3" '
+        function finish() {
+            if (in_section && !written) { print key "=" value; written = 1 }
+        }
+        /^[ \t]*\[/ {
+            finish()
+            header = $0
+            sub(/^[ \t]*\[[ \t]*/, "", header)
+            sub(/[ \t]*\].*$/, "", header)
+            in_section = (tolower(header) == tolower(section))
+            if (in_section) { found = 1 }
+            print
+            next
+        }
+        in_section && index($0, "=") > 0 {
+            name = $0
+            sub(/=.*$/, "", name)
+            gsub(/^[ \t]+|[ \t]+$/, "", name)
+            if (tolower(name) == tolower(key)) {
+                if (!written) { print key "=" value; written = 1 }
+                next
+            }
+        }
+        { print }
+        END {
+            finish()
+            if (!found) { printf "\n[%s]\n%s=%s\n", section, key, value }
+        }
+    ' "$conf" > "$conf.wsl-proxy-tmp"
+    cat "$conf.wsl-proxy-tmp" > "$conf"
+    rm -f "$conf.wsl-proxy-tmp"
+}
+"#;
+
 fn setup_script(options: InstallOptions) -> String {
+    // Only `create` supplies a username. Every run enables systemd so an edited
+    // distribution can become a takeover target; a newly created environment
+    // also always gets the base packages and a default user. Editing never
+    // changes an existing [user] default.
+    let new_environment = if options.username.is_some() { "1" } else { "0" };
+    let wsl_conf_set = WSL_CONF_SET;
     let install_zsh = if options.zsh { "1" } else { "0" };
     let install_chrome = if options.chrome { "1" } else { "0" };
     let install_chinese = if options.chinese { "1" } else { "0" };
@@ -187,12 +238,15 @@ fn setup_script(options: InstallOptions) -> String {
         r#"#!/bin/sh
 set -eu
 export DEBIAN_FRONTEND=noninteractive
+new_environment={new_environment}
 install_zsh={install_zsh}
 install_chrome={install_chrome}
 install_chinese={install_chinese}
 environment_user={username}
 environment_password={password}
 timezone={timezone}
+
+{wsl_conf_set}
 
 if [ -n "$timezone" ]; then
     if [ -r "/usr/share/zoneinfo/$timezone" ]; then
@@ -204,8 +258,21 @@ if [ -n "$timezone" ]; then
     fi
 fi
 
+install_components=0
 if [ "$install_zsh" = 1 ] || [ "$install_chrome" = 1 ] || [ "$install_chinese" = 1 ]; then
-if command -v apt-get >/dev/null 2>&1; then
+    install_components=1
+fi
+if [ "$install_components" = 1 ] && ! command -v apt-get >/dev/null 2>&1; then
+    echo 'environment_setup_requires_apt' >&2
+    exit 20
+fi
+# A new environment always gets systemd and iptables (the takeover needs both),
+# even when no optional component was selected.
+run_apt=$install_components
+if [ "$new_environment" = 1 ] && command -v apt-get >/dev/null 2>&1; then
+    run_apt=1
+fi
+if [ "$run_apt" = 1 ]; then
     apt-get update
     packages=""
     if [ "$install_zsh" = 1 ] && apt-cache show zsh >/dev/null 2>&1; then
@@ -218,6 +285,11 @@ if command -v apt-get >/dev/null 2>&1; then
             fi
         done
     fi
+    for package in systemd systemd-sysv iptables; do
+        if apt-cache show "$package" >/dev/null 2>&1; then
+            packages="$packages $package"
+        fi
+    done
     if [ -n "$packages" ]; then
         # The package list is assembled from fixed package names above.
         apt-get install -y --no-install-recommends $packages
@@ -251,7 +323,7 @@ elif command -v google-chrome >/dev/null 2>&1; then
 else
     exit 127
 fi
-launch_args="--lang=zh-CN --accept-lang=zh-CN,zh"
+launch_args="--lang=zh-CN --accept-lang=zh-CN,zh --disable-quic --disable-features=AsyncDns"
 if [ "$(id -u)" = 0 ]; then
     launch_args="$launch_args --no-sandbox"
 fi
@@ -307,10 +379,6 @@ DESKTOP
             cp /etc/skel/.config/autostart/fcitx5.desktop /root/.config/autostart/fcitx5.desktop
         fi
     fi
-else
-    echo 'environment_setup_requires_apt' >&2
-    exit 20
-fi
 fi
 
 if [ -n "$environment_user" ]; then
@@ -325,10 +393,16 @@ if [ -n "$environment_user" ]; then
     if command -v getent >/dev/null 2>&1 && getent group sudo >/dev/null 2>&1 && command -v usermod >/dev/null 2>&1; then
         usermod --append --groups sudo "$environment_user" || true
     fi
-    cat > /etc/wsl.conf <<WSL_CONF
-[user]
-default=$environment_user
-WSL_CONF
+fi
+
+# Only the keys this tool owns are written; every other wsl.conf setting stays.
+# The takeover needs systemd, so it is enabled on create and on every edit.
+wsl_conf_set boot systemd true
+if [ -n "$environment_user" ]; then
+    wsl_conf_set user default "$environment_user"
+fi
+if [ -n "$timezone" ]; then
+    wsl_conf_set time useWindowsTimezone false
 fi
 "#
     )
@@ -390,13 +464,24 @@ fn distro_view(distro: &Distro, features: Value) -> Value {
     })
 }
 
-fn rollback_import(name: &str, setup_error: String) -> String {
-    let args = vec!["--unregister".into(), name.into()];
-    match host::wsl_command(&args, None, IMPORT_DEADLINE) {
-        Ok(_) => format!("environment_setup_failed:{setup_error};environment_import_rolled_back"),
-        Err(cleanup_error) => format!(
-            "environment_setup_failed:{setup_error};environment_cleanup_failed:{cleanup_error}"
-        ),
+/// Undo a failed `create`. `create` refused an existing name and an existing
+/// destination, so a distribution registered under `name` and the destination
+/// directory both came from this request. Only an empty directory is removed.
+fn rollback_create(name: &str, destination: &Path, failure: String) -> String {
+    let unregistered = match registered_distribution(name) {
+        Ok(Some(distro)) => host::wsl_command(
+            &["--unregister".into(), distro.name.clone()],
+            None,
+            IMPORT_DEADLINE,
+        )
+        .map(|_| ()),
+        Ok(None) => Ok(()),
+        Err(error) => Err(error),
+    };
+    let _ = fs::remove_dir(destination);
+    match unregistered {
+        Ok(()) => format!("{failure};environment_import_rolled_back"),
+        Err(cleanup_error) => format!("{failure};environment_cleanup_failed:{cleanup_error}"),
     }
 }
 
@@ -411,98 +496,70 @@ fn registered_distribution(key: &str) -> Result<Option<Distro>, String> {
     Ok(first)
 }
 
-fn online_archive_path(name: &str) -> Result<PathBuf, String> {
-    let directory = host::state_dir()?;
-    fs::create_dir_all(&directory)
-        .map_err(|error| format!("environment_download_directory:{error}"))?;
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| "environment_download_clock".to_owned())?
-        .as_nanos();
-    let archive = directory.join(format!("environment-{name}-{timestamp}.tar"));
-    reject_existing_path(&archive, "environment_download_archive")?;
-    Ok(archive)
+fn write_progress(name: &str, phase: &str, percent: u8, stage: &str, detail: &str) {
+    let Ok(directory) = host::state_dir() else {
+        return;
+    };
+    if fs::create_dir_all(&directory).is_err() {
+        return;
+    }
+    let path = directory.join(format!("environment-progress-{name}.json"));
+    let temporary = directory.join(format!("environment-progress-{name}.tmp"));
+    let value = json!({
+        "phase": phase,
+        "percent": percent,
+        "stage": stage,
+        "detail": detail
+    });
+    if fs::write(&temporary, value.to_string()).is_ok() {
+        let _ = fs::remove_file(&path);
+        let _ = fs::rename(temporary, path);
+    }
 }
 
-fn import_online_distribution(
+fn clear_progress(name: &str) {
+    if let Ok(directory) = host::state_dir() {
+        let _ = fs::remove_file(directory.join(format!("environment-progress-{name}.json")));
+        let _ = fs::remove_file(directory.join(format!("environment-progress-{name}.tmp")));
+    }
+}
+
+/// `--name` and `--location` exist only in newer WSL releases. An older
+/// wsl.exe rejects the argument and echoes it, so that case gets its own code
+/// telling the user to update WSL instead of a generic install failure.
+fn install_failure(error: String) -> String {
+    if error.contains("--location") {
+        format!("environment_wsl_update_required:{error}")
+    } else {
+        format!("environment_distribution_install_failed:{error}")
+    }
+}
+
+fn install_online_distribution(
     name: &str,
     distribution: &str,
     destination: &Path,
 ) -> Result<(), String> {
-    let archive = online_archive_path(name)?;
-    let existing = registered_distribution(distribution)?;
-    let (source, temporary) = if let Some(source) = existing {
-        (source, false)
-    } else {
-        let install_args = vec![
-            "--install".into(),
-            "--web-download".into(),
-            "--distribution".into(),
-            distribution.into(),
-            "--no-launch".into(),
-        ];
-        if let Err(error) = host::wsl_command(&install_args, None, DOWNLOAD_DEADLINE) {
-            return Err(format!("environment_distribution_download_failed:{error}"));
-        }
-        let source = registered_distribution(distribution)?
-            .ok_or_else(|| format!("environment_distribution_not_registered:{distribution}"))?;
-        (source, true)
-    };
-    // A prior interrupted export can leave the source registered as Exporting.
-    // Terminating only this source clears that stale runtime state before taking
-    // the snapshot and leaves the registered distribution intact.
-    let _ = host::wsl_command(
-        &["--terminate".into(), source.name.clone()],
-        None,
-        IMPORT_DEADLINE,
-    );
-    let export_args = vec![
-        "--export".into(),
-        source.name.clone(),
-        archive.to_string_lossy().into_owned(),
-    ];
-    let export_result = host::wsl_command(&export_args, None, EXPORT_DEADLINE).and_then(|_| {
-        let metadata = fs::symlink_metadata(&archive)
-            .map_err(|error| format!("environment_download_archive_metadata:{error}"))?;
-        if !metadata.is_file() || is_reparse(&metadata) {
-            return Err("environment_download_archive_invalid".into());
-        }
-        Ok(())
-    });
-    let cleanup_source = if temporary {
-        host::wsl_command(
-            &["--unregister".into(), source.name.clone()],
-            None,
-            IMPORT_DEADLINE,
-        )
-        .map(|_| ())
-    } else {
-        Ok(())
-    };
-    if let Err(error) = export_result {
-        let _ = fs::remove_file(&archive);
-        if let Err(cleanup_error) = cleanup_source {
-            return Err(format!(
-                "environment_distribution_export_failed:{error};environment_distribution_cleanup_failed:{cleanup_error}"
-            ));
-        }
-        return Err(format!("environment_distribution_export_failed:{error}"));
-    }
-    if let Err(error) = cleanup_source {
-        let _ = fs::remove_file(&archive);
-        return Err(format!("environment_distribution_cleanup_failed:{error}"));
-    }
-    let import_args = vec![
-        "--import".into(),
-        name.into(),
+    let install_args = vec![
+        "--install".into(),
+        "--web-download".into(),
+        "--distribution".into(),
+        distribution.into(),
+        "--location".into(),
         destination.to_string_lossy().into_owned(),
-        archive.to_string_lossy().into_owned(),
+        "--name".into(),
+        name.into(),
+        "--no-launch".into(),
         "--version".into(),
         "2".into(),
     ];
-    let result = host::wsl_command(&import_args, None, IMPORT_DEADLINE);
-    let _ = fs::remove_file(&archive);
-    result.map(|_| ())
+    host::wsl_command(&install_args, None, DOWNLOAD_DEADLINE).map_err(install_failure)?;
+    let installed = registered_distribution(name)?
+        .ok_or_else(|| format!("environment_not_registered:{name}"))?;
+    if installed.version != 2 {
+        return Err(format!("environment_not_wsl2:{name}"));
+    }
+    Ok(())
 }
 
 pub(crate) fn view(key: &str) -> Result<Value, String> {
@@ -555,17 +612,55 @@ pub(crate) fn create(
     };
     reject_existing_path(&destination, "environment_install_dir")?;
     require_existing_parent(&destination, "environment_install_dir")?;
-    import_online_distribution(name, distribution, &destination)?;
-    let distro = match locate(name) {
-        Ok(distro) => distro,
-        Err(error) => return Err(rollback_import(name, error)),
-    };
-    if let Err(error) =
-        host::guest_script_with_timeout(&distro, &setup_script(options), CONFIGURE_DEADLINE)
-    {
-        return Err(rollback_import(&distro.name, error));
-    }
-    view(name)
+    write_progress(
+        name,
+        "download",
+        18,
+        "下载发行版",
+        "正在通过 wsl.exe 从微软官方源下载发行版",
+    );
+    let result = (|| {
+        if let Err(error) = install_online_distribution(name, distribution, &destination) {
+            return Err(rollback_create(name, &destination, error));
+        }
+        write_progress(
+            name,
+            "initialize",
+            52,
+            "初始化用户和组件",
+            "环境目录已创建，正在创建用户并安装组件",
+        );
+        let distro = match locate(name) {
+            Ok(distro) => distro,
+            Err(error) => {
+                let failure = format!("environment_setup_failed:{error}");
+                return Err(rollback_create(name, &destination, failure));
+            }
+        };
+        if let Err(error) =
+            host::guest_script_with_timeout(&distro, &setup_script(options), CONFIGURE_DEADLINE)
+        {
+            let failure = format!("environment_setup_failed:{error}");
+            return Err(rollback_create(name, &destination, failure));
+        }
+        // Applies the new [boot] systemd and [user] default; nothing else runs
+        // in a distribution created moments ago.
+        let _ = host::wsl_command(
+            &["--terminate".into(), distro.name.clone()],
+            None,
+            IMPORT_DEADLINE,
+        );
+        write_progress(
+            name,
+            "inspect",
+            92,
+            "检查环境",
+            "正在读取发行版能力并确认创建结果",
+        );
+        view(name)
+    })();
+    clear_progress(name);
+    result
 }
 
 pub(crate) fn edit(key: &str, options: InstallOptions) -> Result<Value, String> {
@@ -575,9 +670,34 @@ pub(crate) fn edit(key: &str, options: InstallOptions) -> Result<Value, String> 
         }
     }
     let distro = locate(key)?;
-    host::guest_script_with_timeout(&distro, &setup_script(options), CONFIGURE_DEADLINE)
-        .map_err(|error| format!("environment_setup_failed:{error}"))?;
-    view(&distro.name)
+    write_progress(
+        &distro.name,
+        "initialize",
+        52,
+        "安装组件",
+        "正在执行环境初始化脚本",
+    );
+    let result = (|| {
+        host::guest_script_with_timeout(&distro, &setup_script(options), CONFIGURE_DEADLINE)
+            .map_err(|error| format!("environment_setup_failed:{error}"))?;
+        // Restart so [boot] systemd and [time] take effect. This stops every
+        // process in the distribution; the desktop warns before submitting.
+        let _ = host::wsl_command(
+            &["--terminate".into(), distro.name.clone()],
+            None,
+            IMPORT_DEADLINE,
+        );
+        write_progress(
+            &distro.name,
+            "inspect",
+            92,
+            "检查环境",
+            "正在读取组件能力并刷新环境详情",
+        );
+        view(&distro.name)
+    })();
+    clear_progress(&distro.name);
+    result
 }
 
 pub(crate) fn backup(key: &str, destination: &str) -> Result<Value, String> {
@@ -675,11 +795,125 @@ mod tests {
         assert!(script.contains("/usr/local/bin/chrome"));
         assert!(script.contains("--lang=zh-CN"));
         assert!(script.contains("--accept-lang=zh-CN,zh"));
+        assert!(script.contains("--disable-quic"));
+        assert!(script.contains("--disable-features=AsyncDns"));
         assert!(script.contains("alias chrome='/usr/local/bin/chrome'"));
         assert!(script.contains(">/dev/null 2>&1 </dev/null &"));
         assert!(script.contains("timezone=Asia/Shanghai"));
         assert!(script.contains("useradd --create-home --shell /bin/bash"));
-        assert!(script.contains("default=$environment_user"));
+        assert!(script.contains("new_environment=1"));
+        assert!(script.contains("wsl_conf_set boot systemd true"));
+        assert!(script.contains("wsl_conf_set user default \"$environment_user\""));
+        assert!(script.contains("wsl_conf_set time useWindowsTimezone false"));
+        assert!(script.contains("for package in systemd systemd-sysv iptables"));
+        assert!(!script.contains("> /etc/wsl.conf"));
+    }
+
+    #[test]
+    fn old_wsl_rejecting_install_location_asks_for_an_update() {
+        assert!(
+            super::install_failure(
+                "wsl_exit_failed: 1: Invalid command line argument: --location".into()
+            )
+            .starts_with("environment_wsl_update_required:")
+        );
+        assert!(
+            super::install_failure("wsl_exit_failed: 1: network unreachable".into())
+                .starts_with("environment_distribution_install_failed:")
+        );
+    }
+
+    #[test]
+    fn editing_never_marks_an_existing_distribution_as_new() {
+        let script = setup_script(InstallOptions {
+            timezone: Some("Asia/Shanghai".into()),
+            ..InstallOptions::default()
+        });
+        assert!(script.contains("new_environment=0"));
+        assert!(script.contains("environment_user=''"));
+        // systemd is enabled on every edit, outside any create-only branch.
+        assert!(script.contains("\nwsl_conf_set boot systemd true\n"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_scripts_parse_as_posix_shell() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        for options in [
+            InstallOptions {
+                zsh: true,
+                chrome: true,
+                chinese: true,
+                username: Some("dev".into()),
+                password: Some("p@ss'word".into()),
+                timezone: None,
+            },
+            InstallOptions {
+                timezone: Some("Asia/Shanghai".into()),
+                ..InstallOptions::default()
+            },
+        ] {
+            let mut child = Command::new("sh")
+                .arg("-n")
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(setup_script(options).as_bytes())
+                .unwrap();
+            assert!(child.wait().unwrap().success());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wsl_conf_set_keeps_unrelated_settings() {
+        use std::fs;
+        use std::process::Command;
+        let directory = std::env::temp_dir().join(format!(
+            "wpl-wsl-conf-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let conf = directory.join("wsl.conf");
+        let original = "# keep me\n[boot]\ncommand = service ssh start\n\n[user]\ndefault = operator\n\n[network]\ngenerateResolvConf=false\n";
+        fs::write(&conf, original).unwrap();
+        let run = |calls: &str| {
+            let script = format!(
+                "set -eu\nwsl_conf='{}'\n{}\n{}\n",
+                conf.display(),
+                super::WSL_CONF_SET,
+                calls
+            );
+            let status = Command::new("sh").arg("-c").arg(script).status().unwrap();
+            assert!(status.success());
+            fs::read_to_string(&conf).unwrap()
+        };
+
+        // Editing a timezone adds [time] and changes nothing else.
+        let after = run("wsl_conf_set time useWindowsTimezone false");
+        assert!(after.starts_with(original));
+        assert!(after.ends_with("[time]\nuseWindowsTimezone=false\n"));
+        let backup = conf.with_file_name("wsl.conf.wsl-proxy-backup");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), original);
+
+        // Re-setting replaces in place, also when the key had spaces around '='.
+        let after = run(
+            "wsl_conf_set boot systemd true\nwsl_conf_set user default builder\nwsl_conf_set time useWindowsTimezone false",
+        );
+        assert_eq!(
+            after,
+            "# keep me\n[boot]\ncommand = service ssh start\n\nsystemd=true\n[user]\ndefault=builder\n\n[network]\ngenerateResolvConf=false\n\n[time]\nuseWindowsTimezone=false\n"
+        );
+        assert_eq!(after.matches("useWindowsTimezone").count(), 1);
+        assert!(!directory.join("wsl.conf.wsl-proxy-tmp").exists());
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]

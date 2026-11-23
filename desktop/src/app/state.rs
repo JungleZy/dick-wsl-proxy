@@ -3,18 +3,35 @@
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Instant;
 
+use gpui_kit::base::VirtualListScrollHandle;
 use gpui_kit::{FocusHandle, Subscription};
 use serde_json::Value;
 
 use super::backend::{Job, Kind, Reply};
 use super::model::{
-    Confirmation, EnvironmentDistributionSelectState, EnvironmentEditor, Fields, LogFilter, Page,
-    PendingPrepare, TimezoneSelectState, TrafficSample,
+    Confirmation, ConnectionFilter, ConnectionHistory, ConnectionRow,
+    EnvironmentDistributionSelectState, EnvironmentEditor, EnvironmentResult, Fields, LogFilter,
+    Page, PendingPrepare, RuntimeLog, TimezoneSelectState, TrafficSample,
 };
 
 pub(crate) struct Desktop {
     pub(crate) page: Page,
     pub(crate) log_filter: LogFilter,
+    pub(crate) logs: Vec<RuntimeLog>,
+    pub(crate) logs_total: u64,
+    pub(crate) logs_has_more: bool,
+    pub(crate) logs_refresh_pending: bool,
+    pub(crate) logs_before_id: Option<i64>,
+    pub(crate) logs_loading_more: bool,
+    pub(crate) logs_scroll: VirtualListScrollHandle,
+    /// 由 `accept_status` 从最近一次有效快照解析；状态未确认时页面不显示它们。
+    pub(crate) live_connections: Vec<ConnectionRow>,
+    /// 后台写进 SQLite 的已结束连接，按页读取。
+    pub(crate) connection_history: ConnectionHistory,
+    pub(crate) connection_filter: ConnectionFilter,
+    /// 连接历史的环境名称筛选；`None` 表示全部环境。
+    pub(crate) connection_environment: Option<String>,
+    pub(crate) connections_scroll: VirtualListScrollHandle,
     pub(crate) nav_focus: [FocusHandle; 6],
     pub(crate) fields: Fields,
     pub(crate) timezone_select: gpui_kit::Entity<TimezoneSelectState>,
@@ -49,15 +66,20 @@ pub(crate) struct Desktop {
     pub(crate) pending_prepare: Option<PendingPrepare>,
     pub(crate) notice: String,
     pub(crate) error: bool,
+    pub(crate) save_error: bool,
     pub(crate) autostart_enabled: bool,
     pub(crate) confirmation: Option<Confirmation>,
+    pub(crate) confirmation_pending: bool,
     pub(crate) export_path: Option<String>,
     pub(crate) environment_editor: Option<EnvironmentEditor>,
     pub(crate) environment_edit_target: Option<String>,
     pub(crate) environment_selected: Option<String>,
     pub(crate) environment_detail: Option<Value>,
     pub(crate) environment_started: Option<Instant>,
+    pub(crate) environment_timezone_only: bool,
     pub(crate) loading_dialog_open: bool,
+    pub(crate) environment_result_dialog_open: bool,
+    pub(crate) environment_result_pending: Option<EnvironmentResult>,
     pub(crate) backup_dialog_open: bool,
     pub(crate) environment_backup_target: Option<String>,
     pub(crate) backup_result_dialog_open: bool,

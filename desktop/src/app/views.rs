@@ -13,17 +13,25 @@ use gpui_kit::component::{
 };
 use gpui_kit::{prelude::*, *};
 use serde_json::{Value, json};
+use std::fs;
 use std::path::Path;
+use std::rc::Rc;
 use std::time::Duration;
 
 use super::backend::Kind;
 use super::components::{app_icon, badge, design_icon, icon, status_dot, text};
-use super::model::{EnvironmentEditor, Field, LogFilter, Page, UiAction};
+use super::model::{EnvironmentEditor, Field, LogFilter, Page, RuntimeLog, UiAction};
 use super::state::Desktop;
 use super::theme::{
-    AMBER, BLUE, BLUE_SOFT, INK, MONO_FONT, MUTED, PAPER, RULE, RUST, SIDEBAR_BG, SUCCESS_BG,
-    SURFACE, SURFACE_SOFT, TEAL, WARNING_BG, app_rgb as rgb,
+    AMBER, BLUE, BLUE_ACTIVE, BLUE_SOFT, INK, MONO_FONT, MUTED, PAPER, RULE, RUST, SELECTED_BG,
+    SIDEBAR_BG, SUCCESS_BG, SURFACE, SURFACE_SOFT, TEAL, WARNING_BG, app_rgb as rgb,
 };
+
+const LOG_ROW_HEIGHT: f32 = 54.;
+
+/// Editing an environment enables systemd and then terminates the distribution.
+const EDIT_RESTART_WARNING: &str =
+    "保存后会开启 systemd 并重启该发行版，其中正在运行的程序会被关闭，请先保存好工作。";
 
 pub(crate) fn card_header(title: &'static str, caption: &'static str) -> Div {
     let mut title_view = div()
@@ -275,13 +283,25 @@ impl Desktop {
             .px_3()
             .rounded_md()
             .text_base()
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, window, cx| {
                 this.page = page;
+                match page {
+                    Page::Environment => this.open_target_environment(window, cx),
+                    Page::Connection => this.refresh_connection_history(cx),
+                    Page::Logs => this.refresh_logs(cx),
+                    _ => {}
+                }
                 cx.notify();
             }))
-            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                 if matches!(event.keystroke.key.as_str(), "enter" | "space") {
                     this.page = key_page;
+                    match key_page {
+                        Page::Environment => this.open_target_environment(window, cx),
+                        Page::Connection => this.refresh_connection_history(cx),
+                        Page::Logs => this.refresh_logs(cx),
+                        _ => {}
+                    }
                     cx.notify();
                 }
             }));
@@ -296,7 +316,7 @@ impl Desktop {
         if compact {
             button = button.justify_center().px_0();
         } else {
-            button = button.px(px(14.)).child(label);
+            button = button.gap_2().px(px(6.)).child(label);
         }
         button
     }
@@ -310,7 +330,7 @@ impl Desktop {
             (Page::Logs, 4, "日志", "logs"),
             (Page::Settings, 5, "设置", "settings"),
         ];
-        let mut navigation = div().flex().flex_col().gap_1().px_3().pt_3();
+        let mut navigation = div().flex().flex_col().gap_1().px_2().pt_3();
         for (page, index, label, icon_path) in pages {
             navigation =
                 navigation.child(self.nav_button(page, index, label, icon_path, compact, cx));
@@ -319,7 +339,7 @@ impl Desktop {
             .flex()
             .flex_col()
             .h_full()
-            .w(px(if compact { 72. } else { 128. }))
+            .w(px(if compact { 72. } else { 88. }))
             .flex_shrink_0()
             .bg(rgb(SIDEBAR_BG))
             .border_r_1()
@@ -381,6 +401,7 @@ impl Desktop {
                     .ghost()
                     .compact(),
             )
+            .child(self.status_observations())
             .child(div().flex_1())
             .child(
                 div()
@@ -391,66 +412,114 @@ impl Desktop {
             )
     }
 
-    fn environment_progress(&self) -> Option<Div> {
+    fn environment_target_ready(&self, cx: &App) -> bool {
+        if self.busy != Some(Kind::EnvironmentCreate) {
+            return false;
+        }
+        let base = Self::field_value(&self.fields.environment_install, cx);
+        let name = Self::field_value(&self.fields.environment_name, cx);
+        if base.is_empty() || name.is_empty() {
+            return false;
+        }
+        let path = Self::environment_install_path(&base, &name);
+        Path::new(&path).is_dir()
+    }
+
+    fn environment_progress_marker(&self, cx: &App) -> Option<(u8, String, String)> {
+        let creating = self.busy == Some(Kind::EnvironmentCreate);
+        let name = if creating {
+            Self::field_value(&self.fields.environment_name, cx)
+        } else {
+            self.environment_edit_target.clone().unwrap_or_default()
+        };
+        if name.is_empty() {
+            return None;
+        }
+        // Same known-folder lookup the controller uses when it writes the file.
+        let path = wsl_proxyctl::paths::state_dir()
+            .ok()?
+            .join(format!("environment-progress-{name}.json"));
+        let value = serde_json::from_str::<Value>(&fs::read_to_string(path).ok()?).ok()?;
+        Some((
+            value["percent"].as_u64()?.min(100) as u8,
+            value["stage"].as_str()?.to_owned(),
+            value["detail"].as_str()?.to_owned(),
+        ))
+    }
+
+    fn environment_progress(&self, cx: &App) -> Option<Div> {
         let creating = self.busy == Some(Kind::EnvironmentCreate);
         let editing = self.busy == Some(Kind::EnvironmentEdit);
         if !creating && !editing {
+            return None;
+        }
+        if self.environment_timezone_only {
             return None;
         }
         let elapsed = self
             .environment_started
             .map(|started| started.elapsed())
             .unwrap_or_default();
-        let (percent, stage, detail) = if creating {
-            if elapsed < Duration::from_secs(2) {
-                (8, "校验输入", "正在检查名称、发行版和安装目录")
-            } else if elapsed < Duration::from_secs(12) {
-                (28, "下载发行版", "正在通过 wsl.exe 从微软官方源下载发行版")
-            } else if elapsed < Duration::from_secs(20) {
-                (40, "导入环境", "正在把官方发行版导入到指定安装目录")
-            } else if elapsed < Duration::from_secs(32) {
-                (54, "安装 zsh", "正在安装 zsh 终端工具")
-            } else if elapsed < Duration::from_secs(46) {
-                (
-                    68,
-                    "安装 Chrome",
-                    "正在安装 Chrome、中文语言支持和静默启动命令",
-                )
-            } else if elapsed < Duration::from_secs(60) {
-                (
-                    82,
-                    "配置中文环境和输入法",
-                    "正在写入 locale、fcitx5 和自动启动配置",
-                )
-            } else {
-                (92, "检查环境", "正在读取发行版能力并刷新环境列表")
-            }
+        let target_ready = self.environment_target_ready(cx);
+        let elapsed_seconds = elapsed.as_secs();
+        let (percent, stage, detail) = if let Some(marker) = self.environment_progress_marker(cx) {
+            marker
         } else {
-            if elapsed < Duration::from_secs(2) {
-                (10, "准备组件", "正在校验发行版能力和安装选项")
-            } else if elapsed < Duration::from_secs(12) {
-                (38, "安装 zsh", "正在安装 zsh 终端工具")
-            } else if elapsed < Duration::from_secs(24) {
-                (
-                    60,
-                    "安装 Chrome",
-                    "正在安装 Chrome、中文语言支持和静默启动命令",
-                )
-            } else if elapsed < Duration::from_secs(36) {
-                (
-                    80,
-                    "配置中文环境和输入法",
-                    "正在写入 locale、fcitx5 和自动启动配置",
-                )
+            let (percent, stage, detail) = if creating {
+                if elapsed < Duration::from_secs(2) {
+                    (
+                        6,
+                        "校验输入",
+                        "正在检查名称、发行版、父目录和用户信息".into(),
+                    )
+                } else if target_ready {
+                    (
+                        72,
+                        "初始化用户和组件",
+                        format!(
+                            "环境目录已创建，正在完成用户、zsh、Chrome 和中文环境初始化（已用时 {elapsed_seconds} 秒）"
+                        ),
+                    )
+                } else {
+                    (
+                        18,
+                        "下载发行版",
+                        format!("正在等待微软 WSL 安装命令完成（已用时 {elapsed_seconds} 秒）"),
+                    )
+                }
             } else {
-                (92, "完成检查", "正在确认组件状态并刷新详情")
-            }
+                if elapsed < Duration::from_secs(2) {
+                    (10, "准备组件", "正在校验发行版能力和安装选项".into())
+                } else if elapsed < Duration::from_secs(16) {
+                    (38, "安装 zsh", "正在安装 zsh 终端工具".into())
+                } else if elapsed < Duration::from_secs(30) {
+                    (
+                        60,
+                        "安装 Chrome",
+                        "正在安装 Chrome、中文语言支持和静默启动命令".into(),
+                    )
+                } else if elapsed < Duration::from_secs(44) {
+                    (
+                        80,
+                        "配置中文环境和输入法",
+                        "正在写入 locale、fcitx5 和自动启动配置".into(),
+                    )
+                } else {
+                    (
+                        88,
+                        "完成检查",
+                        format!("正在等待组件命令返回（已用时 {elapsed_seconds} 秒）"),
+                    )
+                }
+            };
+            (percent, stage.to_owned(), detail)
         };
         let mut steps = if creating {
             vec![
-                ("校验输入", true, percent >= 8),
-                ("下载发行版", true, percent >= 28),
-                ("导入环境", true, percent >= 40),
+                ("校验输入", true, elapsed >= Duration::from_secs(2)),
+                ("下载发行版", true, target_ready),
+                ("安装环境", true, target_ready),
+                ("初始化用户", true, false),
             ]
         } else {
             vec![("准备组件", true, percent >= 10)]
@@ -459,20 +528,20 @@ impl Desktop {
             (
                 "安装 zsh",
                 self.environment_zsh,
-                percent >= if creating { 54 } else { 38 },
+                percent >= if creating { 90 } else { 38 },
             ),
             (
                 "安装 Chrome",
                 self.environment_chrome,
-                percent >= if creating { 68 } else { 60 },
+                percent >= if creating { 90 } else { 60 },
             ),
             (
                 "中文环境和输入法",
                 self.environment_chinese,
-                percent >= if creating { 82 } else { 80 },
+                percent >= if creating { 90 } else { 80 },
             ),
         ]);
-        steps.push(("检查环境", true, percent >= 92));
+        steps.push(("检查环境", true, false));
         let mut step_view = div().flex().flex_col().gap_1();
         for (name, selected, done) in steps {
             let label = if selected {
@@ -528,12 +597,17 @@ impl Desktop {
                         ),
                 )
                 .child(div().text_base().text_color(rgb(MUTED)).child(detail))
+                .child(
+                    Progress::new("environment-stage-loading")
+                        .loading(true)
+                        .accessibility_label("正在等待当前阶段完成"),
+                )
                 .child(step_view),
         )
     }
 
-    fn loading_dialog_body(&self) -> Div {
-        if let Some(progress) = self.environment_progress() {
+    fn loading_dialog_body(&self, cx: &App) -> Div {
+        if let Some(progress) = self.environment_progress(cx) {
             return progress;
         }
         div()
@@ -565,6 +639,7 @@ impl Desktop {
             let this = view.read(cx);
             let title = match this.busy {
                 Some(Kind::EnvironmentCreate) => "创建环境",
+                Some(Kind::EnvironmentEdit) if this.environment_timezone_only => "更新时区",
                 Some(Kind::EnvironmentEdit) => "安装组件",
                 Some(Kind::EnvironmentDelete) => "删除环境",
                 Some(_) => "正在处理",
@@ -580,7 +655,77 @@ impl Desktop {
                 .overlay_closable(false)
                 .keyboard(false)
                 .close_button(false)
-                .child(this.loading_dialog_body())
+                .child(this.loading_dialog_body(cx))
+        });
+    }
+
+    pub(crate) fn open_environment_result_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.environment_result_dialog_open {
+            return;
+        }
+        let Some(result) = self.environment_result_pending.take() else {
+            return;
+        };
+        self.environment_result_dialog_open = true;
+        let title = if result.timezone_only {
+            if result.success {
+                "时区已更新"
+            } else {
+                "时区更新失败"
+            }
+        } else if result.success {
+            match result.kind {
+                Kind::EnvironmentCreate => "环境创建成功",
+                Kind::EnvironmentEdit => "环境设置已更新",
+                Kind::EnvironmentDelete => "环境删除成功",
+                _ => "环境操作完成",
+            }
+        } else {
+            match result.kind {
+                Kind::EnvironmentCreate => "环境创建失败",
+                Kind::EnvironmentEdit => "环境设置失败",
+                Kind::EnvironmentDelete => "环境删除失败",
+                _ => "环境操作失败",
+            }
+        };
+        let icon_color = if result.success { TEAL } else { RUST };
+        let icon_name = if result.success { "check" } else { "info" };
+        let message = result.message;
+        let view = cx.entity().clone();
+        let close_view = view.clone();
+        let finish_view = view.clone();
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            dialog
+                .w(px(520.))
+                .title(title)
+                .icon(design_icon(icon_name, 22., icon_color))
+                .description(div().text_base().child(message.clone()))
+                .confirm()
+                .ok_text("知道了")
+                .show_cancel(false)
+                .on_ok({
+                    let finish_view = finish_view.clone();
+                    move |_, _, cx| {
+                        finish_view.update(cx, |this, cx| {
+                            this.environment_result_dialog_open = false;
+                            cx.notify();
+                        });
+                        true
+                    }
+                })
+                .on_close({
+                    let close_view = close_view.clone();
+                    move |_, _, cx| {
+                        close_view.update(cx, |this, cx| {
+                            this.environment_result_dialog_open = false;
+                            cx.notify();
+                        });
+                    }
+                })
         });
     }
 
@@ -764,6 +909,12 @@ impl Desktop {
                                 .text_base()
                                 .text_color(rgb(MUTED))
                                 .child("按国家分组，可搜索城市或时区名称。"),
+                        )
+                        .child(
+                            div()
+                                .text_base()
+                                .text_color(rgb(AMBER))
+                                .child(EDIT_RESTART_WARNING),
                         )
                         .child(
                             Select::new(&this.timezone_select)
@@ -976,6 +1127,14 @@ impl Desktop {
                         ),
                 ),
         );
+        if !creating {
+            body = body.child(
+                div()
+                    .text_base()
+                    .text_color(rgb(AMBER))
+                    .child(EDIT_RESTART_WARNING),
+            );
+        }
         body = body.child(div().flex_1());
         let action_bar = ButtonGroup::new("environment-editor-actions")
             .child(
@@ -1247,11 +1406,18 @@ impl Desktop {
             let view_name = row_name.clone();
             let target_id = id.clone();
             let row_background = if active {
-                super::theme::TARGET_BG
+                SELECTED_BG
             } else if target {
                 super::theme::BLUE_SOFT
             } else {
                 SURFACE_SOFT
+            };
+            let row_border = if active {
+                super::theme::BLUE_ACTIVE
+            } else if target {
+                super::theme::BLUE
+            } else {
+                RULE
             };
             let target_label = if version != 2 {
                 "WSL 1 不支持"
@@ -1263,7 +1429,7 @@ impl Desktop {
             let target_color = if version != 2 {
                 RUST
             } else if target {
-                BLUE
+                SURFACE
             } else {
                 MUTED
             };
@@ -1288,7 +1454,7 @@ impl Desktop {
                     .p_3()
                     .bg(rgb(row_background))
                     .border_1()
-                    .border_color(rgb(if active { BLUE } else { RULE }))
+                    .border_color(rgb(row_border))
                     .rounded_md()
                     .hover(|style| style.bg(rgb(BLUE_SOFT)))
                     .child(
@@ -1298,13 +1464,18 @@ impl Desktop {
                             .gap_2()
                             .child(div().pt_1().flex_shrink_0().child(icon("icons/folder.svg")))
                             .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(div().text_base().truncate().child(name)),
+                                div().flex().flex_col().gap_1().flex_1().min_w_0().child(
+                                    div()
+                                        .text_base()
+                                        .font_weight(if active {
+                                            FontWeight::SEMIBOLD
+                                        } else {
+                                            FontWeight::NORMAL
+                                        })
+                                        .text_color(rgb(if active { BLUE_ACTIVE } else { INK }))
+                                        .truncate()
+                                        .child(name),
+                                ),
                             )
                             .child(
                                 Button::new(("environment-target", index))
@@ -1477,7 +1648,7 @@ impl Desktop {
                     h_resizable("environment-panels")
                         .child(
                             resizable_panel()
-                                .size(px(390.))
+                                .size(px(280.))
                                 .size_range(px(280.)..px(520.))
                                 .child(left.w_full().h_full()),
                         )
@@ -1497,71 +1668,188 @@ impl Desktop {
             Page::Overview => self.overview(cx),
             Page::Environment => self.environment_page(window, cx),
             Page::Policy => self.policy_page(cx),
-            Page::Connection => self.diagnostics(cx),
-            Page::Logs => self.logs_page(cx),
+            Page::Connection => self.connection_page(window, cx),
+            Page::Logs => self.logs_page(window, cx),
             Page::Settings => self.settings_page(cx),
         }
     }
 
-    fn logs_page(&self, cx: &Context<Self>) -> Div {
-        let row = |time: &'static str,
-                   level: &'static str,
-                   message: &'static str,
-                   source: &'static str| {
+    fn logs_page(&self, window: &Window, cx: &Context<Self>) -> Div {
+        let list_height = (window.viewport_size().height - px(280.)).max(px(260.));
+        let search = match &self.fields.log_search {
+            Field::Single(state) => Input::new(state).w(px(240.)).into_any_element(),
+            Field::Multi(state) => Textarea::new(state).into_any_element(),
+        };
+        let log_row = |log: RuntimeLog| {
+            let (label, color, background) = match log.level.as_str() {
+                "error" => ("错误", RUST, WARNING_BG),
+                "warning" => ("警告", AMBER, WARNING_BG),
+                _ => ("信息", TEAL, SUCCESS_BG),
+            };
+            let phase = log.phase.as_deref().map(|phase| match phase {
+                "idle" => "空闲",
+                "forwarding_managed" => "接管中",
+                "forwarding_scoped" => "诊断转发",
+                "recovery_required" => "需要恢复",
+                _ => phase,
+            });
+            let context = match (log.target.as_deref(), phase) {
+                (Some(target), Some(phase)) => format!("{target} · {phase}"),
+                (Some(target), None) => target.to_owned(),
+                (None, Some(phase)) => phase.to_owned(),
+                (None, None) => String::new(),
+            };
+            let context = match log.generation {
+                Some(generation) if context.is_empty() => format!("代次 {generation}"),
+                Some(generation) => format!("{context} · 代次 {generation}"),
+                None => context,
+            };
             div()
+                .id(("runtime-log-row", log.id as u64))
                 .flex()
+                .w_full()
+                .min_w_0()
                 .items_center()
                 .gap_3()
-                .min_h(px(42.))
+                .h(px(LOG_ROW_HEIGHT))
+                .px_2()
                 .border_b_1()
                 .border_color(rgb(RULE))
                 .child(
                     div()
-                        .w(px(72.))
+                        .w(px(142.))
+                        .flex_shrink_0()
                         .font_family(super::theme::MONO_FONT)
-                        .child(time),
+                        .text_color(rgb(MUTED))
+                        .child(log.occurred_at),
                 )
-                .child(div().w(px(72.)).child(if level == "待处理" {
-                    badge(level, AMBER, WARNING_BG)
-                } else {
-                    badge(level, TEAL, SUCCESS_BG)
-                }))
-                .child(div().flex_1().child(message))
-                .child(div().w(px(120.)).text_color(rgb(MUTED)).child(source))
-        };
-        let rows = if self.log_filter == LogFilter::Errors {
-            div()
-                .p_4()
-                .bg(rgb(SURFACE_SOFT))
-                .rounded_md()
-                .text_base()
-                .text_color(rgb(MUTED))
-                .child("暂无错误记录。")
-        } else {
-            div()
-                .flex()
-                .flex_col()
-                .child(row("刚刚", "信息", "后台心跳正常，等待接管目标", "runtime"))
-                .child(row("2 分钟", "信息", "SQLite 配置已加载", "desktop_store"))
-                .child(row(
-                    "5 分钟",
-                    "待处理",
-                    "目标 WSL 尚未选择，预检未执行",
-                    "preflight",
-                ))
-        };
-        card(
-            "运行日志",
-            "后台事件、预检结果和接管生命周期",
-            div()
-                .flex()
-                .flex_col()
+                .child(
+                    div()
+                        .w(px(68.))
+                        .flex_shrink_0()
+                        .child(badge(label, color, background)),
+                )
                 .child(
                     div()
                         .flex()
-                        .justify_end()
+                        .flex_col()
+                        .justify_center()
+                        .gap_1()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().truncate().child(log.message))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(MUTED))
+                                .truncate()
+                                .child(context),
+                        ),
+                )
+                .child(
+                    div()
+                        .w(px(112.))
+                        .flex_shrink_0()
+                        .text_color(rgb(MUTED))
+                        .truncate()
+                        .child(log.source),
+                )
+        };
+        let rows = if self.logs.is_empty() {
+            div()
+                .w_full()
+                .h(list_height)
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(MUTED))
+                .child(if self.reading {
+                    "正在读取运行日志…"
+                } else if self.log_filter == LogFilter::Errors {
+                    "暂无错误记录。"
+                } else if self.log_filter == LogFilter::Warnings {
+                    "暂无警告记录。"
+                } else {
+                    "暂无运行日志。"
+                })
+                .into_any_element()
+        } else {
+            let item_sizes = Rc::new(vec![size(px(1.), px(LOG_ROW_HEIGHT)); self.logs.len()]);
+            let list = gpui_kit::base::v_virtual_list(
+                cx.entity(),
+                "runtime-log-list",
+                item_sizes,
+                move |this, range, _, _| {
+                    range
+                        .filter_map(|index| this.logs.get(index).cloned())
+                        .map(&log_row)
+                        .collect::<Vec<_>>()
+                },
+            );
+            div()
+                .id("runtime-log-viewport")
+                .w_full()
+                .h(list_height)
+                .min_h_0()
+                .overflow_x_hidden()
+                .child(list.track_scroll(&self.logs_scroll).size_full())
+                .into_any_element()
+        };
+        let count = if self.logs_has_more {
+            format!(
+                "显示最近 {} 条，共 {} 条；最新的在顶部",
+                self.logs.len(),
+                self.logs_total
+            )
+        } else {
+            format!("共 {} 条；最新的在顶部", self.logs_total)
+        };
+        let table_header = div()
+            .flex()
+            .w_full()
+            .h(px(32.))
+            .px_2()
+            .items_center()
+            .gap_3()
+            .border_b_1()
+            .border_color(rgb(RULE))
+            .text_sm()
+            .text_color(rgb(MUTED))
+            .child(div().w(px(142.)).flex_shrink_0().child("时间"))
+            .child(div().w(px(68.)).flex_shrink_0().child("级别"))
+            .child(div().flex_1().min_w_0().child("事件"))
+            .child(div().w(px(112.)).flex_shrink_0().child("来源"));
+        let load_more = if self.logs_has_more {
+            div().flex().justify_center().pt_2().child(
+                self.button(
+                    "log-load-more",
+                    "加载更早",
+                    UiAction::LogLoadMore,
+                    self.logs_loading_more,
+                    cx,
+                )
+                .outline()
+                .small(),
+            )
+        } else {
+            div().h(px(4.))
+        };
+        card(
+            "运行日志",
+            "后台事件、预检结果和接管生命周期，数据保存在 SQLite",
+            div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .min_h_0()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
                         .gap_2()
                         .mb_3()
+                        .child(search)
+                        .child(div().flex_1())
                         .child(
                             self.button(
                                 "log-all",
@@ -1585,10 +1873,32 @@ impl Desktop {
                             .outline()
                             .small()
                             .selected(self.log_filter == LogFilter::Errors),
+                        )
+                        .child(
+                            self.button(
+                                "log-warnings",
+                                "警告",
+                                UiAction::LogFilter(LogFilter::Warnings),
+                                false,
+                                cx,
+                            )
+                            .outline()
+                            .small()
+                            .selected(self.log_filter == LogFilter::Warnings),
+                        )
+                        .child(
+                            self.button("log-refresh", "刷新", UiAction::LogRefresh, false, cx)
+                                .outline()
+                                .small(),
                         ),
                 )
-                .child(rows),
+                .child(div().text_sm().text_color(rgb(MUTED)).child(count))
+                .child(table_header)
+                .child(rows)
+                .child(load_more),
         )
+        .w_full()
+        .min_h_0()
     }
 
     fn compact_setting(&self, label: &'static str, field: &Field) -> Div {

@@ -9,3 +9,12 @@
 - 实现过程中定下来的决定先记在 `docs/plans/m0/README.md` 这类执行记录里，最后并进 `decisions.md`、`docs/arch/`、`docs/contracts/`（`docs/plans/m0/README.md` 开头）。
 - 文档、注释、测试数据里举例不用真人的名字，用角色或虚构的名字（维护者约定）。
 - `docs/arch/` 和 `docs/decisions.md` 的改动是设计变更，不要在实现任务里顺手改；发现文档缺口或不一致，报给负责人。
+
+## 构建与验证规矩
+
+- 不管在 WSL 里还是在 Windows 宿主机上改代码，最终的编译、测试、运行都在 Windows 上、用 Windows 的 Rust 工具链完成，构建的必须是同一份工作区代码（从 WSL 触发时用 `wslpath -w` 换算仓库路径）。只有这样得到的结果才能写成「已验证」「已通过」（维护者约定）。
+- 原因：控制器和桌面端都是 Windows 程序，`src/` 里多个文件的 `cfg(windows)` 代码在 Linux 上不参与编译，WSL 里通过说明不了 Windows 版本能编译、能跑。
+- WSL 里的 `cargo build`/`cargo test`、`--target x86_64-pc-windows-*` 交叉编译、`scripts/build-desktop-windows.sh` 只算开发中途的检查，不算最终验证。
+- 发布打包同样在 Windows 上做：进包的 EXE 必须是 Windows 上编译出来的，`scripts/package-windows.py` 也在 Windows 上运行；WSL 交叉编译的 EXE 不能进发布包（维护者约定）。
+- 构建命令用现有文档里的原生 Windows 命令（`README.md`「构建与只读预检」；`docs/plans/m4/README.md` 原生 Windows 构建）。
+- 调不到 Windows（interop 报错、Windows 侧缺工具链）就停下，如实报告「未在 Windows 验证」，把要在 PowerShell 里跑的命令交给用户，不要拿 WSL 的结果代替。

@@ -6,14 +6,30 @@ use gpui_kit::component::plot::shape::BarAlignment;
 use gpui_kit::{prelude::*, *};
 
 use super::backend::{self, Kind};
-use super::components::{design_icon, status_dot, text};
-use super::model::UiAction;
+use super::components::{bytes, design_icon, status_dot, text};
+use super::model::{TrafficSample, UiAction};
 use super::state::Desktop;
 use super::theme::{AMBER, BLUE, MUTED, RULE, RUST, SURFACE, SURFACE_SOFT, TEAL, app_rgb as rgb};
 use super::views::{card, card_header, chart_card, key_value, metric};
 
 impl Desktop {
     pub(crate) fn overview(&self, cx: &Context<Self>) -> Div {
+        let takeover_active = self.status_valid && !matches!(self.phase(), "idle" | "unknown");
+        let (session_label, session_action, session_disabled, session_icon) = if takeover_active {
+            (
+                "退出接管",
+                UiAction::Prepare(Kind::Stop),
+                self.locked(),
+                "close",
+            )
+        } else {
+            (
+                "启动接管",
+                UiAction::Prepare(Kind::Start),
+                self.locked() || !self.idle(),
+                "play",
+            )
+        };
         let status_card = div()
             .flex()
             .flex_col()
@@ -32,13 +48,13 @@ impl Desktop {
                     .child(card_header("运行状态", "后台状态、接管目标和流量健康度"))
                     .child(
                         self.button(
-                            "overview-start",
-                            "启动接管",
-                            UiAction::Prepare(Kind::Start),
-                            self.locked() || !self.idle(),
+                            "overview-session-action",
+                            session_label,
+                            session_action,
+                            session_disabled,
                             cx,
                         )
-                        .icon(design_icon("play", 15., super::theme::SURFACE))
+                        .icon(design_icon(session_icon, 15., super::theme::SURFACE))
                         .primary(),
                     ),
             )
@@ -56,14 +72,8 @@ impl Desktop {
                             .map(|value| value.to_string())
                             .unwrap_or_else(|| "—".into()),
                     ))
-                    .child(metric(
-                        "DNS",
-                        if self.status["dns_managed"] == true {
-                            "已接管"
-                        } else {
-                            "未验证"
-                        },
-                    )),
+                    .child(metric("DNS", self.dns_state_label()))
+                    .child(metric("UDP", self.udp_state_label())),
             );
 
         let health = card(
@@ -203,53 +213,85 @@ impl Desktop {
     }
 
     fn traffic_chart(&self) -> Div {
-        if self.traffic_history.is_empty() {
-            return chart_card(
-                "流量趋势",
-                "入口吞吐 · 最近 24 小时",
+        const TITLE: &str = "流量趋势";
+        const CAPTION: &str = "上行 / 下行速率 · 每次状态刷新采样一次（约 2 秒）";
+        let empty = |message: &'static str| {
+            chart_card(
+                TITLE,
+                CAPTION,
                 div()
                     .p_4()
                     .bg(rgb(SURFACE_SOFT))
                     .rounded_md()
                     .text_base()
                     .text_color(rgb(MUTED))
-                    .child("暂无流量样本，启动接管并产生流量后开始采样。"),
-            );
+                    .child(message),
+            )
+        };
+        if !self.status_valid {
+            return empty("后台状态未确认，暂停采样。");
         }
-        let denominator = self.traffic_history.len().saturating_sub(1).max(1);
+        let Some(first) = self.traffic_history.first() else {
+            return empty("当前没有在转发，暂无流量样本。启动接管后开始采样。");
+        };
+        let per_second = |value: f64| format!("{}/s", bytes(value.max(0.) as u64));
+        let span = first.at.elapsed().as_secs();
+        let span = if span < 60 {
+            format!("{span} 秒")
+        } else {
+            format!("{} 分 {} 秒", span / 60, span % 60)
+        };
+        let peak = |pick: fn(&TrafficSample) -> f32| {
+            self.traffic_history.iter().map(pick).fold(0., f32::max) as f64
+        };
+        let summary = format!(
+            "最近 {span}峰值 ↑ {} ↓ {}",
+            per_second(peak(|sample| sample.tx)),
+            per_second(peak(|sample| sample.rx)),
+        );
+        // 横轴按样本顺序等距排列，刻度写的是该样本距现在多久。
         let data = self
             .traffic_history
             .iter()
-            .enumerate()
-            .map(|(index, sample)| {
-                (
-                    format!("{:02}", index.saturating_mul(24) / denominator),
-                    *sample,
-                )
+            .map(|sample| {
+                let age = sample.at.elapsed().as_secs();
+                let label = if age == 0 {
+                    "刚刚".to_owned()
+                } else {
+                    format!("{age} 秒前")
+                };
+                (label, *sample)
             })
             .collect::<Vec<_>>();
         chart_card(
-            "流量趋势",
-            "入口吞吐 · 最近 24 小时",
+            TITLE,
+            CAPTION,
             div()
                 .flex()
                 .flex_col()
                 .gap_2()
                 .child(
-                    div().relative().h(px(150.)).child(
+                    div()
+                        .text_base()
+                        .font_family(super::theme::MONO_FONT)
+                        .truncate()
+                        .child(summary),
+                )
+                .child(
+                    div().relative().h(px(128.)).child(
                         AreaChart::new(data)
                             .id("traffic-trend")
                             .x(|point| point.0.clone())
                             .y(|point| point.1.tx)
                             .stroke(rgb(BLUE))
                             .fill(rgb(BLUE).opacity(0.14))
-                            .name("入口流量")
+                            .name("上行")
                             .y(|point| point.1.rx)
                             .stroke(rgb(TEAL))
                             .fill(rgb(TEAL).opacity(0.12))
-                            .name("转发流量")
-                            .x_tick_count(7)
-                            .tooltip_value(|_, _, value| format!("{value:.1}").into()),
+                            .name("下行")
+                            .x_tick_count(5)
+                            .tooltip_value(move |_, _, value| per_second(value).into()),
                     ),
                 )
                 .child(
@@ -260,9 +302,9 @@ impl Desktop {
                         .text_base()
                         .text_color(rgb(MUTED))
                         .child(status_dot(BLUE))
-                        .child("入口流量")
+                        .child("上行")
                         .child(status_dot(TEAL))
-                        .child("转发流量"),
+                        .child("下行"),
                 ),
         )
     }
@@ -460,8 +502,45 @@ impl Desktop {
             "系统 DNS 已接管".into()
         } else if self.idle() {
             "系统 DNS 未接管".into()
+        } else if self.phase() == "recovery_required" {
+            "DNS 需要恢复；系统 DNS 未接管。请先停止并恢复直连。".into()
         } else {
             "DNS 状态未确认".into()
+        }
+    }
+
+    pub(crate) fn dns_state_label(&self) -> &'static str {
+        if !self.status_valid {
+            "未知"
+        } else if self.status["dns_managed"] == true {
+            "已接管"
+        } else if self.idle() {
+            "未接管"
+        } else if self.phase() == "recovery_required" {
+            "需要恢复"
+        } else {
+            "未确认"
+        }
+    }
+
+    /// Non-whitelisted application UDP. Managed takeover starts even when the
+    /// startup UDP probe fails; such UDP is then refused (never sent direct) for
+    /// the session. System DNS on port 53 is managed separately.
+    pub(crate) fn udp_state_label(&self) -> &'static str {
+        if !self.status_valid {
+            "未知"
+        } else if self.phase() == "forwarding_managed" {
+            match self.status["startup_verified"]["udp_supported"].as_bool() {
+                Some(true) => "经代理链",
+                Some(false) => "已阻断",
+                None => "未确认",
+            }
+        } else if self.idle() {
+            "未接管"
+        } else if self.phase() == "recovery_required" {
+            "需要恢复"
+        } else {
+            "未确认"
         }
     }
 }

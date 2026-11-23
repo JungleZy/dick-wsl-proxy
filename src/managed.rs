@@ -1,14 +1,30 @@
 //! Runtime-only M2 configuration. The recovery journal never contains credentials or policy.
-use crate::{host, managed_dns::ManagedDns, plan::Plan, policy::Policy, probe::Snapshot};
+use crate::{
+    host,
+    managed_dns::ManagedDns,
+    plan::Plan,
+    policy::{Policy, UdpChain},
+    probe::Snapshot,
+};
 use serde::Serialize;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+// The leading code lets the desktop translate this when it surfaces as last_error.
+const UDP_CHAIN_UNSUPPORTED: &str = "udp_chain_unavailable: chained UDP failed its readiness probe; non-whitelisted UDP is refused until the next start or switch";
+const HTTPS_PROBE_ATTEMPTS: usize = 2;
+const HTTPS_PROBE_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 pub struct Runtime {
     pub policy: Arc<Policy>,
     pub dns: ManagedDns,
+    // Set when the readiness UDP probe fails for any reason (UDP ASSOCIATE
+    // refused, hop unreachable, timeout). There is no in-session retry: a fresh
+    // Runtime (new start or switch) starts unset and is probed again.
+    udp_chain_unsupported: AtomicBool,
 }
 
 pub fn valid_resolver(ip: Ipv4Addr) -> bool {
@@ -58,6 +74,7 @@ pub struct Readiness {
     pub system_dns: Ipv4Addr,
     pub fresh_udp_dns: bool,
     pub fresh_tcp_dns: bool,
+    pub udp_supported: bool,
     pub dns_latency_ms: u32,
     pub https_host: String,
     pub https_status: u16,
@@ -83,7 +100,27 @@ impl Runtime {
 
     fn with_policy(policy: Arc<Policy>) -> Result<Arc<Self>, String> {
         let dns = ManagedDns::new(Arc::clone(&policy))?;
-        Ok(Arc::new(Self { policy, dns }))
+        Ok(Arc::new(Self {
+            policy,
+            dns,
+            udp_chain_unsupported: AtomicBool::new(false),
+        }))
+    }
+
+    fn record_udp_capability(&self, supported: bool) {
+        self.udp_chain_unsupported
+            .store(!supported, Ordering::Release);
+    }
+
+    /// Chained UDP for a new flow. Once the readiness probe has failed, refuse
+    /// immediately: retrying the two-hop setup for
+    /// every datagram would block the ingress UDP loop (and system DNS intake)
+    /// for up to the setup timeout per flow, only to be refused again.
+    pub(crate) fn chain_udp(&self, dest: impl Into<SocketAddr>) -> Result<UdpChain, String> {
+        if self.udp_chain_unsupported.load(Ordering::Acquire) {
+            return Err(UDP_CHAIN_UNSUPPORTED.into());
+        }
+        self.policy.chain_udp(dest)
     }
 
     /// Exercise the actual target's sockets (not a Windows probe that skips the NAT rules).
@@ -107,15 +144,17 @@ impl Runtime {
                 return Err(format!("{label}_dns_not_verified_through_upstream"));
             }
         }
-        // A healthy DNS path only proves the managed DNS terminator. Verify that
-        // the selected residential chain can create both SOCKS5 UDP associations
-        // before claiming that ordinary non-whitelisted UDP is covered. The
-        // documentation endpoint is carried only in the association setup, so
-        // this probe emits no application datagram.
-        self.policy
+        // DNS and HTTPS are the readiness gates for ordinary web traffic. A
+        // residential SOCKS5 endpoint may support CONNECT while rejecting
+        // UDP-ASSOCIATE. Keep that capability in the readiness snapshot so
+        // TCP applications can still use the managed path and UDP callers can
+        // receive an explicit flow error instead of taking a direct fallback.
+        // The probe bypasses the gate so a fresh check is never short-circuited.
+        let udp_supported = self
+            .policy
             .chain_udp(SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 1), 443))
-            .map(|_| ())
-            .map_err(|error| format!("nonwhite_udp_chain_unavailable:{error}"))?;
+            .is_ok();
+        self.record_udp_capability(udp_supported);
         let host = self.policy.health_domain();
         if self.policy.allows_domain(host) {
             return Err("health_domain_is_direct_not_chain".into());
@@ -130,8 +169,23 @@ impl Runtime {
             "exec /usr/bin/python3 -I - <<'WPL_TLS'\nname=bytes.fromhex('{encoded}').decode('ascii')\n{}\nWPL_TLS\n",
             include_str!("guest/https_probe.py")
         );
-        let response = host::guest_script(&p.target, &script)
-            .map_err(|_| "target_https_probe_failed".to_string())?;
+        // A transient WSL or proxy reset should not leave a newly installed
+        // target in recovery solely because the readiness request lost its
+        // first connection attempt. Retry only the guest execution failure.
+        let mut response = None;
+        for attempt in 0..HTTPS_PROBE_ATTEMPTS {
+            match host::guest_script(&p.target, &script) {
+                Ok(value) => {
+                    response = Some(value);
+                    break;
+                }
+                Err(_) if attempt + 1 < HTTPS_PROBE_ATTEMPTS => {
+                    std::thread::sleep(HTTPS_PROBE_RETRY_DELAY);
+                }
+                Err(_) => return Err("target_https_probe_failed".into()),
+            }
+        }
+        let response = response.expect("HTTPS probe attempts must be nonzero");
         let (ip, code) = response
             .trim()
             .split_once(' ')
@@ -151,6 +205,7 @@ impl Runtime {
             system_dns: server,
             fresh_udp_dns: true,
             fresh_tcp_dns: true,
+            udp_supported,
             dns_latency_ms: average_dns_latency_ms(dns_elapsed),
             https_host: host.to_string(),
             https_status: status,
@@ -181,6 +236,53 @@ mod tests {
         ] {
             assert!(parse_resolver(unsound).is_err());
         }
+    }
+
+    #[test]
+    fn unsupported_residential_udp_refuses_new_flows_without_dialing() {
+        use std::net::TcpListener;
+        let first_hop = TcpListener::bind("127.0.0.1:0").unwrap();
+        first_hop.set_nonblocking(true).unwrap();
+        let first_endpoint = match first_hop.local_addr().unwrap() {
+            SocketAddr::V4(address) => address,
+            SocketAddr::V6(_) => unreachable!(),
+        };
+        let config: crate::policy::Config = serde_json::from_value(serde_json::json!({
+            "first_hop": first_endpoint.to_string(),
+            "credential": "fixture",
+            "dns_upstream": "8.8.8.8:443",
+            "dns_tls_name": "dns.google",
+            "direct_ips": [],
+            "direct_domains": [],
+            "direct_suffixes": [],
+            "allow_loopback_residential": true
+        }))
+        .unwrap();
+        let policy = Policy::assemble_for_store(
+            crate::policy::Validated::new(config).unwrap(),
+            crate::credential::fixture(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9)),
+        )
+        .unwrap();
+        let runtime = Runtime::with_policy(Arc::new(policy)).unwrap();
+        assert!(!runtime.udp_chain_unsupported.load(Ordering::Acquire));
+
+        runtime.record_udp_capability(false);
+        let v4 = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 443);
+        let v6: SocketAddr = "[2001:db8::9]:443".parse().unwrap();
+        for target in [SocketAddr::V4(v4), v6] {
+            let started = Instant::now();
+            let error = runtime.chain_udp(target).err();
+            assert_eq!(error.as_deref(), Some(UDP_CHAIN_UNSUPPORTED));
+            assert!(started.elapsed() < Duration::from_millis(100));
+        }
+        // Neither the first hop nor the residential hop was contacted.
+        assert_eq!(
+            first_hop.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
+        runtime.record_udp_capability(true);
+        assert!(!runtime.udp_chain_unsupported.load(Ordering::Acquire));
     }
 
     #[test]

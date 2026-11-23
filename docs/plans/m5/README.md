@@ -115,3 +115,25 @@ UDP 活跃表实际达到 128 条，发生 70 次安静映射回收，容量拒�
 `kernel/cleanup.json` 确认本轮暂时加载的五个模块均已移除，冷基线模块无缺失，实际表与规则、双栈路由及解析器一致。
 
 候选包：`D:\WSL\ProxyLab\udp-latency-lab\final\package\wsl-proxy-0.1.3-windows-x64.zip`，SHA-256 `2cd2342bd9524e2649b8fc48abaea4e1e3e389dacdf40f12fb5d66a5fe184eed`。包未签名，本轮未重复安装升级验收。
+
+## 发布包改由 Windows 原生 MSVC 编译
+
+**状态：脚本已改，还没有在 Windows 上编译、打包、安装或升级验证。**
+
+- **为什么改：**维护者约定最终的编译、测试、运行和打包都在 Windows 上完成（`AGENTS.md`「构建与验证规矩」）。Windows 上的 Rust 工具链是 `x86_64-pc-windows-msvc`，所以发布包目标从 `x86_64-pc-windows-gnu` 改为 `x86_64-pc-windows-msvc`。`scripts/build-desktop-windows.sh` 在 WSL 交叉编译出的 EXE 不再进发布包。
+- **C 运行库静态链接：**MSVC 默认动态依赖 VC++ 运行库。改动前在 Windows 上编出的 `wsl-proxyctl.exe` 和 `wsl-proxy-desktop.exe`，导入表里都有 `VCRUNTIME140.dll`，用户机器没装 VC++ 运行库就打不开。仓库的 `.cargo/config.toml` 为 MSVC 目标开启了 `+crt-static`。设置了 `RUSTFLAGS` 环境变量时这项配置不生效，打发布包前要确认没设。
+- **构建与打包：**在 Windows PowerShell 里执行 `cargo build --locked --release -p wsl-proxyctl -p wsl-proxy-desktop`，产物在 `target\release\`。构建记录的 `target` 写 `x86_64-pc-windows-msvc`。`scripts/package-windows.py` 在 Windows 上运行，需要 Python 3.11 或更高版本。
+- **升级（从代码推断，未实测）：**安装器只接受 MSVC 清单的新包。已安装的副本则 GNU 和 MSVC 清单都接受，所以已装 GNU 版的用户可以直接用新包覆盖升级，也能用新版卸载。
+- **降级（从代码推断，未实测）：**GNU 版旧包自带的安装脚本只认 GNU 清单。装了 MSVC 版之后，用旧包加 `-AllowDowngrade` 降级会被旧脚本拒绝。要回到旧版，先用已安装新版的 `uninstall.ps1` 卸载，再装旧包。
+- **待在 Windows 上验证：**原生 release 构建和 `cargo test --locked` 通过；两个 EXE 不再导入 `VCRUNTIME140.dll`；EXE 能在 Windows 上运行；打包脚本能在 Windows 上生成 ZIP；新包能覆盖升级已装的 GNU 版；新版 `uninstall.ps1` 能完整卸载。
+
+## 0.1.8 开发中定下的行为
+
+**状态：代码已改，未在 Windows 上编译、测试或实机验证。**这几项待负责人决定是否并入 `docs/decisions.md` 和 `docs/arch/`。
+
+- **住宅出口不支持 UDP 时：**接管照常启动。启动时探测一次住宅 UDP Associate，探测因任何原因失败，本次接管期间非白名单 UDP（含 QUIC）一律拒绝、不直连，也不再为每个新 UDP 流重试两跳握手；下次启动或切换目标时重新探测。系统 DNS（53 端口）不受影响。桌面端总览和诊断页显示「UDP 已阻断」。此前的行为是启动失败。
+- **TCP、UDP 以外的协议：**目标发行版发出的 ICMP 等其他协议一律丢弃，接管期间 ping 外部地址会超时。SOCKS5 不能转发 ICMP，放行就等于直连出口。
+- **编辑环境：**只写入 `/etc/wsl.conf` 里本工具负责的键，其余节和键原样保留。每次修改前把当时的文件存为 `/etc/wsl.conf.wsl-proxy-backup`，只保留最近一次修改前的版本。新建和编辑都写 `[boot] systemd=true`，让发行版能成为接管目标；新建还写 `[user] default`，设置时区写 `[time] useWindowsTimezone`。编辑已有发行版不改原来的默认用户。编辑完成后终止该发行版使设置生效，其中运行的程序会被关闭，桌面端在编辑表单和时区对话框里提前提示。
+- **新建环境：**总是安装 systemd 和 iptables。失败时注销本次注册的发行版，并删除本次留下的空目录。依赖支持 `wsl --install --name --location` 的 WSL；旧版拒绝这些参数时，提示用户先运行 `wsl --update`。
+- **运行日志：**最多保留最新 10,000 条。状态快照只在阶段、目标、代次或 DNS 状态变化时写入。
+- **连接记录：**每条连接结束时，后台把它写进同一个 `desktop.sqlite`，每次系统 DNS 查询也算一条，最多保留最新 50,000 条。只有桌面端启动的后台（`daemon`）写入，CLI 会话不写。记录目的 IP 和端口、协议、路由和判定原因、状态和失败阶段、上下行字节、开始和结束时间、目标发行版，不含域名、DNS 查询内容和传输内容。转发线程只把记录放进一个 8,192 条的有界队列，由单独的线程每批最多 512 条写入；队列满或写入失败时丢弃并计数，不阻塞转发，连接页显示没写进去的条数。进行中的连接仍只在内存里，后台异常退出时这些连接不会落盘。脱敏诊断导出不包含这些记录。这推翻了 M4 执行记录里「连接记录是有界的内存数据……近期保留 5 分钟」的说法。

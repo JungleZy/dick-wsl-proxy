@@ -87,10 +87,29 @@ impl Desktop {
                     UiAction::EnvironmentSubmit => this.environment_submit(cx),
                     UiAction::EnvironmentCancel => this.environment_cancel(cx),
                     UiAction::EnvironmentPickInstall => this.environment_pick_install(window, cx),
+                    UiAction::LogRefresh => this.refresh_logs(cx),
+                    UiAction::LogLoadMore => this.load_more_logs(cx),
                     UiAction::LogFilter(filter) => {
                         this.log_filter = filter;
+                        this.refresh_logs(cx);
+                    }
+                    UiAction::Export => {
+                        this.send(Kind::Export, json!({"command":"export_diagnostics"}), cx)
+                    }
+                    UiAction::ConnectionFilter(filter) => {
+                        if this.connection_filter != filter {
+                            this.connection_filter = filter;
+                            this.connection_history.reset();
+                            this.refresh_connection_history(cx);
+                        }
+                        this.connections_scroll
+                            .scroll_to_item(0, ScrollStrategy::Top);
                         cx.notify();
                     }
+                    UiAction::ConnectionEnvironment(environment) => {
+                        this.set_connection_environment(environment, cx);
+                    }
+                    UiAction::ConnectionLoadMore => this.load_more_connection_history(cx),
                 }),
             )
     }

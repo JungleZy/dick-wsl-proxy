@@ -17,7 +17,21 @@ mod metadata_lane;
 use metadata_lane::{MetadataLane, Observation};
 
 mod flow_stats;
+pub(crate) use flow_stats::{FinishedFlow, FlowEvent, FlowSink};
 use flow_stats::{Flow, FlowStats};
+
+/// Installed once by the desktop daemon; CLI sessions and tests leave it unset.
+static FLOW_SINK: std::sync::OnceLock<FlowSink> = std::sync::OnceLock::new();
+
+/// Every ingress bound after this call offers its finished flows to `sink`.
+pub(crate) fn install_flow_sink(sink: FlowSink) -> bool {
+    FLOW_SINK.set(sink).is_ok()
+}
+
+/// Finished flows not queued for persistence because the queue was full.
+pub(crate) fn flow_sink_dropped() -> Option<u64> {
+    FLOW_SINK.get().map(FlowSink::dropped)
+}
 mod metadata_timing;
 use metadata_timing::MetadataTiming;
 mod udp_admission;
@@ -32,7 +46,7 @@ const MAX_TCP: usize = 64;
 const MAX_UDP: usize = 128;
 const ACCEPT_BATCH: usize = 16;
 const UDP_BATCH: usize = 16;
-const MAX_DNS_UDP: usize = 8;
+const MAX_DNS_UDP: usize = 64;
 const BUFFER_SIZE: usize = 16 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -92,7 +106,7 @@ impl Ingress {
         };
         // Authenticate the transient metadata lane before handing duplicate binds
         // to the lease owner. A failed handshake must not leave a custody lease.
-        let shared = Arc::new(Shared::new());
+        let shared = Arc::new(Shared::for_plan(plan));
         let bridge = MetadataLane::start(plan, Arc::clone(&shared.stopping))?;
         crate::lease::reserve(
             plan,
@@ -316,7 +330,21 @@ struct Shared {
 }
 
 impl Shared {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_flows(FlowStats::new())
+    }
+
+    /// Flows of a bound ingress are tagged with the target and, in the desktop
+    /// daemon, also offered to the installed persistence sink.
+    fn for_plan(plan: &Plan) -> Self {
+        Self::with_flows(FlowStats::recording(
+            Some(plan.target.name.as_str().into()),
+            FLOW_SINK.get().cloned(),
+        ))
+    }
+
+    fn with_flows(flows: FlowStats) -> Self {
         Self {
             stopping: Arc::new(AtomicBool::new(false)),
             failure: Mutex::new(None),
@@ -325,7 +353,7 @@ impl Shared {
             dns_udp_active: std::sync::atomic::AtomicUsize::new(0),
             counters: Mutex::new(HealthCounters::default()),
             timing: Mutex::new(MetadataTiming::default()),
-            flows: Arc::new(FlowStats::new()),
+            flows: Arc::new(flows),
         }
     }
 
@@ -999,7 +1027,7 @@ fn run(
                         shared.record_error("udp", "UDP chain requires managed runtime".into());
                         continue;
                     };
-                    match UdpFlow::connect_chain(origin, origin, &runtime.policy, stats) {
+                    match UdpFlow::connect_chain(origin, origin, runtime, stats) {
                         Ok(flow) => flow,
                         Err(error) => {
                             shared.record_error("udp", error);
@@ -1070,7 +1098,7 @@ impl Drop for DnsUdpSlot {
     }
 }
 
-// At most eight independent DNS jobs retain one datagram each. There is no
+// At most 64 independent DNS jobs retain one datagram each. There is no
 // waiting queue: overload is rejected. Upstream DNS deadlines therefore cannot
 // stall the ingress UDP loop, and every job is joined before socket release.
 fn schedule_dns_udp(
@@ -1353,10 +1381,10 @@ impl UdpFlow {
     fn connect_chain(
         origin: SocketAddrV4,
         target: SocketAddrV4,
-        policy: &crate::policy::Policy,
+        runtime: &crate::managed::Runtime,
         stats: Flow,
     ) -> Result<Self, String> {
-        let socket = match policy.chain_udp(target) {
+        let socket = match runtime.chain_udp(target) {
             Ok(socket) => socket,
             Err(error) => {
                 stats.failed();

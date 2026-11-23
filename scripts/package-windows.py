@@ -10,7 +10,7 @@ import sys
 import tomllib
 import zipfile
 
-TARGET = "x86_64-pc-windows-gnu"
+TARGET = "x86_64-pc-windows-msvc"
 BINARIES = ("wsl-proxyctl.exe", "wsl-proxy-desktop.exe")
 SCRIPTS = ("install.ps1", "uninstall.ps1", "common.ps1")
 ROOT = Path(__file__).resolve().parent.parent

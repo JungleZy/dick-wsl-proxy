@@ -23,6 +23,10 @@ use std::process::ExitCode;
 use clap::Parser;
 use command::{Command, Failure};
 
+/// Finished flows waiting for the connection recorder. A takeover stop ends up to 256
+/// active rows at once; beyond this many queued rows, new ones are counted and dropped.
+const CONNECTION_QUEUE: usize = 8192;
+
 #[derive(Parser)]
 #[command(
     version,
@@ -109,8 +113,33 @@ fn run(command: Command) -> Result<u8, Failure> {
         return Ok(0);
     }
     if matches!(command, Command::Daemon) {
-        wsl_proxyctl::ipc::serve(|req| desktop_control::handle(req, &mut controller))
-            .map_err(|e| Failure::new("daemon_failed", e))?;
+        let store = desktop_store::path().ok();
+        if let Some(path) = &store {
+            let _ = desktop_store::append_runtime_log(
+                path,
+                "info",
+                "runtime",
+                "后台服务已启动",
+                None,
+                None,
+                None,
+            );
+        }
+        // Every takeover served by this daemon keeps its finished connections in the
+        // desktop store. Without a recorder, forwarding behaves exactly as before.
+        let recorder = store.and_then(|path| {
+            let (sink, events) = ingress::FlowSink::new(CONNECTION_QUEUE);
+            desktop_store::spawn_connection_recorder(path, events).ok()?;
+            ingress::install_flow_sink(sink.clone());
+            Some(sink)
+        });
+        let served = wsl_proxyctl::ipc::serve(|req| desktop_control::handle(req, &mut controller));
+        if let Some(sink) = &recorder {
+            // shutdown_daemon is accepted only when idle, so every flow has already ended
+            // and been queued; wait for the last batch before the process exits.
+            let _ = sink.flush(std::time::Duration::from_secs(5));
+        }
+        served.map_err(|e| Failure::new("daemon_failed", e))?;
         return Ok(0);
     }
     if matches!(command, Command::Session) {

@@ -98,7 +98,6 @@ mod windows {
     use std::os::windows::process::CommandExt;
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
-    use std::ptr;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -106,9 +105,7 @@ mod windows {
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
     };
-    use windows_sys::Win32::System::Com::CoTaskMemFree;
     use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
-    use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath};
     use winreg::RegKey;
     use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WOW64_64KEY};
 
@@ -336,33 +333,8 @@ mod windows {
         run_wsl_process(&args, Some(script.as_bytes()), timeout)
     }
 
-    fn local_app_data() -> Result<PathBuf, String> {
-        let mut path = ptr::null_mut();
-        // A null token selects this user's OS-known folder, never an environment path.
-        let result =
-            unsafe { SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, ptr::null_mut(), &mut path) };
-        if result < 0 || path.is_null() {
-            if !path.is_null() {
-                unsafe { CoTaskMemFree(path.cast()) };
-            }
-            return Err(format!("lock_known_folder_failed: HRESULT {result:#x}"));
-        }
-        // SHGetKnownFolderPath returns a NUL-terminated allocation owned by this call.
-        let directory = unsafe {
-            let mut length = 0;
-            while *path.add(length) != 0 {
-                length += 1;
-            }
-            PathBuf::from(OsString::from_wide(std::slice::from_raw_parts(
-                path, length,
-            )))
-        };
-        unsafe { CoTaskMemFree(path.cast()) };
-        Ok(directory)
-    }
-
     pub fn state_dir() -> Result<PathBuf, String> {
-        Ok(local_app_data()?.join("WSLProxyLab"))
+        wsl_proxyctl::paths::state_dir()
     }
 
     pub fn ipv6_scope_id(address: std::net::Ipv6Addr) -> Result<Option<u32>, String> {

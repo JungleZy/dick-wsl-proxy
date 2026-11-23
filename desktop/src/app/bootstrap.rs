@@ -4,16 +4,17 @@ use std::time::{Duration, Instant};
 
 const UI_TICK_INTERVAL: Duration = Duration::from_millis(200);
 const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// 按 2 秒一次的状态轮询，约保留最近 2 分钟的速率样本。
+const TRAFFIC_SAMPLE_LIMIT: usize = 60;
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
-use gpui_kit::component::notification::{Notification, NotificationType};
 use gpui_kit::component::select::{SelectEvent, SelectState};
 use gpui_kit::{prelude::*, *};
 use serde_json::{Value, json};
 
 use super::backend::{Job, Kind, worker};
-use super::model::{Field, Fields, LogFilter, Page};
+use super::model::{EnvironmentResult, Field, Fields, LogFilter, Page, RuntimeLog};
 use super::state::Desktop;
 
 fn input(window: &mut Window, cx: &mut App, hint: &'static str, multiline: bool) -> Field {
@@ -28,6 +29,7 @@ impl Desktop {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let nav_focus = std::array::from_fn(|_| cx.focus_handle().tab_stop(true));
         let fields = Fields {
+            log_search: input(window, cx, "搜索消息、来源或目标", false),
             first_hop: input(window, cx, "宿主 SOCKS5：IPv4:端口", false),
             residential_ip: input(window, cx, "住宅服务器 IPv4", false),
             residential_port: input(window, cx, "住宅服务器端口", false),
@@ -86,10 +88,18 @@ impl Desktop {
                         this.preflight = None;
                         this.pending_prepare = None;
                         this.dirty = this.draft_is_dirty(cx);
+                        this.save_error = false;
                         cx.notify();
                     }
                 }));
             }
+        }
+        if let Field::Single(field) = &fields.log_search {
+            subscriptions.push(cx.subscribe(field, |this, _, event, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.refresh_logs(cx);
+                }
+            }));
         }
         for field in [
             &fields.direct_ips,
@@ -102,6 +112,7 @@ impl Desktop {
                         this.preflight = None;
                         this.pending_prepare = None;
                         this.dirty = this.draft_is_dirty(cx);
+                        this.save_error = false;
                         cx.notify();
                     }
                 }));
@@ -147,6 +158,18 @@ impl Desktop {
         let mut this = Self {
             page: Page::Overview,
             log_filter: LogFilter::All,
+            logs: Vec::new(),
+            logs_total: 0,
+            logs_has_more: false,
+            logs_refresh_pending: false,
+            logs_before_id: None,
+            logs_loading_more: false,
+            logs_scroll: gpui_kit::base::VirtualListScrollHandle::new(),
+            live_connections: Vec::new(),
+            connection_history: Default::default(),
+            connection_filter: super::model::ConnectionFilter::All,
+            connection_environment: None,
+            connections_scroll: gpui_kit::base::VirtualListScrollHandle::new(),
             nav_focus,
             fields,
             timezone_select,
@@ -180,15 +203,20 @@ impl Desktop {
             pending_prepare: None,
             notice: "正在连接后台；关闭窗口不会停止接管。".into(),
             error: false,
+            save_error: false,
             autostart_enabled: super::autostart::enabled().unwrap_or(false),
             confirmation: None,
+            confirmation_pending: false,
             export_path: None,
             environment_editor: None,
             environment_edit_target: None,
             environment_selected: None,
             environment_detail: None,
             environment_started: None,
+            environment_timezone_only: false,
             loading_dialog_open: false,
+            environment_result_dialog_open: false,
+            environment_result_pending: None,
             backup_dialog_open: false,
             environment_backup_target: None,
             backup_result_dialog_open: false,
@@ -196,7 +224,7 @@ impl Desktop {
             backup_result_pending: false,
             timezone_dialog_open: false,
             environment_zsh: true,
-            environment_chrome: false,
+            environment_chrome: true,
             environment_chinese: true,
         };
         this.send(Kind::Bootstrap, Value::Null, cx);
@@ -222,16 +250,22 @@ impl Desktop {
             self.epoch += 1;
             self.busy = Some(kind);
             self.confirmation = None;
+            self.confirmation_pending = false;
         } else if kind == Kind::Status {
             if self.refreshing || self.reading || self.busy.is_some() {
                 return;
             }
             self.refreshing = true;
+        } else if kind == Kind::Connections {
+            // 后台静默读取：不置 reading，不弹加载框，也不改页面提示。
         } else {
             if self.reading || self.busy.is_some() {
                 return;
             }
             self.reading = true;
+        }
+        if kind == Kind::Save {
+            self.save_error = false;
         }
         if self
             .sender
@@ -246,12 +280,24 @@ impl Desktop {
             self.reading = false;
             self.refreshing = false;
             self.pending_prepare = None;
+            if kind == Kind::EnvironmentEdit {
+                self.environment_timezone_only = false;
+            }
             self.status_valid = false;
+            if kind == Kind::Save {
+                self.save_error = true;
+            }
+            if kind == Kind::Logs {
+                self.logs_loading_more = false;
+            }
             self.fail("后台通信线程已退出，请重新打开窗口。", cx);
         } else {
-            if kind != Kind::Status {
+            if !matches!(kind, Kind::Status | Kind::Connections) {
                 self.notice = match kind {
                     Kind::EnvironmentCreate => "正在创建环境并安装组件…".into(),
+                    Kind::EnvironmentEdit if self.environment_timezone_only => {
+                        "正在更新时区并刷新环境详情…".into()
+                    }
                     Kind::EnvironmentEdit => "正在安装组件并刷新环境能力…".into(),
                     _ => format!("{}中…", kind.label()),
                 };
@@ -261,8 +307,138 @@ impl Desktop {
         }
     }
 
+    pub(crate) fn refresh_logs(&mut self, cx: &mut Context<Self>) {
+        if self.reading || self.busy.is_some() {
+            self.logs_refresh_pending = true;
+            return;
+        }
+        self.logs_refresh_pending = false;
+        self.logs_before_id = None;
+        self.logs_loading_more = false;
+        let search = Self::field_value(&self.fields.log_search, cx)
+            .trim()
+            .to_owned();
+        self.send(
+            Kind::Logs,
+            json!({
+                "command": "runtime_logs",
+                "level": self.log_filter.level(),
+                "search": search,
+                "limit": 500,
+            }),
+            cx,
+        );
+    }
+
+    pub(crate) fn load_more_logs(&mut self, cx: &mut Context<Self>) {
+        if self.logs_loading_more || !self.logs_has_more || self.reading || self.busy.is_some() {
+            return;
+        }
+        let search = Self::field_value(&self.fields.log_search, cx)
+            .trim()
+            .to_owned();
+        self.logs_loading_more = true;
+        self.send(
+            Kind::Logs,
+            json!({
+                "command": "runtime_logs",
+                "level": self.log_filter.level(),
+                "search": search,
+                "before_id": self.logs_before_id,
+                "limit": 500,
+            }),
+            cx,
+        );
+    }
+
+    /// 读取已落盘的连接记录第一页；同一时间只有一个在途请求。「进行中」筛选不显示
+    /// 历史，但仍读取第一页，让页面上的记录总数保持最新。
+    pub(crate) fn refresh_connection_history(&mut self, cx: &mut Context<Self>) {
+        let filter = self.connection_filter;
+        let environment = self.connection_environment.clone();
+        if self.connection_history.requested.is_some() {
+            return;
+        }
+        self.connection_history.requested = Some((filter, environment.clone(), false));
+        self.send(
+            Kind::Connections,
+            json!({
+                "command": "connection_records",
+                "status": filter.status(),
+                "target": environment,
+                "limit": 200
+            }),
+            cx,
+        );
+    }
+
+    pub(crate) fn set_connection_environment(
+        &mut self,
+        environment: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.connection_environment == environment {
+            return;
+        }
+        self.connection_environment = environment;
+        self.connection_history.reset();
+        self.refresh_connection_history(cx);
+        self.connections_scroll
+            .scroll_to_item(0, ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    pub(crate) fn load_more_connection_history(&mut self, cx: &mut Context<Self>) {
+        let filter = self.connection_filter;
+        let environment = self.connection_environment.clone();
+        let history = &self.connection_history;
+        if !filter.history() || history.requested.is_some() || !history.has_more {
+            return;
+        }
+        let before_id = history.before_id;
+        self.connection_history.requested = Some((filter, environment.clone(), true));
+        self.send(
+            Kind::Connections,
+            json!({
+                "command": "connection_records",
+                "status": filter.status(),
+                "target": environment,
+                "before_id": before_id,
+                "limit": 200,
+            }),
+            cx,
+        );
+    }
+
+    /// 读取失败只写在连接页上，不改全局提示，也不影响状态是否有效。
+    fn accept_connection_history(&mut self, result: Result<Value, String>, cx: &mut Context<Self>) {
+        let requested = self.connection_history.requested.take();
+        match requested {
+            Some((filter, environment, append))
+                if filter == self.connection_filter
+                    && environment == self.connection_environment =>
+            {
+                match result {
+                    Ok(value) => self.connection_history.accept(&value, append),
+                    Err(error) => {
+                        self.connection_history.error =
+                            Some(super::backend::humanize_error(&error));
+                    }
+                }
+            }
+            // 请求发出后换了筛选：丢弃旧结果，按当前筛选重读。
+            _ if self.page == Page::Connection => self.refresh_connection_history(cx),
+            _ => {}
+        }
+    }
+
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         while let Ok(reply) = self.replies.try_recv() {
+            if reply.kind == Kind::Connections {
+                self.accept_connection_history(reply.result, cx);
+                cx.notify();
+                continue;
+            }
             if reply.kind == Kind::Status {
                 self.refreshing = false;
                 if reply.epoch != self.epoch || self.busy.is_some() {
@@ -302,10 +478,19 @@ impl Desktop {
                     if reply.kind == Kind::Preflight {
                         self.pending_prepare = None;
                     }
+                    if reply.kind == Kind::Logs {
+                        self.logs_loading_more = false;
+                    }
+                    if reply.kind == Kind::Save {
+                        self.save_error = true;
+                    }
                     let readable_error = super::backend::humanize_error(&error);
                     let message = match reply.kind {
                         Kind::EnvironmentCreate => {
                             format!("环境创建失败，组件安装未完成：{readable_error}")
+                        }
+                        Kind::EnvironmentEdit if self.environment_timezone_only => {
+                            format!("时区更新失败，环境设置未更新：{readable_error}")
                         }
                         Kind::EnvironmentEdit => {
                             format!("组件安装失败，环境设置未更新：{readable_error}")
@@ -317,18 +502,26 @@ impl Desktop {
                 }
                 Ok(value) => match reply.kind {
                     Kind::Bootstrap => {
-                        self.distributions = value["distributions"]
-                            .as_array()
-                            .cloned()
-                            .unwrap_or_default();
+                        if let Some(distributions) = value["distributions"].as_array() {
+                            self.distributions = distributions.clone();
+                        }
                         self.accept_profile(&value["profile"], window, cx);
                         self.accept_status(value["status"].clone());
+                        self.accept_logs(&value["logs"], false);
                         self.notice = "后台已连接。请选择目标，然后启动接管。".into();
                         self.error = false;
+                        // 连接记录独立于当前接管状态，后台空闲时也要预先读取，
+                        // 这样打开连接页可以直接看到历史记录。
+                        self.refresh_connection_history(cx);
                     }
                     Kind::Status => {
                         self.accept_status(value);
+                        if self.page == Page::Connection {
+                            self.refresh_connection_history(cx);
+                        }
                     }
+                    // 已在循环开头单独处理，不会走到这里。
+                    Kind::Connections => {}
                     Kind::List => {
                         self.distributions = value.as_array().cloned().unwrap_or_default();
                         let valid = |id: &Option<String>| {
@@ -346,8 +539,14 @@ impl Desktop {
                         self.dirty = self.draft_is_dirty(cx);
                         self.notice = "列表已刷新；未启动 WSL。".into();
                     }
+                    Kind::Logs => {
+                        let append = self.logs_loading_more;
+                        self.logs_loading_more = false;
+                        self.accept_logs(&value, append);
+                    }
                     Kind::Save => {
                         self.accept_profile(&value, window, cx);
+                        self.save_error = false;
                         self.notice = if self.page == Page::Environment {
                             "环境选择已保存；不会立即改变当前接管。"
                         } else {
@@ -381,7 +580,7 @@ impl Desktop {
                                     && selection_matches
                                 {
                                     self.notice = "预检通过，请确认后启动接管。".into();
-                                    self.open_prepare_confirmation(pending, window, cx);
+                                    self.open_prepare_confirmation(pending, cx);
                                 } else {
                                     self.fail("启动前状态已变化，请重新启动接管。", cx);
                                 }
@@ -414,10 +613,27 @@ impl Desktop {
                         self.environment_detail = value.get("environment").cloned();
                         self.environment_selected =
                             value["environment"]["name"].as_str().map(str::to_owned);
-                        self.distributions = value["distributions"]
-                            .as_array()
-                            .cloned()
-                            .unwrap_or_default();
+                        if let Some(distributions) = value["distributions"].as_array() {
+                            self.distributions = distributions.clone();
+                        } else {
+                            // Listing failed after a successful create: add the new
+                            // environment from the reply (it carries the list fields).
+                            let environment = &value["environment"];
+                            let id = environment["id"].as_str();
+                            if id.is_some()
+                                && !self
+                                    .distributions
+                                    .iter()
+                                    .any(|distro| distro["id"].as_str() == id)
+                            {
+                                self.distributions.push(json!({
+                                    "id": environment["id"].clone(),
+                                    "name": environment["name"].clone(),
+                                    "base_path": environment["base_path"].clone(),
+                                    "version": environment["version"].clone(),
+                                }));
+                            }
+                        }
                         self.environment_editor = None;
                         self.environment_edit_target = None;
                         self.error = false;
@@ -433,7 +649,11 @@ impl Desktop {
                         self.environment_editor = None;
                         self.environment_edit_target = None;
                         self.error = false;
-                        self.notice = "组件安装成功，环境能力已刷新。".into();
+                        self.notice = if self.environment_timezone_only {
+                            "时区已更新，环境能力已刷新。".into()
+                        } else {
+                            "组件安装成功，环境能力已刷新。".into()
+                        };
                     }
                     Kind::EnvironmentBackup => {
                         self.export_path = value["backup"]["path"].as_str().map(str::to_owned);
@@ -443,11 +663,15 @@ impl Desktop {
                         self.notice = "环境备份已完成。".into();
                     }
                     Kind::EnvironmentDelete => {
-                        self.distributions = value["distributions"]
-                            .as_array()
-                            .cloned()
-                            .unwrap_or_default();
                         let deleted_id = value["environment"]["id"].as_str();
+                        if let Some(distributions) = value["distributions"].as_array() {
+                            self.distributions = distributions.clone();
+                        } else {
+                            // Listing failed after a successful delete: drop only
+                            // the removed entry instead of the whole list.
+                            self.distributions
+                                .retain(|distro| distro["id"].as_str() != deleted_id);
+                        }
                         if deleted_id.is_some_and(|id| self.selected.as_deref() == Some(id)) {
                             self.selected = None;
                             self.preflight = None;
@@ -468,8 +692,16 @@ impl Desktop {
                             self.preflight = Some(value);
                             self.fail("操作前预检未通过；请查看阻断项。", cx);
                         } else {
-                            self.notice =
-                                format!("{}已完成；请以后台状态为准。", reply.kind.label());
+                            self.notice = if reply.kind != Kind::Stop
+                                && value["startup_verified"]["udp_supported"] == false
+                            {
+                                format!(
+                                    "{}已完成，但住宅出口没有通过 UDP 探测：非白名单 UDP（含 QUIC）已阻断，不会直连；TCP 和系统 DNS 照常经代理链。",
+                                    reply.kind.label()
+                                )
+                            } else {
+                                format!("{}已完成；请以后台状态为准。", reply.kind.label())
+                            };
                             self.preflight = None;
                         }
                     }
@@ -479,25 +711,41 @@ impl Desktop {
                 self.fail(error, cx);
             }
             if environment_operation {
-                let succeeded = result_succeeded && !self.error;
-                let notification_type = if succeeded {
-                    NotificationType::Success
-                } else {
-                    NotificationType::Error
-                };
-                let title = if succeeded {
-                    "环境操作完成"
-                } else {
-                    "环境操作失败"
-                };
-                window.push_notification(
-                    Notification::new()
-                        .with_type(notification_type)
-                        .title(title)
-                        .message(self.notice.clone())
-                        .autohide(true),
-                    cx,
-                );
+                self.environment_result_pending = Some(EnvironmentResult {
+                    kind: reply.kind,
+                    success: result_succeeded && !self.error,
+                    message: self.notice.clone(),
+                    timezone_only: self.environment_timezone_only,
+                });
+                if reply.kind == Kind::EnvironmentEdit {
+                    self.environment_timezone_only = false;
+                }
+            }
+            if self.page == Page::Logs
+                && matches!(
+                    reply.kind,
+                    Kind::Preflight
+                        | Kind::Save
+                        | Kind::Start
+                        | Kind::Switch
+                        | Kind::Stop
+                        | Kind::Export
+                        | Kind::Probe
+                        | Kind::EnvironmentCreate
+                        | Kind::EnvironmentEdit
+                        | Kind::EnvironmentBackup
+                        | Kind::EnvironmentDelete
+                )
+            {
+                self.logs_refresh_pending = true;
+            }
+            if self.logs_refresh_pending && self.busy.is_none() && !self.reading {
+                self.refresh_logs(cx);
+            }
+            if matches!(reply.kind, Kind::Bootstrap | Kind::List | Kind::Save)
+                && self.page == Page::Environment
+            {
+                self.open_target_environment(window, cx);
             }
             cx.notify();
         }
@@ -541,12 +789,22 @@ impl Desktop {
         } else if operation_active && !self.loading_dialog_open {
             self.open_loading_dialog(window, cx);
         }
+        if self.confirmation_pending && !self.loading_dialog_open {
+            self.confirmation_pending = false;
+            self.open_confirmation_dialog(window, cx);
+        }
         if self.backup_result_pending
             && !self.loading_dialog_open
             && !self.backup_result_dialog_open
         {
             self.backup_result_pending = false;
             self.open_backup_result_dialog(window, cx);
+        }
+        if self.environment_result_pending.is_some()
+            && !self.loading_dialog_open
+            && !self.environment_result_dialog_open
+        {
+            self.open_environment_result_dialog(window, cx);
         }
         if matches!(
             self.busy,
@@ -556,21 +814,42 @@ impl Desktop {
         }
     }
 
+    /// 后台按新到旧返回一页，页面照此显示：最新的在顶部，「加载更早」接在底部。
+    fn accept_logs(&mut self, value: &Value, append: bool) {
+        let logs = value["logs"]
+            .as_array()
+            .map(|items| items.iter().filter_map(RuntimeLog::from_value).collect())
+            .unwrap_or_default();
+        if append {
+            self.logs.extend(logs);
+        } else {
+            self.logs = logs;
+            // 刷新后回到顶部，停在最新的一条。
+            self.logs_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        }
+        self.logs_total = value["total"].as_u64().unwrap_or(self.logs.len() as u64);
+        self.logs_has_more = value["has_more"].as_bool().unwrap_or(false);
+        self.logs_before_id = value["next_before_id"].as_i64();
+    }
+
     fn accept_status(&mut self, status: Value) {
         if status["phase"].is_string() && status["operation_generation"].is_u64() {
-            let tx = status["forwarding"]["traffic"]["tx_bytes_per_sec"]
-                .as_u64()
-                .unwrap_or_default() as f32;
-            let rx = status["forwarding"]["traffic"]["rx_bytes_per_sec"]
-                .as_u64()
-                .unwrap_or_default() as f32;
-            if tx > 0. || rx > 0. {
-                self.traffic_history
-                    .push(super::model::TrafficSample { tx, rx });
-                if self.traffic_history.len() > 24 {
-                    let excess = self.traffic_history.len() - 24;
+            let traffic = &status["forwarding"]["traffic"];
+            if traffic.is_object() {
+                // 后台的速率是浮点数。每次有效快照都采样（包括 0），横轴才对应真实时间。
+                let rate = |key: &str| traffic[key].as_f64().unwrap_or_default().max(0.) as f32;
+                self.traffic_history.push(super::model::TrafficSample {
+                    at: Instant::now(),
+                    tx: rate("tx_bytes_per_sec"),
+                    rx: rate("rx_bytes_per_sec"),
+                });
+                if self.traffic_history.len() > TRAFFIC_SAMPLE_LIMIT {
+                    let excess = self.traffic_history.len() - TRAFFIC_SAMPLE_LIMIT;
                     self.traffic_history.drain(0..excess);
                 }
+            } else {
+                // 未接管或需要恢复时没有转发观测，不保留上一次接管的曲线。
+                self.traffic_history.clear();
             }
             let dns_latency = status["startup_verified"]["dns_latency_ms"]
                 .as_f64()
@@ -586,6 +865,10 @@ impl Desktop {
                     self.dns_history.drain(0..excess);
                 }
             }
+            self.live_connections = super::model::ConnectionRow::live_list(
+                &status["forwarding"]["connections"],
+                status["active_target"].as_str(),
+            );
             self.status = status;
             self.status_valid = true;
             self.status_at = Some(Instant::now());
@@ -620,6 +903,7 @@ impl Desktop {
         self.profile = result["profile"].clone();
         self.revision = result["revision"].clone();
         self.profile_exists = result["exists"].as_bool().unwrap_or(false);
+        self.save_error = false;
         // The daemon validates and owns this stable AppData location; never synthesize a CWD path.
         self.profile_path = result["path"].as_str().map(str::to_owned);
         self.residential = result["residential"].clone();

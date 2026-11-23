@@ -70,6 +70,40 @@ struct EnvironmentDelete {
     name: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeLogs {
+    #[serde(default)]
+    level: Option<String>,
+    #[serde(default)]
+    search: Option<String>,
+    #[serde(default)]
+    before_id: Option<i64>,
+    #[serde(default = "default_runtime_log_limit")]
+    limit: u32,
+}
+
+fn default_runtime_log_limit() -> u32 {
+    500
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectionRecords {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    before_id: Option<i64>,
+    #[serde(default = "default_connection_record_limit")]
+    limit: u32,
+}
+
+fn default_connection_record_limit() -> u32 {
+    200
+}
+
 fn environment_options(
     zsh: bool,
     chrome: bool,
@@ -122,6 +156,110 @@ fn sqlite_save(path: &Path, req: SqliteSave) -> Result<Value, String> {
     )?;
     Ok(desktop_store::view(path, &record))
 }
+
+fn log_command(command: &str) -> bool {
+    matches!(
+        command,
+        "profile_save"
+            | "preflight"
+            | "start"
+            | "switch"
+            | "stop"
+            | "probe_exit"
+            | "export_diagnostics"
+            | "environment_create"
+            | "environment_edit"
+            | "environment_backup"
+            | "environment_delete"
+            | "import_credential"
+            | "forget_credential"
+            | "reset_dns_aliases"
+    )
+}
+
+fn command_log(command: &str, response: &Value) -> (&'static str, String, String) {
+    if let Some(code) = response.get("code").and_then(Value::as_str) {
+        return ("error", command.to_owned(), format!("操作失败（{code}）"));
+    }
+    if matches!(command, "start" | "switch" | "stop") && response["passed"] == false {
+        let blockers = response["blockers"].as_array().map_or(0, Vec::len);
+        return (
+            "warning",
+            "preflight".into(),
+            format!("操作前预检未通过（{blockers} 个阻断项）"),
+        );
+    }
+    match command {
+        "profile_save" => ("info", "desktop_store".into(), "配置已保存到 SQLite".into()),
+        "preflight" if response["passed"] == true => {
+            ("info", "preflight".into(), "预检通过".into())
+        }
+        "preflight" => {
+            let blockers = response["blockers"].as_array().map_or(0, Vec::len);
+            (
+                "warning",
+                "preflight".into(),
+                format!("预检未通过（{blockers} 个阻断项）"),
+            )
+        }
+        "start" => ("info", "lifecycle".into(), "已开始接管".into()),
+        "switch" => ("info", "lifecycle".into(), "已切换接管目标".into()),
+        "stop" => ("info", "lifecycle".into(), "已停止接管并恢复直连".into()),
+        "probe_exit" => ("info", "diagnostics".into(), "出口检测完成".into()),
+        "export_diagnostics" => ("info", "diagnostics".into(), "诊断报告已导出".into()),
+        "environment_create" => ("info", "environment".into(), "环境创建完成".into()),
+        "environment_edit" => ("info", "environment".into(), "环境设置已更新".into()),
+        "environment_backup" => ("info", "environment".into(), "环境备份完成".into()),
+        "environment_delete" => ("info", "environment".into(), "环境已删除".into()),
+        "import_credential" => ("info", "desktop_store".into(), "凭据已保存".into()),
+        "forget_credential" => ("info", "desktop_store".into(), "凭据已删除".into()),
+        "reset_dns_aliases" => ("info", "dns".into(), "DNS 别名缓存已重置".into()),
+        _ => ("info", command.to_owned(), "操作完成".into()),
+    }
+}
+
+fn response_status(response: &Value) -> Option<&Value> {
+    if response["phase"].is_string() {
+        Some(response)
+    } else {
+        response.get("controller")
+    }
+}
+
+fn record_runtime_result(command: &str, response: &Value, controller: &controller::Controller) {
+    if !log_command(command) && command != "status" {
+        return;
+    }
+    let Ok(path) = profile_path() else {
+        return;
+    };
+    // An error reply carries no state. Asking again would repeat the guest
+    // inspection in recovery_required, so failures are logged without context.
+    let status = response_status(response).cloned().or_else(|| {
+        if response.get("code").is_some() {
+            None
+        } else {
+            controller.status().ok()
+        }
+    });
+    if let Some(status) = status.as_ref() {
+        let _ = desktop_store::record_runtime_snapshot(&path, status);
+    }
+    if !log_command(command) {
+        return;
+    }
+    let (level, source, message) = command_log(command, response);
+    let status = status.as_ref();
+    let _ = desktop_store::append_runtime_log(
+        &path,
+        level,
+        &source,
+        &message,
+        status.and_then(|value| value["phase"].as_str()),
+        status.and_then(|value| value["active_target"].as_str()),
+        status.and_then(|value| value["operation_generation"].as_u64()),
+    );
+}
 // Diagnostics are an allowlist, not a recursive 'remove password' filter. No free-form
 // strings, flow addresses, hostnames, distribution names, paths, or credential references.
 fn sanitized(s: &Value) -> Value {
@@ -154,7 +292,7 @@ fn sanitized(s: &Value) -> Value {
             counters.insert(k.into(), n.into());
         }
     }
-    json!({"schema":1,"phase":phase,"operation_generation":s["operation_generation"].as_u64(),"dns_managed":s["dns_managed"].as_bool(),"fresh_udp_dns":s["startup_verified"]["fresh_udp_dns"].as_bool(),"fresh_tcp_dns":s["startup_verified"]["fresh_tcp_dns"].as_bool(),"https_status":s["startup_verified"]["https_status"].as_u64(),"tx_bytes":s["forwarding"]["traffic"]["tx_bytes"].as_u64(),"rx_bytes":s["forwarding"]["traffic"]["rx_bytes"].as_u64(),"counters":counters})
+    json!({"schema":1,"phase":phase,"operation_generation":s["operation_generation"].as_u64(),"dns_managed":s["dns_managed"].as_bool(),"fresh_udp_dns":s["startup_verified"]["fresh_udp_dns"].as_bool(),"fresh_tcp_dns":s["startup_verified"]["fresh_tcp_dns"].as_bool(),"udp_supported":s["startup_verified"]["udp_supported"].as_bool(),"https_status":s["startup_verified"]["https_status"].as_u64(),"tx_bytes":s["forwarding"]["traffic"]["tx_bytes"].as_u64(),"rx_bytes":s["forwarding"]["traffic"]["rx_bytes"].as_u64(),"counters":counters})
 }
 fn export(controller: &controller::Controller) -> Result<Value, String> {
     let doc = sanitized(&controller.status()?);
@@ -174,6 +312,10 @@ fn export(controller: &controller::Controller) -> Result<Value, String> {
 }
 
 pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (Value, bool) {
+    let command = request
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let result = (|| -> Result<(Value, bool), crate::command::Failure> {
         let bad = |m: String| crate::command::Failure::new("desktop_request_failed", m);
         let cmd = request
@@ -195,6 +337,43 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                     serde_json::from_value::<SqliteSave>(Value::Object(std::mem::take(request)))
                         .map_err(|_| bad("invalid_desktop_profile_fields".into()))?;
                 sqlite_save(&profile_path().map_err(bad)?, req).map_err(bad)?
+            }
+            "runtime_logs" => {
+                let request = request
+                    .as_object_mut()
+                    .ok_or_else(|| bad("invalid_runtime_log_fields".into()))?;
+                request.remove("command");
+                let req =
+                    serde_json::from_value::<RuntimeLogs>(Value::Object(std::mem::take(request)))
+                        .map_err(|_| bad("invalid_runtime_log_fields".into()))?;
+                desktop_store::runtime_logs(
+                    &profile_path().map_err(bad)?,
+                    req.level.as_deref(),
+                    req.search.as_deref(),
+                    req.before_id,
+                    req.limit,
+                )
+                .map_err(bad)?
+            }
+            "connection_records" => {
+                let request = request
+                    .as_object_mut()
+                    .ok_or_else(|| bad("invalid_connection_record_fields".into()))?;
+                request.remove("command");
+                let req = serde_json::from_value::<ConnectionRecords>(Value::Object(
+                    std::mem::take(request),
+                ))
+                .map_err(|_| bad("invalid_connection_record_fields".into()))?;
+                let mut records = desktop_store::connection_records(
+                    &profile_path().map_err(bad)?,
+                    req.status.as_deref(),
+                    req.target.as_deref(),
+                    req.before_id,
+                    req.limit,
+                )
+                .map_err(bad)?;
+                records["queue_dropped"] = json!(crate::ingress::flow_sink_dropped());
+                records
             }
             "environment_view" => {
                 let request = request
@@ -231,7 +410,11 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                     ),
                 )
                 .map_err(bad)?;
-                json!({"environment":environment,"distributions":host::distributions().map_err(bad)?})
+                let mut response = json!({"environment":environment});
+                if let Ok(distributions) = host::distributions() {
+                    response["distributions"] = json!(distributions);
+                }
+                response
             }
             "environment_edit" => {
                 require_idle(controller)?;
@@ -281,10 +464,11 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                 ))
                 .map_err(|_| bad("invalid_environment_fields".into()))?;
                 let environment = environment::remove(&req.name).map_err(bad)?;
-                json!({
-                    "environment":environment,
-                    "distributions":host::distributions().map_err(bad)?
-                })
+                let mut response = json!({"environment":environment});
+                if let Ok(distributions) = host::distributions() {
+                    response["distributions"] = json!(distributions);
+                }
+                response
             }
             "export_diagnostics" => export(controller).map_err(bad)?,
             "probe_exit" => {
@@ -328,7 +512,11 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
         };
         Ok((data, false))
     })();
-    result.unwrap_or_else(|e| (json!({"code":e.code,"message":e.message}), false))
+    let response = result.unwrap_or_else(|e| (json!({"code":e.code,"message":e.message}), false));
+    if let Some(command) = command.as_deref() {
+        record_runtime_result(command, &response.0, controller);
+    }
+    response
 }
 
 #[cfg(test)]

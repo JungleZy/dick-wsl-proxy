@@ -255,7 +255,7 @@ fn receive_udp(
                 continue;
             }
             let socket = if chained {
-                match runtime.policy.chain_udp(SocketAddr::V6(origin)) {
+                match runtime.chain_udp(SocketAddr::V6(origin)) {
                     Ok(socket) => UdpTransport::Chain(socket),
                     Err(error) => {
                         shared.record_error("udp", format!("IPv6 UDP chain setup failed: {error}"));

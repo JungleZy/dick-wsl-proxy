@@ -436,6 +436,9 @@ def m2_artifacts(p):
         ["-A", "OUTPUT", *local, "-m", "conntrack", "!", "--ctorigdst", "127.0.0.0/8", *comment, "-j", guard_chain],
         ["-A", "OUTPUT", "!", "-d", "127.0.0.0/8", *local, "-m", "conntrack", "--ctstate", "INVALID,UNTRACKED", *comment, "-j", guard_chain],
         ["-A", guard_chain, "-m", "conntrack", "--ctdir", "REPLY", *comment, "-j", "RETURN"],
+        # SOCKS5 has no ICMP mode, so ICMP and every other non-TCP/UDP protocol
+        # falls through to the final DROP. A RETURN here would leave the guest
+        # through Windows NAT and expose the host's own public address.
     ]
     for protocol in ("tcp", "udp"):
         guards.append(["-A", "FORWARD", "-p", protocol, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-m", "connmark", "--mark", mark, *comment, "-j", "RETURN"])

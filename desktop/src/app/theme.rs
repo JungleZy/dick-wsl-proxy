@@ -15,6 +15,7 @@ pub(crate) const SIDEBAR_BG: u32 = 0xeef0f2;
 pub(crate) const BLUE: u32 = 0x3658c8;
 pub(crate) const BLUE_ACTIVE: u32 = 0x314d91;
 pub(crate) const BLUE_SOFT: u32 = 0xe7edff;
+pub(crate) const SELECTED_BG: u32 = 0xdbeafe;
 pub(crate) const TEAL: u32 = 0x287b61;
 pub(crate) const AMBER: u32 = 0xa66a1d;
 pub(crate) const RUST: u32 = 0xb34f42;
@@ -34,7 +35,6 @@ const PRIMARY_ACTIVE: u32 = 0x263d73;
 const SECONDARY: u32 = 0x18344c;
 const SECONDARY_HOVER: u32 = 0x234b67;
 const DANGER_HOVER: u32 = 0x9b3e1f;
-const SELECTION: u32 = 0xdbeafe;
 const DARK_INK: u32 = 0xe5e7eb;
 const DARK_PAPER: u32 = 0x111827;
 const DARK_SURFACE: u32 = 0x1f2937;
@@ -115,7 +115,7 @@ fn resolve_color(value: u32) -> u32 {
         SECONDARY => DARK_SECONDARY,
         SECONDARY_HOVER => DARK_SECONDARY_HOVER,
         DANGER_HOVER => DARK_DANGER_HOVER,
-        SELECTION => DARK_SELECTION,
+        SELECTED_BG => DARK_SELECTION,
         0xe3e8ed => DARK_SURFACE_SOFT,
         value => value,
     }
@@ -149,7 +149,7 @@ pub(crate) fn apply(mode: ThemeMode, cx: &mut App) {
         theme.danger = app_rgb(RUST).into();
         theme.danger_hover = app_rgb(DANGER_HOVER).into();
         theme.danger_foreground = app_rgb(SURFACE).into();
-        theme.selection = app_rgb(SELECTION).into();
+        theme.selection = app_rgb(SELECTED_BG).into();
         theme.sidebar = app_rgb(SIDEBAR_BG).into();
         theme.sidebar_foreground = app_rgb(INK).into();
         theme.sidebar_border = app_rgb(RULE).into();

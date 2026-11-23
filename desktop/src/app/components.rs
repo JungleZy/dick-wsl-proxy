@@ -4,13 +4,15 @@ use gpui_kit::component::Sizable as _;
 use gpui_kit::{prelude::*, *};
 use serde_json::Value;
 
-use super::theme::{BLUE, INK, MUTED, RULE, SURFACE, SURFACE_SOFT, app_rgb as rgb};
+use super::theme::{BLUE, MUTED, SURFACE_SOFT, app_rgb as rgb};
 
 pub(crate) fn text(value: &Value, key: &str, fallback: &str) -> String {
     value[key].as_str().unwrap_or(fallback).to_owned()
 }
 pub(crate) fn bytes(value: u64) -> String {
-    if value >= 1024 * 1024 {
+    if value >= 1024 * 1024 * 1024 {
+        format!("{:.1} GiB", value as f64 / 1073741824.)
+    } else if value >= 1024 * 1024 {
         format!("{:.1} MiB", value as f64 / 1048576.)
     } else if value >= 1024 {
         format!("{:.1} KiB", value as f64 / 1024.)
@@ -18,11 +20,12 @@ pub(crate) fn bytes(value: u64) -> String {
         format!("{value} B")
     }
 }
+/// 后台发送的速率是浮点数；缺失时（未接管或状态未确认）显示「—」。
 pub(crate) fn rate(value: &Value) -> String {
     value
         .as_f64()
         .map(|v| format!("{}/s", bytes(v.max(0.) as u64)))
-        .unwrap_or_else(|| "未采样".into())
+        .unwrap_or_else(|| "—".into())
 }
 
 pub(crate) fn badge(label: impl Into<SharedString>, color: u32, background: u32) -> Div {
@@ -42,30 +45,6 @@ pub(crate) fn badge(label: impl Into<SharedString>, color: u32, background: u32)
                 .text_color(rgb(color))
                 .child(label.into()),
         )
-}
-
-pub(crate) fn panel(title: &'static str, caption: impl Into<SharedString>) -> Div {
-    let caption = caption.into();
-    let mut header = div().flex().flex_col().gap_1().child(
-        div()
-            .text_base()
-            .font_weight(FontWeight::NORMAL)
-            .text_color(rgb(INK))
-            .child(title),
-    );
-    if !caption.is_empty() {
-        header = header.child(div().text_base().text_color(rgb(MUTED)).child(caption));
-    }
-    div()
-        .flex()
-        .flex_col()
-        .gap_3()
-        .p_3()
-        .bg(rgb(SURFACE))
-        .border_1()
-        .border_color(rgb(RULE))
-        .rounded_md()
-        .child(header)
 }
 
 pub(crate) fn fact(label: &'static str, value: impl Into<SharedString>, color: u32) -> Div {
