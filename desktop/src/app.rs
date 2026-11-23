@@ -11,6 +11,7 @@ mod components;
 mod diagnostics;
 mod distributions;
 mod instance;
+mod integrity;
 mod model;
 mod overview;
 mod policy;
@@ -27,6 +28,12 @@ const WINDOW_WIDTH: f32 = 980.;
 const WINDOW_HEIGHT: f32 = 700.;
 
 pub fn run() {
+    // 先于单实例锁检查：Low 级别下托盘注册不了，关窗会把窗口藏进不存在的托盘、无法找回，
+    // 所以直接提示并退出，也不占用单实例锁。
+    if integrity::below_medium() {
+        integrity::warn();
+        return;
+    }
     let Some(_instance) = instance::acquire() else {
         return;
     };
