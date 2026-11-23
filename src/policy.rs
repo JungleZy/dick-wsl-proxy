@@ -28,10 +28,74 @@ pub(crate) struct Config {
     health_domain: String,
     #[serde(default)]
     allow_loopback_residential: bool,
+    // Forwarding limits. Defaults are not written, so a profile that keeps
+    // them stays readable by builds that predate these fields.
+    #[serde(
+        default = "default_max_tcp",
+        skip_serializing_if = "is_default_max_tcp"
+    )]
+    max_tcp_connections: u32,
+    #[serde(
+        default = "default_tcp_idle",
+        skip_serializing_if = "is_default_tcp_idle"
+    )]
+    tcp_idle_timeout_seconds: u64,
+    #[serde(
+        default = "default_half_close",
+        skip_serializing_if = "is_default_half_close"
+    )]
+    tcp_half_close_timeout_seconds: u64,
 }
 
 fn default_health_domain() -> String {
     "ippure.com".into()
+}
+
+const DEFAULT_MAX_TCP: u32 = 256;
+const DEFAULT_TCP_IDLE_SECONDS: u64 = 30 * 60;
+const DEFAULT_HALF_CLOSE_SECONDS: u64 = 60;
+const MAX_TCP_RANGE: std::ops::RangeInclusive<u32> = 16..=1024;
+const TCP_IDLE_RANGE: std::ops::RangeInclusive<u64> = 30..=86_400;
+const HALF_CLOSE_RANGE: std::ops::RangeInclusive<u64> = 5..=3_600;
+
+fn default_max_tcp() -> u32 {
+    DEFAULT_MAX_TCP
+}
+fn is_default_max_tcp(value: &u32) -> bool {
+    *value == DEFAULT_MAX_TCP
+}
+fn default_tcp_idle() -> u64 {
+    DEFAULT_TCP_IDLE_SECONDS
+}
+fn is_default_tcp_idle(value: &u64) -> bool {
+    *value == DEFAULT_TCP_IDLE_SECONDS
+}
+fn default_half_close() -> u64 {
+    DEFAULT_HALF_CLOSE_SECONDS
+}
+fn is_default_half_close(value: &u64) -> bool {
+    *value == DEFAULT_HALF_CLOSE_SECONDS
+}
+
+/// TCP forwarding limits, fixed for the life of one takeover.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Limits {
+    /// Concurrent guest TCP connections, DNS over TCP included.
+    pub(crate) max_tcp: usize,
+    /// A connection without traffic in either direction for this long is closed.
+    pub(crate) tcp_idle: Duration,
+    /// After one side ends, the other may stay quiet this long.
+    pub(crate) half_close: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_tcp: DEFAULT_MAX_TCP as usize,
+            tcp_idle: Duration::from_secs(DEFAULT_TCP_IDLE_SECONDS),
+            half_close: Duration::from_secs(DEFAULT_HALF_CLOSE_SECONDS),
+        }
+    }
 }
 
 impl Config {
@@ -57,6 +121,7 @@ pub struct Policy {
     direct_domains: Vec<String>,
     direct_suffixes: Vec<String>,
     health_domain: String,
+    limits: Limits,
 }
 
 /// A nested SOCKS5 UDP relay. The first-hop relay carries an inner SOCKS5
@@ -315,7 +380,12 @@ impl Policy {
             direct_domains: config.direct_domains,
             direct_suffixes: config.direct_suffixes,
             health_domain: config.health_domain,
+            limits: config.limits,
         })
+    }
+
+    pub(crate) fn limits(&self) -> Limits {
+        self.limits
     }
 
     pub(crate) fn public_summary(&self) -> serde_json::Value {
@@ -571,6 +641,7 @@ pub(crate) struct Validated {
     direct_suffixes: Vec<String>,
     health_domain: String,
     allow_loopback_residential: bool,
+    limits: Limits,
 }
 
 impl Validated {
@@ -594,6 +665,20 @@ impl Validated {
             .iter()
             .map(|entry| network(entry))
             .collect::<Result<_, _>>()?;
+        if !MAX_TCP_RANGE.contains(&config.max_tcp_connections) {
+            return Err("max_tcp_connections must be between 16 and 1024".into());
+        }
+        if !TCP_IDLE_RANGE.contains(&config.tcp_idle_timeout_seconds) {
+            return Err("tcp_idle_timeout_seconds must be between 30 and 86400".into());
+        }
+        if !HALF_CLOSE_RANGE.contains(&config.tcp_half_close_timeout_seconds) {
+            return Err("tcp_half_close_timeout_seconds must be between 5 and 3600".into());
+        }
+        let limits = Limits {
+            max_tcp: config.max_tcp_connections as usize,
+            tcp_idle: Duration::from_secs(config.tcp_idle_timeout_seconds),
+            half_close: Duration::from_secs(config.tcp_half_close_timeout_seconds),
+        };
         Ok(Self {
             first_hop,
             credential: config.credential,
@@ -612,6 +697,7 @@ impl Validated {
                 .collect::<Result<_, _>>()?,
             health_domain: normalize_domain(config.health_domain)?,
             allow_loopback_residential: config.allow_loopback_residential,
+            limits,
         })
     }
 }
@@ -908,6 +994,49 @@ mod tests {
             direct_suffixes: vec!["suffix.example".into()],
             allow_loopback_residential: true,
             health_domain: default_health_domain(),
+            max_tcp_connections: default_max_tcp(),
+            tcp_idle_timeout_seconds: default_tcp_idle(),
+            tcp_half_close_timeout_seconds: default_half_close(),
+        }
+    }
+
+    #[test]
+    fn forwarding_limits_default_stay_unwritten_and_reject_out_of_range_values() {
+        let first_hop = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7892);
+        let defaults = config(first_hop);
+        let written = serde_json::to_value(&defaults).unwrap();
+        for key in [
+            "max_tcp_connections",
+            "tcp_idle_timeout_seconds",
+            "tcp_half_close_timeout_seconds",
+        ] {
+            assert!(written.get(key).is_none(), "{key}");
+        }
+        assert_eq!(
+            Validated::new(defaults.clone()).unwrap().limits,
+            Limits::default()
+        );
+        let mut custom = defaults.clone();
+        custom.max_tcp_connections = 512;
+        custom.tcp_idle_timeout_seconds = 3600;
+        custom.tcp_half_close_timeout_seconds = 30;
+        let written = serde_json::to_value(&custom).unwrap();
+        assert_eq!(written["max_tcp_connections"], 512);
+        let limits = Validated::new(custom).unwrap().limits;
+        assert_eq!(limits.max_tcp, 512);
+        assert_eq!(limits.tcp_idle, Duration::from_secs(3600));
+        assert_eq!(limits.half_close, Duration::from_secs(30));
+        for (max_tcp, idle, half_close) in [
+            (15, 1800, 60),
+            (1025, 1800, 60),
+            (256, 29, 60),
+            (256, 1800, 4),
+        ] {
+            let mut invalid = defaults.clone();
+            invalid.max_tcp_connections = max_tcp;
+            invalid.tcp_idle_timeout_seconds = idle;
+            invalid.tcp_half_close_timeout_seconds = half_close;
+            assert!(Validated::new(invalid).is_err());
         }
     }
 

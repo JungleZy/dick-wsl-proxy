@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, hash_map::Entry};
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -11,11 +11,23 @@ const MAX_RECORDS: usize = 128;
 const MAX_ALIASES: usize = 16_384;
 const MAX_TTL: u32 = 300;
 const IO_DEADLINE: Duration = Duration::from_secs(10);
+/// A kept connection that a hop dropped without closing it would otherwise
+/// hold the query for the whole I/O deadline before the fresh retry; guest
+/// resolvers give up after about five seconds.
+const REUSED_IO_DEADLINE: Duration = Duration::from_secs(4);
+/// An idle DoH connection is reused only this long; upstreams and proxy hops
+/// close quiet keep-alives on their own schedule.
+const UPSTREAM_IDLE: Duration = Duration::from_secs(30);
+const MAX_IDLE_UPSTREAMS: usize = 4;
+/// Queries per connection before a fresh chain is built.
+const MAX_UPSTREAM_USES: u32 = 100;
 const ALIAS_START: u32 = u32::from_be_bytes([198, 18, 0, 1]);
 const ALIAS_SPACE: u32 = 131_070;
 const ALIAS_BLOCK: u32 = 32;
 mod http;
-use http::{DeadlineStream, read_http};
+#[cfg(test)]
+use http::read_http;
+use http::{DeadlineStream, post_query};
 mod wire;
 use wire::{Message, finish_answer, reserved};
 mod ledger;
@@ -35,6 +47,46 @@ pub struct ManagedDns {
     tls: TlsConnector,
     aliases: Mutex<Aliases>,
     probe: Mutex<Probe>,
+    upstreams: IdlePool<Upstream>,
+}
+
+/// One verified DoH connection over the proxy chain, kept for the next query.
+struct Upstream {
+    reader: BufReader<native_tls::TlsStream<DeadlineStream>>,
+    uses: u32,
+}
+
+/// Idle connections, most recent last. Expired ones are dropped on every use.
+struct IdlePool<T> {
+    idle: Mutex<Vec<(T, Instant)>>,
+}
+
+impl<T> IdlePool<T> {
+    fn new() -> Self {
+        Self {
+            idle: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn take(&self, now: Instant) -> Option<T> {
+        let mut idle = self
+            .idle
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        idle.retain(|(_, since)| now.saturating_duration_since(*since) < UPSTREAM_IDLE);
+        idle.pop().map(|(item, _)| item)
+    }
+
+    fn put(&self, item: T, now: Instant) {
+        let mut idle = self
+            .idle
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        idle.retain(|(_, since)| now.saturating_duration_since(*since) < UPSTREAM_IDLE);
+        if idle.len() < MAX_IDLE_UPSTREAMS {
+            idle.push((item, now));
+        }
+    }
 }
 
 #[derive(Default)]
@@ -71,6 +123,7 @@ impl ManagedDns {
             tls,
             aliases: Mutex::new(Aliases::default()),
             probe: Mutex::new(Probe::default()),
+            upstreams: IdlePool::new(),
         })
     }
 
@@ -143,6 +196,17 @@ impl ManagedDns {
     }
 
     fn exchange(&self, wire: &[u8]) -> Result<Vec<u8>, String> {
+        if let Some(upstream) = self.upstreams.take(Instant::now())
+            && let Ok(answer) = self.exchange_on(upstream, wire, REUSED_IO_DEADLINE)
+        {
+            return Ok(answer);
+        }
+        // No idle connection, or the upstream or a proxy hop closed it while it
+        // was idle. A DNS query is idempotent: send it once more on a fresh chain.
+        self.exchange_on(self.connect_upstream()?, wire, IO_DEADLINE)
+    }
+
+    fn connect_upstream(&self) -> Result<Upstream, String> {
         let socket = self.policy.chain(self.policy.dns_upstream())?;
         let stream = DeadlineStream {
             socket,
@@ -150,20 +214,34 @@ impl ManagedDns {
         };
         // This is a preconnected literal-address chain stream. The DNS hostname
         // is used only for SNI, certificate verification, and the HTTP Host field.
-        let mut tls = self
+        let tls = self
             .tls
             .connect(self.policy.dns_tls_name(), stream)
             .map_err(|_| "DNS TLS verification/handshake failed".to_string())?;
-        let request = format!(
-            "POST /dns-query HTTP/1.1\r\nHost: {}\r\nAccept: application/dns-message\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            self.policy.dns_tls_name(),
-            wire.len()
-        );
-        tls.write_all(request.as_bytes())
-            .and_then(|_| tls.write_all(wire))
-            .and_then(|_| tls.flush())
-            .map_err(|e| format!("write DNS HTTPS request: {e}"))?;
-        read_http(&mut BufReader::new(tls))
+        Ok(Upstream {
+            reader: BufReader::new(tls),
+            uses: 0,
+        })
+    }
+
+    fn exchange_on(
+        &self,
+        mut upstream: Upstream,
+        wire: &[u8],
+        budget: Duration,
+    ) -> Result<Vec<u8>, String> {
+        // Each query gets its own I/O budget, also on a connection kept from earlier.
+        upstream.reader.get_mut().get_mut().deadline = Instant::now() + budget;
+        let response = post_query(&mut upstream.reader, self.policy.dns_tls_name(), wire)?;
+        upstream.uses += 1;
+        // Reuse only an exactly framed HTTP/1.1 exchange with nothing left over.
+        if response.keep_alive
+            && upstream.reader.buffer().is_empty()
+            && upstream.uses < MAX_UPSTREAM_USES
+        {
+            self.upstreams.put(upstream, Instant::now());
+        }
+        Ok(response.body)
     }
 }
 

@@ -24,6 +24,15 @@ def json_bytes(value):
     return (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode()
 
 
+def read_json(path):
+    """UTF-8 (with or without BOM) or UTF-16 as written by PowerShell 5.1 redirection,
+    never the locale code page (cp936 on Chinese Windows)."""
+    data = Path(path).read_bytes()
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return json.loads(data.decode("utf-16"))
+    return json.loads(data.decode("utf-8-sig"))
+
+
 def require(condition, message):
     if not condition:
         raise ValueError(message)
@@ -85,14 +94,14 @@ def assemble(args):
     require(not args.qa_vintage or args.version == "0.1.0", "Vintage fixture only supports 0.1.0")
     lock_bytes = (ROOT / "Cargo.lock").read_bytes()
     lock = tomllib.loads(lock_bytes.decode())
-    record = json.loads(args.build_record.read_text())
-    metadata = json.loads(args.cargo_metadata.read_text())
+    record = read_json(args.build_record)
+    metadata = read_json(args.cargo_metadata)
     require(record.get("schema_version") == 1, "Unsupported build record")
     require(record.get("version") == args.version and record.get("target") == TARGET, "Build record version/target mismatch")
     require(record.get("cargo_lock_sha256") == digest(lock_bytes), "Build record lock mismatch")
     require(metadata.get("resolve") is not None, "Cargo metadata requires resolved graph")
     if not args.qa_vintage:
-        source = tomllib.loads((ROOT / "Cargo.toml").read_text())
+        source = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
         require(source["workspace"]["package"]["version"] == args.version, "Source workspace version mismatch")
         for p in metadata["packages"]:
             if p["id"] in metadata["workspace_members"]:

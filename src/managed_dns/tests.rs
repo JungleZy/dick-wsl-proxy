@@ -3,7 +3,7 @@ use super::ledger::read_alias_highwater;
 use super::wire::{a_address, put_name, word};
 use super::*;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::thread;
@@ -290,7 +290,7 @@ fn https_requires_dns_content_type_and_unambiguous_bounded_framing() {
     )
     .into_bytes();
     http.extend_from_slice(&body);
-    assert_eq!(read_http(&mut io::Cursor::new(http)).unwrap(), body);
+    assert_eq!(read_http(&mut io::Cursor::new(http)).unwrap().body, body);
     assert!(read_http(&mut io::Cursor::new(b"HTTP/1.1 503 Error\r\n\r\n")).is_err());
     assert!(
         read_http(&mut io::Cursor::new(
@@ -299,6 +299,93 @@ fn https_requires_dns_content_type_and_unambiguous_bounded_framing() {
         .is_err()
     );
     assert!(read_http(&mut io::Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: 999999\r\n\r\n")).is_err());
+}
+
+#[test]
+fn only_an_http11_response_without_close_keeps_the_connection() {
+    let body = query("test.example");
+    let reply = |status: &str, extra: &str| {
+        let mut http = format!(
+            "{status}\r\nContent-Type: application/dns-message\r\n{extra}Content-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        http.extend_from_slice(&body);
+        read_http(&mut io::Cursor::new(http)).unwrap().keep_alive
+    };
+    assert!(reply("HTTP/1.1 200 OK", ""));
+    assert!(reply("HTTP/1.1 200 OK", "Connection: keep-alive\r\n"));
+    assert!(!reply("HTTP/1.1 200 OK", "Connection: close\r\n"));
+    assert!(!reply(
+        "HTTP/1.1 200 OK",
+        "Connection: Keep-Alive, Close\r\n"
+    ));
+    assert!(!reply("HTTP/1.0 200 OK", ""));
+}
+
+#[test]
+fn one_connection_carries_consecutive_queries_with_exact_framing() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let first = query("one.example");
+    let second = query("two.example");
+    let answers = [first.clone(), second.clone()];
+    let server = thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut reader = io::BufReader::new(socket);
+        for answer in answers {
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.strip_prefix("Content-Length: ") {
+                    length = value.trim().parse().unwrap();
+                }
+                assert!(!line.to_ascii_lowercase().starts_with("connection: close"));
+            }
+            let mut request = vec![0; length];
+            reader.read_exact(&mut request).unwrap();
+            let mut reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\n\r\n",
+                answer.len()
+            )
+            .into_bytes();
+            reply.extend_from_slice(&answer);
+            reader.get_mut().write_all(&reply).unwrap();
+        }
+    });
+    let socket = TcpStream::connect(address).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut reader = io::BufReader::new(socket);
+    for expected in [first, second] {
+        let response = super::http::post_query(&mut reader, "dns.example", &expected).unwrap();
+        assert_eq!(response.body, expected);
+        assert!(response.keep_alive);
+        assert!(reader.buffer().is_empty());
+    }
+    server.join().unwrap();
+}
+
+#[test]
+fn idle_upstreams_expire_and_stay_bounded() {
+    let pool = IdlePool::new();
+    let start = Instant::now();
+    assert_eq!(pool.take(start), None);
+    for index in 0..MAX_IDLE_UPSTREAMS + 2 {
+        pool.put(index, start);
+    }
+    // The newest kept connection comes back first; extras beyond the cap were dropped.
+    assert_eq!(pool.take(start), Some(MAX_IDLE_UPSTREAMS - 1));
+    pool.put(99, start);
+    assert_eq!(pool.take(start + UPSTREAM_IDLE), None);
 }
 
 #[test]
@@ -419,7 +506,7 @@ fn durable_alias_exhaustion_is_atomic_and_never_resets() {
 }
 
 #[test]
-fn explicit_idle_reset_removes_the_ledger_but_preserves_uncertain_commits() {
+fn explicit_idle_reset_removes_the_ledger_including_an_uncertain_commit() {
     let owner = AliasLedger::default();
     let path = owner.path.as_ref().unwrap().clone();
     write_highwater(&path, ALIAS_BLOCK);
@@ -428,11 +515,25 @@ fn explicit_idle_reset_removes_the_ledger_but_preserves_uncertain_commits() {
     assert!(!path.exists());
     assert!(!path.with_extension("map").exists());
 
+    // An uncertain commit still blocks allocation; the confirmed reset clears it.
     write_highwater(&path, ALIAS_BLOCK);
     fs::write(path.with_extension("pending"), b"uncertain").unwrap();
+    assert!(AliasLedger::at(path.clone()).allocate(1).is_err());
+    AliasLedger::reset_at(&path).unwrap();
+    assert!(!path.exists());
+    assert!(!path.with_extension("pending").exists());
+    assert!(AliasLedger::at(path.clone()).allocate(1).is_ok());
+
+    // A pending commit that is not a regular file is never deleted.
+    write_highwater(&path, ALIAS_BLOCK);
+    fs::create_dir(path.with_extension("pending")).unwrap();
     assert!(AliasLedger::reset_at(&path).is_err());
-    assert!(path.exists());
-    assert!(path.with_extension("pending").exists());
+    assert!(path.with_extension("pending").is_dir());
+    assert!(
+        path.exists(),
+        "nothing is deleted when one entry is foreign"
+    );
+    fs::remove_dir(path.with_extension("pending")).unwrap();
 }
 
 #[test]

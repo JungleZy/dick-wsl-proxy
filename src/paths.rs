@@ -1,13 +1,36 @@
-//! Per-user state directory, shared so the controller and the desktop client
-//! always agree on where state files such as environment progress live.
+//! Where the controller and the desktop client keep their files. Both resolve
+//! through this module so they always agree on the same location.
 use std::path::PathBuf;
 
+/// Per-user account state: the controller lock, the takeover recovery records
+/// and the DNS alias ledger. These guard one controller per Windows account
+/// and must outlive any single program folder, so they stay in
 /// `<LocalAppData>\WSLProxyLab`, resolved through the OS known-folder API,
 /// never through the `LOCALAPPDATA` environment variable.
 pub fn state_dir() -> Result<PathBuf, String> {
     #[cfg(windows)]
     {
         Ok(windows::local_app_data()?.join("WSLProxyLab"))
+    }
+    #[cfg(not(windows))]
+    {
+        Err("unsupported_platform: Windows host required".into())
+    }
+}
+
+/// Runtime data the program produces (the desktop store, environment progress,
+/// diagnostics exports and scratch files) lives in the directory of the running
+/// EXE. The two EXEs always ship side by side, so the controller and the
+/// desktop resolve the same directory.
+pub fn data_dir() -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    {
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("data_directory_unavailable:{error}"))?;
+        executable
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .ok_or_else(|| "data_directory_unavailable: executable has no parent".into())
     }
     #[cfg(not(windows))]
     {

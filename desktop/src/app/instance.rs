@@ -21,6 +21,8 @@ pub(crate) fn acquire() -> Option<Guard> {
     }
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         unsafe { CloseHandle(handle) };
+        // Bring the running window forward rather than exiting silently.
+        super::tray::activate_running_instance();
         None
     } else {
         Some(Guard(handle))

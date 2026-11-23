@@ -23,12 +23,37 @@ pub enum LockError {
 
 #[cfg(windows)]
 pub use windows::{
-    acquire, distributions, guest_script, guest_script_with_timeout, ipv6_scope_id, state_dir,
-    wsl_command, wsl_executable,
+    acquire, data_dir, distributions, guest_script, guest_script_with_timeout, ipv6_scope_id,
+    state_dir, wsl_command, wsl_executable,
 };
+
+/// Registered names of the distributions WSL reports as running. Listing does
+/// not start a stopped distribution.
+pub fn running_distributions() -> Result<Vec<String>, String> {
+    let output = wsl_command(
+        &["--list".into(), "--running".into(), "--quiet".into()],
+        None,
+        std::time::Duration::from_secs(10),
+    )?;
+    Ok(parse_running(&output))
+}
+
+fn parse_running(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(|line| line.trim().trim_start_matches('\u{feff}').trim())
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
 
 #[cfg(not(windows))]
 pub fn state_dir() -> Result<std::path::PathBuf, String> {
+    Err("unsupported_platform: Windows host required".into())
+}
+
+#[cfg(not(windows))]
+pub fn data_dir() -> Result<std::path::PathBuf, String> {
     Err("unsupported_platform: Windows host required".into())
 }
 
@@ -201,7 +226,7 @@ mod windows {
             FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE,
         };
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = state_dir().map_err(io::Error::other)?;
+        let dir = data_dir().map_err(io::Error::other)?;
         let path = dir.join(format!(
             "io-{}-{}.tmp",
             std::process::id(),
@@ -213,7 +238,15 @@ mod windows {
             .create_new(true)
             .attributes(FILE_ATTRIBUTE_TEMPORARY)
             .custom_flags(FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)
+            .open(&path)
+            // Runtime files live beside the EXE; name the folder so a read-only
+            // install location is recognisable from the error alone.
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("scratch_file_failed:{}:{error}", dir.display()),
+                )
+            })
     }
 
     fn capture(mut file: File) -> Result<String, String> {
@@ -337,6 +370,10 @@ mod windows {
         wsl_proxyctl::paths::state_dir()
     }
 
+    pub fn data_dir() -> Result<PathBuf, String> {
+        wsl_proxyctl::paths::data_dir()
+    }
+
     pub fn ipv6_scope_id(address: std::net::Ipv6Addr) -> Result<Option<u32>, String> {
         use windows_sys::Win32::NetworkManagement::IpHelper::GetBestInterfaceEx;
         use windows_sys::Win32::Networking::WinSock::{
@@ -404,6 +441,15 @@ mod windows {
 #[cfg(test)]
 mod tests {
     use super::valid_distribution_id;
+
+    #[test]
+    fn running_list_is_one_registered_name_per_line() {
+        assert_eq!(
+            super::parse_running("\u{feff}Target\r\n  Other Name \r\n\r\n"),
+            vec!["Target".to_string(), "Other Name".to_string()]
+        );
+        assert!(super::parse_running("").is_empty());
+    }
 
     #[test]
     fn accepts_only_registry_guid_ids() {

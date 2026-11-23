@@ -11,7 +11,8 @@ use super::{ALIAS_BLOCK, ALIAS_SPACE, ALIAS_START};
 /// ledger contains a version marker and an allocated-address count. The
 /// digest map contains no domain names or real IP addresses, only stable
 /// name/IP digests and their reserved aliases. A leftover pending file is an
-/// uncertain commit, never permission to reset.
+/// uncertain commit: it forbids every allocation. Only the explicit, confirmed
+/// idle reset discards it, together with the whole ledger.
 const MAP_MAGIC: &[u8; 4] = b"WDM1";
 const MAP_RECORD_BYTES: usize = 36;
 const MAX_MAP_BYTES: usize = 4 + MAP_RECORD_BYTES * ALIAS_SPACE as usize;
@@ -251,18 +252,17 @@ impl AliasLedger {
         Self::reset_paths(highwater, &mapping, &pending)
     }
 
+    /// Removes the ledger. The pending commit goes last: until it is gone, a
+    /// crash midway still leaves a ledger that refuses every allocation.
     fn reset_paths(highwater: &Path, mapping: &Path, pending: &Path) -> Result<(), String> {
-        match fs::symlink_metadata(pending) {
-            Ok(_) => {
-                return Err(
-                    "DNS alias ledger has an uncertain pending commit; manual recovery required"
-                        .into(),
-                );
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("inspect DNS alias pending commit: {error}")),
-        }
-        for (path, label) in [(highwater, "high-water"), (mapping, "mapping")] {
+        let files = [
+            (highwater, "high-water"),
+            (mapping, "mapping"),
+            (pending, "pending commit"),
+        ];
+        // Check all three before deleting any, so a foreign entry changes nothing.
+        let mut present = Vec::with_capacity(files.len());
+        for (path, label) in files {
             let metadata = match fs::symlink_metadata(path) {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -281,6 +281,9 @@ impl AliasLedger {
             if !metadata.is_file() {
                 return Err(format!("DNS alias {label} is not a regular file"));
             }
+            present.push((path, label));
+        }
+        for (path, label) in present {
             fs::remove_file(path).map_err(|error| format!("remove DNS alias {label}: {error}"))?;
         }
         Ok(())

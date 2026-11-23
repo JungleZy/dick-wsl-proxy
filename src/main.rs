@@ -18,7 +18,11 @@ mod query_bridge;
 mod transition;
 
 use std::io::{self, BufRead};
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use command::{Command, Failure};
@@ -26,6 +30,99 @@ use command::{Command, Failure};
 /// Finished flows waiting for the connection recorder. A takeover stop ends up to 256
 /// active rows at once; beyond this many queued rows, new ones are counted and dropped.
 const CONNECTION_QUEUE: usize = 8192;
+
+/// How often a serving process re-checks that the live target still carries
+/// this takeover's rules. Detection, not prevention: traffic from a restarted
+/// target can leave unprotected until the next check.
+const PROTECTION_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+fn owned(controller: &Mutex<controller::Controller>) -> MutexGuard<'_, controller::Controller> {
+    controller
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Runs `Controller::watch_protection` about every 30 seconds. It never waits
+/// behind a command in flight: a busy round is retried a second later.
+struct ProtectionWatch {
+    stop: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProtectionWatch {
+    fn spawn(controller: Arc<Mutex<controller::Controller>>, store: Option<PathBuf>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let worker = std::thread::Builder::new()
+            .name("protection-watch".into())
+            .spawn(move || {
+                let mut next = Instant::now() + PROTECTION_CHECK_INTERVAL;
+                while !stopping.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_secs(1));
+                    if Instant::now() < next {
+                        continue;
+                    }
+                    let mut guard = match controller.try_lock() {
+                        Ok(guard) => guard,
+                        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                        Err(TryLockError::WouldBlock) => continue,
+                    };
+                    let lost = guard.watch_protection();
+                    let target = guard
+                        .live
+                        .as_ref()
+                        .map(|(plan, _)| plan.target.name.clone());
+                    drop(guard);
+                    next = Instant::now() + PROTECTION_CHECK_INTERVAL;
+                    if let (Some(reason), Some(path)) = (lost, &store) {
+                        let _ = desktop_store::append_runtime_log(
+                            path,
+                            "error",
+                            "protection",
+                            &protection_lost_message(&reason),
+                            Some("recovery_required"),
+                            target.as_deref(),
+                            None,
+                        );
+                    }
+                }
+            })
+            .ok();
+        Self { stop, worker }
+    }
+}
+
+/// The operator-facing log line for a `protection_lost: <kind>: ...` reason.
+fn protection_lost_message(reason: &str) -> String {
+    let mut parts = reason.splitn(3, ": ");
+    let _ = parts.next();
+    let kind = parts.next().unwrap_or_default();
+    let detail = parts.next().unwrap_or_default();
+    let cause = match kind {
+        "restarted" => "目标发行版或 WSL 重启过，本次接管的规则已不再生效".to_owned(),
+        "rules_incomplete" | "rules_missing" => {
+            "目标发行版里本次接管的规则已缺失或不完整".to_owned()
+        }
+        "target_unregistered" => {
+            return "目标发行版已被注销，无法再停止或清理它。请在概览页点「放弃本次记录」，并在下次启动接管前执行一次 wsl --shutdown。".into();
+        }
+        "environment_changed" => format!(
+            "目标发行版的环境变了（{}），无法再确认本次接管覆盖它的全部流量",
+            detail.split(':').next().unwrap_or(detail)
+        ),
+        _ => "无法再确认本次接管仍然有效".to_owned(),
+    };
+    format!("{cause}，它的新连接可能已不经代理。请停止接管并恢复，再重新启动接管。")
+}
+
+impl Drop for ProtectionWatch {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -80,7 +177,7 @@ fn run(command: Command) -> Result<u8, Failure> {
         ),
         host::LockError::Other(s) => Failure::new("lock_failed", s),
     })?;
-    let mut controller = controller::Controller::default();
+    let controller = Arc::new(Mutex::new(controller::Controller::default()));
     if matches!(command, Command::Maintenance) {
         // Do not start WSL, try recovery or even consult a live guest. A journal or pending
         // transition is sufficient reason to refuse. _lock stays alive across the handshake.
@@ -127,13 +224,16 @@ fn run(command: Command) -> Result<u8, Failure> {
         }
         // Every takeover served by this daemon keeps its finished connections in the
         // desktop store. Without a recorder, forwarding behaves exactly as before.
-        let recorder = store.and_then(|path| {
+        let recorder = store.clone().and_then(|path| {
             let (sink, events) = ingress::FlowSink::new(CONNECTION_QUEUE);
             desktop_store::spawn_connection_recorder(path, events).ok()?;
             ingress::install_flow_sink(sink.clone());
             Some(sink)
         });
-        let served = wsl_proxyctl::ipc::serve(|req| desktop_control::handle(req, &mut controller));
+        let watch = ProtectionWatch::spawn(Arc::clone(&controller), store);
+        let served =
+            wsl_proxyctl::ipc::serve(|req| desktop_control::handle(req, &mut owned(&controller)));
+        drop(watch);
         if let Some(sink) = &recorder {
             // shutdown_daemon is accepted only when idle, so every flow has already ended
             // and been queued; wait for the last batch before the process exits.
@@ -143,23 +243,42 @@ fn run(command: Command) -> Result<u8, Failure> {
         return Ok(0);
     }
     if matches!(command, Command::Session) {
-        command::dispatch(Command::Status, &mut controller)?;
+        command::dispatch(Command::Status, &mut owned(&controller))?;
     } else {
         let foreground = matches!(command, Command::Start { .. } | Command::StartScoped { .. });
-        let rc = command::dispatch(command, &mut controller)?;
+        let rc = command::dispatch(command, &mut owned(&controller))?;
         if !foreground || rc != 0 {
             return Ok(rc);
         }
     }
+    let watch = ProtectionWatch::spawn(Arc::clone(&controller), None);
     for line in io::stdin().lock().lines() {
-        let line = line.map_err(|e| Failure::new("input_failed", e.to_string()))?;
+        // A broken input or output stream must still reach the stop below,
+        // exactly like EOF. One undecodable line is reported and reading goes on.
+        let line = match line {
+            Ok(line) => line,
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                if command::emit(&Failure::new("invalid_request", error.to_string())).is_err() {
+                    break;
+                }
+                continue;
+            }
+            Err(error) => {
+                let _ = command::emit(&Failure::new("input_failed", error.to_string()));
+                break;
+            }
+        };
         let result = serde_json::from_str(&line)
             .map_err(|e| Failure::new("invalid_request", e.to_string()))
-            .and_then(|req| command::dispatch(req, &mut controller));
-        if let Err(e) = result {
-            command::emit(&e)?;
+            .and_then(|req| command::dispatch(req, &mut owned(&controller)));
+        if let Err(e) = result
+            && command::emit(&e).is_err()
+        {
+            break;
         }
     }
+    drop(watch);
+    let mut controller = owned(&controller);
     if controller.live.is_some() {
         controller
             .stop()

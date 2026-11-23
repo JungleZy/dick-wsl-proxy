@@ -464,17 +464,23 @@ fn distro_view(distro: &Distro, features: Value) -> Value {
     })
 }
 
-/// Undo a failed `create`. `create` refused an existing name and an existing
-/// destination, so a distribution registered under `name` and the destination
-/// directory both came from this request. Only an empty directory is removed.
-fn rollback_create(name: &str, destination: &Path, failure: String) -> String {
+/// Undo a failed `create`. The download and setup take many minutes, so another
+/// tool may have registered the same name meanwhile. Unregister only an entry
+/// whose ID did not exist before this request and whose storage is this
+/// request's destination; anything else is left alone and reported. Only an
+/// empty directory is removed.
+fn rollback_create(name: &str, destination: &Path, before: &[String], failure: String) -> String {
     let unregistered = match registered_distribution(name) {
-        Ok(Some(distro)) => host::wsl_command(
+        Ok(Some(distro)) if created_by_request(&distro, before, destination) => host::wsl_command(
             &["--unregister".into(), distro.name.clone()],
             None,
             IMPORT_DEADLINE,
         )
         .map(|_| ()),
+        Ok(Some(distro)) => Err(format!(
+            "environment_rollback_refused:{} was not created by this request",
+            distro.name
+        )),
         Ok(None) => Ok(()),
         Err(error) => Err(error),
     };
@@ -483,6 +489,32 @@ fn rollback_create(name: &str, destination: &Path, failure: String) -> String {
         Ok(()) => format!("{failure};environment_import_rolled_back"),
         Err(cleanup_error) => format!("{failure};environment_cleanup_failed:{cleanup_error}"),
     }
+}
+
+/// `create` refused an existing destination, so storage at or under it can
+/// only come from this request (WSL may keep the disk in a subdirectory).
+fn created_by_request(distro: &Distro, before: &[String], destination: &Path) -> bool {
+    !before.iter().any(|id| id.eq_ignore_ascii_case(&distro.id))
+        && within_windows_path(&distro.base_path, &destination.to_string_lossy())
+}
+
+/// Registry paths may carry the `\\?\` prefix, forward slashes or a trailing
+/// separator; letter case is not significant on Windows.
+fn within_windows_path(path: &str, directory: &str) -> bool {
+    let normal = |path: &str| {
+        let path = path
+            .strip_prefix(r"\\?\")
+            .unwrap_or(path)
+            .replace('/', "\\");
+        path.trim_end_matches('\\').to_lowercase()
+    };
+    let (path, directory) = (normal(path), normal(directory));
+    !path.is_empty()
+        && !directory.is_empty()
+        && (path == directory
+            || path
+                .strip_prefix(&directory)
+                .is_some_and(|rest| rest.starts_with('\\')))
 }
 
 fn registered_distribution(key: &str) -> Result<Option<Distro>, String> {
@@ -497,7 +529,7 @@ fn registered_distribution(key: &str) -> Result<Option<Distro>, String> {
 }
 
 fn write_progress(name: &str, phase: &str, percent: u8, stage: &str, detail: &str) {
-    let Ok(directory) = host::state_dir() else {
+    let Ok(directory) = host::data_dir() else {
         return;
     };
     if fs::create_dir_all(&directory).is_err() {
@@ -518,7 +550,7 @@ fn write_progress(name: &str, phase: &str, percent: u8, stage: &str, detail: &st
 }
 
 fn clear_progress(name: &str) {
-    if let Ok(directory) = host::state_dir() {
+    if let Ok(directory) = host::data_dir() {
         let _ = fs::remove_file(directory.join(format!("environment-progress-{name}.json")));
         let _ = fs::remove_file(directory.join(format!("environment-progress-{name}.tmp")));
     }
@@ -594,12 +626,14 @@ pub(crate) fn create(
     if !valid_password(password) {
         return Err("environment_password_invalid".into());
     }
-    if host::distributions()?
+    let registered = host::distributions()?;
+    if registered
         .iter()
         .any(|distro| distro.name.eq_ignore_ascii_case(name))
     {
         return Err("environment_name_exists".into());
     }
+    let before: Vec<String> = registered.into_iter().map(|distro| distro.id).collect();
     let base_directory = absolute_path(install_dir, "environment_install_dir")?;
     let destination = if base_directory
         .file_name()
@@ -621,7 +655,7 @@ pub(crate) fn create(
     );
     let result = (|| {
         if let Err(error) = install_online_distribution(name, distribution, &destination) {
-            return Err(rollback_create(name, &destination, error));
+            return Err(rollback_create(name, &destination, &before, error));
         }
         write_progress(
             name,
@@ -634,14 +668,14 @@ pub(crate) fn create(
             Ok(distro) => distro,
             Err(error) => {
                 let failure = format!("environment_setup_failed:{error}");
-                return Err(rollback_create(name, &destination, failure));
+                return Err(rollback_create(name, &destination, &before, failure));
             }
         };
         if let Err(error) =
             host::guest_script_with_timeout(&distro, &setup_script(options), CONFIGURE_DEADLINE)
         {
             let failure = format!("environment_setup_failed:{error}");
-            return Err(rollback_create(name, &destination, failure));
+            return Err(rollback_create(name, &destination, &before, failure));
         }
         // Applies the new [boot] systemd and [user] default; nothing else runs
         // in a distribution created moments ago.
@@ -664,10 +698,10 @@ pub(crate) fn create(
 }
 
 pub(crate) fn edit(key: &str, options: InstallOptions) -> Result<Value, String> {
-    if let Some(timezone) = options.timezone.as_deref() {
-        if !valid_timezone(timezone) {
-            return Err("environment_timezone_invalid".into());
-        }
+    if let Some(timezone) = options.timezone.as_deref()
+        && !valid_timezone(timezone)
+    {
+        return Err("environment_timezone_invalid".into());
     }
     let distro = locate(key)?;
     write_progress(
@@ -732,9 +766,58 @@ pub(crate) fn remove(key: &str) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        InstallOptions, absolute_path, inspect_script, setup_script, valid_distribution,
-        valid_name, valid_password, valid_timezone, valid_username,
+        InstallOptions, absolute_path, created_by_request, inspect_script, setup_script,
+        valid_distribution, valid_name, valid_password, valid_timezone, valid_username,
+        within_windows_path,
     };
+    use crate::host::Distro;
+    use std::path::Path;
+
+    #[test]
+    fn rollback_only_claims_a_new_registration_stored_at_this_destination() {
+        let distro = |id: &str, base_path: &str| Distro {
+            id: id.into(),
+            name: "Dev".into(),
+            base_path: base_path.into(),
+            version: 2,
+        };
+        let destination = Path::new(r"D:\WSL\Dev");
+        let before = vec!["{11111111-1111-1111-1111-111111111111}".to_string()];
+        let fresh = "{22222222-2222-2222-2222-222222222222}";
+        assert!(created_by_request(
+            &distro(fresh, r"\\?\d:\wsl\dev\"),
+            &before,
+            destination
+        ));
+        assert!(created_by_request(
+            &distro(fresh, "D:/WSL/Dev"),
+            &before,
+            destination
+        ));
+        // Registered before this request, or stored somewhere else: never ours.
+        assert!(!created_by_request(
+            &distro("{11111111-1111-1111-1111-111111111111}", r"D:\WSL\Dev"),
+            &before,
+            destination
+        ));
+        assert!(!created_by_request(
+            &distro(fresh, r"E:\Other\Dev"),
+            &before,
+            destination
+        ));
+        assert!(!created_by_request(
+            &distro(fresh, ""),
+            &before,
+            destination
+        ));
+        assert!(created_by_request(
+            &distro(fresh, r"D:\WSL\Dev\{22222222-2222-2222-2222-222222222222}"),
+            &before,
+            destination
+        ));
+        assert!(!within_windows_path(r"D:\WSL\Dev2", r"D:\WSL\Dev"));
+        assert!(!within_windows_path(r"D:\WSL", r"D:\WSL\Dev"));
+    }
 
     #[test]
     fn validates_wsl_names_without_shell_metacharacters() {

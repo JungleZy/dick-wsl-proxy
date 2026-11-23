@@ -181,3 +181,14 @@ fn requests_preserve_ipv6_scope_in_the_wire_endpoint() {
     let value: serde_json::Value = serde_json::to_value(query).unwrap();
     assert_eq!(value["lookups"][0]["peer"], "[2001:db8:1::2]:45000");
 }
+
+#[test]
+fn the_embedded_guest_helper_fits_the_bootstrap_limit_with_room_for_a_plan() {
+    // The query bridge sends kernel.py JSON-encoded together with the plan.
+    let kernel = serde_json::to_vec(include_str!("../guest/kernel.py")).unwrap();
+    assert!(
+        kernel.len() + 8 * 1024 < BOOTSTRAP_LIMIT,
+        "kernel.py encodes to {} bytes",
+        kernel.len()
+    );
+}

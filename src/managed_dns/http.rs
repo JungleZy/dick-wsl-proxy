@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
@@ -58,12 +58,38 @@ fn http_line(reader: &mut impl BufRead, budget: &mut usize) -> Result<String, St
     String::from_utf8(line).map_err(|_| "non-ASCII DNS HTTPS header".into())
 }
 
-pub(super) fn read_http(reader: &mut impl BufRead) -> Result<Vec<u8>, String> {
+pub(super) struct HttpResponse {
+    pub(super) body: Vec<u8>,
+    /// HTTP/1.1 without `Connection: close`: the connection may carry another query.
+    pub(super) keep_alive: bool,
+}
+
+/// Sends one DoH POST on an established stream and reads exactly its response.
+pub(super) fn post_query<S: Read + Write>(
+    reader: &mut BufReader<S>,
+    host: &str,
+    wire: &[u8],
+) -> Result<HttpResponse, String> {
+    let request = format!(
+        "POST /dns-query HTTP/1.1\r\nHost: {host}\r\nAccept: application/dns-message\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\n\r\n",
+        wire.len()
+    );
+    let stream = reader.get_mut();
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|_| stream.write_all(wire))
+        .and_then(|_| stream.flush())
+        .map_err(|e| format!("write DNS HTTPS request: {e}"))?;
+    read_http(reader)
+}
+
+pub(super) fn read_http(reader: &mut impl BufRead) -> Result<HttpResponse, String> {
     let mut budget = 16_384;
     let status = http_line(reader, &mut budget)?;
     if !status.starts_with("HTTP/1.1 200 ") && !status.starts_with("HTTP/1.0 200 ") {
         return Err("DNS HTTPS upstream did not return HTTP 200".into());
     }
+    let mut keep_alive = status.starts_with("HTTP/1.1 ");
     let mut length = None;
     let mut chunked = false;
     let mut content_type = false;
@@ -101,6 +127,13 @@ pub(super) fn read_http(reader: &mut impl BufRead) -> Result<Vec<u8>, String> {
             }
             "content-encoding" if !value.eq_ignore_ascii_case("identity") => {
                 return Err("compressed DNS HTTPS body is unsupported".into());
+            }
+            "connection"
+                if value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("close")) =>
+            {
+                keep_alive = false;
             }
             _ => {}
         }
@@ -151,5 +184,5 @@ pub(super) fn read_http(reader: &mut impl BufRead) -> Result<Vec<u8>, String> {
     if body.len() < 12 {
         return Err("short DNS HTTPS body".into());
     }
-    Ok(body)
+    Ok(HttpResponse { body, keep_alive })
 }

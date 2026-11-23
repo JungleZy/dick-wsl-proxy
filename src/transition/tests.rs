@@ -411,3 +411,29 @@ fn symlink_journal_and_directory_are_refused_without_following() {
     symlink(&dir.0, &directory_link).unwrap();
     assert!(load_at(&directory_link.join(FILE_NAME)).is_err());
 }
+
+#[test]
+fn abandon_clears_an_intent_at_any_stage_but_never_a_stale_one() {
+    let directory = TempDir::new();
+    let path = directory.journal();
+    let idle = load_at(&path).unwrap();
+    let releasing = begin_at(&path, &idle, Kind::Stop, Some(&plan(1)), None).unwrap();
+    // A normal finish refuses to skip the old owner's release ...
+    assert_eq!(
+        finish_at(&path, &releasing).unwrap_err(),
+        "transition_old_not_restored"
+    );
+    // ... the explicit abandon of an unregistered target does not.
+    let cleared = abandon_at(&path, &releasing).unwrap();
+    assert_eq!(cleared.pending, None);
+    assert_eq!(cleared.generation, releasing.generation);
+    assert_eq!(load_at(&path).unwrap(), cleared);
+    // Repeating it is harmless; an outdated record is refused.
+    assert_eq!(abandon_at(&path, &releasing).unwrap(), cleared);
+    let next = begin_at(&path, &cleared, Kind::Stop, Some(&plan(2)), None).unwrap();
+    assert_eq!(
+        abandon_at(&path, &releasing).unwrap_err(),
+        "transition_stale_record"
+    );
+    assert_eq!(load_at(&path).unwrap(), next);
+}

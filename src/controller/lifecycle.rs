@@ -24,7 +24,7 @@ fn registered(p: &Plan) -> Result<(), String> {
     }
 }
 
-fn registration_present(p: &Plan) -> Result<bool, String> {
+pub(super) fn registration_present(p: &Plan) -> Result<bool, String> {
     Ok(host::distributions()?
         .iter()
         .any(|d| d.id.eq_ignore_ascii_case(&p.target.id)))
@@ -104,6 +104,7 @@ impl Controller {
             .or_else(|| intent.and_then(stage_owner))
             .or_else(|| intent.and_then(|i| i.old.as_ref()));
         let mut protected_target = None;
+        let target_registered = subject.and_then(|p| registration_present(p).ok());
         let evidence = subject.map(
             |p| match inspect(p).and_then(|k| Ok((k, lease::alive(p)?))) {
                 Ok((k, custodian)) => {
@@ -116,7 +117,7 @@ impl Controller {
             },
         );
         Ok(
-            json!({"phase":"recovery_required","operation_generation":op.generation,"active_target":protected_target,"recorded_target":owner.as_ref().map(|p|&p.target.name),"config_generation":owner.as_ref().map(|p|p.cookie),"dns_managed":false,"pending":intent.map(|i|json!({"kind":i.kind,"stage":i.stage,"old":i.old.as_ref().map(|p|&p.target.name),"new":i.new.as_ref().map(|p|&p.target.name)})),"observation":evidence,"issue":self.readiness.as_ref().and_then(|r|r.as_ref().err())}),
+            json!({"phase":"recovery_required","operation_generation":op.generation,"active_target":protected_target,"recorded_target":owner.as_ref().map(|p|&p.target.name),"config_generation":owner.as_ref().map(|p|p.cookie),"dns_managed":false,"pending":intent.map(|i|json!({"kind":i.kind,"stage":i.stage,"old":i.old.as_ref().map(|p|&p.target.name),"new":i.new.as_ref().map(|p|&p.target.name)})),"observation":evidence,"target_registered":target_registered,"issue":self.readiness.as_ref().and_then(|r|r.as_ref().err())}),
         )
     }
     pub fn switch_source(&self, expected: u64) -> Result<(&Plan, &Runtime), String> {
@@ -195,6 +196,46 @@ impl Controller {
         }
         result
     }
+    /// Explicit operator release of a takeover whose target distribution is no
+    /// longer registered, so no guest exists to restore or inspect. Frees this
+    /// instance's Windows ports and recovery records only. Rules it installed
+    /// may remain inside a still-running WSL VM until the next `wsl --shutdown`.
+    pub fn abandon(&mut self, expected: Option<u64>) -> Result<Value, String> {
+        let record = checked(expected)?;
+        let owner = journal::load()?;
+        let Some(plan) = owner
+            .clone()
+            .or_else(|| record.pending.as_ref().and_then(stage_owner).cloned())
+        else {
+            return Err("abandon_nothing_recorded: use stop".into());
+        };
+        // Only a successful registry read without this GUID proves it gone;
+        // an unreadable registry is no evidence and refuses.
+        if registration_present(&plan)? {
+            return Err("abandon_requires_unregistered_target: use stop".into());
+        }
+        if let Some((live, ingress)) = &mut self.live {
+            if *live != plan {
+                return Err("journal_ownership_changed".into());
+            }
+            // An earlier forwarding failure is no reason to keep the ports.
+            let _ = ingress.stop();
+        }
+        lease::release(&plan)?;
+        if owner.is_some() {
+            journal::forget(&plan)?;
+        }
+        if record.pending.is_some() {
+            transition::abandon(&record)?;
+        }
+        self.live = None;
+        self.readiness = None;
+        self.runtime = None;
+        self.recent_exit = None;
+        self.watch = super::Watch::default();
+        Ok(json!({"abandoned":plan.target.name,"next":"run wsl --shutdown before the next start"}))
+    }
+
     pub fn stop(&mut self) -> Result<(), String> {
         let mut record = checked(None)?;
         if record.pending.is_none() {

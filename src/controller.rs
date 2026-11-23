@@ -15,8 +15,191 @@ pub struct Controller {
     pub(crate) readiness: Option<Result<Readiness, String>>,
     pub(crate) runtime: Option<Arc<Runtime>>,
     recent_exit: Option<serde_json::Value>,
+    watch: Watch,
 }
+
+/// Periodic, read-only evidence that the live target still carries this
+/// generation's rules. Only definite loss changes the phase; a check that
+/// could not run is reported but is not evidence either way.
+#[derive(Default)]
+struct Watch {
+    cookie: u32,
+    lost: Option<String>,
+    checked_unix_seconds: Option<u64>,
+    target_running: Option<bool>,
+    consecutive_failures: u32,
+    last_error: Option<String>,
+}
+
+/// The outcome of one guest observation, judged only by its evidence.
+#[derive(Debug, PartialEq, Eq)]
+enum Observed {
+    Protected,
+    Lost(String),
+    Unverified(String),
+}
+
+/// How an identity or environment drift reported by the guest counts.
+#[derive(Debug, PartialEq, Eq)]
+enum Drift {
+    /// The target or the WSL VM restarted: old rules no longer apply.
+    Restarted,
+    /// A passing race or a missing or failing tool: says nothing about the rules.
+    Unverifiable,
+    /// Anything else (rename, new address, a workload outside the cgroup, ...).
+    Changed,
+}
+
+fn drift_kind(reason: &str) -> Drift {
+    const UNVERIFIABLE: [&str; 4] = [
+        "unverifiable_workload",
+        "tool_unavailable_or_timeout",
+        "tool_failed",
+        "missing_prerequisite",
+    ];
+    if UNVERIFIABLE.iter().any(|prefix| reason.starts_with(prefix)) {
+        Drift::Unverifiable
+    } else if matches!(
+        reason,
+        "boot_changed" | "cgroup_namespace_changed" | "cgroup_root_changed"
+    ) {
+        Drift::Restarted
+    } else {
+        Drift::Changed
+    }
+}
+
+const RESTARTED: &str = "protection_lost: restarted: the target or the WSL VM restarted; this takeover's rules no longer apply";
+
+fn changed(reason: &str) -> String {
+    format!(
+        "protection_lost: environment_changed: {reason}: this takeover can no longer prove it covers the target"
+    )
+}
+
+fn classify(result: Result<(kernel::Ownership, Option<String>), String>) -> Observed {
+    match result {
+        Ok((own, _)) if own.identity_matches && own.rules_complete => Observed::Protected,
+        Ok((own, _)) if own.identity_matches => Observed::Lost(
+            "protection_lost: rules_incomplete: this takeover's rules are missing or incomplete in the target".into(),
+        ),
+        // Identity unconfirmed and nothing of this generation is left: the rules
+        // are gone, whatever else changed.
+        Ok((_, drift)) => Observed::Lost(match drift.as_deref().map(|reason| (drift_kind(reason), reason)) {
+            Some((Drift::Restarted, _)) => RESTARTED.into(),
+            Some((Drift::Changed, reason)) => changed(reason),
+            _ => "protection_lost: rules_missing: this takeover's rules are gone from the target".into(),
+        }),
+        // Rules survive, but the guest could not confirm the identity they were
+        // installed for. Only a restart or a real change counts as a loss.
+        Err(error) => match error
+            .split_once("stale_identity_has_owned_artifacts: ")
+            .map(|(_, reason)| reason.trim())
+        {
+            Some(reason) => match drift_kind(reason) {
+                Drift::Restarted => Observed::Lost(RESTARTED.into()),
+                Drift::Changed => Observed::Lost(changed(reason)),
+                Drift::Unverifiable => Observed::Unverified(error),
+            },
+            None => Observed::Unverified(error),
+        },
+    }
+}
+
+fn unix_seconds() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| elapsed.as_secs())
+}
+
 impl Controller {
+    /// Checks the forwarding target once. Never mutates the guest. Skips a
+    /// target that WSL does not list as running (no traffic can leave it),
+    /// so the check does not wake a stopped distribution. Returns the reason
+    /// the first time protection is found lost; the loss stays until stop.
+    pub(crate) fn watch_protection(&mut self) -> Option<String> {
+        let plan = match &self.live {
+            Some((plan, _)) if self.readiness.as_ref().is_some_and(Result::is_ok) => plan.clone(),
+            _ => return None,
+        };
+        if self.watch.cookie != plan.cookie {
+            self.watch = Watch {
+                cookie: plan.cookie,
+                ..Watch::default()
+            };
+        }
+        if self.watch.lost.is_some() {
+            return None;
+        }
+        // Registration first: a renamed or unregistered target is no longer
+        // listed under the name this takeover recorded.
+        let current = match host::distributions() {
+            Ok(all) => all
+                .into_iter()
+                .find(|d| d.id.eq_ignore_ascii_case(&plan.target.id)),
+            Err(error) => return self.unverified(format!("registry_read_failed:{error}")),
+        };
+        self.watch.checked_unix_seconds = unix_seconds();
+        let Some(current) = current else {
+            return self.lose(
+                "protection_lost: target_unregistered: the target distribution is no longer registered"
+                    .into(),
+            );
+        };
+        let running = match host::running_distributions() {
+            Ok(names) => names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&current.name)),
+            Err(error) => return self.unverified(format!("running_list_failed:{error}")),
+        };
+        self.watch.target_running = Some(running);
+        if !running {
+            self.watch.consecutive_failures = 0;
+            self.watch.last_error = None;
+            return None;
+        }
+        match classify(kernel::inspect_detail(&plan)) {
+            Observed::Protected => {
+                self.watch.consecutive_failures = 0;
+                self.watch.last_error = None;
+                None
+            }
+            Observed::Lost(reason) => self.lose(reason),
+            Observed::Unverified(error) => self.unverified(error),
+        }
+    }
+
+    fn lose(&mut self, reason: String) -> Option<String> {
+        self.watch.lost = Some(reason.clone());
+        Some(reason)
+    }
+
+    fn unverified(&mut self, error: String) -> Option<String> {
+        self.watch.consecutive_failures = self.watch.consecutive_failures.saturating_add(1);
+        self.watch.last_error = Some(error);
+        None
+    }
+
+    fn watch_lost(&self, plan: &Plan) -> Option<String> {
+        (self.watch.cookie == plan.cookie)
+            .then(|| self.watch.lost.clone())
+            .flatten()
+    }
+
+    fn watch_view(&self, plan: &Plan) -> serde_json::Value {
+        if self.watch.cookie != plan.cookie {
+            return serde_json::json!({"checked_unix_seconds": null});
+        }
+        serde_json::json!({
+            "checked_unix_seconds": self.watch.checked_unix_seconds,
+            "target_running": self.watch.target_running,
+            "consecutive_failures": self.watch.consecutive_failures,
+            "last_error": self.watch.last_error,
+            "lost": self.watch.lost,
+        })
+    }
+
     /// Explicit operator request only: observe the target's actual TLS-verified public exit.
     pub(crate) fn probe_exit(&mut self, expected: u64) -> Result<(), String> {
         let (plan, runtime) = self.switch_source(expected)?;
@@ -72,13 +255,14 @@ impl Controller {
                         Ok(true) => None,
                         Ok(false) => Some("port_custodian_missing".into()),
                         Err(e) => Some(e),
-                    });
+                    })
+                    .or_else(|| self.watch_lost(p));
                 Ok(
-                    json!({"phase":if issue.is_some(){"recovery_required"}else if p.system_dns.is_some(){"forwarding_managed"}else{"forwarding_scoped"},"active_target":p.target.name,"config_generation":p.cookie,"ingress":p.ingress,"origins":p.origins,"issue":issue,"forwarding":ingress.diagnostics(),"dns_managed":p.system_dns.is_some() && issue.is_none(),"startup_verified":self.readiness.as_ref().and_then(|r|r.as_ref().ok()),"active_policy":self.runtime.as_ref().map(|r|r.policy.public_summary()),"recent_exit":self.recent_exit}),
+                    json!({"phase":if issue.is_some(){"recovery_required"}else if p.system_dns.is_some(){"forwarding_managed"}else{"forwarding_scoped"},"active_target":p.target.name,"config_generation":p.cookie,"ingress":p.ingress,"origins":p.origins,"issue":issue,"forwarding":ingress.diagnostics(),"dns_managed":p.system_dns.is_some() && issue.is_none(),"startup_verified":self.readiness.as_ref().and_then(|r|r.as_ref().ok()),"active_policy":self.runtime.as_ref().map(|r|r.policy.public_summary()),"recent_exit":self.recent_exit,"protection_check":self.watch_view(p),"target_registered":issue.is_some().then(|| lifecycle::registration_present(p).ok()).flatten()}),
                 )
             }
             (None, Some(d)) => Ok(
-                json!({"phase":"recovery_required","active_target":d.target.name,"config_generation":d.cookie,"ingress":d.ingress,"port_reserved":lease::alive(&d)?,"dns_managed":false}),
+                json!({"phase":"recovery_required","active_target":d.target.name,"config_generation":d.cookie,"ingress":d.ingress,"port_reserved":lease::alive(&d)?,"target_registered":lifecycle::registration_present(&d).ok(),"dns_managed":false}),
             ),
             _ => Err("journal_ownership_changed".into()),
         }
@@ -205,6 +389,96 @@ impl Controller {
         self.readiness = None;
         self.runtime = None;
         self.recent_exit = None;
+        self.watch = Watch::default();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ownership(identity_matches: bool, rules_complete: bool) -> kernel::Ownership {
+        kernel::Ownership {
+            identity_matches,
+            rules_present: rules_complete,
+            mappings_present: false,
+            rules_complete,
+        }
+    }
+
+    #[test]
+    fn only_definite_evidence_marks_protection_lost() {
+        let observed = |identity, complete, drift: Option<&str>| {
+            classify(Ok((
+                ownership(identity, complete),
+                drift.map(str::to_owned),
+            )))
+        };
+        let lost = |observed: Observed, kind: &str| match observed {
+            Observed::Lost(reason) => assert!(reason.starts_with(kind), "{reason}"),
+            other => panic!("expected loss {kind}, got {other:?}"),
+        };
+        assert_eq!(observed(true, true, None), Observed::Protected);
+        // Same identity, but the rules were flushed or partly removed.
+        lost(
+            observed(true, false, None),
+            "protection_lost: rules_incomplete",
+        );
+        // Identity unconfirmed and nothing of ours is left: lost, named by cause.
+        lost(
+            observed(false, false, Some("boot_changed")),
+            "protection_lost: restarted",
+        );
+        lost(
+            observed(false, false, Some("workload_outside_distro_cgroup")),
+            "protection_lost: environment_changed: workload_outside_distro_cgroup",
+        );
+        lost(
+            observed(false, false, Some("unverifiable_workload")),
+            "protection_lost: rules_missing",
+        );
+        let surviving = |reason: &str| {
+            classify(Err(format!(
+                "inspect:wsl_exit_failed: exit code: 1: kernel_operation_failed: stale_identity_has_owned_artifacts: {reason}"
+            )))
+        };
+        // Rules survive an identity the guest could not confirm.
+        lost(
+            surviving("cgroup_namespace_changed"),
+            "protection_lost: restarted",
+        );
+        lost(
+            surviving("guest_ipv6_address_changed"),
+            "protection_lost: environment_changed: guest_ipv6_address_changed",
+        );
+        // A passing race or a missing tool is not evidence of loss.
+        for reason in [
+            "unverifiable_workload",
+            "tool_unavailable_or_timeout: ip",
+            "missing_prerequisite: iptables-legacy-save",
+        ] {
+            assert!(
+                matches!(surviving(reason), Observed::Unverified(_)),
+                "{reason}"
+            );
+        }
+        // A check that could not run at all is not evidence either.
+        for error in [
+            "inspect:wsl_deadline_exceeded",
+            "registry_enumeration_failed: access denied",
+        ] {
+            assert_eq!(
+                classify(Err(error.into())),
+                Observed::Unverified(error.into())
+            );
+        }
+    }
+
+    #[test]
+    fn an_idle_controller_never_checks_the_guest() {
+        let mut controller = Controller::default();
+        assert_eq!(controller.watch_protection(), None);
+        assert_eq!(controller.watch.checked_unix_seconds, None);
     }
 }

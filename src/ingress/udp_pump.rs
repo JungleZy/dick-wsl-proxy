@@ -178,20 +178,56 @@ pub(super) fn wait(
     flows: &mut BTreeMap<SocketAddrV4, UdpFlow>,
     shared: &Shared,
 ) -> Result<(), String> {
+    let mut failed = [false; MAX_UDP];
+    wait_ready(
+        listener,
+        ingress,
+        flows.values().map(|flow| flow.socket.as_raw_socket()),
+        |index| failed[index] = true,
+    )?;
+    // Connected UDP can report an origin ICMP error here. Retire just that
+    // flow so a persistent error cannot turn the idle poll into a busy loop.
+    let retired: Vec<SocketAddrV4> = flows
+        .keys()
+        .zip(failed)
+        .filter_map(|(peer, failed)| failed.then_some(*peer))
+        .collect();
+    for peer in retired {
+        if let Some(flow) = flows.remove(&peer) {
+            flow.stats.failed();
+            shared.record_error("udp", "origin socket readiness failed".into());
+        }
+    }
+    Ok(())
+}
+
+/// Waits at most one poll interval until the listener, the ingress socket or
+/// one of `origins` is readable. `failed` receives the position (in iteration
+/// order) of every origin socket that reported an error; a failed listener or
+/// ingress socket is an error for the whole worker.
+#[cfg(windows)]
+pub(super) fn wait_ready(
+    listener: &TcpListener,
+    ingress: &UdpSocket,
+    origins: impl ExactSizeIterator<Item = std::os::windows::io::RawSocket>,
+    mut failed: impl FnMut(usize),
+) -> Result<(), String> {
     use std::os::windows::io::AsRawSocket;
     use windows_sys::Win32::Networking::WinSock::{
         POLLERR, POLLHUP, POLLNVAL, POLLRDNORM, SOCKET_ERROR, WSAGetLastError, WSAPOLLFD, WSAPoll,
     };
 
+    if origins.len() > MAX_UDP {
+        return Err("ingress readiness wait exceeds the UDP flow limit".into());
+    }
     let mut descriptors = [WSAPOLLFD::default(); MAX_UDP + 2];
-    let mut peers = [None; MAX_UDP];
     descriptors[0].fd = listener.as_raw_socket() as _;
     descriptors[1].fd = ingress.as_raw_socket() as _;
-    for (index, (peer, flow)) in flows.iter().enumerate() {
-        descriptors[index + 2].fd = flow.socket.as_raw_socket() as _;
-        peers[index] = Some(*peer);
+    let mut count = 2;
+    for socket in origins {
+        descriptors[count].fd = socket as _;
+        count += 1;
     }
-    let count = flows.len() + 2;
     for descriptor in &mut descriptors[..count] {
         descriptor.events = POLLRDNORM;
     }
@@ -221,13 +257,7 @@ pub(super) fn wait(
         if index < 2 {
             return Err("ingress readiness wait found a failed listener".into());
         }
-        // Connected UDP can report an origin ICMP error here. Retire just that
-        // flow so a persistent error cannot turn the idle poll into a busy loop.
-        let peer = peers[index - 2].expect("polled UDP flow has a peer");
-        if let Some(flow) = flows.remove(&peer) {
-            flow.stats.failed();
-            shared.record_error("udp", "origin socket readiness failed".into());
-        }
+        failed(index - 2);
     }
     Ok(())
 }

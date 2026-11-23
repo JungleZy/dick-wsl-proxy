@@ -69,6 +69,15 @@ pub(crate) enum Command {
         #[arg(long)]
         expected_generation: Option<u64>,
     },
+    /// Release a takeover whose target distribution is no longer registered:
+    /// frees its Windows ports and recovery records. Run `wsl --shutdown`
+    /// before the next start; rules may remain in a running WSL VM.
+    Abandon {
+        #[arg(long)]
+        confirm: bool,
+        #[arg(long)]
+        expected_generation: Option<u64>,
+    },
     /// Reset the durable DNS alias ledger after an explicit idle-state confirmation.
     ResetDnsAliases {
         #[arg(long)]
@@ -385,6 +394,21 @@ pub(crate) fn dispatch_result(
             controller::lifecycle::checked(expected_generation).map_err(error)?;
             controller.stop().map_err(error)?;
             controller.status().map_err(error)?
+        }
+        Command::Abandon {
+            confirm,
+            expected_generation,
+        } => {
+            if !confirm {
+                return Err(Failure::new(
+                    "confirmation_required",
+                    "Pass --confirm after verifying the target distribution was unregistered; run wsl --shutdown before the next start",
+                ));
+            }
+            let abandoned = controller.abandon(expected_generation).map_err(error)?;
+            let mut status = controller.status().map_err(error)?;
+            status["abandoned"] = abandoned;
+            status
         }
         Command::Session
         | Command::Daemon

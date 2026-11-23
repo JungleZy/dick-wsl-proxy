@@ -14,9 +14,12 @@
 
 - `wsl-proxyctl.exe session` 仍是 CLI 自己持锁的前台模式，EOF 保留原有的正常停止语义。桌面使用独立的命名管道后台，两者不能同时拥有同一个用户的网络控制权。已有 CLI 会话时不要强杀它来启动桌面；先在原会话中正常停止并退出。
 - 窗口与后台通过仅当前用户、本机可连接的命名管道交换有界 JSON。客户端在发送请求前核对服务端进程的用户和配套 EXE 身份。读写有时限，未确认的变更不会因窗口断连被自动重放。拿不到状态时应显示未知，并重新读取后台，而不是使用过期绿色状态。
-- 关闭窗口后也能在同目录 PowerShell 调用：`'{"command":"status"}' | .\wsl-proxyctl.exe rpc`。要主动停止，将状态中的实际 `operation_generation` 带入 `{"command":"stop","expected_generation":…}`。正常恢复至 `idle` 后，发送 `{"command":"shutdown_daemon"}` 可退出后台，便于替换 EXE。不能带着活动规则退出后台；如果后台已崩溃，沿用 [M3 的独立恢复流程](../m3/README.md)，不手删恢复日志。
+- 关闭窗口后也能在同目录 PowerShell 调用：`'{"command":"status"}' | .\wsl-proxyctl.exe rpc`。要主动停止，将状态中的实际 `operation_generation` 带入 `{"command":"stop","expected_generation":…}`。正常恢复至 `idle` 后，发送 `{"command":"shutdown_daemon"}` 可退出后台，便于替换 EXE。不能带着活动规则退出后台；如果后台已崩溃，沿用 [M3 的独立恢复流程](../m3/README.md)，不手删恢复日志；目标已被注销时，用概览页「放弃本次记录」，之后执行一次 `wsl --shutdown`。
 - EXE 所在目录带有 Windows「低完整性」强制标签时（例如被开发工具沙箱标记的工作目录），系统以 Low 级别启动其中的程序，双击时还会弹「无法验证发布者」的安全警告。Low 级别的后台打不开 LocalAppData 中的锁文件，托盘图标也无法注册，所以桌面 EXE 启动时一旦检测到自身低于普通用户级别，就弹框说明原因和所在目录，然后直接退出，不占用单实例锁。处理方法：将两件 EXE 一起复制到不带该标签的目录运行，或移除目录标签；不需要以管理员身份运行。
-- 桌面草稿在当前 Windows 用户 LocalAppData 的 `WSLProxyLab\desktop.sqlite`，含策略、选择和版本，不含住宅密码。保存操作使用版本比较避免覆盖另一窗口的修改。脱敏诊断导出到同一用户目录，只保留状态与数值计数，不导出原始请求正文、目的地址、域名、凭据引用或任意错误全文。住宅凭据写入 Windows Credential Manager。
+- 桌面草稿在 EXE 同级目录的 `desktop.sqlite`，含策略、选择和版本，不含住宅密码。保存操作使用版本比较避免覆盖另一窗口的修改。脱敏诊断同样导出到 EXE 同级目录（`diagnostics-<时间>.json`），只保留状态与数值计数，不导出原始请求正文、目的地址、域名、凭据引用或任意错误全文。住宅凭据写入 Windows Credential Manager。
+- 程序运行产生的其他文件也放在 EXE 同级目录：环境新建/编辑的进度文件 `environment-progress-<名称>.json`，以及和 `wsl.exe` 交换输入输出的临时文件 `io-*.tmp`（关闭即删）。EXE 所在目录必须可写，否则配置库和 WSL 调用都会失败，错误信息里带出该目录。
+- 早先版本把 `desktop.sqlite` 放在当前用户 LocalAppData 的 `WSLProxyLab` 下。新版后台第一次打开配置库时，若 EXE 旁边还没有配置库，就把旧库（含未合并的 WAL 内容）整理复制过来，落盘后再删除旧文件；迁移失败直接报错并给出旧文件路径，不会换成空配置库继续。EXE 旁边已有配置库时不再迁移，也不覆盖。
+- 以下文件仍按 Windows 账户放在 LocalAppData 的 `WSLProxyLab`，不跟程序文件夹走：控制锁 `controller.lock`、恢复记录 `m1-active.json` 与 `m3-operation.json`、DNS 别名账本 `dns-alias.*`。它们保证每个账户只有一个控制器，并且崩溃恢复和别名分配不会因为换了文件夹运行而丢失或被悄悄重置。主题偏好和开机自启在注册表 `HKCU`，住宅密码在 Credential Manager，都不是文件。
 - 连接记录是有界的内存数据，不是抓包：最多 256 条活跃、128 条近期记录；近期保留 5 分钟。`tx`/`rx` 是入口实际处理的传输字节；速率是两次采样的增量，不是线路测速。无内核映射时不虚构目标或域名。
 
 ## 构建

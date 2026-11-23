@@ -5,6 +5,10 @@ $script:Product = 'wsl-proxy'
 $script:MarkerName = '.wsl-proxy-install.json'
 $script:Sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $script:RootNames = @('wsl-proxyctl.exe', 'wsl-proxy-desktop.exe', 'install.ps1', 'uninstall.ps1', 'common.ps1', 'USAGE.txt', 'BUILD-RECORD.json', 'Cargo.lock', 'THIRD-PARTY-NOTICES.json')
+# Runtime files the application writes beside its EXEs (desktop store, environment progress,
+# diagnostics exports, scratch). They belong to the user, not to a release: walks skip them,
+# upgrades carry them into the new directory, and uninstall leaves them in the install directory.
+$script:DataPattern = '^(?:desktop\.sqlite(?:\.migrating)?(?:-wal|-shm|-journal)?|environment-progress-.{1,255}\.(?:json|tmp)|diagnostics-[0-9]{1,24}\.json|io-[0-9]{1,10}-[0-9]{1,20}\.tmp)$'
 if (-not ('WslProxyInstallerPath' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -109,6 +113,39 @@ function Assert-RelativeFile([string] $Name) {
     throw "Unexpected package filename: $Name"
 }
 
+function Test-DataName([string] $Relative, $Item) {
+    return (-not $Relative -and -not $Item.PSIsContainer -and $Item.Name -cmatch $script:DataPattern)
+}
+
+# A directory left by uninstall: no marker, no release files, only runtime data (or nothing).
+function Test-DataOnly([string] $Path) {
+    foreach ($item in Get-ChildItem -LiteralPath $Path -Force) { if (-not (Test-DataName '' $item)) { return $false } }
+    return $true
+}
+
+function Move-Data([string] $From, [string] $To, $Gate) {
+    $items = @(Get-ChildItem -LiteralPath $From -Force | Where-Object { Test-DataName '' $_ })
+    if ($items.Count -eq 0) { return }
+    if (-not (Test-Path -LiteralPath $To)) { New-PrivateDirectory $To }
+    Assert-Owned $To
+    foreach ($item in $items) {
+        Assert-Owned $item.FullName
+        $destination = Join-Path $To $item.Name
+        Assert-NoReparse $destination
+        if (Test-Path -LiteralPath $destination) { throw "Runtime data file exists in both $From and $To; preserve both: $($item.Name)" }
+        Assert-Maintenance $Gate
+        [IO.File]::Move($item.FullName, $destination)
+    }
+}
+
+function Remove-DataBackup([string] $Path, [string] $Target, $Gate) {
+    Assert-Owned $Path
+    if (-not (Test-DataOnly $Path)) { throw "Backup holds more than runtime data; preserve it: $Path" }
+    Move-Data $Path $Target $Gate
+    Assert-Maintenance $Gate
+    [IO.Directory]::Delete($Path, $false)
+}
+
 function Get-Package([string] $Root, [switch] $Installed) {
     Assert-NoReparse $Root
     if (-not (Test-Path -LiteralPath $Root -PathType Container)) { throw "Package directory is missing: $Root" }
@@ -147,8 +184,11 @@ function Get-Package([string] $Root, [switch] $Installed) {
     while ($pending.Count) {
         $relative = $pending.Dequeue()
         foreach ($item in Get-ChildItem -LiteralPath (Join-Path $Root $relative) -Force) {
-            if ($Installed) { Assert-Owned $item.FullName }
             if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Reparse package entry: $($item.FullName)" }
+            # Runtime data may be held open by a running app (WAL, delete-on-close scratch), so it
+            # is not opened here; Move-Data checks ownership when maintenance relocates it.
+            if (Test-DataName $relative $item) { continue }
+            if ($Installed) { Assert-Owned $item.FullName }
             $name = if ($relative) { "$relative\$($item.Name)" } else { $item.Name }
             if ($item.PSIsContainer) {
                 if (-not $directories.ContainsKey($name)) { throw "Unowned directory in package/install: $name" }
@@ -202,6 +242,7 @@ function Remove-RecordedInstall([string] $Path, $Tx, [string] $Digest, $Records,
     while ($pending.Count) {
         $relative = $pending.Dequeue()
         foreach ($item in Get-ChildItem -LiteralPath (Join-Path $Path $relative) -Force) {
+            if (Test-DataName $relative $item) { continue }
             Assert-Owned $item.FullName
             if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Reparse point in transaction cleanup; nothing is followed.' }
             $name = if ($relative) { "$relative\$($item.Name)" } else { $item.Name }
@@ -220,6 +261,9 @@ function Remove-RecordedInstall([string] $Path, $Tx, [string] $Digest, $Records,
             }
         }
     }
+    # Runtime data stays with the installation path: the new release after an upgrade, or the
+    # otherwise empty install directory after uninstall.
+    Move-Data $Path $Tx.install_dir $Gate
     # Missing recorded files are allowed only here, enabling restart after partial cleanup.
     foreach ($name in @($files.Keys)) {
         Assert-Maintenance $Gate
@@ -392,7 +436,8 @@ function Recover-Transaction([string] $Target, $Gate) {
     Assert-Maintenance $Gate
     if ($tx.operation -ceq 'uninstall') {
         if (Test-Path -LiteralPath $tx.stage_dir) { throw 'Unexpected uninstall staging directory; preserve it.' }
-        if (Test-Path -LiteralPath $Target) {
+        # Cleanup may already have moved runtime data back into a fresh install directory.
+        if ((Test-Path -LiteralPath $Target) -and -not (Test-DataOnly $Target)) {
             Assert-TransactionInstall $Target $tx $tx.old_digest
             if (Test-Path -LiteralPath $tx.backup_dir) { throw 'Both uninstall target and backup exist; preserve them for inspection.' }
             Assert-Maintenance $Gate
@@ -400,15 +445,23 @@ function Recover-Transaction([string] $Target, $Gate) {
         }
         if (Test-Path -LiteralPath $tx.backup_dir) { Remove-RecordedInstall $tx.backup_dir $tx $tx.old_digest $tx.old_files $Gate }
     } else {
-        if ((Test-Path -LiteralPath $Target) -and @(Get-ChildItem -LiteralPath $Target -Force).Count -gt 0) {
+        # A first install over a directory holding only runtime data parks that data as the backup.
+        $restoredData = $null -eq $tx.old_digest -and (Test-Path -LiteralPath $Target) -and (Test-DataOnly $Target)
+        if ((Test-Path -LiteralPath $Target) -and @(Get-ChildItem -LiteralPath $Target -Force).Count -gt 0 -and -not $restoredData) {
             $present = Get-Install $Target
             if ($present.Marker.installation_id -cne $tx.id -or $present.Package.Digest -notin @($tx.old_digest, $tx.new_digest)) { throw 'Interrupted target differs from recorded owned releases.' }
             if (Test-Path -LiteralPath $tx.backup_dir) {
                 if ($present.Package.Digest -cne $tx.new_digest) { throw 'Old target and backup both exist; preserve them.' }
-                Remove-RecordedInstall $tx.backup_dir $tx $tx.old_digest $tx.old_files $Gate
+                if ($null -eq $tx.old_digest) { Remove-DataBackup $tx.backup_dir $Target $Gate
+                } else { Remove-RecordedInstall $tx.backup_dir $tx $tx.old_digest $tx.old_files $Gate }
             }
+        } elseif ($restoredData) {
+            if (Test-Path -LiteralPath $tx.backup_dir) { throw 'Runtime data exists in both the target and the backup; preserve them.' }
         } elseif (Test-Path -LiteralPath $tx.backup_dir) {
-            Assert-TransactionInstall $tx.backup_dir $tx $tx.old_digest
+            if ($null -eq $tx.old_digest) {
+                Assert-Owned $tx.backup_dir
+                if (-not (Test-DataOnly $tx.backup_dir)) { throw 'Backup holds more than runtime data; preserve it.' }
+            } else { Assert-TransactionInstall $tx.backup_dir $tx $tx.old_digest }
             Assert-Maintenance $Gate
             [IO.Directory]::Move($tx.backup_dir, $Target)
         } elseif ($null -ne $tx.old_digest) { throw 'Previous installation is missing; preserve transaction/staging files for inspection.' }
@@ -440,10 +493,12 @@ function Invoke-Installer([string] $SourceRoot, [string] $InstallDir, [switch] $
     if ($Recover -and -not $hasTransaction) { throw 'No owned interrupted transaction exists at the selected installation path.' }
     $installed = $null
     $emptyTarget = $false
+    $dataOnly = $false
     if (Test-Path -LiteralPath $target) {
         Assert-Owned $target
         if (-not (Test-Path -LiteralPath $target -PathType Container)) { throw 'Installation path is not a directory.' }
         if (@(Get-ChildItem -LiteralPath $target -Force).Count -eq 0) { $emptyTarget = $true
+        } elseif (Test-DataOnly $target) { $dataOnly = $true
         } else { $installed = Get-Install $target }
     }
     if ($Recover) {
@@ -451,7 +506,8 @@ function Invoke-Installer([string] $SourceRoot, [string] $InstallDir, [switch] $
         if (($Uninstall -and $tx.operation -cne 'uninstall') -or (-not $Uninstall -and $tx.operation -cne 'install')) { throw 'Use the same install/uninstall entrypoint that created this interrupted transaction.' }
     } elseif ($Uninstall -and $null -eq $installed) {
         if ($emptyTarget) { throw 'Selected empty directory is not an owned installation; it was not deleted.' }
-        Write-Output "Not installed at $target; nothing changed."
+        if ($dataOnly) { Write-Output "Not installed at $target; only runtime data files remain there. Nothing changed."
+        } else { Write-Output "Not installed at $target; nothing changed." }
         return
     }
     if (-not $Uninstall -and -not $Recover -and $null -ne $installed) {
@@ -476,7 +532,8 @@ function Invoke-Installer([string] $SourceRoot, [string] $InstallDir, [switch] $
             if ($current.Package.Digest -cne $installed.Package.Digest -or $current.Marker.installation_id -cne $installed.Marker.installation_id) { throw 'Installation changed while acquiring maintenance; no mutation performed.' }
         } elseif (Test-Path -LiteralPath $target) {
             Assert-Owned $target
-            if (@(Get-ChildItem -LiteralPath $target -Force).Count -ne 0) { throw 'Target became nonempty while acquiring maintenance.' }
+            if ($dataOnly) { if (-not (Test-DataOnly $target)) { throw 'Target gained non-data files while acquiring maintenance.' }
+            } elseif (@(Get-ChildItem -LiteralPath $target -Force).Count -ne 0) { throw 'Target became nonempty while acquiring maintenance.' }
         }
         if (-not $Uninstall -and $null -ne $installed -and $source.Digest -ceq $installed.Package.Digest) {
             Write-Output "Already installed, verified release $($source.Manifest.version) at $target; no files changed."
@@ -503,14 +560,15 @@ function Invoke-Installer([string] $SourceRoot, [string] $InstallDir, [switch] $
             } else {
                 Copy-Package $source $tx.stage_dir $target $id
                 Assert-Maintenance $gate
-                if ($null -ne $installed) { [IO.Directory]::Move($target, $tx.backup_dir)
+                if ($null -ne $installed -or $dataOnly) { [IO.Directory]::Move($target, $tx.backup_dir)
                 } elseif (Test-Path -LiteralPath $target) { [IO.Directory]::Delete($target, $false) }
                 try {
                     Assert-Maintenance $gate
                     [IO.Directory]::Move($tx.stage_dir, $target)
                 } catch {
-                    if ($null -ne $installed -and -not (Test-Path -LiteralPath $target) -and -not $gate.Process.HasExited) {
-                        Assert-TransactionInstall $tx.backup_dir $tx $tx.old_digest
+                    if (($null -ne $installed -or $dataOnly) -and -not (Test-Path -LiteralPath $target) -and -not $gate.Process.HasExited) {
+                        if ($null -ne $installed) { Assert-TransactionInstall $tx.backup_dir $tx $tx.old_digest
+                        } elseif (-not (Test-DataOnly $tx.backup_dir)) { throw 'Backup holds more than runtime data; preserve it.' }
                         [IO.Directory]::Move($tx.backup_dir, $target)
                     }
                     throw
@@ -521,7 +579,9 @@ function Invoke-Installer([string] $SourceRoot, [string] $InstallDir, [switch] $
         } catch {
             throw "Maintenance transaction did not finish: $($_.Exception.Message) Preserve $transactionPath and its named stage/backup. Do not launch the app. From an intact extracted package rerun the same entrypoint -InstallDir `"$target`" -Recover. Do not delete controller journals or unknown files."
         }
-        if ($Uninstall) { Write-Output "Uninstalled owned application files from $target. User configuration, credentials and recovery journals were preserved."
+        if ($Uninstall) {
+            Write-Output "Uninstalled owned application files from $target. User configuration, credentials and recovery journals were preserved."
+            if (Test-Path -LiteralPath $target) { Write-Output "Runtime data files (desktop.sqlite and others) remain in $target; a later install there keeps using them. Delete that folder to remove them." }
         } else { Write-Output "Installed verified release $($source.Manifest.version) at $target. Unsigned SHA256 checks prove consistency, not publisher authenticity." }
     } finally { Stop-Maintenance $gate }
 }

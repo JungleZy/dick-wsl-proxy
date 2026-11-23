@@ -96,6 +96,7 @@ impl Desktop {
                     UiAction::Export => {
                         this.send(Kind::Export, json!({"command":"export_diagnostics"}), cx)
                     }
+                    UiAction::ResetDnsAliases => this.prepare_reset_dns_aliases(window, cx),
                     UiAction::ConnectionFilter(filter) => {
                         if this.connection_filter != filter {
                             this.connection_filter = filter;
@@ -170,16 +171,13 @@ impl Desktop {
             .child(input)
     }
 
+    /// An input with a folder button beside it; `button` comes from `self.button`.
     pub(crate) fn field_with_action(
         &self,
         label: &'static str,
         hint: &'static str,
         state: &Field,
-        action: UiAction,
-        button_id: &'static str,
-        button_label: &'static str,
-        disabled: bool,
-        cx: &Context<Desktop>,
+        button: Button,
     ) -> Div {
         let input = match state {
             Field::Single(state) => Input::new(state).disabled(self.locked()).into_any_element(),
@@ -206,7 +204,7 @@ impl Desktop {
                     .gap_2()
                     .child(div().flex_1().min_w_0().child(input))
                     .child(
-                        self.button(button_id, button_label, action, disabled, cx)
+                        button
                             .icon(design_icon("folder", 15., MUTED))
                             .small()
                             .flex_shrink_0(),

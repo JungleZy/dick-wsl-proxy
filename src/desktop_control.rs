@@ -10,6 +10,139 @@ use serde_json::{Value, json};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+use std::thread::JoinHandle;
+
+/// One environment operation (create, edit, back up, delete) running off the
+/// request thread. Such an operation can take many minutes; the request
+/// returns at once and the desktop polls `environment_job` for the result.
+struct EnvironmentJob {
+    command: &'static str,
+    target: String,
+    worker: Option<JoinHandle<Result<Value, String>>>,
+}
+
+impl EnvironmentJob {
+    fn running(&self) -> bool {
+        self.worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+    }
+
+    fn view(&self) -> Value {
+        json!({
+            "state": if self.running() { "running" } else { "finished" },
+            "command": self.command,
+            "target": self.target,
+        })
+    }
+}
+
+static ENVIRONMENT_JOB: Mutex<Option<EnvironmentJob>> = Mutex::new(None);
+
+fn environment_job() -> MutexGuard<'static, Option<EnvironmentJob>> {
+    ENVIRONMENT_JOB
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// Commands refused while an environment operation runs: they would start,
+/// inspect or reshape a distribution that is being created or changed.
+fn blocked_by_environment_job(command: &str, request: &Value, target: &str) -> bool {
+    matches!(
+        command,
+        "start"
+            | "switch"
+            | "preflight"
+            | "probe_exit"
+            | "shutdown_daemon"
+            | "environment_create"
+            | "environment_edit"
+            | "environment_backup"
+            | "environment_delete"
+    ) || (command == "environment_view" && request["name"].as_str() == Some(target))
+}
+
+fn start_environment_job(
+    command: &'static str,
+    target: String,
+    work: impl FnOnce() -> Result<Value, String> + Send + 'static,
+) -> Result<Value, crate::command::Failure> {
+    let mut job = environment_job();
+    // A finished job nobody collected is replaced; its result is in the log.
+    if job.as_ref().is_some_and(EnvironmentJob::running) {
+        return Err(crate::command::Failure::new(
+            "environment_job_running",
+            "Another environment operation is still running",
+        ));
+    }
+    let worker = std::thread::Builder::new()
+        .name("environment-job".into())
+        .spawn(move || {
+            let result = work();
+            log_environment_result(command, &result);
+            result
+        })
+        .map_err(|error| {
+            crate::command::Failure::new(
+                "desktop_request_failed",
+                format!("environment_job_start:{error}"),
+            )
+        })?;
+    // Always "running": a job that fails at once must still be collected with
+    // `environment_job`, never mistaken for a finished result here.
+    let view = json!({"state":"running","command":command,"target":target});
+    *job = Some(EnvironmentJob {
+        command,
+        target,
+        worker: Some(worker),
+    });
+    Ok(json!({"job":view}))
+}
+
+/// The running job's state, or its result exactly once after it ends.
+fn poll_environment_job() -> Result<Value, crate::command::Failure> {
+    let mut slot = environment_job();
+    let Some(job) = slot.as_mut() else {
+        return Err(crate::command::Failure::new(
+            "environment_job_missing",
+            "No environment operation result is waiting",
+        ));
+    };
+    if job.running() {
+        return Ok(json!({"job":job.view()}));
+    }
+    let worker = job.worker.take();
+    *slot = None;
+    match worker.map(JoinHandle::join) {
+        Some(Ok(Ok(value))) => Ok(value),
+        Some(Ok(Err(error))) => Err(crate::command::Failure::new(
+            "desktop_request_failed",
+            error,
+        )),
+        _ => Err(crate::command::Failure::new(
+            "desktop_request_failed",
+            "environment_job_panicked",
+        )),
+    }
+}
+
+/// Written when the operation ends, whether or not a window is still open.
+fn log_environment_result(command: &str, result: &Result<Value, String>) {
+    // Unit tests must not write into the real per-user store.
+    if cfg!(test) {
+        return;
+    }
+    let Ok(path) = profile_path() else {
+        return;
+    };
+    let response = match result {
+        Ok(value) => value.clone(),
+        Err(error) => json!({"code":"desktop_request_failed","message":error}),
+    };
+    let (level, source, message) = command_log(command, &response);
+    let _ = desktop_store::append_runtime_log(&path, level, &source, &message, None, None, None);
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -174,6 +307,7 @@ fn log_command(command: &str) -> bool {
             | "import_credential"
             | "forget_credential"
             | "reset_dns_aliases"
+            | "abandon"
     )
 }
 
@@ -214,6 +348,11 @@ fn command_log(command: &str, response: &Value) -> (&'static str, String, String
         "import_credential" => ("info", "desktop_store".into(), "凭据已保存".into()),
         "forget_credential" => ("info", "desktop_store".into(), "凭据已删除".into()),
         "reset_dns_aliases" => ("info", "dns".into(), "DNS 别名缓存已重置".into()),
+        "abandon" => (
+            "warning",
+            "lifecycle".into(),
+            "已放弃已注销目标的接管记录；下次启动前请执行 wsl --shutdown".into(),
+        ),
         _ => ("info", command.to_owned(), "操作完成".into()),
     }
 }
@@ -282,6 +421,7 @@ fn sanitized(s: &Value) -> Value {
         "chain_udp",
         "rejected_tcp",
         "rejected_udp",
+        "tcp_capacity_rejections",
         "metadata_queries",
         "metadata_successes",
         "metadata_transport_failures",
@@ -300,7 +440,7 @@ fn export(controller: &controller::Controller) -> Result<Value, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| "invalid_clock")?
         .as_nanos();
-    let path = host::state_dir()?.join(format!("diagnostics-{now}.json"));
+    let path = host::data_dir()?.join(format!("diagnostics-{now}.json"));
     let mut f = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -323,6 +463,14 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
             .and_then(Value::as_str)
             .ok_or_else(|| bad("missing_command".into()))?
             .to_owned();
+        if let Some(job) = environment_job().as_ref().filter(|job| job.running())
+            && blocked_by_environment_job(&cmd, &request, &job.target)
+        {
+            return Err(crate::command::Failure::new(
+                "environment_job_running",
+                format!("{} is still running for {}", job.command, job.target),
+            ));
+        }
         let data = match cmd.as_str() {
             "profile_get" => {
                 let p = profile_path().map_err(bad)?;
@@ -396,25 +544,27 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                     std::mem::take(request),
                 ))
                 .map_err(|_| bad("invalid_environment_fields".into()))?;
-                let environment = environment::create(
-                    &req.name,
-                    &req.distribution,
-                    &req.install_path,
-                    environment_options(
-                        req.install_zsh,
-                        req.install_chrome,
-                        req.install_chinese,
-                        Some(req.username.clone()),
-                        Some(req.password.clone()),
-                        None,
-                    ),
-                )
-                .map_err(bad)?;
-                let mut response = json!({"environment":environment});
-                if let Ok(distributions) = host::distributions() {
-                    response["distributions"] = json!(distributions);
-                }
-                response
+                let target = req.name.clone();
+                start_environment_job("environment_create", target, move || {
+                    let environment = environment::create(
+                        &req.name,
+                        &req.distribution,
+                        &req.install_path,
+                        environment_options(
+                            req.install_zsh,
+                            req.install_chrome,
+                            req.install_chinese,
+                            Some(req.username.clone()),
+                            Some(req.password.clone()),
+                            None,
+                        ),
+                    )?;
+                    let mut response = json!({"environment":environment});
+                    if let Ok(distributions) = host::distributions() {
+                        response["distributions"] = json!(distributions);
+                    }
+                    Ok(response)
+                })?
             }
             "environment_edit" => {
                 require_idle(controller)?;
@@ -426,19 +576,21 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                     request,
                 )))
                 .map_err(|_| bad("invalid_environment_fields".into()))?;
-                let environment = environment::edit(
-                    &req.name,
-                    environment_options(
-                        req.install_zsh,
-                        req.install_chrome,
-                        req.install_chinese,
-                        None,
-                        None,
-                        req.timezone,
-                    ),
-                )
-                .map_err(bad)?;
-                json!({"environment":environment})
+                let target = req.name.clone();
+                start_environment_job("environment_edit", target, move || {
+                    let environment = environment::edit(
+                        &req.name,
+                        environment_options(
+                            req.install_zsh,
+                            req.install_chrome,
+                            req.install_chinese,
+                            None,
+                            None,
+                            req.timezone,
+                        ),
+                    )?;
+                    Ok(json!({"environment":environment}))
+                })?
             }
             "environment_backup" => {
                 require_idle(controller)?;
@@ -450,8 +602,11 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                     std::mem::take(request),
                 ))
                 .map_err(|_| bad("invalid_environment_fields".into()))?;
-                let backup = environment::backup(&req.name, &req.backup_path).map_err(bad)?;
-                json!({"backup":backup})
+                let target = req.name.clone();
+                start_environment_job("environment_backup", target, move || {
+                    let backup = environment::backup(&req.name, &req.backup_path)?;
+                    Ok(json!({"backup":backup}))
+                })?
             }
             "environment_delete" => {
                 require_idle(controller)?;
@@ -463,13 +618,17 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                     std::mem::take(request),
                 ))
                 .map_err(|_| bad("invalid_environment_fields".into()))?;
-                let environment = environment::remove(&req.name).map_err(bad)?;
-                let mut response = json!({"environment":environment});
-                if let Ok(distributions) = host::distributions() {
-                    response["distributions"] = json!(distributions);
-                }
-                response
+                let target = req.name.clone();
+                start_environment_job("environment_delete", target, move || {
+                    let environment = environment::remove(&req.name)?;
+                    let mut response = json!({"environment":environment});
+                    if let Ok(distributions) = host::distributions() {
+                        response["distributions"] = json!(distributions);
+                    }
+                    Ok(response)
+                })?
             }
+            "environment_job" => poll_environment_job()?,
             "export_diagnostics" => export(controller).map_err(bad)?,
             "probe_exit" => {
                 let generation = request["expected_generation"]
@@ -485,8 +644,8 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                 return Ok((json!({"shutdown":true}), true));
             }
             "list" | "status" | "preflight" | "import_credential" | "forget_credential"
-            | "start" | "switch" | "stop" => {
-                if matches!(&*cmd, "start" | "switch" | "stop")
+            | "start" | "switch" | "stop" | "abandon" | "reset_dns_aliases" => {
+                if matches!(&*cmd, "start" | "switch" | "stop" | "abandon")
                     && request["expected_generation"].as_u64().is_none()
                 {
                     return Err(bad("expected_generation_required".into()));
@@ -506,7 +665,14 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                 }
                 let req = serde_json::from_value::<crate::command::Command>(request)
                     .map_err(|_| bad("invalid_request_fields".into()))?;
-                return crate::command::dispatch_result(req, controller).map(|(_, v)| (v, false));
+                let (_, mut value) = crate::command::dispatch_result(req, controller)?;
+                // A reopened window learns that an environment operation is running.
+                if cmd == "status"
+                    && let Some(job) = environment_job().as_ref()
+                {
+                    value["environment_job"] = job.view();
+                }
+                return Ok((value, false));
             }
             _ => return Err(bad("command_not_available_on_desktop_channel".into())),
         };
@@ -514,7 +680,10 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
     })();
     let response = result.unwrap_or_else(|e| (json!({"code":e.code,"message":e.message}), false));
     if let Some(command) = command.as_deref() {
-        record_runtime_result(command, &response.0, controller);
+        // A started environment job logs its own outcome when it ends.
+        if response.0["job"]["state"] != "running" {
+            record_runtime_result(command, &response.0, controller);
+        }
     }
     response
 }
@@ -522,6 +691,90 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_environment_job_runs_once_reports_once_and_blocks_conflicting_requests() {
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let started = start_environment_job("environment_create", "Dev".into(), move || {
+            gate.recv().unwrap();
+            Ok(json!({"environment":{"name":"Dev"}}))
+        })
+        .map_err(|error| error.code)
+        .unwrap();
+        assert_eq!(started["job"]["state"], "running");
+        assert_eq!(
+            poll_environment_job().map_err(|e| e.code).unwrap()["job"]["state"],
+            "running"
+        );
+        assert_eq!(
+            start_environment_job("environment_edit", "Other".into(), || Ok(json!({})))
+                .map_err(|error| error.code)
+                .unwrap_err(),
+            "environment_job_running"
+        );
+        let request = json!({"command":"environment_view","name":"Dev"});
+        assert!(blocked_by_environment_job("start", &request, "Dev"));
+        assert!(blocked_by_environment_job(
+            "environment_view",
+            &request,
+            "Dev"
+        ));
+        assert!(!blocked_by_environment_job(
+            "environment_view",
+            &request,
+            "Other"
+        ));
+        assert!(!blocked_by_environment_job("status", &request, "Dev"));
+
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let result = loop {
+            let value = poll_environment_job().map_err(|error| error.code).unwrap();
+            if value["job"]["state"] != "running" {
+                break value;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(result["environment"]["name"], "Dev");
+        // The result is handed out once; a failed job reports its error.
+        assert_eq!(
+            poll_environment_job().map_err(|e| e.code).unwrap_err(),
+            "environment_job_missing"
+        );
+        start_environment_job("environment_delete", "Dev".into(), || {
+            Err("environment_not_found:Dev".into())
+        })
+        .map_err(|error| error.code)
+        .unwrap();
+        let failure = loop {
+            match poll_environment_job() {
+                Ok(value) if value["job"]["state"] == "running" => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                other => break other.map_err(|error| error.message).unwrap_err(),
+            }
+        };
+        assert_eq!(failure, "environment_not_found:Dev");
+
+        // A job that fails before the reply is built still starts as running.
+        let started = start_environment_job("environment_create", "Dup".into(), || {
+            Err("environment_name_exists".into())
+        })
+        .map_err(|error| error.code)
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(started["job"]["state"], "running");
+        let failure = loop {
+            match poll_environment_job() {
+                Ok(value) if value.get("job").is_some() => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                other => break other.map_err(|error| error.message).unwrap_err(),
+            }
+        };
+        assert_eq!(failure, "environment_name_exists");
+    }
     #[test]
     fn exported_diagnostic_omits_network_identifiers_and_free_text() {
         let v = sanitized(

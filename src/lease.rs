@@ -92,15 +92,24 @@ mod windows {
         ipv6: Option<(&Socket, &Socket)>,
     ) -> Result<(), String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let mut child = Command::new(exe)
+        let mut command = Command::new(exe);
+        command
             .arg("lease-worker")
             .arg(plan.cookie.to_string())
             .creation_flags(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| e.to_string())?;
+            .stderr(Stdio::null());
+        // A job that forbids breakaway (some SSH sessions, schedulers, CI)
+        // refuses the flag. Then the custodian stays in that job: it still
+        // holds the ports while the job lives, instead of never starting.
+        let mut child = match command.spawn() {
+            Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => command
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .map_err(|e| e.to_string())?,
+            result => result.map_err(|e| e.to_string())?,
+        };
         let result = (|| {
             let mut input = child.stdin.take().ok_or("lease_stdin_missing")?;
             let mut sockets = vec![tcp, udp];

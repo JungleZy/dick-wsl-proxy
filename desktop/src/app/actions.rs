@@ -10,6 +10,14 @@ use super::model::{Confirmation, EnvironmentEditor, Field, PendingPrepare};
 use super::state::Desktop;
 use std::path::Path;
 
+/// 转发限制输入框、策略字段名、允许范围、出错提示。
+type LimitField<'a> = (
+    &'a Field,
+    &'static str,
+    std::ops::RangeInclusive<u64>,
+    &'static str,
+);
+
 fn valid_environment_name(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
@@ -115,6 +123,21 @@ impl Desktop {
             (&self.fields.direct_ips, "direct_ips", true),
             (&self.fields.direct_domains, "direct_domains", true),
             (&self.fields.direct_suffixes, "direct_suffixes", true),
+            (
+                &self.fields.max_tcp_connections,
+                "max_tcp_connections",
+                false,
+            ),
+            (
+                &self.fields.tcp_idle_timeout,
+                "tcp_idle_timeout_seconds",
+                false,
+            ),
+            (
+                &self.fields.tcp_half_close_timeout,
+                "tcp_half_close_timeout_seconds",
+                false,
+            ),
         ] {
             if Self::field_value(field, cx) != Self::profile_field_value(&self.profile, key, array)
             {
@@ -181,8 +204,59 @@ impl Desktop {
                 },
             );
         }
+        for (field, key, _, _) in self.limit_fields() {
+            let text = Self::field_value(field, cx);
+            if text.is_empty() {
+                // 空着就用后台的默认值。
+                profile.remove(key);
+            } else {
+                profile.insert(
+                    key.into(),
+                    text.parse::<u64>()
+                        .map_or_else(|_| json!(text), |value| json!(value)),
+                );
+            }
+        }
         profile.insert("credential".into(), json!("desktop-residence"));
         Value::Object(profile)
+    }
+
+    /// 转发限制的输入框、策略字段名、允许范围和出错提示。
+    fn limit_fields(&self) -> [LimitField<'_>; 3] {
+        [
+            (
+                &self.fields.max_tcp_connections,
+                "max_tcp_connections",
+                16..=1024,
+                "并发 TCP 上限需为 16–1024 的整数，留空为默认 256。",
+            ),
+            (
+                &self.fields.tcp_idle_timeout,
+                "tcp_idle_timeout_seconds",
+                30..=86_400,
+                "TCP 空闲断开时间需为 30–86400 秒的整数，留空为默认 1800。",
+            ),
+            (
+                &self.fields.tcp_half_close_timeout,
+                "tcp_half_close_timeout_seconds",
+                5..=3_600,
+                "半关闭等待时间需为 5–3600 秒的整数，留空为默认 60。",
+            ),
+        ]
+    }
+
+    fn limits_valid(&self, cx: &App) -> Result<(), &'static str> {
+        for (field, _, range, message) in self.limit_fields() {
+            let text = Self::field_value(field, cx);
+            if !text.is_empty()
+                && !text
+                    .parse::<u64>()
+                    .is_ok_and(|value| range.contains(&value))
+            {
+                return Err(message);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn residential_draft(&self, cx: &App) -> Result<Value, &'static str> {
@@ -293,6 +367,17 @@ impl Desktop {
             self.fail("后台状态未确认，请先刷新。", cx);
             return;
         };
+        if kind == Kind::Abandon {
+            self.confirmation = Some(Confirmation {
+                kind,
+                generation,
+                request: json!({"command":"abandon","confirm":true,"expected_generation":generation}),
+                message: "目标发行版已不在 WSL 注册表里，无法清理它的规则。将释放本次接管占用的端口并清掉恢复记录。WSL 里可能还残留本次接管的规则：下次启动接管前，请先在终端执行一次 wsl --shutdown（会关闭所有发行版）。".into(),
+            });
+            self.open_confirmation_dialog(window, cx);
+            cx.notify();
+            return;
+        }
         if kind == Kind::Stop {
             self.confirmation = Some(Confirmation {
                 kind,
@@ -332,6 +417,33 @@ impl Desktop {
         );
     }
 
+    /// 只在空闲时可用。清空别名记录可能让旧别名分给别的域名，先确认。
+    pub(crate) fn prepare_reset_dns_aliases(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.locked() {
+            return;
+        }
+        if self.phase() != "idle" {
+            self.fail("请先停止接管并恢复直连，再重置 DNS 别名。", cx);
+            return;
+        }
+        let Some(generation) = self.generation() else {
+            self.fail("后台状态未确认，请先刷新。", cx);
+            return;
+        };
+        self.confirmation = Some(Confirmation {
+            kind: Kind::ResetDnsAliases,
+            generation,
+            request: json!({"command":"reset_dns_aliases","confirm":true}),
+            message: "将清空白名单域名的 DNS 别名记录（包括没写完的那次修改），只在提示 DNS 别名号段已用完或别名记录异常时使用。重置后旧别名可能分给别的域名：请先确认目标发行版里没有还在用旧解析结果的程序，例如重启目标发行版，或等几分钟再重置。".into(),
+        });
+        self.open_confirmation_dialog(window, cx);
+        cx.notify();
+    }
+
     pub(crate) fn confirm(&mut self, cx: &mut Context<Self>) {
         let Some(confirmation) = self.confirmation.take() else {
             return;
@@ -361,6 +473,10 @@ impl Desktop {
     }
 
     pub(crate) fn save(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) = self.limits_valid(cx) {
+            self.fail(error, cx);
+            return;
+        }
         let port = match self.port(cx) {
             Ok(port) => port,
             Err(error) => {

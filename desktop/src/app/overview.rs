@@ -15,7 +15,17 @@ use super::views::{card, card_header, chart_card, key_value, metric};
 impl Desktop {
     pub(crate) fn overview(&self, cx: &Context<Self>) -> Div {
         let takeover_active = self.status_valid && !matches!(self.phase(), "idle" | "unknown");
-        let (session_label, session_action, session_disabled, session_icon) = if takeover_active {
+        // A target that is no longer registered cannot be stopped normally.
+        let target_gone = self.phase() == "recovery_required"
+            && self.status["target_registered"] == serde_json::Value::Bool(false);
+        let (session_label, session_action, session_disabled, session_icon) = if target_gone {
+            (
+                "放弃本次记录",
+                UiAction::Prepare(Kind::Abandon),
+                self.locked(),
+                "close",
+            )
+        } else if takeover_active {
             (
                 "退出接管",
                 UiAction::Prepare(Kind::Stop),

@@ -71,8 +71,63 @@ pub(crate) struct Record {
     pub(crate) residential: ResidentialSettings,
 }
 
+const FILE_NAME: &str = "desktop.sqlite";
+
+/// The store lives beside the EXE. Earlier releases kept it in the per-user
+/// state directory; the first call after such an upgrade moves it here.
 pub(crate) fn path() -> Result<PathBuf, String> {
-    Ok(host::state_dir()?.join("desktop.sqlite"))
+    let path = host::data_dir()?.join(FILE_NAME);
+    if let Ok(directory) = host::state_dir() {
+        adopt_legacy(&directory.join(FILE_NAME), &path)?;
+    }
+    Ok(path)
+}
+
+/// Copies a store left at `legacy` to `path`, then removes the old files.
+/// Every caller holds the controller lock, so no other process has either file
+/// open; the mutex orders this process's own threads. An existing store at
+/// `path` is never replaced. The old store is removed only after the copy is
+/// complete and flushed to disk, so an interrupted move is simply retried, and
+/// a failure is reported instead of silently starting with an empty store.
+fn adopt_legacy(legacy: &Path, path: &Path) -> Result<(), String> {
+    static MOVING: Mutex<()> = Mutex::new(());
+    let _guard = MOVING.lock().unwrap_or_else(PoisonError::into_inner);
+    let failed = |error: &dyn std::fmt::Display| {
+        format!(
+            "desktop_store_migration_failed:{}:{error}",
+            legacy.display()
+        )
+    };
+    if path.try_exists().map_err(|e| failed(&e))? || !legacy.try_exists().map_err(|e| failed(&e))? {
+        return Ok(());
+    }
+    let staging = path.with_file_name(format!("{FILE_NAME}.migrating"));
+    let _ = fs::remove_file(&staging);
+    let target = staging
+        .to_str()
+        .ok_or_else(|| failed(&"non_unicode_path"))?;
+    {
+        let source = Connection::open(legacy).map_err(|e| failed(&e))?;
+        source
+            .busy_timeout(Duration::from_secs(2))
+            .map_err(|e| failed(&e))?;
+        // VACUUM INTO also reads committed WAL content, so -wal/-shm need no copy.
+        source
+            .execute("VACUUM INTO ?1", [target])
+            .map_err(|e| failed(&e))?;
+    }
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&staging)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| failed(&e))?;
+    fs::rename(&staging, path).map_err(|e| failed(&e))?;
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut name = legacy.as_os_str().to_owned();
+        name.push(suffix);
+        let _ = fs::remove_file(name);
+    }
+    Ok(())
 }
 
 fn default_profile() -> Result<Config, String> {
@@ -133,18 +188,20 @@ fn open(path: &Path) -> Result<Connection, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("desktop_store_directory:{e}"))?;
     }
-    let connection = Connection::open(path).map_err(|e| format!("desktop_store_open:{e}"))?;
+    // The path names the folder, so a read-only install location is recognisable.
+    let connection =
+        Connection::open(path).map_err(|e| format!("desktop_store_open:{}:{e}", path.display()))?;
     connection
         .busy_timeout(std::time::Duration::from_secs(2))
         .map_err(|e| format!("desktop_store_busy_timeout:{e}"))?;
-    let journal_mode: String = connection
-        .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
-        .map_err(|e| format!("desktop_store_journal_mode:{e}"))?;
-    if !journal_mode.eq_ignore_ascii_case("wal") {
-        return Err(format!(
-            "desktop_store_journal_mode_unavailable:{journal_mode}"
-        ));
-    }
+    // Some redirected or network volumes cannot hold WAL's shared-memory index.
+    // SQLite then keeps its rollback journal: slower under concurrent writes, but
+    // correct with the busy timeout. Stay usable and say so once per process.
+    let journal_mode: Result<String, _> =
+        connection.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0));
+    let wal = journal_mode
+        .as_ref()
+        .is_ok_and(|mode| mode.eq_ignore_ascii_case("wal"));
     connection
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS desktop_state (
@@ -202,7 +259,36 @@ fn open(path: &Path) -> Result<Connection, String> {
                 ON connection_records (target, id DESC);",
         )
         .map_err(|e| format!("desktop_store_schema:{e}"))?;
+    if !wal && !WAL_FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
+        let _ = insert_runtime_log(
+            &connection,
+            now_unix_seconds().unwrap_or_default(),
+            LogEntry {
+                level: "warning",
+                source: "storage",
+                message: &wal_fallback_message(&journal_mode),
+                phase: None,
+                target: None,
+                generation: None,
+            },
+        );
+    }
     Ok(connection)
+}
+
+/// Set once the rollback-journal fallback has been logged by this process.
+static WAL_FALLBACK_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn wal_fallback_message(journal_mode: &Result<String, rusqlite::Error>) -> String {
+    match journal_mode {
+        Ok(mode) => format!(
+            "数据库所在位置不支持 WAL，已改用 SQLite 日志模式 {mode} 继续运行；功能不受影响，并发写入会慢一些"
+        ),
+        Err(error) => format!(
+            "数据库开启 WAL 失败（{error}），已按 SQLite 默认日志模式继续运行；功能不受影响，并发写入会慢一些"
+        ),
+    }
 }
 
 fn now_unix_seconds() -> Result<i64, String> {
@@ -216,16 +302,29 @@ fn clipped(value: &str, max: usize) -> String {
     value.chars().take(max).collect()
 }
 
+/// One runtime log row, clipped to the column limits when it is stored.
+struct LogEntry<'a> {
+    level: &'a str,
+    source: &'a str,
+    message: &'a str,
+    phase: Option<&'a str>,
+    target: Option<&'a str>,
+    generation: Option<u64>,
+}
+
 fn insert_runtime_log(
     connection: &Connection,
     occurred_at: i64,
-    level: &str,
-    source: &str,
-    message: &str,
-    phase: Option<&str>,
-    target: Option<&str>,
-    generation: Option<u64>,
+    entry: LogEntry<'_>,
 ) -> Result<(), String> {
+    let LogEntry {
+        level,
+        source,
+        message,
+        phase,
+        target,
+        generation,
+    } = entry;
     let level = match level {
         "warning" | "error" => level,
         _ => "info",
@@ -274,12 +373,14 @@ pub(crate) fn append_runtime_log(
     insert_runtime_log(
         &connection,
         now_unix_seconds()?,
-        level,
-        source,
-        message,
-        phase,
-        target,
-        generation,
+        LogEntry {
+            level,
+            source,
+            message,
+            phase,
+            target,
+            generation,
+        },
     )
 }
 
@@ -293,6 +394,7 @@ fn runtime_snapshot(status: &Value) -> Value {
         "chain_udp",
         "rejected_tcp",
         "rejected_udp",
+        "tcp_capacity_rejections",
         "metadata_queries",
         "metadata_successes",
         "metadata_transport_failures",
@@ -387,12 +489,14 @@ pub(crate) fn record_runtime_snapshot(path: &Path, status: &Value) -> Result<(),
         insert_runtime_log(
             &connection,
             now,
-            level,
-            "runtime",
-            &message,
-            snapshot["phase"].as_str(),
-            snapshot["active_target"].as_str(),
-            snapshot["operation_generation"].as_u64(),
+            LogEntry {
+                level,
+                source: "runtime",
+                message: &message,
+                phase: snapshot["phase"].as_str(),
+                target: snapshot["active_target"].as_str(),
+                generation: snapshot["operation_generation"].as_u64(),
+            },
         )?;
     }
     *last = Some((path.to_path_buf(), key));
@@ -885,6 +989,78 @@ pub(crate) fn view(path: &Path, record: &Record) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_volume_without_wal_keeps_the_store_usable() {
+        // An in-memory database reports journal mode "memory", like a volume
+        // that cannot hold WAL's shared-memory index.
+        let connection = open(Path::new(":memory:")).unwrap();
+        insert_runtime_log(
+            &connection,
+            1,
+            LogEntry {
+                level: "info",
+                source: "runtime",
+                message: "ok",
+                phase: None,
+                target: None,
+                generation: None,
+            },
+        )
+        .unwrap();
+        let rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_logs WHERE source = 'runtime'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert!(WAL_FALLBACK_LOGGED.load(Ordering::Relaxed));
+        assert!(wal_fallback_message(&Ok("memory".into())).contains("memory"));
+    }
+
+    #[test]
+    fn legacy_store_moves_beside_the_executable_once() {
+        let root = std::env::temp_dir().join(format!(
+            "wpl-store-migration-{}-{}",
+            std::process::id(),
+            now_unix_seconds().unwrap()
+        ));
+        let legacy_dir = root.join("state");
+        let data_dir = root.join("program");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+        let legacy = legacy_dir.join(FILE_NAME);
+        let path = data_dir.join(FILE_NAME);
+        let initial = ensure(&legacy).unwrap();
+        let residential = ResidentialSettings {
+            ip: "198.51.100.2".into(),
+            port: 1080,
+            username: "fixture-user".into(),
+            password: "fixture-password".into(),
+        };
+        save(
+            &legacy,
+            initial.profile.clone(),
+            initial.desktop.clone(),
+            Some(residential),
+            Some("0".into()),
+        )
+        .unwrap();
+
+        adopt_legacy(&legacy, &path).unwrap();
+        assert_eq!(revision(&path).unwrap(), 1);
+        assert!(!legacy.exists());
+        assert!(!data_dir.join(format!("{FILE_NAME}.migrating")).exists());
+
+        // A store already beside the EXE wins; a later legacy file is left alone.
+        ensure(&legacy).unwrap();
+        adopt_legacy(&legacy, &path).unwrap();
+        assert_eq!(revision(&path).unwrap(), 1);
+        assert!(legacy.exists());
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn sqlite_profile_has_revision_cas_and_runtime_credentials() {

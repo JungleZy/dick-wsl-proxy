@@ -157,6 +157,85 @@ fn stopped_owner_refuses_new_shutdown_registrations() {
     let shared = Arc::new(Shared::new());
     shared.request_stop();
     assert!(shared.register(peer, &ingress).unwrap().is_none());
+    // Stopping is not a capacity refusal.
+    assert_eq!(lock(&shared.counters).tcp_capacity_rejections, 0);
+    assert!(lock(&shared.counters).last_error.is_none());
+}
+
+#[test]
+fn full_tcp_table_refusal_is_counted_recorded_and_explained() {
+    let (_client, ingress) = tcp_pair();
+    let shared = Arc::new(Shared::new());
+    {
+        let mut active = lock(&shared.active);
+        for index in 0..shared.limits.max_tcp {
+            active.insert(
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30_000 + index as u16),
+                ActiveTcp {
+                    client: ingress.try_clone().unwrap(),
+                    origin: None,
+                },
+            );
+        }
+    }
+    let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40_000);
+    assert!(shared.register(peer, &ingress).unwrap().is_none());
+    assert_eq!(lock(&shared.active).len(), shared.limits.max_tcp);
+    assert!(!lock(&shared.active).contains_key(&peer));
+    {
+        let counters = lock(&shared.counters);
+        assert_eq!(counters.tcp_capacity_rejections, 1);
+        assert_eq!(counters.tcp_failures, 1);
+        assert!(
+            counters
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("tcp_capacity_reached:"))
+        );
+    }
+    let (connections, _) = shared.flows.snapshot();
+    assert!(connections["active"].as_array().unwrap().is_empty());
+    let recent = connections["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0]["protocol"], "tcp");
+    assert_eq!(recent[0]["status"], "failed");
+    assert_eq!(recent[0]["route"], "reject");
+    assert_eq!(recent[0]["reason"], "capacity_limit");
+    assert_eq!(recent[0]["failure_stage"], "connect");
+    assert!(recent[0]["destination"].is_null());
+    assert!(!shared.is_stopping());
+    assert!(lock(&shared.failure).is_none());
+}
+
+#[test]
+fn a_reused_guest_port_is_refused_visibly_while_its_previous_connection_drains() {
+    let (_client, ingress) = tcp_pair();
+    let peer = match ingress.peer_addr().unwrap() {
+        SocketAddr::V4(peer) => peer,
+        _ => unreachable!(),
+    };
+    let shared = Arc::new(Shared::new());
+    let first = shared.register(peer, &ingress).unwrap().unwrap();
+    assert!(shared.register(peer, &ingress).unwrap().is_none());
+    assert_eq!(lock(&shared.active).len(), 1);
+    {
+        let counters = lock(&shared.counters);
+        assert_eq!(counters.tcp_capacity_rejections, 0);
+        assert_eq!(counters.tcp_failures, 1);
+        assert!(
+            counters
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("tcp_peer_still_registered:"))
+        );
+    }
+    let (connections, _) = shared.flows.snapshot();
+    let recent = connections["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0]["reason"], "peer_busy");
+    assert_eq!(recent[0]["status"], "failed");
+    drop(first);
+    assert!(lock(&shared.active).is_empty());
 }
 
 fn udp_table_peer(index: usize) -> SocketAddrV4 {
@@ -582,4 +661,55 @@ fn finished_flows_reach_sqlite_through_the_sink_and_flush_waits_for_them() {
         "the recorder drains the queue before it exits"
     );
     let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn dns_alias_ledger_states_reach_diagnostics_but_upstream_text_does_not() {
+    assert!(
+        dns_failure(
+            "UDP",
+            "durable DNS alias range exhausted; automatic reset is forbidden"
+        )
+        .starts_with("dns_alias_space_exhausted:")
+    );
+    assert!(
+        dns_failure(
+            "UDP",
+            "DNS session alias capacity exhausted; restart session explicitly"
+        )
+        .starts_with("dns_alias_session_full:")
+    );
+    assert!(
+        dns_failure(
+            "TCP",
+            "DNS alias ledger has an uncertain pending commit; manual recovery required"
+        )
+        .starts_with("dns_alias_ledger_pending:")
+    );
+    assert_eq!(
+        dns_failure("TCP", "read DNS HTTPS body: name.example refused"),
+        "managed TCP DNS answer failed"
+    );
+}
+
+#[test]
+fn a_quiet_connection_closes_at_the_configured_idle_deadline() {
+    let (_client, ingress) = tcp_pair();
+    let (upstream, _origin) = tcp_pair();
+    let limits = crate::policy::Limits {
+        max_tcp: 16,
+        tcp_idle: Duration::from_millis(300),
+        half_close: Duration::from_secs(60),
+    };
+    let shared = Shared::with_flows(FlowStats::new(), limits);
+    let flow = shared.flows.begin("tcp");
+    let started = Instant::now();
+    let error = relay(ingress, upstream, &shared, &flow).unwrap_err();
+    let elapsed = started.elapsed();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    // The readiness wait never sleeps past the deadline.
+    assert!(
+        elapsed >= Duration::from_millis(300) && elapsed < Duration::from_secs(2),
+        "{elapsed:?}"
+    );
 }

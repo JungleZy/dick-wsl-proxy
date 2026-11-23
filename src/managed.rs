@@ -112,6 +112,14 @@ impl Runtime {
             .store(!supported, Ordering::Release);
     }
 
+    /// The refusal for every new chained UDP flow once the readiness probe has
+    /// failed, so callers need not start a setup worker just to be refused.
+    pub(crate) fn udp_chain_refusal(&self) -> Option<&'static str> {
+        self.udp_chain_unsupported
+            .load(Ordering::Acquire)
+            .then_some(UDP_CHAIN_UNSUPPORTED)
+    }
+
     /// Chained UDP for a new flow. Once the readiness probe has failed, refuse
     /// immediately: retrying the two-hop setup for
     /// every datagram would block the ingress UDP loop (and system DNS intake)

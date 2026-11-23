@@ -12,7 +12,7 @@ use gpui_kit::component::{
     select::Select,
 };
 use gpui_kit::{prelude::*, *};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::fs;
 use std::path::Path;
 use std::rc::Rc;
@@ -350,6 +350,11 @@ impl Desktop {
 
     fn status_bar(&self, cx: &Context<Self>) -> Div {
         let online_color = if self.status_valid { TEAL } else { RUST };
+        let online_label = if self.status_valid {
+            "后台在线"
+        } else {
+            "后台未连接，点击重新连接"
+        };
         let (idle_label, idle_color) = match self.phase() {
             "idle" => ("未接管", TEAL),
             "forwarding_managed" => ("接管中", TEAL),
@@ -370,14 +375,12 @@ impl Desktop {
             .child(
                 Button::new("status-online")
                     .icon(design_icon("online", 17., online_color))
-                    .accessibility_label("后台在线")
-                    .tooltip("后台在线")
+                    .accessibility_label(online_label)
+                    .tooltip(online_label)
                     .text_color(rgb(online_color))
                     .ghost()
                     .compact()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.send(Kind::Status, json!({"command":"status"}), cx);
-                    })),
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh_or_reconnect(cx))),
             )
             .child(
                 Button::new("status-idle")
@@ -435,8 +438,8 @@ impl Desktop {
         if name.is_empty() {
             return None;
         }
-        // Same known-folder lookup the controller uses when it writes the file.
-        let path = wsl_proxyctl::paths::state_dir()
+        // The controller writes this file beside its EXE, which is this EXE's sibling.
+        let path = wsl_proxyctl::paths::data_dir()
             .ok()?
             .join(format!("environment-progress-{name}.json"));
         let value = serde_json::from_str::<Value>(&fs::read_to_string(path).ok()?).ok()?;
@@ -1018,11 +1021,13 @@ impl Desktop {
                     "安装目录",
                     "选择父目录，系统会自动创建环境名称子目录。",
                     &self.fields.environment_install,
-                    UiAction::EnvironmentPickInstall,
-                    "env-pick-install",
-                    "选择目录",
-                    locked,
-                    cx,
+                    self.button(
+                        "env-pick-install",
+                        "选择目录",
+                        UiAction::EnvironmentPickInstall,
+                        locked,
+                        cx,
+                    ),
                 ))
                 .child(div().text_base().text_color(rgb(MUTED)).child({
                     let base = Self::field_value(&self.fields.environment_install, cx);
@@ -2044,6 +2049,34 @@ impl Desktop {
                 ))
                 .child(key_value("Revision", self.revision.as_str().unwrap_or("0"))),
         );
+        let limits =
+            card(
+                "转发限制",
+                "",
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_3()
+                            .child(self.compact_setting(
+                                "并发 TCP 上限（条）",
+                                &self.fields.max_tcp_connections,
+                            ))
+                            .child(self.compact_setting(
+                                "TCP 空闲断开（秒）",
+                                &self.fields.tcp_idle_timeout,
+                            ))
+                            .child(self.compact_setting(
+                                "半关闭等待（秒）",
+                                &self.fields.tcp_half_close_timeout,
+                            )),
+                    )
+                    .child(key_value("生效时间", "下次启动或切换接管时")),
+            );
         div()
             .flex()
             .flex_col()
@@ -2058,6 +2091,7 @@ impl Desktop {
                     .child(routing.flex_1().min_w(px(360.)))
                     .child(dns.flex_1().min_w(px(460.))),
             )
+            .child(limits)
             .child(runtime)
             .child(if self.error {
                 div()

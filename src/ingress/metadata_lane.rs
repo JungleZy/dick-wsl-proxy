@@ -16,6 +16,16 @@ use std::{
 };
 
 type Origin = Result<SocketAddr, String>;
+
+/// Every caller waits for its own reply, so this many lookups can be queued at
+/// once while the lane keeps up: one per IPv4 and IPv6 TCP worker, one per DNS
+/// UDP worker, plus one group from the IPv4 loop and one lookup from the IPv6
+/// loop. A smaller queue refuses valid lookups under load. Callers that gave up
+/// after their timeout still hold a slot until dispatched; then the lane is
+/// stalled anyway and a full queue fails new lookups fast.
+pub(super) fn queue_capacity(max_tcp: usize) -> usize {
+    2 * max_tcp + super::MAX_DNS_UDP + 2
+}
 pub(super) struct Observation {
     pub origin: Origin,
     pub started: Instant,
@@ -35,10 +45,9 @@ pub(super) struct MetadataLane {
 }
 
 impl MetadataLane {
-    pub fn start(plan: &Plan, stopping: Arc<AtomicBool>) -> Result<Self, String> {
+    pub fn start(plan: &Plan, stopping: Arc<AtomicBool>, queue: usize) -> Result<Self, String> {
         let mut bridge = QueryBridge::open(plan)?;
-        // 64 TCP workers, eight DNS workers and one bounded datagram group can wait.
-        let (jobs, receiver) = mpsc::sync_channel(80);
+        let (jobs, receiver) = mpsc::sync_channel(queue);
         let worker = thread::Builder::new()
             .name("wsl-metadata".into())
             .spawn(move || {
@@ -247,5 +256,30 @@ mod tests {
         assert!(miss.origin.is_err());
         assert_eq!(miss.guest_us, None);
         assert_eq!(r2.recv().unwrap().origin.unwrap().port(), 4);
+    }
+
+    #[test]
+    fn the_queue_holds_every_concurrent_caller_at_the_worker_limits() {
+        // The dispatcher has not started: every possible waiter is still queued.
+        let max_tcp = crate::policy::Limits::default().max_tcp;
+        let (jobs, _receiver) = mpsc::sync_channel(queue_capacity(max_tcp));
+        let lane = MetadataLane {
+            jobs: Some(jobs),
+            worker: None,
+        };
+        let key = |port| Lookup {
+            protocol: "tcp",
+            peer: SocketAddr::V4(SocketAddrV4::new([127, 0, 0, 1].into(), port)),
+        };
+        let mut replies = Vec::new();
+        let waiters = 2 * max_tcp + crate::ingress::MAX_DNS_UDP + 1;
+        for index in 0..waiters {
+            replies.push(lane.submit(key(10_000 + index as u16)).unwrap());
+        }
+        assert!(lane.submit_group(&[key(1), key(2)]).is_ok());
+        assert_eq!(
+            lane.submit(key(3)).err().as_deref(),
+            Some("query_transport_queue_full")
+        );
     }
 }

@@ -367,6 +367,31 @@ fn finish_at(path: &Path, expected: &Record) -> Result<Record, String> {
     Ok(next)
 }
 
+fn abandon_at(path: &Path, expected: &Record) -> Result<Record, String> {
+    validate(expected)?;
+    let actual = load_at(path)?;
+    let next = Record {
+        generation: expected.generation,
+        pending: None,
+    };
+    if actual == next {
+        return Ok(next);
+    }
+    if actual != *expected {
+        return Err("transition_stale_record".into());
+    }
+    persist(path, expected, &next)?;
+    Ok(next)
+}
+
+/// Clears an intent at any stage, keeping its generation. Only the explicit
+/// operator abandon of a target that is no longer registered may call this:
+/// there is no guest left to restore. A normal stop uses `finish`, which never
+/// skips the release of an old owner.
+pub fn abandon(expected: &Record) -> Result<Record, String> {
+    abandon_at(&journal()?, expected)
+}
+
 /// Clear completed or safely rolled-back intent, retaining its generation for stale callers.
 /// Retrying a successful finish is harmless; an old-owner release cannot be finished early.
 pub fn finish(expected: &Record) -> Result<Record, String> {

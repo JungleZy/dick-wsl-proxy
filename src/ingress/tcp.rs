@@ -1,11 +1,16 @@
 use super::{
-    BUFFER_SIZE, CONNECT_TIMEOUT, Flow, HALF_CLOSE_TIMEOUT, POLL_INTERVAL, Plan, Route, Shared,
-    TCP_IDLE_TIMEOUT, TcpRegistration, destination, route, select_route, serve_dns_tcp,
+    BUFFER_SIZE, CONNECT_TIMEOUT, Flow, POLL_INTERVAL, Plan, Route, Shared, TcpRegistration,
+    destination, route, select_route, serve_dns_tcp,
 };
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Longest single wait on a quiet connection. Deadlines and the stop flag are
+/// rechecked at least this often; a stop also shuts the sockets down, which
+/// ends the wait at once.
+const QUIET_WAIT: Duration = Duration::from_secs(1);
 
 pub(super) fn forward_tcp(
     plan: &Plan,
@@ -65,6 +70,20 @@ pub(super) fn transient(error: &io::Error) -> bool {
     )
 }
 
+/// Out of sockets, handles or buffer space. That passes; it is no reason to
+/// stop forwarding for every other connection.
+pub(super) fn exhausted(error: &io::Error) -> bool {
+    // WSAEMFILE and WSAENOBUFS on Windows; ENFILE, EMFILE and ENOBUFS elsewhere.
+    #[cfg(windows)]
+    const CODES: [i32; 2] = [10024, 10055];
+    #[cfg(not(windows))]
+    const CODES: [i32; 3] = [23, 24, 105];
+    error.kind() == io::ErrorKind::OutOfMemory
+        || error
+            .raw_os_error()
+            .is_some_and(|code| CODES.contains(&code))
+}
+
 struct Pipe {
     buffer: [u8; BUFFER_SIZE],
     start: usize,
@@ -74,6 +93,16 @@ struct Pipe {
 }
 
 impl Pipe {
+    /// This direction waits for data from its source.
+    fn wants_read(&self) -> bool {
+        self.start == self.end && !self.eof
+    }
+
+    /// This direction holds data its target has not accepted yet.
+    fn wants_write(&self) -> bool {
+        self.start < self.end
+    }
+
     fn new() -> Self {
         Self {
             buffer: [0; BUFFER_SIZE],
@@ -173,18 +202,34 @@ pub(super) fn relay(
             } else {
                 *half_closed.get_or_insert(now)
             };
-            if now.duration_since(since) >= HALF_CLOSE_TIMEOUT {
+            if now.duration_since(since) >= shared.limits.half_close {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "TCP half-close deadline",
                 ));
             }
         }
-        if now.duration_since(touched) >= TCP_IDLE_TIMEOUT {
+        if now.duration_since(touched) >= shared.limits.tcp_idle {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "TCP idle deadline"));
         }
         if !progressed {
-            thread::sleep(POLL_INTERVAL);
+            // Sleep until a socket is ready instead of polling: a long-lived
+            // idle connection then costs no CPU.
+            let mut wait = QUIET_WAIT.min(
+                shared
+                    .limits
+                    .tcp_idle
+                    .saturating_sub(now.duration_since(touched)),
+            );
+            if let Some(since) = half_closed {
+                wait = wait.min(
+                    shared
+                        .limits
+                        .half_close
+                        .saturating_sub(now.duration_since(since)),
+                );
+            }
+            wait_quiet(&client, &upstream, &request, &response, wait);
         }
     }
     let _ = client.shutdown(Shutdown::Both);
@@ -192,9 +237,74 @@ pub(super) fn relay(
     Ok(())
 }
 
+/// Waits until one side can be read or written as `request` and `response`
+/// need, a socket fails or hangs up, or `timeout` passes.
+#[cfg(windows)]
+fn wait_quiet(
+    client: &TcpStream,
+    upstream: &TcpStream,
+    request: &Pipe,
+    response: &Pipe,
+    timeout: Duration,
+) {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        POLLRDNORM, POLLWRNORM, SOCKET_ERROR, WSAPOLLFD, WSAPoll,
+    };
+    let interest = |read: bool, write: bool| {
+        (if read { POLLRDNORM } else { 0 }) | (if write { POLLWRNORM } else { 0 })
+    };
+    let mut descriptors = [WSAPOLLFD::default(); 2];
+    let mut count = 0;
+    for (socket, events) in [
+        (
+            client.as_raw_socket(),
+            interest(request.wants_read(), response.wants_write()),
+        ),
+        (
+            upstream.as_raw_socket(),
+            interest(response.wants_read(), request.wants_write()),
+        ),
+    ] {
+        if events != 0 {
+            descriptors[count].fd = socket as _;
+            descriptors[count].events = events;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        thread::sleep(POLL_INTERVAL);
+        return;
+    }
+    let millis = timeout.as_millis().clamp(1, i32::MAX as u128) as i32;
+    // Both sockets belong to this thread for the whole call. Readiness, an
+    // error or a hang-up all end the wait; the next pump finds out which.
+    if unsafe { WSAPoll(descriptors.as_mut_ptr(), count as u32, millis) } == SOCKET_ERROR {
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+#[cfg(not(windows))]
+fn wait_quiet(_: &TcpStream, _: &TcpStream, _: &Pipe, _: &Pipe, _: Duration) {
+    thread::sleep(POLL_INTERVAL);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn running_out_of_sockets_is_not_a_listener_failure() {
+        #[cfg(windows)]
+        let (codes, broken) = ([10024, 10055], 10038); // WSAENOTSOCK stays fatal.
+        #[cfg(not(windows))]
+        let (codes, broken) = ([24, 105], 9); // EBADF stays fatal.
+        for code in codes {
+            assert!(exhausted(&io::Error::from_raw_os_error(code)));
+        }
+        assert!(!exhausted(&io::Error::from_raw_os_error(broken)));
+        assert!(!exhausted(&io::Error::from(io::ErrorKind::ConnectionReset)));
+    }
 
     #[test]
     fn connection_reset_is_transient() {

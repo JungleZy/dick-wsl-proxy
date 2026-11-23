@@ -23,6 +23,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 const TRAY_MESSAGE: u32 = WM_APP + 1;
+/// Sent by a second launch: show this instance's main window instead.
+const SHOW_MESSAGE: u32 = WM_APP + 2;
+const TRAY_CLASS: &str = "WSLProxyLabTrayWindow";
 const TRAY_TIMER: usize = 1;
 const OPEN_COMMAND: usize = 1;
 const REFRESH_COMMAND: usize = 2;
@@ -77,6 +80,17 @@ fn request_action(action: TrayAction) {
     ACTION.store(value, Ordering::Release);
 }
 
+/// Asks the instance that already runs in this session to show its window.
+/// Returns false when no such tray window exists.
+pub(crate) fn activate_running_instance() -> bool {
+    let class_name = wide(TRAY_CLASS);
+    unsafe {
+        let hwnd =
+            windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(class_name.as_ptr(), null());
+        !hwnd.is_null() && PostMessageW(hwnd, SHOW_MESSAGE, 0, 0) != 0
+    }
+}
+
 pub(crate) fn hide_main_window() {
     unsafe {
         let hwnd = find_main_window(null_mut());
@@ -101,6 +115,10 @@ unsafe extern "system" fn window_proc(
             }
             0
         }
+        SHOW_MESSAGE => {
+            show_main_window();
+            0
+        }
         WM_TIMER => {
             if find_main_window(hwnd).is_null() {
                 DestroyWindow(hwnd);
@@ -108,8 +126,8 @@ unsafe extern "system" fn window_proc(
             0
         }
         WM_DESTROY => {
-            let mut data = notify_data(hwnd);
-            Shell_NotifyIconW(NIM_DELETE, &mut data);
+            let data = notify_data(hwnd);
+            Shell_NotifyIconW(NIM_DELETE, &data);
             PostQuitMessage(0);
             0
         }
@@ -118,7 +136,7 @@ unsafe extern "system" fn window_proc(
 }
 
 unsafe fn run() {
-    let class_name = wide("WSLProxyLabTrayWindow");
+    let class_name = wide(TRAY_CLASS);
     let instance = GetModuleHandleW(null());
     let class = WNDCLASSW {
         hInstance: instance,
@@ -147,8 +165,8 @@ unsafe fn run() {
         return;
     }
     ShowWindow(hwnd, SW_HIDE);
-    let mut data = notify_data(hwnd);
-    if Shell_NotifyIconW(NIM_ADD, &mut data) == 0 {
+    let data = notify_data(hwnd);
+    if Shell_NotifyIconW(NIM_ADD, &data) == 0 {
         DestroyWindow(hwnd);
         return;
     }
@@ -247,7 +265,7 @@ unsafe fn find_main_window(excluded: HWND) -> HWND {
         let mut class = [0u16; 64];
         let class_length = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
         let is_tray_window = class_length > 0
-            && String::from_utf16_lossy(&class[..class_length as usize]) == "WSLProxyLabTrayWindow";
+            && String::from_utf16_lossy(&class[..class_length as usize]) == TRAY_CLASS;
         if pid == search.pid && hwnd != search.excluded && !is_tray_window {
             search.hwnd = hwnd;
             0
@@ -272,19 +290,23 @@ fn wide(value: &str) -> Vec<u16> {
 }
 
 unsafe fn notify_data(hwnd: HWND) -> NOTIFYICONDATAW {
-    let mut data = NOTIFYICONDATAW::default();
-    data.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
-    data.hWnd = hwnd;
-    data.uID = 1;
-    data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
-    data.uCallbackMessage = TRAY_MESSAGE;
-    let resource = 1usize as *const u16;
+    // Icon resource 1, as MAKEINTRESOURCEW passes it: the integer 1 in pointer
+    // form, never dereferenced. (`ptr::dangling` would be 2 for `u16`.)
+    let resource = std::ptr::without_provenance::<u16>(1);
     let application = GetModuleHandleW(null());
     let icon = LoadImageW(application, resource, IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
-    data.hIcon = if icon.is_null() {
-        LoadIconW(null_mut(), IDI_APPLICATION)
-    } else {
-        icon
+    let mut data = NOTIFYICONDATAW {
+        cbSize: size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: 1,
+        uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
+        uCallbackMessage: TRAY_MESSAGE,
+        hIcon: if icon.is_null() {
+            LoadIconW(null_mut(), IDI_APPLICATION)
+        } else {
+            icon
+        },
+        ..Default::default()
     };
     let tip = wide("WSL Proxy");
     let length = tip.len().min(data.szTip.len());

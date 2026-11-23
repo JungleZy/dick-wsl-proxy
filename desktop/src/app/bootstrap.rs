@@ -41,6 +41,9 @@ impl Desktop {
             direct_ips: input(window, cx, "每行一个 IPv4 或 CIDR", true),
             direct_domains: input(window, cx, "每行一个精确域名", true),
             direct_suffixes: input(window, cx, "每行一个域名后缀", true),
+            max_tcp_connections: input(window, cx, "留空为默认 256", false),
+            tcp_idle_timeout: input(window, cx, "留空为默认 1800", false),
+            tcp_half_close_timeout: input(window, cx, "留空为默认 60", false),
             port: Field::Single(cx.new(|cx| InputState::new(window, cx).default_value("43531"))),
             environment_name: input(window, cx, "例如 Ubuntu-Dev", false),
             environment_distribution: input(window, cx, "发行版，例如 Ubuntu-24.04", false),
@@ -73,6 +76,9 @@ impl Desktop {
             &fields.direct_ips,
             &fields.direct_domains,
             &fields.direct_suffixes,
+            &fields.max_tcp_connections,
+            &fields.tcp_idle_timeout,
+            &fields.tcp_half_close_timeout,
             &fields.port,
             &fields.environment_name,
             &fields.environment_distribution,
@@ -242,6 +248,15 @@ impl Desktop {
         .detach();
         this
     }
+    /// 后台在线时刷新状态；连不上时重新拉起后台并重新加载，例如后台已退出。
+    pub(crate) fn refresh_or_reconnect(&mut self, cx: &mut Context<Self>) {
+        if self.status_valid {
+            self.send(Kind::Status, json!({"command":"status"}), cx);
+        } else {
+            self.send(Kind::Bootstrap, Value::Null, cx);
+        }
+    }
+
     pub(crate) fn send(&mut self, kind: Kind, request: Value, cx: &mut Context<Self>) {
         if kind.mutation() {
             if self.busy.is_some() || self.reading {
@@ -505,11 +520,29 @@ impl Desktop {
                         if let Some(distributions) = value["distributions"].as_array() {
                             self.distributions = distributions.clone();
                         }
-                        self.accept_profile(&value["profile"], window, cx);
+                        // A reconnect keeps edits the user has not saved yet.
+                        if !(self.dirty && self.profile_path.is_some()) {
+                            self.accept_profile(&value["profile"], window, cx);
+                        }
                         self.accept_status(value["status"].clone());
                         self.accept_logs(&value["logs"], false);
                         self.notice = "后台已连接。请选择目标，然后启动接管。".into();
                         self.error = false;
+                        // 关窗期间开始的环境操作仍在后台执行。
+                        let job = &value["status"]["environment_job"];
+                        if job["state"] == "running" {
+                            let operation = match job["command"].as_str() {
+                                Some("environment_create") => "新建环境",
+                                Some("environment_edit") => "编辑环境",
+                                Some("environment_backup") => "备份环境",
+                                Some("environment_delete") => "删除环境",
+                                _ => "环境操作",
+                            };
+                            self.notice = format!(
+                                "后台正在{operation}（{}），完成前不能启动接管或管理环境；结果见运行日志。",
+                                job["target"].as_str().unwrap_or("未知环境")
+                            );
+                        }
                         // 连接记录独立于当前接管状态，后台空闲时也要预先读取，
                         // 这样打开连接页可以直接看到历史记录。
                         self.refresh_connection_history(cx);
@@ -599,6 +632,17 @@ impl Desktop {
                     Kind::Export => {
                         self.export_path = value["path"].as_str().map(str::to_owned);
                         self.notice = "诊断已导出；请按内部资料处理。".into();
+                    }
+                    Kind::Abandon => {
+                        self.accept_status(value);
+                        self.notice =
+                            "已放弃本次接管记录。下次启动接管前，请先执行一次 wsl --shutdown。"
+                                .into();
+                        self.error = false;
+                    }
+                    Kind::ResetDnsAliases => {
+                        self.notice = "DNS 别名记录已清空，下次启动接管时重新分配。".into();
+                        self.error = false;
                     }
                     Kind::Probe => {
                         self.accept_status(value);
@@ -735,6 +779,8 @@ impl Desktop {
                         | Kind::EnvironmentEdit
                         | Kind::EnvironmentBackup
                         | Kind::EnvironmentDelete
+                        | Kind::ResetDnsAliases
+                        | Kind::Abandon
                 )
             {
                 self.logs_refresh_pending = true;
@@ -751,9 +797,7 @@ impl Desktop {
         }
         if let Some(action) = super::tray::consume_action() {
             match action {
-                super::tray::TrayAction::Refresh => {
-                    self.send(Kind::Status, json!({"command":"status"}), cx);
-                }
+                super::tray::TrayAction::Refresh => self.refresh_or_reconnect(cx),
                 super::tray::TrayAction::Start => {
                     self.page = Page::Overview;
                     match self.phase() {
@@ -931,6 +975,21 @@ impl Desktop {
             } else {
                 self.profile[key].as_str().unwrap_or_default().to_owned()
             };
+            field.set_value(value, window, cx);
+        }
+        // 留空表示用默认值；后台不保存默认值，所以默认时这里是空的。
+        for (field, key) in [
+            (&self.fields.max_tcp_connections, "max_tcp_connections"),
+            (&self.fields.tcp_idle_timeout, "tcp_idle_timeout_seconds"),
+            (
+                &self.fields.tcp_half_close_timeout,
+                "tcp_half_close_timeout_seconds",
+            ),
+        ] {
+            let value = self.profile[key]
+                .as_u64()
+                .map(|value| value.to_string())
+                .unwrap_or_default();
             field.set_value(value, window, cx);
         }
         for (field, key) in [

@@ -5,6 +5,7 @@ import json
 import os
 import struct
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -738,13 +739,17 @@ class FirewallTests(unittest.TestCase):
         self.assertTrue(ipv6.kwargs["ipv6"])
         self.assertTrue(all(rule[0] in ("-D", "-X") for call in transact.call_args_list for rule in call.args[1]))
 
-    def test_stale_remove_recovers_after_allowed_identity_changes_with_exact_rules(self):
+    def test_stale_remove_recovers_after_any_identity_or_environment_drift_with_exact_rules(self):
         for reason in (
             "boot_changed",
             "cgroup_namespace_changed",
             "cgroup_root_changed",
             "guest_address_changed",
             "gateway_changed_or_ambiguous",
+            "distribution_name_changed",
+            "guest_ipv6_address_changed",
+            "workload_outside_distro_cgroup",
+            "unverifiable_workload",
         ):
             with self.subTest(reason=reason):
                 p = plan()
@@ -760,7 +765,7 @@ class FirewallTests(unittest.TestCase):
                 ):
                     conntrack.return_value.dump.return_value = []
                     result = kernel.execute(operation)
-                self.assertEqual(result, {"ok": True, "operation": "remove"})
+                self.assertEqual(result, {"ok": True, "operation": "remove", "identity_error": reason})
                 guard.assert_called_once_with(p, check_resolver=False, write_tools=True)
                 grant.assert_called_once_with(p, "revoke")
                 self.assertTrue(transact.call_args_list)
@@ -774,47 +779,75 @@ class FirewallTests(unittest.TestCase):
                 conntrack.return_value.delete.assert_not_called()
 
     def test_stale_remove_rejects_foreign_same_cookie_firewall(self):
-        p = plan()
-        foreign = copy.deepcopy(p)
-        foreign["ingress"] = "172.28.80.1:43780"
-        operation = request(p)
-        operation["operation"] = "remove"
-        with (
-            patch.object(kernel, "guest_lock"),
-            patch.object(kernel, "guard", side_effect=kernel.Failure("cgroup_namespace_changed")) as guard,
-            patch.object(kernel, "grant") as grant,
-            patch.object(kernel, "Conntrack") as conntrack,
-            patch.object(kernel, "firewall", return_value=snapshot(foreign)),
-            patch.object(kernel, "transaction") as transact,
-        ):
-            with self.assertRaisesRegex(kernel.Failure, "foreign_instance_rule"):
-                kernel.execute(operation)
-        guard.assert_called_once_with(p, check_resolver=False, write_tools=True)
-        grant.assert_called_once_with(p, "revoke")
-        transact.assert_not_called()
-        conntrack.return_value.delete.assert_not_called()
+        for reason in ("cgroup_namespace_changed", "workload_outside_distro_cgroup"):
+            with self.subTest(reason=reason):
+                p = plan()
+                foreign = copy.deepcopy(p)
+                foreign["ingress"] = "172.28.80.1:43780"
+                operation = request(p)
+                operation["operation"] = "remove"
+                with (
+                    patch.object(kernel, "guest_lock"),
+                    patch.object(kernel, "guard", side_effect=kernel.Failure(reason)) as guard,
+                    patch.object(kernel, "grant") as grant,
+                    patch.object(kernel, "Conntrack") as conntrack,
+                    patch.object(kernel, "firewall", return_value=snapshot(foreign)),
+                    patch.object(kernel, "transaction") as transact,
+                ):
+                    with self.assertRaisesRegex(kernel.Failure, "foreign_instance_rule"):
+                        kernel.execute(operation)
+                guard.assert_called_once_with(p, check_resolver=False, write_tools=True)
+                grant.assert_called_once_with(p, "revoke")
+                transact.assert_not_called()
+                conntrack.return_value.delete.assert_not_called()
 
     def test_stale_remove_rejects_foreign_same_cookie_conntrack(self):
-        p = plan()
-        foreign = entry(p)
-        foreign["original"] = (17, p["guest"], 44000, "172.28.80.2", 43772)
-        operation = request(p)
-        operation["operation"] = "remove"
-        with (
-            patch.object(kernel, "guest_lock"),
-            patch.object(kernel, "guard", side_effect=kernel.Failure("cgroup_namespace_changed")) as guard,
-            patch.object(kernel, "grant") as grant,
-            patch.object(kernel, "Conntrack") as conntrack,
-            patch.object(kernel, "firewall", return_value={}),
-            patch.object(kernel, "transaction") as transact,
-        ):
-            conntrack.return_value.dump.return_value = [foreign]
-            with self.assertRaisesRegex(kernel.Failure, "instance_mark_has_unproven_mapping"):
-                kernel.execute(operation)
-        guard.assert_called_once_with(p, check_resolver=False, write_tools=True)
-        grant.assert_called_once_with(p, "revoke")
-        transact.assert_not_called()
-        conntrack.return_value.delete.assert_not_called()
+        for reason in ("cgroup_namespace_changed", "workload_outside_distro_cgroup"):
+            with self.subTest(reason=reason):
+                p = plan()
+                foreign = entry(p)
+                foreign["original"] = (17, p["guest"], 44000, "172.28.80.2", 43772)
+                operation = request(p)
+                operation["operation"] = "remove"
+                with (
+                    patch.object(kernel, "guest_lock"),
+                    patch.object(kernel, "guard", side_effect=kernel.Failure(reason)) as guard,
+                    patch.object(kernel, "grant") as grant,
+                    patch.object(kernel, "Conntrack") as conntrack,
+                    patch.object(kernel, "firewall", return_value={}),
+                    patch.object(kernel, "transaction") as transact,
+                ):
+                    conntrack.return_value.dump.return_value = [foreign]
+                    with self.assertRaisesRegex(kernel.Failure, "instance_mark_has_unproven_mapping"):
+                        kernel.execute(operation)
+                guard.assert_called_once_with(p, check_resolver=False, write_tools=True)
+                grant.assert_called_once_with(p, "revoke")
+                transact.assert_not_called()
+                conntrack.return_value.delete.assert_not_called()
+
+    def test_install_paths_still_refuse_every_guard_failure(self):
+        for operation_name in ("precheck", "install", "arm"):
+            for reason in ("workload_outside_distro_cgroup", "boot_changed", "distribution_name_changed"):
+                with self.subTest(operation=operation_name, reason=reason):
+                    p = plan()
+                    operation = request(p)
+                    operation["operation"] = operation_name
+                    if operation_name == "arm":
+                        operation["deadline"] = int(time.time()) + 10
+                    with (
+                        patch.object(kernel, "guest_lock"),
+                        patch.object(kernel, "guard", side_effect=kernel.Failure(reason)),
+                        patch.object(kernel, "grant") as grant,
+                        patch.object(kernel, "Conntrack") as conntrack,
+                        patch.object(kernel, "install_rules") as install,
+                        patch.object(kernel, "transaction") as transact,
+                    ):
+                        with self.assertRaisesRegex(kernel.Failure, reason):
+                            kernel.execute(operation)
+                    grant.assert_not_called()
+                    install.assert_not_called()
+                    transact.assert_not_called()
+                    conntrack.assert_not_called()
 
 
 class InspectionTests(unittest.TestCase):
@@ -881,8 +914,11 @@ class InspectionTests(unittest.TestCase):
             self.assertEqual(value, {"identity_matches": False, "rules_present": False, "rules_complete": False, "mappings_present": False})
             with self.subTest(reason=reason), self.assertRaises(kernel.Failure):
                 self.observe(p, [snapshot(p), ipv6_snapshot(p)], identity_error=reason)
-        with self.assertRaises(kernel.Failure):
-            self.observe(plan(), [{}], identity_error="workload_outside_distro_cgroup")
+        # Any other drift is handled the same way: it can attest absence only.
+        value = self.observe(plan(), [{}], identity_error="workload_outside_distro_cgroup")
+        self.assertEqual(value, {"identity_matches": False, "rules_present": False, "rules_complete": False, "mappings_present": False})
+        with self.assertRaisesRegex(kernel.Failure, "stale_identity_has_owned_artifacts: workload_outside_distro_cgroup"):
+            self.observe(plan(), [snapshot(plan())], identity_error="workload_outside_distro_cgroup")
 
     def test_pending_install_and_corrupt_owned_shapes_never_attest_clean(self):
         with self.assertRaisesRegex(kernel.Failure, "install_grant_pending"):

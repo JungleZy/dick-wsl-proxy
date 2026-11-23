@@ -14,9 +14,9 @@ mod inner {
     use std::ptr::{null, null_mut};
     use std::time::{Duration, Instant};
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_BUSY,
-        ERROR_PIPE_CONNECTED, ERROR_SEM_TIMEOUT, GENERIC_READ, GENERIC_WRITE, HANDLE,
-        INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_NO_DATA,
+        ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_SEM_TIMEOUT, GENERIC_READ, GENERIC_WRITE,
+        HANDLE, INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -326,10 +326,13 @@ mod inner {
                     "ipc_invalid_executable",
                 )));
             }
-            let mut command = vec![b'"' as u16];
-            command.extend_from_slice(&application[..application.len() - 1]);
-            command.extend("\" daemon".encode_utf16());
-            command.push(0);
+            let command_line = || {
+                let mut command = vec![b'"' as u16];
+                command.extend_from_slice(&application[..application.len() - 1]);
+                command.extend("\" daemon".encode_utf16());
+                command.push(0);
+                command
+            };
             let directory = wide(
                 self.path
                     .parent()
@@ -347,22 +350,38 @@ mod inner {
                 ..Default::default()
             };
             let mut info = PROCESS_INFORMATION::default();
-            if unsafe {
-                CreateProcessW(
-                    application.as_ptr(),
-                    command.as_mut_ptr(),
-                    null(),
-                    null(),
-                    0,
-                    CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB,
-                    null(),
-                    directory.as_ptr(),
-                    &startup,
-                    &mut info,
-                )
-            } == 0
-            {
-                return Err(SpawnError::Io(io::Error::last_os_error()));
+            // CreateProcessW may write to the command line, so each attempt gets its own.
+            let mut create = |flags| {
+                let mut command = command_line();
+                if unsafe {
+                    CreateProcessW(
+                        application.as_ptr(),
+                        command.as_mut_ptr(),
+                        null(),
+                        null(),
+                        0,
+                        flags,
+                        null(),
+                        directory.as_ptr(),
+                        &startup,
+                        &mut info,
+                    )
+                } == 0
+                {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            };
+            // A job that forbids breakaway (some SSH sessions, schedulers, CI)
+            // refuses the flag. Then the daemon stays in that job and lives as
+            // long as it does, instead of never starting.
+            match create(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+                    create(CREATE_NO_WINDOW).map_err(SpawnError::Io)?
+                }
+                Err(error) => return Err(SpawnError::Io(error)),
             }
             let process = match Handle::checked(info.hProcess) {
                 Ok(process) => process,

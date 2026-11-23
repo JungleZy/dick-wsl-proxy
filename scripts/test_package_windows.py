@@ -26,6 +26,19 @@ def pe(machine=0x8664):
 
 
 class PackagingTests(unittest.TestCase):
+    def test_reads_json_records_regardless_of_the_windows_code_page(self):
+        value = {"schema_version": 1, "note": "中文"}
+        text = json.dumps(value, ensure_ascii=False)
+        with tempfile.TemporaryDirectory(prefix="wsl-proxy-package-test-") as temporary:
+            for name, data in (
+                ("plain.json", text.encode("utf-8")),
+                ("bom.json", text.encode("utf-8-sig")),
+                ("powershell.json", text.encode("utf-16")),
+            ):
+                path = Path(temporary) / name
+                path.write_bytes(data)
+                self.assertEqual(pack.read_json(path), value)
+
     def test_rejects_wrong_architecture_and_truncation(self):
         for data in (pe(0x14c), b"MZ", b"not executable"):
             with self.assertRaises(ValueError):

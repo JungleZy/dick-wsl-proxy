@@ -1176,16 +1176,20 @@ def execute(request):
     operation = request["operation"]
     with guest_lock():
         identity_matches = True
+        drift = None
         try:
             guard(p, check_resolver=operation not in ("remove", "inspect"), write_tools=operation != "inspect")
         except Failure as error:
-            stale_context_errors = {"boot_changed", "cgroup_namespace_changed", "cgroup_root_changed", "guest_address_changed", "gateway_changed_or_ambiguous"}
-            if operation not in ("inspect", "remove") or str(error) not in stale_context_errors:
+            if operation not in ("inspect", "remove"):
                 raise
-            # Only inspect and remove may continue after these stale-context errors:
-            # inspect attests absence, while remove deletes exact per-instance
-            # firewall and conntrack artifacts below. All other operations fail.
+            # After any identity or environment drift (restart, rename, new
+            # addresses, a workload outside the cgroup, ...), only inspect and
+            # remove continue: inspect may attest absence only, and remove
+            # deletes this instance's exact tagged firewall and conntrack
+            # artifacts below. Every other operation fails. The reason is
+            # returned so the host can tell a restart from a passing race.
             identity_matches = False
+            drift = str(error)
         if operation == "arm":
             grant(p, "arm", request["deadline"])
             return {"ok": True, "operation": operation}
@@ -1224,10 +1228,13 @@ def execute(request):
                         "rules_complete": rules_complete(p, present, rules, ipv6_rules),
                         "mappings_present": bool(entries or ipv6_entries),
                     }
-                    require(identity_matches or not (ownership["rules_present"] or ownership["mappings_present"]), "stale_identity_has_owned_artifacts")
+                    require(identity_matches or not (ownership["rules_present"] or ownership["mappings_present"]), "stale_identity_has_owned_artifacts: " + str(drift))
                     if not ownership["rules_present"] and not ownership["mappings_present"]:
                         require(not grant_pending(p), "install_grant_pending")
-                    return {"ok": True, "operation": operation, "ownership": ownership}
+                    result = {"ok": True, "operation": operation, "ownership": ownership}
+                    if drift is not None:
+                        result["identity_error"] = drift
+                    return result
                 chain = artifacts(p)[0]
                 deletions = [["-D", *rule[1:]] for rule in rules["nat"]]
                 if present:
@@ -1285,6 +1292,8 @@ def execute(request):
                 else:
                     origin = resolve(p, ct.dump(), request["protocol"], request["peer"])
                 return {"ok": True, "operation": operation, "origin": origin}
+            if drift is not None:
+                return {"ok": True, "operation": operation, "identity_error": drift}
             return {"ok": True, "operation": operation}
         except (OSError, Failure) as error:
             if cached_conntrack and (

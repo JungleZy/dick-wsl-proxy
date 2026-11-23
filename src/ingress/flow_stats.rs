@@ -7,7 +7,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::lock;
 
-const ACTIVE_LIMIT: usize = 256;
+/// Active rows kept for display; forwarding itself is not limited by this.
+const ACTIVE_LIMIT: usize = 1024;
 const RECENT_LIMIT: usize = 128;
 const RECENT_TTL: Duration = Duration::from_secs(300);
 
@@ -286,6 +287,16 @@ impl FailureMarker {
             sink.offer(finished);
         }
     }
+
+    /// As `failed`, recording why the flow never started.
+    pub(super) fn refused(self, reason: &'static str) {
+        {
+            let mut details = lock(&self.record.details);
+            details.route = Some("reject");
+            details.reason = Some(reason);
+        }
+        self.failed();
+    }
 }
 
 impl FlowStats {
@@ -415,6 +426,20 @@ impl Drop for Flow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_flow_that_never_started_records_why() {
+        let stats = Arc::new(FlowStats::new());
+        let flow = stats.begin("tcp");
+        let marker = flow.failure_marker();
+        drop(flow);
+        marker.refused("resource_limit");
+        let (rows, _) = stats.snapshot();
+        let recent = &rows["recent"][0];
+        assert_eq!(recent["status"], "failed");
+        assert_eq!(recent["route"], "reject");
+        assert_eq!(recent["reason"], "resource_limit");
+    }
 
     #[test]
     fn active_rows_have_a_hard_cap_and_completed_rows_remain_bounded() {

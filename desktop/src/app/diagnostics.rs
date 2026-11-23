@@ -68,6 +68,9 @@ fn reason_label(reason: Option<&str>) -> &'static str {
         Some("system_dns") => "系统 DNS",
         Some("policy_reject") => "策略拒绝",
         Some("metadata_unavailable") => "目标未识别",
+        Some("capacity_limit") => "并发已满",
+        Some("peer_busy") => "源端口未释放",
+        Some("resource_limit") => "系统资源不足",
         _ => "等待元数据",
     }
 }
@@ -515,6 +518,17 @@ impl Desktop {
                 )
                 .child(
                     self.button(
+                        "reset-dns-aliases",
+                        "重置 DNS 别名",
+                        UiAction::ResetDnsAliases,
+                        locked || self.phase() != "idle",
+                        cx,
+                    )
+                    .tooltip("只在提示 DNS 别名号段已用完时使用；需要先停止接管。")
+                    .small(),
+                )
+                .child(
+                    self.button(
                         "reveal",
                         "打开报告位置",
                         UiAction::Reveal,
@@ -773,7 +787,7 @@ fn grouped(value: u64) -> String {
     let digits = value.to_string();
     let mut grouped = String::new();
     for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             grouped.push(',');
         }
         grouped.push(digit);

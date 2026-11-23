@@ -65,9 +65,15 @@ impl Ownership {
 /// The caller must first verify the current Windows registration. A stale guest
 /// identity can attest absence only; surviving or ambiguous artifacts fail closed.
 pub fn inspect(p: &Plan) -> Result<Ownership, String> {
-    invoke(p, "inspect", None)?
-        .ownership
-        .ok_or_else(|| "kernel_missing_ownership".into())
+    inspect_detail(p).map(|(ownership, _)| ownership)
+}
+
+/// As `inspect`, plus the guest's reason when it could not confirm this
+/// generation's identity (restart, rename, new address, foreign workload, ...).
+pub fn inspect_detail(p: &Plan) -> Result<(Ownership, Option<String>), String> {
+    let response = invoke(p, "inspect", None)?;
+    let ownership = response.ownership.ok_or("kernel_missing_ownership")?;
+    Ok((ownership, response.identity_error))
 }
 
 #[derive(Serialize)]
@@ -88,6 +94,8 @@ struct Response {
     origin: Option<SocketAddr>,
     ownership: Option<Ownership>,
     grant_deadline: Option<u64>,
+    #[serde(default)]
+    identity_error: Option<String>,
 }
 
 fn invoke(p: &Plan, operation: &str, deadline: Option<u64>) -> Result<Response, String> {
@@ -130,6 +138,9 @@ fn parse_response(output: &str, operation: &str) -> Result<Response, String> {
     }
     if (operation == "inspect") != response.ownership.is_some() {
         return Err("kernel_unexpected_or_missing_ownership".into());
+    }
+    if response.identity_error.is_some() && !matches!(operation, "inspect" | "remove") {
+        return Err("kernel_unexpected_identity_error".into());
     }
     if let Some(ownership) = &response.ownership
         && ((ownership.rules_complete && !ownership.rules_present)
@@ -392,6 +403,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn identity_drift_is_reported_only_by_inspect_and_remove() {
+        let inspect = r#"{"ok":true,"operation":"inspect","ownership":{"identity_matches":false,"rules_present":false,"rules_complete":false,"mappings_present":false},"identity_error":"boot_changed"}"#;
+        assert_eq!(
+            parse_response(inspect, "inspect")
+                .unwrap()
+                .identity_error
+                .as_deref(),
+            Some("boot_changed")
+        );
+        let remove =
+            r#"{"ok":true,"operation":"remove","identity_error":"workload_outside_distro_cgroup"}"#;
+        assert!(parse_response(remove, "remove").is_ok());
+        for operation in ["install", "arm"] {
+            let response = format!(
+                r#"{{"ok":true,"operation":"{operation}","identity_error":"boot_changed"}}"#
+            );
+            assert!(parse_response(&response, operation).is_err(), "{operation}");
+        }
+        assert!(
+            parse_response(
+                r#"{"ok":true,"operation":"precheck","grant_deadline":5,"identity_error":"boot_changed"}"#,
+                "precheck"
+            )
+            .is_err()
+        );
     }
 
     #[test]

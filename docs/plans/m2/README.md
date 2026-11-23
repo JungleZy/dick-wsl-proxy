@@ -21,6 +21,8 @@
    }
    ```
 
+   可选的转发限制，不写就用默认值，在启动或切换接管时固定：`max_tcp_connections`（并发 TCP 上限，含 TCP 上的 DNS，16–1024，默认 256）、`tcp_idle_timeout_seconds`（两个方向都没有数据多久后断开，30–86400，默认 1800）、`tcp_half_close_timeout_seconds`（一方结束后另一方无数据多久后断开，5–3600，默认 60）。取默认值时不写入桌面端配置库。
+
 2. 用 `wsl-proxyctl.exe import-credential --name my-residence --env-file <文件路径>` 导入现有 `.env`（`ip`、`port`、`username`、`password`）。策略文件只引用名称；凭据仅保存在当前 Windows 用户的凭据管理器，导入不覆盖同名记录。审阅策略后运行 `wsl-proxyctl.exe session`。
 3. 在同一会话逐行提交，例如：
 
@@ -30,7 +32,7 @@
    {"command":"stop"}
    ```
 
-   `startup_verified` 是**启动时**的探测结果，不是实时可用性保证。只有来自目标的两个独立未缓存 DNS 探测（UDP、强制 TCP）在 Windows 端经认证上游收到对应回答、双跳 SOCKS5 UDP 关联可以建立，以及目标的非白名单 HTTPS 探测通过，才返回 `forwarding_managed`。UDP 关联探测只建立并关闭代理关联，不发送业务数据。住宅端拒绝 UDP 时启动进入恢复状态，查看状态后显式 `stop` 恢复；不通过删除日志或改成只代理网页来跳过失败。正常结束拥有活动入口的会话会执行停止；若控制器崩溃，另行运行 `wsl-proxyctl.exe status`、`wsl-proxyctl.exe stop`。
+   `startup_verified` 是**启动时**的探测结果，不是实时可用性保证。只有来自目标的两个独立未缓存 DNS 探测（UDP、强制 TCP）在 Windows 端经认证上游收到对应回答，以及目标的非白名单 HTTPS 探测经双跳完成，才返回 `forwarding_managed`；任一项失败进入恢复状态，查看状态后显式 `stop` 恢复，不通过删除日志或改成只代理网页来跳过失败。启动时另探测一次双跳 SOCKS5 UDP 关联，只建立并关闭关联、不发送业务数据：住宅端拒绝 UDP 时接管照常，结果记在 `startup_verified.udp_supported`，本次接管期间非白名单 UDP（含 QUIC）一律拒绝、不直连。正常结束拥有活动入口的会话会执行停止；若控制器崩溃，另行运行 `wsl-proxyctl.exe status`、`wsl-proxyctl.exe stop`。
 4. 停止不会删除用户凭据。如不再使用，可运行 `wsl-proxyctl.exe forget-credential --name my-residence`。不得把密码放进命令行或策略文件。
 
 ## 分流与故障语义
