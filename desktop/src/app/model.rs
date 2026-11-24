@@ -370,6 +370,7 @@ pub(crate) enum UiAction {
     Save,
     Probe,
     Prepare(Kind),
+    KernelPrepare,
     Reveal,
     EnvironmentCreate,
     EnvironmentSubmit,

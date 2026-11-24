@@ -12,6 +12,7 @@ pub(crate) enum Kind {
     List,
     Logs,
     Preflight,
+    PrepareKernel,
     Save,
     Start,
     Switch,
@@ -32,6 +33,7 @@ impl Kind {
         matches!(
             self,
             Self::Save
+                | Self::PrepareKernel
                 | Self::Start
                 | Self::Switch
                 | Self::Stop
@@ -63,6 +65,7 @@ impl Kind {
             Self::Connections => "读取连接记录",
             Self::Logs => "刷新日志",
             Self::Preflight => "启动前检查",
+            Self::PrepareKernel => "准备内核环境",
             Self::Save => "保存策略",
             Self::Start => "启动接管",
             Self::Switch => "切换目标",
@@ -121,6 +124,10 @@ fn humanize_code(code: &str, message: &str) -> String {
         "enumeration_failed" => "读取 WSL 环境列表失败，请检查 WSL 服务状态。".into(),
         "probe_failed" => "检查目标 WSL 失败，请确认发行版可以正常启动。".into(),
         "target_already_owned" => "当前已有接管任务，请先停止接管并恢复直连。".into(),
+        "kernel_prepare_requires_idle" => "请先停止接管并恢复直连，再准备内核环境。".into(),
+        "kernel_prepare_failed" => {
+            "内核环境准备失败，请确认目标发行版能启动，并且带有内核模块。".into()
+        }
         "environment_requires_idle" => "请先停止接管并恢复直连，再管理 WSL 环境。".into(),
         "same_target" => "当前目标没有变化。".into(),
         "environment_name_invalid" => "环境名称只能使用字母、数字、点、下划线和短横线。".into(),
@@ -266,6 +273,48 @@ fn humanize_detail(detail: &str) -> String {
     "操作失败，请检查当前状态后重试。".into()
 }
 
+/// The overview notice for one explicit kernel preparation. `true` means the
+/// result still needs attention (modules unavailable or remaining blockers).
+pub(crate) fn kernel_prepare_notice(value: &Value) -> (String, bool) {
+    let preparation = &value["preparation"];
+    let count = |key: &str| preparation[key].as_array().map_or(0, Vec::len);
+    if preparation["ok"] != true {
+        return (humanize_code("kernel_prepare_failed", ""), true);
+    }
+    let added = count("modules_added");
+    let failed = count("modules_failed");
+    let tables = ["v4", "v6"]
+        .iter()
+        .map(|family| {
+            preparation["tables"]["added"][family]
+                .as_array()
+                .map_or(0, Vec::len)
+        })
+        .sum::<usize>();
+    let blockers = value["blockers"].as_array().map_or(0, Vec::len);
+    let mut message = if added == 0 && tables == 0 {
+        "内核环境已就绪，无需新增模块或空表。".to_owned()
+    } else {
+        format!("内核环境已准备：新增 {added} 个模块、{tables} 个空表。")
+    };
+    if failed > 0 {
+        message.push_str(&format!("{failed} 个模块不可用，请检查目标内核模块。"));
+    }
+    let record_error = value["record_error"].as_str().is_some();
+    if record_error {
+        message.push_str("准备记录写入失败，请检查本机配置目录。");
+    }
+    if value["inspection_error"].as_str().is_some() {
+        message.push_str("无法复核预检结果，请稍后手动预检。");
+        return (message, true);
+    }
+    match blockers {
+        0 => message.push_str("可以在总览重新预检并启动接管。"),
+        blockers => message.push_str(&format!("仍有 {blockers} 个阻断项，请查看预检结果。")),
+    }
+    (message, failed > 0 || blockers > 0 || record_error)
+}
+
 pub(crate) fn request(value: &Value) -> Result<Value, String> {
     let reply = wsl_proxyctl::ipc::request(value)?;
     if let Some(message) = reply.get("message").and_then(Value::as_str)
@@ -367,7 +416,80 @@ pub(crate) fn worker() -> (Sender<Job>, Receiver<Reply>) {
 
 #[cfg(test)]
 mod tests {
-    use super::humanize_error;
+    use super::{humanize_error, kernel_prepare_notice};
+    use serde_json::json;
+
+    #[test]
+    fn summarizes_kernel_preparation_and_keeps_failures_visible() {
+        let ready = json!({
+            "preparation": {
+                "ok": true,
+                "modules_added": ["xt_cgroup"],
+                "modules_failed": [],
+                "tables": {"added": {"v4": ["filter"], "v6": ["filter", "nat"]}}
+            },
+            "blockers": [],
+            "inspection_error": null
+        });
+        let (message, error) = kernel_prepare_notice(&ready);
+        assert!(message.contains("新增 1 个模块、3 个空表"), "{message}");
+        assert!(message.contains("可以"), "{message}");
+        assert!(!error);
+
+        let incomplete = json!({
+            "preparation": {
+                "ok": true,
+                "modules_added": [],
+                "modules_failed": [{"module": "xt_cgroup", "reason": "not_available"}],
+                "tables": {"added": {"v4": [], "v6": []}}
+            },
+            "blockers": ["capability.kernel.module.xt_cgroup.unverified"],
+            "inspection_error": null
+        });
+        let (message, error) = kernel_prepare_notice(&incomplete);
+        assert!(message.contains("1 个模块不可用"), "{message}");
+        assert!(message.contains("仍有 1 个阻断项"), "{message}");
+        assert!(error);
+
+        let unrecorded = json!({
+            "preparation": {
+                "ok": true,
+                "modules_added": [],
+                "modules_failed": [],
+                "tables": {"added": {"v4": [], "v6": []}}
+            },
+            "record_error": "kernel_env_record_rename: denied",
+            "blockers": [],
+            "inspection_error": null
+        });
+        let (message, error) = kernel_prepare_notice(&unrecorded);
+        assert!(message.contains("准备记录写入失败"), "{message}");
+        assert!(error);
+
+        let refused = json!({
+            "preparation": {"ok": false, "error": "root_required"},
+            "blockers": [],
+            "inspection_error": null
+        });
+        let (message, error) = kernel_prepare_notice(&refused);
+        assert_eq!(
+            message,
+            "内核环境准备失败，请确认目标发行版能启动，并且带有内核模块。"
+        );
+        assert!(error);
+    }
+
+    #[test]
+    fn translates_kernel_preparation_errors_for_the_ui() {
+        assert_eq!(
+            humanize_error("kernel_prepare_requires_idle"),
+            "请先停止接管并恢复直连，再准备内核环境。"
+        );
+        assert_eq!(
+            humanize_error("kernel_prepare_failed: Target"),
+            "内核环境准备失败，请确认目标发行版能启动，并且带有内核模块。"
+        );
+    }
 
     #[test]
     fn translates_environment_errors_for_the_ui() {

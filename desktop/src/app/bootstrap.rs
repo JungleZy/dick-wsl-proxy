@@ -622,12 +622,31 @@ impl Desktop {
                             }
                         } else {
                             self.error = true;
+                            let kernel_gap = blockers.iter().any(|blocker| {
+                                blocker.starts_with("capability.kernel.")
+                                    || blocker.starts_with("baseline.ip6tables")
+                                    || blocker.starts_with("baseline.iptables")
+                            });
                             self.notice = if blockers.is_empty() {
                                 "预检未通过，请检查当前环境。".into()
                             } else {
-                                format!("预检未通过：{}", blockers.join("；"))
+                                let mut notice = format!("预检未通过：{}", blockers.join("；"));
+                                if kernel_gap {
+                                    notice.push_str(
+                                        "。缺少的内核能力可由「准备内核环境」从目标已有的模块补齐。",
+                                    );
+                                }
+                                notice
                             };
                         }
+                    }
+                    Kind::PrepareKernel => {
+                        self.preflight = None;
+                        self.pending_prepare = None;
+                        let (notice, needs_attention) =
+                            super::backend::kernel_prepare_notice(&value);
+                        self.notice = notice;
+                        self.error = needs_attention;
                     }
                     Kind::Export => {
                         self.export_path = value["path"].as_str().map(str::to_owned);

@@ -57,15 +57,37 @@ impl Desktop {
                     .gap_3()
                     .child(card_header("运行状态", "后台状态、接管目标和流量健康度"))
                     .child(
-                        self.button(
-                            "overview-session-action",
-                            session_label,
-                            session_action,
-                            session_disabled,
-                            cx,
-                        )
-                        .icon(design_icon(session_icon, 15., super::theme::SURFACE))
-                        .primary(),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .when(self.idle(), |this| {
+                                this.child(
+                                    self.button(
+                                        "overview-kernel-prepare",
+                                        "准备内核环境",
+                                        UiAction::KernelPrepare,
+                                        self.locked(),
+                                        cx,
+                                    )
+                                    .icon(design_icon("refresh", 15., MUTED))
+                                    .ghost()
+                                    .tooltip(
+                                        "冷启动后加载目标已有的内核模块并创建空表；不安装软件，需先停止接管",
+                                    ),
+                                )
+                            })
+                            .child(
+                                self.button(
+                                    "overview-session-action",
+                                    session_label,
+                                    session_action,
+                                    session_disabled,
+                                    cx,
+                                )
+                                .icon(design_icon(session_icon, 15., super::theme::SURFACE))
+                                .primary(),
+                            ),
                     ),
             )
             .child(

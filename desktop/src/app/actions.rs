@@ -417,6 +417,41 @@ impl Desktop {
         );
     }
 
+    /// 只在空闲时可用。只加载目标发行版里已经存在的模块，但影响共享内核，
+    /// 所以要用户确认；不安装软件包、不启动接管。
+    pub(crate) fn prepare_kernel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.locked() {
+            return;
+        }
+        if !self.idle() {
+            self.fail("请先停止接管并恢复直连，再准备内核环境。", cx);
+            return;
+        }
+        let Some(generation) = self.generation() else {
+            self.fail("后台状态未确认，请先刷新。", cx);
+            return;
+        };
+        let Some(target) = self.selected.clone() else {
+            self.fail("请先选择目标 WSL。", cx);
+            return;
+        };
+        let target_name = self.environment_display_name(&target);
+        self.confirmation = Some(Confirmation {
+            kind: Kind::PrepareKernel,
+            generation,
+            request: json!({
+                "command":"prepare_kernel",
+                "target":target,
+                "confirm":true
+            }),
+            message: format!(
+                "将为 {target_name} 加载发行版里已有的内核模块（含 xt_cgroup、ip6table_nat 等 12 个），并创建空的 filter/nat 表。这会影响同一 WSL 内核上的所有发行版，直到 WSL 重启；不安装软件包、不改 .wslconfig、不启动接管。"
+            ),
+        });
+        self.open_confirmation_dialog(window, cx);
+        cx.notify();
+    }
+
     /// 只在空闲时可用。清空别名记录可能让旧别名分给别的域名，先确认。
     pub(crate) fn prepare_reset_dns_aliases(
         &mut self,

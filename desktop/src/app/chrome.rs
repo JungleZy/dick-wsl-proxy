@@ -78,6 +78,7 @@ impl Desktop {
                     UiAction::Save => this.save(cx),
                     UiAction::Probe => this.probe(cx),
                     UiAction::Prepare(kind) => this.prepare(kind, window, cx),
+                    UiAction::KernelPrepare => this.prepare_kernel(window, cx),
                     UiAction::Reveal => {
                         if let Some(path) = &this.export_path {
                             cx.reveal_path(std::path::Path::new(path));

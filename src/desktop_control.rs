@@ -54,6 +54,7 @@ fn blocked_by_environment_job(command: &str, request: &Value, target: &str) -> b
         "start"
             | "switch"
             | "preflight"
+            | "prepare_kernel"
             | "probe_exit"
             | "shutdown_daemon"
             | "environment_create"
@@ -295,6 +296,7 @@ fn log_command(command: &str) -> bool {
         command,
         "profile_save"
             | "preflight"
+            | "prepare_kernel"
             | "start"
             | "switch"
             | "stop"
@@ -334,6 +336,24 @@ fn command_log(command: &str, response: &Value) -> (&'static str, String, String
                 "warning",
                 "preflight".into(),
                 format!("预检未通过（{blockers} 个阻断项）"),
+            )
+        }
+        "prepare_kernel" => {
+            let preparation = &response["preparation"];
+            let added = preparation["modules_added"].as_array().map_or(0, Vec::len);
+            let failed = preparation["modules_failed"].as_array().map_or(0, Vec::len);
+            let blockers = response["blockers"].as_array().map_or(0, Vec::len);
+            let level = if preparation["ok"] == true && failed == 0 {
+                "info"
+            } else {
+                "warning"
+            };
+            (
+                level,
+                "kernel".into(),
+                format!(
+                    "内核环境准备：新增 {added} 个模块，{failed} 个未加载，剩余 {blockers} 个阻断项"
+                ),
             )
         }
         "start" => ("info", "lifecycle".into(), "已开始接管".into()),
@@ -643,8 +663,9 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                 }
                 return Ok((json!({"shutdown":true}), true));
             }
-            "list" | "status" | "preflight" | "import_credential" | "forget_credential"
-            | "start" | "switch" | "stop" | "abandon" | "reset_dns_aliases" => {
+            "list" | "status" | "preflight" | "prepare_kernel" | "import_credential"
+            | "forget_credential" | "start" | "switch" | "stop" | "abandon"
+            | "reset_dns_aliases" => {
                 if matches!(&*cmd, "start" | "switch" | "stop" | "abandon")
                     && request["expected_generation"].as_u64().is_none()
                 {

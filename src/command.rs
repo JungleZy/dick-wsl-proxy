@@ -1,4 +1,6 @@
-use crate::{controller, credential, host, managed, managed_dns, plan, ports, probe, transition};
+use crate::{
+    controller, credential, host, kernel_env, managed, managed_dns, plan, ports, probe, transition,
+};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
@@ -19,6 +21,13 @@ pub(crate) enum Command {
         #[arg(long, default_value = "43531")]
         #[serde(default = "default_port")]
         port: NonZeroU16,
+    },
+    /// Load the target's already-installed kernel modules and register empty
+    /// legacy tables. Run only while idle; never installs packages.
+    PrepareKernel {
+        target: String,
+        #[arg(long)]
+        confirm: bool,
     },
     /// Enable the single-target policy including protected system DNS.
     Start {
@@ -246,6 +255,51 @@ pub(crate) fn dispatch_result(
             };
             let result = preflight(&all, &target, port, state, reserved)?;
             return Ok((if result.passed { 0 } else { 2 }, serde_json::json!(result)));
+        }
+        Command::PrepareKernel { target, confirm } => {
+            if !confirm {
+                return Err(Failure::new(
+                    "confirmation_required",
+                    "Pass --confirm after stopping any takeover: loading modules changes the shared WSL kernel",
+                ));
+            }
+            let state = controller.status().map_err(error)?;
+            if state["phase"] != "idle" {
+                return Err(Failure::new(
+                    "kernel_prepare_requires_idle",
+                    "Stop the target and restore direct networking first",
+                ));
+            }
+            if controller::journal::load().map_err(error)?.is_some()
+                || transition::load().map_err(error)?.pending.is_some()
+            {
+                return Err(Failure::new(
+                    "target_already_owned",
+                    "Restore the recorded target before preparing the kernel",
+                ));
+            }
+            let all = registry()?;
+            let distro = find(&all, &target)?;
+            let preparation = kernel_env::prepare(distro).map_err(|e| {
+                Failure::new("kernel_prepare_failed", format!("{}: {e}", distro.name))
+            })?;
+            let (record_path, record_error) = match kernel_env::record(distro, &preparation) {
+                Ok(path) => (Some(path.to_string_lossy().into_owned()), None),
+                Err(error) => (None, Some(error)),
+            };
+            let (blockers, inspection_error) = match probe::inspect(distro) {
+                Ok(snapshot) => (snapshot.blockers, None),
+                Err(error) => (Vec::new(), Some(error)),
+            };
+            serde_json::json!({
+                "schema_version": 1,
+                "target": distro,
+                "preparation": preparation,
+                "record_path": record_path,
+                "record_error": record_error,
+                "blockers": blockers,
+                "inspection_error": inspection_error,
+            })
         }
         Command::ImportCredential { name, env_file } => {
             credential::import(&name, &env_file).map_err(error)?;

@@ -10,7 +10,7 @@
 
 **适用范围。** Windows x64 原生桌面控制台与 CLI，后端按 WSL2 NAT 验证，不是通用 VPN。目标具备全局 IPv6 地址和默认路由时启用受管 IPv6，否则阻断目标外部 IPv6。非白名单普通 UDP（含 QUIC）经住宅代理的 UDP Associate 转发；启动时这项探测不通过（例如住宅代理不支持 UDP），接管仍会启动，但本次接管期间这类 UDP 一律拒绝、不会直连，界面显示“UDP 已阻断”，下次启动或切换时重新探测。同一 Windows 账户一次只接管一个发行版；切换前先确认旧目标已恢复，不迁移既有 TCP 连接。
 
-**图形界面。** 将 `wsl-proxy-desktop.exe` 与配套 `wsl-proxyctl.exe` 放在同目录，打开前者。选目标、保存策略并明确启动；关闭窗口不等于停止代理。重新打开可连接已有后台，恢复原网须选择“停止并恢复直连”。见 [M4 使用说明和验收边界](docs/plans/m4/README.md)。
+**图形界面。** 将 `wsl-proxy-desktop.exe` 与配套 `wsl-proxyctl.exe` 放在同目录，打开前者。选目标、保存策略并明确启动；关闭窗口不等于停止代理。重新打开可连接已有后台，恢复原网须选择“停止并恢复直连”。见 [M4 使用说明和验收边界](docs/plans/m4/README.md)。冷启动或 WSL 重启后，目标内核可能没有加载所需模块；总览页的「准备内核环境」会显式加载发行版里已有的模块并创建空表（不安装软件、需先停止接管）。见 [M6 内核环境准备](docs/plans/m6/README.md)。
 
 **安装与升级。** Windows x64 候选包采用按用户安装的未签名 ZIP。校验、显式恢复、升级/卸载步骤与已测/未测环境见 [M5 发布说明](docs/plans/m5/README.md)；不要将 ZIP 哈希当作签名。
 `0.1.3` 在保留逐包归属校验的前提下合并 UDP 回包查询：本地 16 并发已连接 UDP 回显 p95 从 348.66 ms 降至 88.55 ms，直连为 6.71 ms。全表均忙时仍拒绝新流。见 [M5 延迟与边界](docs/plans/m5/README.md#013udp-回包并发延迟)。
@@ -25,7 +25,7 @@
 
 **Supported scope.** The Windows x64 native desktop and CLI share the controller tested on WSL2 NAT. It is not a general-purpose VPN. A target with a global IPv6 address and default route uses managed IPv6 interception, while external IPv6 is blocked when those prerequisites are absent. Non-allowlisted application UDP, including QUIC, uses the residential UDP Associate. If that startup probe fails (for example, the residential proxy lacks UDP support), takeover still starts, but such UDP is refused, never sent direct, for the rest of that session; the desktop shows UDP as blocked, and the next start or switch probes again. Only one distribution per account can be active. Switching restores the old target before enabling the new one; existing TCP connections do not migrate.
 
-**Desktop.** Keep `wsl-proxy-desktop.exe` and the matching `wsl-proxyctl.exe` together and launch the desktop executable. Choose a target, save the policy, and explicitly start it. Closing the window disconnects the UI, not the proxy; reopen to reconnect, or explicitly stop to restore routing. See the [M4 operator guide](docs/plans/m4/README.md).
+**Desktop.** Keep `wsl-proxy-desktop.exe` and the matching `wsl-proxyctl.exe` together and launch the desktop executable. Choose a target, save the policy, and explicitly start it. Closing the window disconnects the UI, not the proxy; reopen to reconnect, or explicitly stop to restore routing. See the [M4 operator guide](docs/plans/m4/README.md). A cold WSL kernel may have none of the required modules loaded. **Prepare kernel environment** on the overview explicitly loads modules already shipped with the distribution and creates empty tables; it installs nothing and needs to be repeated after a WSL restart. See [M6](docs/plans/m6/README.md).
 
 **Install and upgrade.** The Windows x64 candidate is an unsigned per-user ZIP. See [M5 release and recovery notes](docs/plans/m5/README.md) for verification, safe maintenance and the support matrix. The ZIP checksum does not authenticate its publisher.
 Version `0.1.3` batches UDP reply checks without caching destinations. Local connected UDP echo p95 at concurrency 16 fell from 348.66 ms to 88.55 ms (direct: 6.71 ms). A genuinely busy mapping table still rejects new flows.
@@ -51,6 +51,15 @@ $ctl = '.\target\release\wsl-proxyctl.exe'
 
 `list` does not start distributions. `preflight` may wake the selected target, but installs no traffic rules. Check `passed` and `blockers` in the JSON output. `passed: true` means the checks passed, not that the proxy is active.
 
+如果阻断项含 `capability.kernel.*` 或 `baseline.ip*tables*`，说明共享 WSL 内核处于冷启动状态。可在桌面总览点「准备内核环境」，或运行下面的命令；它只加载目标发行版里已有的模块并注册空表，不安装软件，WSL 重启后需要重新准备。
+
+If the blockers contain `capability.kernel.*` or `baseline.ip*tables*`, the shared WSL kernel is cold. Use **Prepare kernel environment** on the desktop overview, or run the commands below. It only loads modules already shipped with the target and registers empty tables; it installs nothing and must be repeated after a WSL restart.
+
+```powershell
+& $ctl prepare-kernel WSLProxyLab-Target --confirm
+& $ctl preflight WSLProxyLab-Target
+```
+
 ## 文档怎么维护 · Documentation guide
 
 | 文档 / Document | 内容 / Purpose |
@@ -62,3 +71,4 @@ $ctl = '.\target\release\wsl-proxyctl.exe'
 | [M3：切换与恢复 / Switching and recovery](docs/plans/m3/README.md) | 切换顺序、异常恢复与实测边界 / Switch sequence, crash recovery, and limits of the validation evidence |
 | [M4：桌面操作 / Desktop operation](docs/plans/m4/README.md) | 原生双件启动、关闭窗口与后台的区别、诊断与恢复 / Native binary pair, reconnect, diagnostics and recovery |
 | [M5：发布与兼容性 / Release and compatibility](docs/plans/m5/README.md) | 安装、升级、卸载、兼容矩阵与性能证据 / Per-user installation, recovery, measured scope and limits |
+| [M6：内核环境准备 / Kernel preparation](docs/plans/m6/README.md) | 冷启动后显式加载目标已有模块、注册空表 / Explicit module loading and empty tables after a cold kernel |

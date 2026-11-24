@@ -7,6 +7,7 @@ mod environment;
 mod host;
 mod ingress;
 mod kernel;
+mod kernel_env;
 mod lease;
 mod managed;
 mod managed_dns;
