@@ -279,7 +279,11 @@ if [ "$run_apt" = 1 ]; then
         packages="$packages zsh"
     fi
     if [ "$install_chinese" = 1 ]; then
-        for package in locales language-pack-zh-hans fcitx5 fcitx5-chinese-addons im-config; do
+        # The GTK frontends are recommends of fcitx5, so --no-install-recommends
+        # drops them; without im-fcitx5.so, GTK apps such as Chrome ignore
+        # GTK_IM_MODULE=fcitx.
+        for package in locales language-pack-zh-hans fcitx5 fcitx5-chinese-addons \
+            fcitx5-frontend-gtk3 fcitx5-frontend-gtk4 im-config; do
             if apt-cache show "$package" >/dev/null 2>&1; then
                 packages="$packages $package"
             fi
@@ -315,6 +319,23 @@ if [ "$run_apt" = 1 ]; then
         cat > /usr/local/bin/chrome <<'CHROME'
 #!/bin/sh
 set -eu
+# Windows starts GUI programs without a login shell, so the variables from
+# /etc/profile.d are not present; export them here as well.
+export LANG=zh_CN.UTF-8
+export LANGUAGE=zh_CN:zh
+export LC_ALL=zh_CN.UTF-8
+if command -v fcitx5 >/dev/null 2>&1 && [ -n "${{DISPLAY:-}}${{WAYLAND_DISPLAY:-}}" ]; then
+    export GTK_IM_MODULE=fcitx
+    export QT_IM_MODULE=fcitx
+    export XMODIFIERS=@im=fcitx
+    # WSLg refuses the Wayland input-method protocol, and fcitx5 exits right
+    # away unless its Wayland frontend is disabled.  The GTK module keeps
+    # working through X11 (XWayland) and the session bus.
+    if ! command -v pgrep >/dev/null 2>&1 || ! pgrep -x fcitx5 >/dev/null 2>&1; then
+        fcitx5 -d --disable=wayland >/dev/null 2>&1 || true
+        sleep 1
+    fi
+fi
 browser=""
 if command -v google-chrome-stable >/dev/null 2>&1; then
     browser=google-chrome-stable
@@ -364,14 +385,18 @@ export GTK_IM_MODULE=fcitx
 export QT_IM_MODULE=fcitx
 export XMODIFIERS=@im=fcitx
 if command -v fcitx5 >/dev/null 2>&1 && [ -n "${{DISPLAY:-}}${{WAYLAND_DISPLAY:-}}" ]; then
-    fcitx5 -d >/dev/null 2>&1 || true
+    if ! command -v pgrep >/dev/null 2>&1 || ! pgrep -x fcitx5 >/dev/null 2>&1; then
+        # WSLg refuses the Wayland input-method protocol, and fcitx5 exits
+        # right away unless that frontend is disabled.
+        fcitx5 -d --disable=wayland >/dev/null 2>&1 || true
+    fi
 fi
 PROFILE
         cat > /etc/skel/.config/autostart/fcitx5.desktop <<'DESKTOP'
 [Desktop Entry]
 Type=Application
 Name=Fcitx 5
-Exec=fcitx5 -d
+Exec=fcitx5 -d --disable=wayland
 X-GNOME-Autostart-enabled=true
 DESKTOP
         if [ -d /root ]; then
@@ -408,9 +433,15 @@ fi
     )
 }
 
+/// Read-only facts for the detail view. Every value is printed as a JSON string
+/// or a literal `true`/`false`, so a missing tool yields `""` or `false` and
+/// never breaks the single JSON line. The fixed PATH also keeps `command -v`
+/// from walking the Windows directories WSL appends.
 fn inspect_script() -> &'static str {
     r#"#!/bin/sh
 set +e
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
 has() {
     if command -v "$1" >/dev/null 2>&1; then
         printf true
@@ -421,6 +452,40 @@ has() {
 }
 json_string() {
     printf '%s' "$1" | tr -d '\r\n' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+# `wsl_conf_get <section> <key>` prints the first value of that key in
+# /etc/wsl.conf (or `$wsl_conf`), matched without regard to letter case.
+wsl_conf_get() {
+    conf=${wsl_conf:-/etc/wsl.conf}
+    [ -r "$conf" ] || return 0
+    awk -v section="$1" -v key="$2" '
+        /^[ \t]*\[/ {
+            header = $0
+            sub(/^[ \t]*\[[ \t]*/, "", header)
+            sub(/[ \t]*\].*$/, "", header)
+            in_section = (tolower(header) == tolower(section))
+            next
+        }
+        in_section && !seen && index($0, "=") > 0 {
+            name = $0
+            sub(/=.*$/, "", name)
+            gsub(/^[ \t]+|[ \t]+$/, "", name)
+            if (tolower(name) == tolower(key)) {
+                value = $0
+                sub(/^[^=]*=/, "", value)
+                sub(/[ \t]+[#;].*$/, "", value)
+                gsub(/^[ \t]+|[ \t\r]+$/, "", value)
+                print value
+                seen = 1
+            }
+        }
+    ' "$conf" 2>/dev/null
+}
+digits() {
+    case "$1" in
+        ''|*[!0-9]*) ;;
+        *) printf '%s' "$1" ;;
+    esac
 }
 locale_name=""
 if command -v locale >/dev/null 2>&1; then locale_name=$(locale 2>/dev/null | sed -n 's/^LANG=//p' | head -n 1); fi
@@ -437,11 +502,52 @@ input_method=false
 if [ -f /etc/profile.d/wsl-proxy-chinese-input.sh ] || command -v fcitx5 >/dev/null 2>&1; then input_method=true; fi
 chrome=false
 if command -v google-chrome >/dev/null 2>&1 || command -v google-chrome-stable >/dev/null 2>&1; then chrome=true; fi
-printf '{"zsh":%s,"chrome":%s,"chinese":%s,"input_method":%s,"locale":"%s","timezone":"%s","distribution":"%s","kernel":"%s","architecture":"%s"}\n' \
+# Pieces the current setup script installs. An environment made by an older
+# version can have fcitx5 without them, and the IME then does not work in Chrome.
+zh_locale=false
+if locale -a 2>/dev/null | grep -Eiq '^zh_CN\.utf-?8$'; then zh_locale=true; fi
+fcitx5_gtk=false
+for module in /usr/lib/*/gtk-3.0/*/immodules/im-fcitx5.so /usr/lib/gtk-3.0/*/immodules/im-fcitx5.so /usr/lib64/gtk-3.0/*/immodules/im-fcitx5.so; do
+    if [ -e "$module" ]; then fcitx5_gtk=true; break; fi
+done
+input_profile=missing
+if [ -f /etc/profile.d/wsl-proxy-chinese-input.sh ]; then
+    input_profile=outdated
+    if grep -q -e '--disable=wayland' /etc/profile.d/wsl-proxy-chinese-input.sh 2>/dev/null; then input_profile=current; fi
+fi
+chrome_launcher=missing
+if [ -f /usr/local/bin/chrome ]; then
+    chrome_launcher=outdated
+    if grep -q 'GTK_IM_MODULE' /usr/local/bin/chrome 2>/dev/null; then chrome_launcher=current; fi
+fi
+# Takeover basics, reported as facts; preflight decides whether takeover works.
+systemd_configured=false
+case "$(wsl_conf_get boot systemd | tr 'A-Z' 'a-z')" in true) systemd_configured=true ;; esac
+pid1=$(head -n 1 /proc/1/comm 2>/dev/null)
+default_user=$(wsl_conf_get user default)
+wslg=false
+if [ -d /mnt/wslg ] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then wslg=true; fi
+display_number=${DISPLAY:-}
+display_number=${display_number#*:}
+display_number=$(digits "${display_number%%.*}")
+x11_socket=false
+if [ -n "$display_number" ] && [ -S "/tmp/.X11-unix/X$display_number" ]; then x11_socket=true; fi
+# Only the root file system: df without a path would stat every drvfs mount.
+# The disk grows on demand, so the total is a ceiling, not space taken on Windows.
+disk=$(df -Pk / 2>/dev/null | awk 'NR == 2 { print $2 " " $3 }')
+disk_total_kb=$(digits "${disk%% *}")
+disk_used_kb=$(digits "${disk##* }")
+printf '{"zsh":%s,"chrome":%s,"chinese":%s,"input_method":%s,"locale":"%s","timezone":"%s","distribution":"%s","kernel":"%s","architecture":"%s",' \
     "$(has zsh)" "$chrome" "$(has fcitx5)" "$input_method" \
     "$(json_string "$locale_name")" "$(json_string "$timezone_name")" \
     "$(json_string "$distribution_name")" "$(json_string "$kernel_name")" \
     "$(json_string "$architecture")"
+printf '"zh_locale":%s,"fcitx5_gtk":%s,"input_profile":"%s","chrome_launcher":"%s",' \
+    "$zh_locale" "$fcitx5_gtk" "$input_profile" "$chrome_launcher"
+printf '"systemd_configured":%s,"pid1":"%s","iptables_legacy":%s,"ip6tables_legacy":%s,' \
+    "$systemd_configured" "$(json_string "$pid1")" "$(has iptables-legacy)" "$(has ip6tables-legacy)"
+printf '"default_user":"%s","wslg":%s,"x11_socket":%s,"disk_total_kb":"%s","disk_used_kb":"%s"}\n' \
+    "$(json_string "$default_user")" "$wslg" "$x11_socket" "$disk_total_kb" "$disk_used_kb"
 "#
 }
 
@@ -869,7 +975,11 @@ mod tests {
             timezone: Some("Asia/Shanghai".into()),
         });
         assert!(script.contains("fcitx5-chinese-addons"));
+        assert!(script.contains("fcitx5-frontend-gtk3"));
+        assert!(script.contains("fcitx5-frontend-gtk4"));
+        assert!(script.contains("fcitx5 -d --disable=wayland"));
         assert!(script.contains("GTK_IM_MODULE=fcitx"));
+        assert_eq!(script.matches("export GTK_IM_MODULE=fcitx").count(), 2);
         assert!(script.contains("XMODIFIERS=@im=fcitx"));
         assert!(script.contains("zh_CN.UTF-8"));
         assert!(script.contains("google-chrome-stable"));
@@ -890,6 +1000,68 @@ mod tests {
         assert!(script.contains("wsl_conf_set time useWindowsTimezone false"));
         assert!(script.contains("for package in systemd systemd-sysv iptables"));
         assert!(!script.contains("> /etc/wsl.conf"));
+    }
+
+    /// The detail view calls a file `current` only when it carries the marker the
+    /// current setup writes, so the two scripts must agree on paths and markers.
+    #[test]
+    fn inspect_looks_for_what_the_current_setup_writes() {
+        let setup = setup_script(InstallOptions {
+            chrome: true,
+            chinese: true,
+            ..InstallOptions::default()
+        });
+        let inspect = inspect_script();
+        let body = |start: &str, end: &str| {
+            setup
+                .split(start)
+                .nth(1)
+                .expect(start)
+                .split(end)
+                .next()
+                .expect(end)
+                .to_owned()
+        };
+        let profile = body(
+            "cat > /etc/profile.d/wsl-proxy-chinese-input.sh <<'PROFILE'\n",
+            "\nPROFILE\n",
+        );
+        let launcher = body("cat > /usr/local/bin/chrome <<'CHROME'\n", "\nCHROME\n");
+
+        assert!(profile.contains("--disable=wayland"));
+        assert!(
+            inspect.contains(
+                "grep -q -e '--disable=wayland' /etc/profile.d/wsl-proxy-chinese-input.sh"
+            )
+        );
+        assert!(launcher.contains("GTK_IM_MODULE"));
+        assert!(inspect.contains("grep -q 'GTK_IM_MODULE' /usr/local/bin/chrome"));
+        assert!(setup.contains("fcitx5-frontend-gtk3"));
+        assert!(inspect.contains("/gtk-3.0/*/immodules/im-fcitx5.so"));
+        assert!(setup.contains("locale-gen zh_CN.UTF-8"));
+        assert!(inspect.contains(r"'^zh_CN\.utf-?8$'"));
+        assert!(setup.contains("wsl_conf_set boot systemd true"));
+        assert!(inspect.contains("wsl_conf_get boot systemd"));
+    }
+
+    #[test]
+    fn chrome_launcher_supplies_the_ime_environment_outside_a_login_shell() {
+        let script = setup_script(InstallOptions {
+            chrome: true,
+            chinese: true,
+            ..InstallOptions::default()
+        });
+        let launcher = script
+            .split("cat > /usr/local/bin/chrome <<'CHROME'")
+            .nth(1)
+            .expect("chrome launcher")
+            .split("\nCHROME\n")
+            .next()
+            .expect("launcher body");
+        assert!(launcher.contains("export GTK_IM_MODULE=fcitx"));
+        assert!(launcher.contains("export XMODIFIERS=@im=fcitx"));
+        assert!(launcher.contains("pgrep -x fcitx5"));
+        assert!(launcher.contains("fcitx5 -d --disable=wayland"));
     }
 
     #[test]
@@ -1006,5 +1178,113 @@ mod tests {
         assert!(script.contains("distribution"));
         assert!(script.contains("kernel"));
         assert!(script.contains("architecture"));
+    }
+
+    /// Runs the real inspect script with `sh` and a stand-in wsl.conf. Most of
+    /// the probed tools and files are absent on a build host, which is exactly
+    /// the case that must still produce one parseable line. Like the wsl.conf
+    /// test above it needs a POSIX `sh`, so it only runs on Unix hosts.
+    #[cfg(unix)]
+    fn run_inspect(conf: &str) -> serde_json::Value {
+        use std::fs;
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+        let directory = std::env::temp_dir().join(format!(
+            "wpl-inspect-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("wsl.conf");
+        fs::write(&path, conf).unwrap();
+        let mut child = Command::new("sh")
+            .arg("-s")
+            .env("wsl_conf", &path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(inspect_script().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let _ = fs::remove_dir_all(directory);
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let line = stdout
+            .lines()
+            .find(|line| line.trim_start().starts_with('{'))
+            .expect("one JSON line");
+        serde_json::from_str(line).expect("valid JSON")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspect_script_prints_every_fact_as_valid_json() {
+        let facts = run_inspect("");
+        for key in [
+            "zsh",
+            "chrome",
+            "chinese",
+            "input_method",
+            "zh_locale",
+            "fcitx5_gtk",
+            "systemd_configured",
+            "iptables_legacy",
+            "ip6tables_legacy",
+            "wslg",
+            "x11_socket",
+        ] {
+            assert!(facts[key].is_boolean(), "{key} = {}", facts[key]);
+        }
+        for key in [
+            "locale",
+            "timezone",
+            "distribution",
+            "kernel",
+            "architecture",
+            "pid1",
+            "default_user",
+            "disk_total_kb",
+            "disk_used_kb",
+        ] {
+            assert!(facts[key].is_string(), "{key} = {}", facts[key]);
+        }
+        for key in ["disk_total_kb", "disk_used_kb"] {
+            let value = facts[key].as_str().unwrap();
+            assert!(
+                value.bytes().all(|byte| byte.is_ascii_digit()),
+                "{key} = {value}"
+            );
+        }
+        for key in ["input_profile", "chrome_launcher"] {
+            assert!(
+                matches!(
+                    facts[key].as_str(),
+                    Some("current" | "outdated" | "missing")
+                ),
+                "{key} = {}",
+                facts[key]
+            );
+        }
+        assert_eq!(facts["systemd_configured"], false);
+        assert_eq!(facts["default_user"], "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspect_script_reads_wsl_conf_like_the_setup_writes_it() {
+        let facts = run_inspect(
+            "# default=commented\n[Boot]\n  SystemD = True  # set by hand\n[user]\ndefault = builder\ndefault = second\n[network]\ndefault=other\n",
+        );
+        assert_eq!(facts["systemd_configured"], true);
+        assert_eq!(facts["default_user"], "builder");
+
+        let facts = run_inspect("[boot]\nsystemd=false\n[user]\n");
+        assert_eq!(facts["systemd_configured"], false);
+        assert_eq!(facts["default_user"], "");
     }
 }

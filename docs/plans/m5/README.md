@@ -139,6 +139,43 @@ UDP 活跃表实际达到 128 条，发生 70 次安静映射回收，容量拒�
 - **运行日志：**最多保留最新 10,000 条。状态快照只在阶段、目标、代次或 DNS 状态变化时写入。
 - **连接记录：**每条连接结束时，后台把它写进同一个 `desktop.sqlite`，每次系统 DNS 查询也算一条，最多保留最新 50,000 条。只有桌面端启动的后台（`daemon`）写入，CLI 会话不写。记录目的 IP 和端口、协议、路由和判定原因、状态和失败阶段、上下行字节、开始和结束时间、目标发行版，不含域名、DNS 查询内容和传输内容。转发线程只把记录放进一个 8,192 条的有界队列，由单独的线程每批最多 512 条写入；队列满或写入失败时丢弃并计数，不阻塞转发，连接页显示没写进去的条数。进行中的连接仍只在内存里，后台异常退出时这些连接不会落盘。脱敏诊断导出不包含这些记录。这推翻了 M4 执行记录里「连接记录是有界的内存数据……近期保留 5 分钟」的说法。
 
+## 0.1.8 中文环境修复
+
+**状态：代码已改，Windows 上 `cargo test`（185 项）与 `clippy` 通过；Target 环境手动应用同一份脚本后实测 Chrome 能输入中文；新版本桌面端「编辑 → 保存设置」这条路径还没有实机重跑。**
+
+- **中文环境与输入法：**安装 fcitx5、`fcitx5-chinese-addons`、GTK3/GTK4 前端和 im-config。只装 fcitx5 本体时 GTK 程序（Chrome）找不到 `im-fcitx5.so`，`GTK_IM_MODULE=fcitx` 不生效——GTK 前端只是 fcitx5 的 Recommends，`--no-install-recommends` 不会带进来。WSLg 的合成器拒绝绑定 `zwp_input_method_v1`，不带 `--disable=wayland` 的 fcitx5 启动即退出；`/etc/profile.d`、`chrome` 启动器和 skel 的 autostart 都改成 `fcitx5 -d --disable=wayland`，走 X11（XWayland）。WSLg 没有桌面会话，XDG autostart 不会运行，从 Windows 直接启动 GUI 程序也不经过登录 shell，所以 `chrome` 启动器自己导出 `LANG`/`GTK_IM_MODULE`/`QT_IM_MODULE`/`XMODIFIERS`，并在 fcitx5 没运行时先启动它。默认 profile 里 `pinyin` 已是默认输入法。修复前建的环境缺 GTK 前端，要用**新版本**桌面端「编辑 → 保存设置」重跑安装补齐（旧版本重跑的还是旧脚本；编辑会终止发行版，Chrome 要重新打开）。实机 2026-11-24：Target 环境装前端后，在干净环境里用 `chrome` 启动器打开 Chrome，Ctrl+Space 后 `fcitx5-remote` 从 1 变 2，`xdotool` 输入 `nihao` 加空格得到「你好」。
+
+## 0.1.8 环境详情补全
+
+**状态：代码已改。2026-11-24 Windows 原生 `cargo test --locked -p wsl-proxyctl -p wsl-proxy-desktop`（控制器 192 + 9 项、桌面端 47 项）、`cargo clippy --all-targets`（无警告）、`cargo build --locked --release` 都通过；检查脚本在一个已运行的 Ubuntu 24.04 里经 `wsl.exe --user root --exec /bin/sh -s` 实跑过，22 个字段都能解析；桌面端界面没有实机看过。**
+
+旧的环境详情只要有 fcitx5 就显示「中文输入法已就绪」，修复前建的环境缺 GTK 前端、启动脚本是旧版，界面却看不出来；也不报告接管要用的 systemd 和 iptables（审查 b03c97a）。
+
+- **后台多读的事实：**`environment_view` 返回的 `features` 原有字段含义不变（编辑表单的默认勾选仍用 `zsh`、`chrome`、`chinese`、`input_method`），新增字段如下。全部按字符串或 `true`/`false` 输出，工具缺失时得到空串或 `false`，不会让整行 JSON 解析失败。脚本固定 PATH（不搜索 WSL 追加的 Windows 目录），只读 `/` 一个文件系统，不调用 `systemctl`；实测一次约 0.2 秒。
+
+  | 字段 | 含义 |
+  |---|---|
+  | `zh_locale` | `locale -a` 里有 zh_CN.UTF-8 |
+  | `fcitx5_gtk` | 有 GTK3 的 `im-fcitx5.so`（Chrome 靠它接输入法） |
+  | `input_profile` | `/etc/profile.d/wsl-proxy-chinese-input.sh`：`current`（带 `--disable=wayland`）、`outdated`、`missing` |
+  | `chrome_launcher` | `/usr/local/bin/chrome`：`current`（导出 `GTK_IM_MODULE`）、`outdated`、`missing` |
+  | `systemd_configured` | `/etc/wsl.conf` 的 `[boot] systemd` 是 `true`（节名、键名不分大小写，取第一个值） |
+  | `pid1` | `/proc/1/comm` |
+  | `iptables_legacy`、`ip6tables_legacy` | 命令在不在；是不是 legacy 版本仍由预检判断 |
+  | `default_user` | `/etc/wsl.conf` 的 `[user] default`，没写时为空；注册表里的 `DefaultUid` 不读 |
+  | `wslg` | `/mnt/wslg` 存在，且有 `DISPLAY` 或 `WAYLAND_DISPLAY` |
+  | `x11_socket` | `DISPLAY` 对应的 `/tmp/.X11-unix/X<n>` 存在 |
+  | `disk_total_kb`、`disk_used_kb` | `df -Pk /` 的总量和已用量，数字字符串，读不到为空 |
+
+- **桌面端怎么判断：**
+  - 中文环境和输入法：fcitx5 和输入法启动脚本都没有才算「未安装」——装 Chrome 也会生成 zh_CN locale，只有 locale 不算装过。有 fcitx5、没有本工具的启动脚本算「手动安装」。启动脚本在时，zh_CN.UTF-8、fcitx5、GTK 输入法模块、新版启动脚本缺任何一样都是「需要补齐」，并列出缺的。
+  - Chrome：浏览器和 `chrome` 启动器都要在；装了 fcitx5 时，启动器还得是导出输入法变量的新版。有浏览器、没有启动器算「手动安装」。
+  - 有「需要补齐」时提示用「编辑 → 保存设置」补齐：编辑表单里已装的组件默认勾选，保存会按当前版本的脚本重装。「手动安装」只列出缺什么、不给这个提示：补齐会跑 apt、`update-locale` 把系统语言改成 zh_CN 并终止发行版。旧版本本工具建的环境两个文件都写过，所以「程序在、文件不在」能把自己装的和旧版本装的分开。
+  - systemd：PID 1 是 systemd 为「运行中」；wsl.conf 开了但 PID 1 不是为「未运行」（还没重启，或没装 systemd）；没开为「未开启」。
+  - 详情只列组件在不在，不给「能否接管」的结论，那仍以预检为准。后台没返回某个字段时显示「未读取」。
+- **顺带修的：**刷新列表或重连后台后，正在查看的环境已不在列表里时，清掉右侧详情和选中（审查 f51245a 的 L6）。
+- **测试边界：**直接用 `sh` 跑检查脚本的两项单测和原有的 wsl.conf 单测一样标了 `cfg(unix)`；Windows 上的 `cargo test` 不跑它们，WSL 里又因缺 openssl 开发包编不过，所以这两项至今没有执行过。Windows 上能跑的是一项纯字符串单测：检查脚本找的文件路径和标记（`--disable=wayland`、`GTK_IM_MODULE`、`im-fcitx5.so`、zh_CN locale、`[boot] systemd`）就是当前安装脚本写的。实跑的那个发行版里没有本工具写的两个文件，`current`/`outdated` 两个分支还没碰到过真实输入；Target 环境当时没在运行，没有为此启动它。
+
 ## 0.1.8 鲁棒性修复
 
 **状态：代码已改，Windows 原生 `cargo test` 通过；没有在真实接管中验证。**下面的数字都是代码里的常量。运行中核对保护、停止时放宽身份要求与放弃记录、别名重置、转发限制已并入 [决策 06–09](../decisions.md) 和 [接管架构](../arch/README.md)；其余是实现细节，只记在这里。
