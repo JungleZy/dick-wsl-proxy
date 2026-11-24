@@ -7,18 +7,27 @@ use super::{
     expect, receive, remaining, send,
 };
 use crate::credential::Residential;
+use std::collections::VecDeque;
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Authenticated tunnels kept ready while chains are being opened.
-pub(super) const POOL_TARGET: usize = if cfg!(test) { 0 } else { 2 };
-/// A pooled tunnel is closed after this long unused; proxies drop quiet
-/// sessions on their own schedule, and an idle one should not be held.
+/// Most authenticated tunnels kept ready. The pool follows recent bursts of
+/// chain requests between `POOL_MIN` and this, so a page load that opened
+/// eight connections finds eight ready the next time.
+pub(super) const POOL_MAX: usize = if cfg!(test) { 0 } else { 8 };
+const POOL_MIN: usize = 2;
+/// Chain requests this close together count as one burst.
+const BURST_WINDOW: Duration = Duration::from_secs(3);
+/// A pooled tunnel is closed after at most this long unused. Proxies drop
+/// sessions that stay quiet after authentication on their own schedule, so
+/// the limit shrinks to 80% of the shortest idle time at which the chain
+/// was seen to close one, but never below `MIN_POOL_IDLE`.
 const POOL_IDLE: Duration = Duration::from_secs(20);
+const MIN_POOL_IDLE: Duration = Duration::from_secs(2);
 /// Tunnels are only kept ready this long after the last chain was opened.
 const DEMAND_WINDOW: Duration = Duration::from_secs(60);
 
@@ -50,27 +59,85 @@ pub(super) struct Dialer {
     /// in one write. Cleared for the rest of this takeover the first time the
     /// proxy cannot follow that.
     pub(super) pipeline: AtomicBool,
-    target: usize,
+    /// Upper bound on the pool; 0 disables it.
+    max: usize,
     pool: Mutex<Vec<Pooled>>,
     next_id: AtomicUsize,
     in_flight: AtomicUsize,
-    last_demand: Mutex<Option<Instant>>,
+    /// When chains were asked for during the last `DEMAND_WINDOW`, oldest first.
+    demand: Mutex<VecDeque<Instant>>,
     closed: AtomicBool,
+    /// The current idle limit in milliseconds; see `POOL_IDLE`.
+    idle_limit_ms: AtomicU64,
+    stats: Stats,
+}
+
+/// What the pool did, for the status report.
+#[derive(Default)]
+struct Stats {
+    hits: AtomicU64,
+    fresh: AtomicU64,
+    /// Pooled tunnels found closed, talking or too old when taken.
+    discarded: AtomicU64,
+    /// Pooled tunnels that broke on their CONNECT.
+    stale_on_connect: AtomicU64,
+    prepared: AtomicU64,
+    prepare_failures: AtomicU64,
+    last_prepare_error: Mutex<Option<String>>,
+    /// How long recently used and discarded tunnels had been idle, newest last.
+    hit_ages_ms: Mutex<VecDeque<u64>>,
+    discard_ages_ms: Mutex<VecDeque<u64>>,
+}
+
+fn remember(ages: &Mutex<VecDeque<u64>>, age: Duration) {
+    let mut ages = ages.lock().unwrap_or_else(|e| e.into_inner());
+    if ages.len() == 16 {
+        ages.pop_front();
+    }
+    ages.push_back(u64::try_from(age.as_millis()).unwrap_or(u64::MAX));
 }
 
 impl Dialer {
-    pub(super) fn new(first_hop: SocketAddrV4, residential: Residential, target: usize) -> Self {
+    pub(super) fn new(first_hop: SocketAddrV4, residential: Residential, max: usize) -> Self {
         Self {
             first_hop,
             residential,
             pipeline: AtomicBool::new(true),
-            target,
+            max,
             pool: Mutex::new(Vec::new()),
             next_id: AtomicUsize::new(0),
             in_flight: AtomicUsize::new(0),
-            last_demand: Mutex::new(None),
+            demand: Mutex::new(VecDeque::new()),
             closed: AtomicBool::new(false),
+            idle_limit_ms: AtomicU64::new(POOL_IDLE.as_millis() as u64),
+            stats: Stats::default(),
         }
+    }
+
+    pub(super) fn report(&self) -> serde_json::Value {
+        let ages = |ages: &Mutex<VecDeque<u64>>| {
+            ages.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        let count = |value: &AtomicU64| value.load(Ordering::Relaxed);
+        serde_json::json!({
+            "pooled": self.pool.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            "target": self.target(Instant::now()),
+            "pipelined": self.pipeline.load(Ordering::Relaxed),
+            "idle_limit_ms": self.idle_limit_ms.load(Ordering::Relaxed),
+            "hits": count(&self.stats.hits),
+            "fresh": count(&self.stats.fresh),
+            "discarded": count(&self.stats.discarded),
+            "stale_on_connect": count(&self.stats.stale_on_connect),
+            "prepared": count(&self.stats.prepared),
+            "prepare_failures": count(&self.stats.prepare_failures),
+            "last_prepare_error": *self.stats.last_prepare_error.lock().unwrap_or_else(|e| e.into_inner()),
+            "hit_idle_ms": ages(&self.stats.hit_ages_ms),
+            "discard_idle_ms": ages(&self.stats.discard_ages_ms),
+        })
     }
 
     /// Drops every pooled tunnel; tunnels still being built are dropped when
@@ -84,17 +151,24 @@ impl Dialer {
     /// fresh one. The single deadline covers every handshake.
     pub(super) fn chain(self: &Arc<Self>, dest: SocketAddr) -> Result<TcpStream, String> {
         let deadline = Instant::now() + SETUP_TIMEOUT;
-        *self.last_demand.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        self.record_demand(Instant::now());
         let pooled = self.take();
         self.refill();
-        if let Some(mut stream) = pooled {
+        if let Some((mut stream, idle)) = pooled {
             match pooled_connect(&mut stream, dest, deadline) {
-                Ok(()) => return finish(stream),
+                Ok(()) => {
+                    self.stats.hits.fetch_add(1, Ordering::Relaxed);
+                    return finish(stream);
+                }
                 Err(Setup::Failed(message)) => return Err(message),
                 // The tunnel went stale while pooled: build a fresh chain.
-                Err(Setup::Incompatible(_)) => {}
+                Err(Setup::Incompatible(_)) => {
+                    self.stats.stale_on_connect.fetch_add(1, Ordering::Relaxed);
+                    self.closed_after(idle);
+                }
             }
         }
+        self.stats.fresh.fetch_add(1, Ordering::Relaxed);
         self.fresh(dest, deadline).and_then(finish)
     }
 
@@ -114,27 +188,53 @@ impl Dialer {
         }
     }
 
-    /// The newest pooled tunnel that is still open and not past its idle limit.
-    fn take(&self) -> Option<TcpStream> {
+    /// The newest pooled tunnel that is still open and not past its idle
+    /// limit, with how long it had been idle.
+    fn take(&self) -> Option<(TcpStream, Duration)> {
         let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
         while let Some(entry) = pool.pop() {
-            if entry.since.elapsed() < POOL_IDLE && alive(&entry.stream) {
-                return Some(entry.stream);
+            let idle = entry.since.elapsed();
+            if idle >= self.idle_limit() {
+                self.stats.discarded.fetch_add(1, Ordering::Relaxed);
+                remember(&self.stats.discard_ages_ms, idle);
+                continue;
             }
+            if alive(&entry.stream) {
+                remember(&self.stats.hit_ages_ms, idle);
+                return Some((entry.stream, idle));
+            }
+            self.stats.discarded.fetch_add(1, Ordering::Relaxed);
+            remember(&self.stats.discard_ages_ms, idle);
+            self.closed_after(idle);
         }
         None
+    }
+
+    fn idle_limit(&self) -> Duration {
+        Duration::from_millis(self.idle_limit_ms.load(Ordering::Relaxed))
+    }
+
+    /// The chain closed a tunnel that had been idle for `idle`: keep later
+    /// tunnels well inside that.
+    fn closed_after(&self, idle: Duration) {
+        let limit = (idle.mul_f64(0.8)).max(MIN_POOL_IDLE);
+        self.idle_limit_ms.fetch_min(
+            u64::try_from(limit.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     /// Starts background dials until pooled plus in-flight tunnels reach the
     /// target, while chains are still being asked for.
     fn refill(self: &Arc<Self>) {
-        if self.target == 0 || self.closed.load(Ordering::Acquire) || !self.in_demand() {
+        let target = self.target(Instant::now());
+        if target == 0 || self.closed.load(Ordering::Acquire) {
             return;
         }
         let pooled = self.pool.lock().unwrap_or_else(|e| e.into_inner()).len();
         loop {
             let in_flight = self.in_flight.load(Ordering::Acquire);
-            if pooled + in_flight >= self.target {
+            if pooled + in_flight >= target {
                 return;
             }
             if self
@@ -160,11 +260,46 @@ impl Dialer {
         }
     }
 
-    fn in_demand(&self) -> bool {
-        self.last_demand
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some_and(|at| at.elapsed() < DEMAND_WINDOW)
+    fn record_demand(&self, now: Instant) {
+        let mut demand = self.demand.lock().unwrap_or_else(|e| e.into_inner());
+        while demand
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= DEMAND_WINDOW)
+        {
+            demand.pop_front();
+        }
+        // Enough history to see the largest burst the pool can follow.
+        if demand.len() >= 1024 {
+            demand.pop_front();
+        }
+        demand.push_back(now);
+    }
+
+    /// How many tunnels to keep ready: the largest burst of chain requests
+    /// within `BURST_WINDOW` during the last `DEMAND_WINDOW`, between
+    /// `POOL_MIN` and the maximum. None at all without recent requests.
+    fn target(&self, now: Instant) -> usize {
+        if self.max == 0 {
+            return 0;
+        }
+        let demand = self.demand.lock().unwrap_or_else(|e| e.into_inner());
+        let recent: Vec<Instant> = demand
+            .iter()
+            .copied()
+            .filter(|at| now.saturating_duration_since(*at) < DEMAND_WINDOW)
+            .collect();
+        if recent.is_empty() {
+            return 0;
+        }
+        let mut largest = 0;
+        let mut start = 0;
+        for end in 0..recent.len() {
+            while recent[end].saturating_duration_since(recent[start]) >= BURST_WINDOW {
+                start += 1;
+            }
+            largest = largest.max(end - start + 1);
+        }
+        largest.clamp(POOL_MIN.min(self.max), self.max)
     }
 
     /// Background: builds one authenticated tunnel, pools it, and closes it
@@ -177,10 +312,24 @@ impl Dialer {
                 .map(|()| stream)
         });
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) as u64;
+        match &built {
+            Ok(_) => {
+                self.stats.prepared.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(error) => {
+                self.stats.prepare_failures.fetch_add(1, Ordering::Relaxed);
+                *self
+                    .stats
+                    .last_prepare_error
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(error.clone());
+            }
+        }
         let pooled = match built {
             Ok(stream) if !self.closed.load(Ordering::Acquire) => {
+                let target = self.target(Instant::now());
                 let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
-                if pool.len() < self.target {
+                if pool.len() < target {
                     pool.push(Pooled {
                         id,
                         stream,
@@ -197,7 +346,15 @@ impl Dialer {
         if !pooled {
             return;
         }
-        thread::sleep(POOL_IDLE);
+        // Re-read after each wake: the limit may have shrunk meanwhile.
+        let since = Instant::now();
+        loop {
+            let left = self.idle_limit().saturating_sub(since.elapsed());
+            if left.is_zero() || self.closed.load(Ordering::Acquire) {
+                break;
+            }
+            thread::sleep(left.min(Duration::from_millis(500)));
+        }
         let expired = {
             let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
             let before = pool.len();
@@ -521,7 +678,7 @@ mod tests {
                 since: now,
             });
         }
-        let taken = dialer.take().unwrap();
+        let (taken, _) = dialer.take().unwrap();
         assert_eq!(taken.local_addr().unwrap().port(), good_port);
         assert!(dialer.take().is_none());
     }
@@ -530,7 +687,7 @@ mod tests {
     fn a_closed_dialer_neither_refills_nor_keeps_tunnels() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let dialer = dialer(local(&listener));
-        *dialer.last_demand.lock().unwrap() = Some(Instant::now());
+        dialer.record_demand(Instant::now());
         dialer.close();
         dialer.refill();
         assert_eq!(dialer.in_flight.load(Ordering::Acquire), 0);
@@ -538,6 +695,63 @@ mod tests {
         let idle = dialer_with_target(local(&listener), 2);
         idle.refill();
         assert_eq!(idle.in_flight.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn the_idle_limit_shrinks_below_the_shortest_observed_close() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let dialer = dialer_with_target(local(&listener), 8);
+        assert_eq!(dialer.idle_limit(), POOL_IDLE);
+        dialer.closed_after(Duration::from_millis(9_500));
+        assert_eq!(dialer.idle_limit(), Duration::from_millis(7_600));
+        // A later, longer close never raises it again.
+        dialer.closed_after(Duration::from_secs(30));
+        assert_eq!(dialer.idle_limit(), Duration::from_millis(7_600));
+        // A very short close stops at the floor.
+        dialer.closed_after(Duration::from_millis(500));
+        assert_eq!(dialer.idle_limit(), MIN_POOL_IDLE);
+        // A pooled tunnel past the learned limit is not handed out.
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let _server = listener.accept().unwrap();
+        dialer.pool.lock().unwrap().push(Pooled {
+            id: 9,
+            stream: client,
+            since: Instant::now() - MIN_POOL_IDLE,
+        });
+        assert!(dialer.take().is_none());
+        assert_eq!(dialer.report()["discarded"], 1);
+    }
+
+    #[test]
+    fn the_pool_follows_the_largest_recent_burst() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let dialer = dialer_with_target(local(&listener), 8);
+        let start = Instant::now();
+        assert_eq!(dialer.target(start), 0, "nothing kept ready without demand");
+        dialer.record_demand(start);
+        assert_eq!(
+            dialer.target(start),
+            2,
+            "at least the minimum once in demand"
+        );
+        // Five requests within the burst window, then a lone one later.
+        for millis in [100, 300, 600, 900] {
+            dialer.record_demand(start + Duration::from_millis(millis));
+        }
+        dialer.record_demand(start + Duration::from_secs(10));
+        assert_eq!(dialer.target(start + Duration::from_secs(10)), 5);
+        // Spread over more than the burst window, requests do not add up.
+        for second in 20..26 {
+            dialer.record_demand(start + Duration::from_secs(second));
+        }
+        assert_eq!(dialer.target(start + Duration::from_secs(26)), 5);
+        // A burst larger than the maximum is capped.
+        for millis in 0..20 {
+            dialer.record_demand(start + Duration::from_secs(30) + Duration::from_millis(millis));
+        }
+        assert_eq!(dialer.target(start + Duration::from_secs(31)), 8);
+        // Once the demand window has passed, nothing is kept ready.
+        assert_eq!(dialer.target(start + Duration::from_secs(100)), 0);
     }
 
     fn dialer_with_target(first_hop: SocketAddrV4, target: usize) -> Arc<Dialer> {

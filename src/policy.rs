@@ -431,7 +431,7 @@ impl Policy {
         let dialer = Arc::new(Dialer::new(
             config.first_hop,
             residential.clone(),
-            dialer::POOL_TARGET,
+            dialer::POOL_MAX,
         ));
         Ok(Self {
             credential_ref: config.credential,
@@ -454,7 +454,7 @@ impl Policy {
     }
 
     pub(crate) fn public_summary(&self) -> serde_json::Value {
-        serde_json::json!({"first_hop":self.first_hop,"credential":self.credential_ref,"dns_upstream":self.dns_upstream,"dns_tls_name":self.dns_tls_name,"health_domain":self.health_domain})
+        serde_json::json!({"first_hop":self.first_hop,"credential":self.credential_ref,"dns_upstream":self.dns_upstream,"dns_tls_name":self.dns_tls_name,"health_domain":self.health_domain,"tunnels":self.dialer.report()})
     }
 
     pub(crate) fn matches_residence(&self, ip: Ipv4Addr) -> bool {
