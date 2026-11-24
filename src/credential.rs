@@ -27,14 +27,38 @@ pub(crate) struct Residential {
     blob: Secret,
 }
 
+/// Builds the credential from the four settings fields exactly as typed: the
+/// username and password bytes go into the SOCKS5 packet unchanged, quotes and
+/// surrounding spaces included. Only the address is trimmed.
 pub(crate) fn from_settings(
     settings: &crate::desktop_store::ResidentialSettings,
 ) -> Result<Residential, String> {
-    let text = format!(
-        "ip={}\nport={}\nusername={}\npassword={}\n",
-        settings.ip, settings.port, settings.username, settings.password
-    );
-    parse_env(text.as_bytes())
+    let ip: Ipv4Addr = settings
+        .ip
+        .trim()
+        .parse()
+        .map_err(|_| "credential ip must be literal IPv4")?;
+    build(
+        ip,
+        settings.port,
+        settings.username.as_bytes(),
+        settings.password.as_bytes(),
+    )
+}
+
+fn build(ip: Ipv4Addr, port: u16, user: &[u8], password: &[u8]) -> Result<Residential, String> {
+    let length = |value: &[u8]| u8::try_from(value.len()).ok().filter(|n| *n > 0);
+    let (Some(user_len), Some(pass_len)) = (length(user), length(password)) else {
+        return Err("SOCKS5 username and password must each contain 1–255 bytes".into());
+    };
+    let mut blob = Secret(Vec::with_capacity(13 + user.len() + password.len()));
+    blob.0.extend_from_slice(MAGIC);
+    blob.0.extend_from_slice(&ip.octets());
+    blob.0.extend_from_slice(&port.to_be_bytes());
+    blob.0.extend_from_slice(&[user_len, pass_len]);
+    blob.0.extend_from_slice(user);
+    blob.0.extend_from_slice(password);
+    Residential::decode(blob)
 }
 
 pub(crate) fn settings(residential: &Residential) -> crate::desktop_store::ResidentialSettings {
@@ -171,20 +195,7 @@ fn parse_env(bytes: &[u8]) -> Result<Residential, String> {
         .parse()
         .map_err(|_| "credential ip must be literal IPv4")?;
     let port: u16 = port?.parse().map_err(|_| "credential port is invalid")?;
-    let user = user?.as_bytes();
-    let password = password?.as_bytes();
-    if user.len() > 255 || password.len() > 255 {
-        return Err("SOCKS5 username and password must each contain 1–255 bytes".into());
-    }
-    let mut blob = Secret(Vec::with_capacity(13 + user.len() + password.len()));
-    blob.0.extend_from_slice(MAGIC);
-    blob.0.extend_from_slice(&ip.octets());
-    blob.0.extend_from_slice(&port.to_be_bytes());
-    blob.0
-        .extend_from_slice(&[user.len() as u8, password.len() as u8]);
-    blob.0.extend_from_slice(user);
-    blob.0.extend_from_slice(password);
-    Residential::decode(blob)
+    build(ip, port, user?.as_bytes(), password?.as_bytes())
 }
 
 #[cfg(test)]
@@ -211,6 +222,64 @@ mod tests {
         let len = credential.auth_packet(&mut packet);
         assert_eq!(&packet[..len], b"\x01\x04user\x08p$#=word");
         wipe(&mut packet);
+    }
+
+    #[test]
+    fn settings_reach_the_auth_packet_byte_for_byte() {
+        for (username, password) in [
+            ("user", "\"q\""),
+            ("'u'", "'lead"),
+            (" spaced ", "p=a#ss "),
+        ] {
+            let settings = crate::desktop_store::ResidentialSettings {
+                ip: " 192.0.2.10 ".into(),
+                port: 1080,
+                username: username.into(),
+                password: password.into(),
+            };
+            let credential = from_settings(&settings).unwrap();
+            let mut packet = [0; 513];
+            let len = credential.auth_packet(&mut packet);
+            let mut expected = vec![1, username.len() as u8];
+            expected.extend_from_slice(username.as_bytes());
+            expected.push(password.len() as u8);
+            expected.extend_from_slice(password.as_bytes());
+            assert_eq!(&packet[..len], expected.as_slice());
+            let back = super::settings(&credential);
+            assert_eq!((back.username.as_str(), back.password.as_str()), (username, password));
+            wipe(&mut packet);
+        }
+    }
+
+    #[test]
+    fn settings_reject_empty_or_oversized_fields() {
+        let base = crate::desktop_store::ResidentialSettings {
+            ip: "192.0.2.10".into(),
+            port: 1080,
+            username: "user".into(),
+            password: "secret".into(),
+        };
+        for broken in [
+            crate::desktop_store::ResidentialSettings {
+                password: String::new(),
+                ..base.clone()
+            },
+            crate::desktop_store::ResidentialSettings {
+                username: "u".repeat(256),
+                ..base.clone()
+            },
+            crate::desktop_store::ResidentialSettings {
+                ip: "proxy.example".into(),
+                ..base.clone()
+            },
+            crate::desktop_store::ResidentialSettings {
+                port: 0,
+                ..base.clone()
+            },
+        ] {
+            assert!(from_settings(&broken).is_err());
+        }
+        assert!(from_settings(&base).is_ok());
     }
 
     #[test]
