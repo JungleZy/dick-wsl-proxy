@@ -1112,6 +1112,60 @@ def resolve6_queries(p, entries, queries):
     return [resolve6_prepared(prepared, entries, protocol, peer) for protocol, peer in queries]
 
 
+def exact_entry(ct, reply, ipv6=False):
+    # A fresh kernel lookup of the one default-zone entry whose reply tuple is
+    # what Windows actually received (ingress -> guest:port). The kernel keeps
+    # reply tuples unique within a zone, so this costs a hash lookup instead of
+    # a walk over every bucket and a decode of every entry in the shared table.
+    # Other zones are not consulted; ownership already requires zone 0.
+    payload = attribute(CTA_REPLY, encode_tuple(reply, ipv6), True)
+    try:
+        replies = ct.request(CT_GET, ACK, payload, ipv6=ipv6)
+    except OSError as error:
+        if error.errno == errno.ENOENT:
+            return None
+        raise
+    require(len(replies) == 1, "ambiguous_exact_conntrack_lookup")
+    entry = parse_entry(replies[0])
+    return entry if entry["reply"] == reply else None
+
+
+def exact_queries(prepared, ct, queries):
+    # No snapshot, index or result survives this call. Each answer is the
+    # kernel's current entry for that tuple, checked with the full ownership
+    # predicate; anything missing, foreign or malformed resolves to None.
+    origins = []
+    for protocol, peer in queries:
+        require(protocol in ("tcp", "udp"), "invalid_lookup_protocol")
+        address, port = endpoint(peer)
+        require(address == prepared.guest, "invalid_lookup_peer")
+        number = 6 if protocol == "tcp" else 17
+        entry = exact_entry(ct, (number, *prepared.ingress, address, port))
+        if entry is None or not prepared.owned(entry):
+            origins.append(None)
+            continue
+        original = entry["original"]
+        origins.append(f"{original[3]}:{original[4]}")
+    return origins
+
+
+def exact6_queries(p, ct, queries):
+    prepared = Ownership6(p)
+    origins = []
+    for protocol, peer in queries:
+        require(protocol in ("tcp", "udp"), "invalid_lookup_protocol")
+        address, port = endpoint6(peer)
+        require(address == prepared.guest, "invalid_lookup_peer")
+        number = 6 if protocol == "tcp" else 17
+        entry = exact_entry(ct, (number, prepared.ingress[0], prepared.ingress[1], prepared.guest, port), ipv6=True)
+        if entry is None or not prepared.owned(entry):
+            origins.append(None)
+            continue
+        original = entry["original"]
+        origins.append(f"[{original[3]}]:{original[4]}")
+    return origins
+
+
 def inspect_mappings(p, ct):
     entries = owned_entries(p, ct.dump())
     if p.get("system_dns") is not None and p.get("ipv6") is None:

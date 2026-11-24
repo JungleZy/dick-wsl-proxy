@@ -90,6 +90,13 @@ fn classify(result: Result<(kernel::Ownership, Option<String>), String>) -> Obse
             Some((Drift::Changed, reason)) => changed(reason),
             _ => "protection_lost: rules_missing: this takeover's rules are gone from the target".into(),
         }),
+        // Per-connection lookups read only the one entry they authorize, so
+        // this check is where a marked entry that is not a provable mapping of
+        // this takeover, or two entries sharing a tuple, is caught.
+        Err(error) if mapping_integrity(&error).is_some() => Observed::Lost(format!(
+            "protection_lost: mapping_integrity: {}: a connection-tracking entry carries this takeover's mark without a provable mapping",
+            mapping_integrity(&error).unwrap_or_default()
+        )),
         // Rules survive, but the guest could not confirm the identity they were
         // installed for. Only a restart or a real change counts as a loss.
         Err(error) => match error
@@ -104,6 +111,18 @@ fn classify(result: Result<(kernel::Ownership, Option<String>), String>) -> Obse
             None => Observed::Unverified(error),
         },
     }
+}
+
+/// The guest's reason when an inspect failed on a mapping-integrity check.
+fn mapping_integrity(error: &str) -> Option<&'static str> {
+    const REASONS: [&str; 4] = [
+        "instance_mark_has_unproven_mapping",
+        "duplicate_conntrack_mapping",
+        "instance_ipv6_mark_has_unproven_mapping",
+        "duplicate_ipv6_conntrack_mapping",
+    ];
+    let (_, reason) = error.split_once("kernel_operation_failed: ")?;
+    REASONS.into_iter().find(|known| reason.trim() == *known)
 }
 
 fn unix_seconds() -> Option<u64> {
@@ -538,6 +557,27 @@ mod tests {
             surviving("guest_ipv6_address_changed"),
             "protection_lost: environment_changed: guest_ipv6_address_changed",
         );
+        // A marked entry that is not a provable mapping is caught here, not
+        // per connection: the lookups read only the entry they authorize.
+        for reason in [
+            "instance_mark_has_unproven_mapping",
+            "duplicate_conntrack_mapping",
+            "instance_ipv6_mark_has_unproven_mapping",
+            "duplicate_ipv6_conntrack_mapping",
+        ] {
+            lost(
+                classify(Err(format!(
+                    "inspect:wsl_exit_failed: exit code: 1: kernel_operation_failed: {reason}\n"
+                ))),
+                &format!("protection_lost: mapping_integrity: {reason}"),
+            );
+        }
+        assert!(matches!(
+            classify(Err(
+                "inspect:wsl_exit_failed: exit code: 1: kernel_operation_failed: duplicate_conntrack_mapping_extra".into()
+            )),
+            Observed::Unverified(_)
+        ));
         // A passing race or a missing tool is not evidence of loss.
         for reason in [
             "unverifiable_workload",

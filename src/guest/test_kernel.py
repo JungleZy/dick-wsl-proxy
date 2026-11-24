@@ -79,6 +79,8 @@ def encoded_entry(value, include_id=True):
     result += kernel.attribute(kernel.CTA_STATUS, struct.pack("!I", value["status"]))
     if include_id:
         result += kernel.attribute(kernel.CTA_ID, struct.pack("!I", value["id"]))
+    if value.get("zone"):
+        result += kernel.attribute(kernel.CTA_ZONE, struct.pack("!H", value["zone"]))
     return result
 
 
@@ -509,6 +511,127 @@ class PreparedLookupTests(unittest.TestCase):
         malformed += b"".join(kernel.attribute(kind, data) for kind, data in fields.items() if kind != kernel.CTA_ORIG)
         with self.assertRaisesRegex(kernel.Failure, "duplicate_netlink_attribute"):
             kernel.parse_entry(malformed)
+
+
+class ExactConntrack:
+    """Answers exact reply-tuple GETs like the kernel: one entry or ENOENT."""
+
+    def __init__(self, *values, extra=None):
+        self.values = values
+        self.extra = extra or []
+        self.requests = []
+
+    def request(self, command, flags, payload=b"", ipv6=False):
+        self.requests.append((command, flags, payload, ipv6))
+        assert command == kernel.CT_GET and flags == kernel.ACK
+        for value in self.values:
+            if payload == kernel.attribute(kernel.CTA_REPLY, kernel.encode_tuple(value["reply"]), True):
+                return [encoded_entry(value), *self.extra]
+        raise OSError(kernel.errno.ENOENT, "No such file or directory")
+
+
+class ExactLookupTests(unittest.TestCase):
+    def test_owned_entry_resolves_with_one_exact_request_per_query(self):
+        p = plan()
+        udp = entry()
+        tcp = entry(origin=1, peer=45001, identifier=2)
+        tcp["original"] = (6, *tcp["original"][1:])
+        tcp["reply"] = (6, *tcp["reply"][1:])
+        ct = ExactConntrack(udp, tcp)
+        queries = [("udp", p["guest"] + ":45000"), ("tcp", p["guest"] + ":45001"), ("tcp", p["guest"] + ":45000")]
+        self.assertEqual(
+            kernel.exact_queries(kernel.prepare_lookup(p), ct, queries),
+            [p["origins"][0], p["origins"][1], None],
+        )
+        self.assertEqual(len(ct.requests), 3)
+        self.assertTrue(all(not request[3] for request in ct.requests))
+
+    def test_missing_foreign_or_malformed_entries_resolve_to_none(self):
+        p = plan()
+        prepared = kernel.prepare_lookup(p)
+        query = [("udp", p["guest"] + ":45000")]
+        self.assertEqual(kernel.exact_queries(prepared, ExactConntrack(), query), [None])
+        for key, value in (("mark", 0), ("zone", 1), ("status", 0x108)):
+            forged = entry()
+            forged[key] = value
+            with self.subTest(key=key):
+                self.assertEqual(kernel.exact_queries(prepared, ExactConntrack(forged), query), [None])
+        unlisted = entry()
+        unlisted["original"] = (17, p["guest"], 44000, "192.0.2.9", 443)
+        self.assertEqual(kernel.exact_queries(prepared, ExactConntrack(unlisted), query), [None])
+
+    def test_kernel_answer_must_be_unique_and_match_the_asked_tuple(self):
+        p = plan()
+        prepared = kernel.prepare_lookup(p)
+        query = [("udp", p["guest"] + ":45000")]
+        with self.assertRaisesRegex(kernel.Failure, "ambiguous_exact_conntrack_lookup"):
+            kernel.exact_queries(prepared, ExactConntrack(entry(), extra=[encoded_entry(entry(identifier=2))]), query)
+
+        class WrongTuple(ExactConntrack):
+            def request(self, command, flags, payload=b"", ipv6=False):
+                other = entry(peer=45009)
+                return [encoded_entry(other)]
+
+        self.assertEqual(kernel.exact_queries(prepared, WrongTuple(), query), [None])
+
+    def test_other_kernel_errors_fail_the_lookup(self):
+        p = plan()
+
+        class Broken(ExactConntrack):
+            def request(self, command, flags, payload=b"", ipv6=False):
+                raise OSError(kernel.errno.EPERM, "Operation not permitted")
+
+        with self.assertRaises(OSError):
+            kernel.exact_queries(kernel.prepare_lookup(p), Broken(), [("udp", p["guest"] + ":45000")])
+
+    def test_ipv6_exact_lookup_uses_the_ipv6_family_and_ownership(self):
+        p = comprehensive_plan()
+        p["ipv6"] = {"guest": "2001:db8:1::2", "ingress": "[fe80::1%2]:43771"}
+        value = {
+            "original": (17, "2001:db8:1::2", 44000, "2001:db8:2::9", 443),
+            "reply": (17, "fe80::1", 43771, "2001:db8:1::2", 45000),
+            "mark": p["cookie"],
+            "id": 1,
+            "zone": 0,
+            "tuple_zones": (0, 0),
+            "status": 0x188 | 0x20,
+        }
+
+        def encoded6(entry6):
+            result = bytes([kernel.socket.AF_INET6, 0, 0, 0])
+            result += kernel.attribute(kernel.CTA_ORIG, kernel.encode_tuple(entry6["original"], True), True)
+            result += kernel.attribute(kernel.CTA_REPLY, kernel.encode_tuple(entry6["reply"], True), True)
+            result += kernel.attribute(kernel.CTA_MARK, struct.pack("!I", entry6["mark"]))
+            result += kernel.attribute(kernel.CTA_STATUS, struct.pack("!I", entry6["status"]))
+            return result + kernel.attribute(kernel.CTA_ID, struct.pack("!I", entry6["id"]))
+
+        class Exact6:
+            def __init__(self, *values):
+                self.values, self.requests = values, []
+
+            def request(self, command, flags, payload=b"", ipv6=False):
+                self.requests.append(ipv6)
+                for item in self.values:
+                    if payload == kernel.attribute(kernel.CTA_REPLY, kernel.encode_tuple(item["reply"], True), True):
+                        return [encoded6(item)]
+                raise OSError(kernel.errno.ENOENT, "No such file or directory")
+
+        ct = Exact6(value)
+        query = [("udp", "[2001:db8:1::2]:45000"), ("udp", "[2001:db8:1::2]:45001")]
+        self.assertEqual(kernel.exact6_queries(p, ct, query), ["[2001:db8:2::9]:443", None])
+        self.assertEqual(ct.requests, [True, True])
+        foreign = copy.deepcopy(value)
+        foreign["mark"] = 0
+        self.assertEqual(kernel.exact6_queries(p, Exact6(foreign), query[:1]), [None])
+        with self.assertRaises(kernel.Failure):
+            kernel.exact6_queries(p, Exact6(value), [("udp", "[2001:db8:1::3]:45000")])
+
+    def test_query_validation_stays_strict(self):
+        p = plan()
+        prepared = kernel.prepare_lookup(p)
+        for protocol, peer in (("UDP", p["guest"] + ":45000"), ("udp", "172.28.80.1:45000"), ("udp", p["guest"] + ":045000")):
+            with self.subTest(protocol=protocol, peer=peer), self.assertRaises(kernel.Failure):
+                kernel.exact_queries(prepared, ExactConntrack(entry()), [(protocol, peer)])
 
 
 class FirewallTests(unittest.TestCase):

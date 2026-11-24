@@ -65,47 +65,22 @@ try:
             keys.append((item['protocol'], item['peer']))
         sequence = request['id']
         try:
+            # One exact kernel lookup per key on a fresh socket: no table dump,
+            # snapshot or cached answer. The lookups are interleaved with their
+            # decoding, so all of it is reported as kernel read time.
             read_start = time.monotonic_ns()
             ct = kernel['Conntrack']()
             try:
-                want_v4 = any(not peer.startswith('[') for _, peer in keys)
-                want_v6 = any(peer.startswith('[') for _, peer in keys)
-                payloads = []
-                if want_v4:
-                    payloads.extend((payload, False) for payload in ct.request(kernel['CT_GET'], kernel['ROOT'] | kernel['MATCH']))
-                if want_v6:
-                    payloads.extend((payload, True) for payload in ct.request(kernel['CT_GET'], kernel['ROOT'] | kernel['MATCH'], ipv6=True))
+                origins = []
+                for protocol, peer in keys:
+                    if peer.startswith('['):
+                        origins.extend(kernel['exact6_queries'](plan, ct, [(protocol, peer)]))
+                    else:
+                        origins.extend(kernel['exact_queries'](prepared, ct, [(protocol, peer)]))
             finally:
                 ct.close()
-            read_end = time.monotonic_ns()
-            # Read includes fresh socket construction, netlink envelope checks,
-            # and socket close; decode includes tuple validation and indexing.
-            try:
-                entries = {
-                    False: [kernel['parse_entry'](payload) for payload, ipv6 in payloads if not ipv6],
-                    True: [kernel['parse_entry'](payload) for payload, ipv6 in payloads if ipv6],
-                }
-            finally:
-                del payloads
-            try:
-                origins = []
-                v4_keys = [(protocol, peer) for protocol, peer in keys if not peer.startswith('[')]
-                v4_origins = kernel['resolve_queries'](prepared, entries[False], v4_keys) if v4_keys else []
-                v6_keys = [(protocol, peer) for protocol, peer in keys if peer.startswith('[')]
-                v6_origins = kernel['resolve6_queries'](plan, entries[True], v6_keys) if v6_keys else []
-                v4_index = v6_index = 0
-                for _, peer in keys:
-                    if peer.startswith('['):
-                        origins.append(v6_origins[v6_index])
-                        v6_index += 1
-                    else:
-                        origins.append(v4_origins[v4_index])
-                        v4_index += 1
-            finally:
-                del entries
-            decode_end = time.monotonic_ns()
-            kernel_read_us = (read_end - read_start) // 1000
-            decode_lookup_us = (decode_end - read_end) // 1000
+            kernel_read_us = (time.monotonic_ns() - read_start) // 1000
+            decode_lookup_us = 0
             require(0 <= kernel_read_us + decode_lookup_us <= 12000000, 'invalid_query_timing')
             emit({'kind': 'origins', 'id': sequence, 'origins': origins, 'kernel_read_us': kernel_read_us, 'decode_lookup_us': decode_lookup_us})
         except (kernel['Failure'], OSError, ValueError, KeyError, TypeError, UnicodeError) as error:

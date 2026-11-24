@@ -30,10 +30,11 @@ pub(crate) struct Lookup {
 }
 
 /// Guest durations per physical batch, measured with a monotonic clock.
-/// `kernel_read_us` includes fresh Conntrack socket construction, the netlink
-/// request/envelope validation, and socket close (not just kernel execution).
-/// `decode_lookup_us` covers tuple decoding/validation and snapshot indexing.
-/// Neither includes JSON/stdio transit, host queueing, or helper startup.
+/// `kernel_read_us` covers fresh Conntrack socket construction, one exact
+/// reply-tuple request per lookup with its envelope validation, decoding and
+/// ownership check, and socket close. `decode_lookup_us` is zero: decoding is
+/// interleaved with the requests. Neither includes JSON/stdio transit, host
+/// queueing, or helper startup.
 #[derive(Debug)]
 pub struct BatchOrigins {
     pub origins: Vec<Option<SocketAddr>>,
