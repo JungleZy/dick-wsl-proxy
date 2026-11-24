@@ -7,6 +7,7 @@ use crate::{
     wsl_platform,
 };
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -532,6 +533,18 @@ fn export(controller: &controller::Controller) -> Result<Value, String> {
     Ok(json!({"path":path}))
 }
 
+/// Parses a desktop request's fields. Any malformed request reports only
+/// `code`: requests can carry passwords, so serde's text must not travel back.
+fn fields<T: DeserializeOwned>(
+    request: &mut Value,
+    code: &'static str,
+) -> Result<T, crate::command::Failure> {
+    let bad = || crate::command::Failure::new("desktop_request_failed", code);
+    let object = request.as_object_mut().ok_or_else(bad)?;
+    object.remove("command");
+    serde_json::from_value(Value::Object(std::mem::take(object))).map_err(|_| bad())
+}
+
 pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (Value, bool) {
     let command = request
         .get("command")
@@ -558,23 +571,11 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                 sqlite_view(&p).map_err(bad)?
             }
             "profile_save" => {
-                let request = request
-                    .as_object_mut()
-                    .ok_or_else(|| bad("invalid_request".into()))?;
-                request.remove("command");
-                let req =
-                    serde_json::from_value::<SqliteSave>(Value::Object(std::mem::take(request)))
-                        .map_err(|_| bad("invalid_desktop_profile_fields".into()))?;
+                let req: SqliteSave = fields(&mut request, "invalid_desktop_profile_fields")?;
                 sqlite_save(&profile_path().map_err(bad)?, req).map_err(bad)?
             }
             "runtime_logs" => {
-                let request = request
-                    .as_object_mut()
-                    .ok_or_else(|| bad("invalid_runtime_log_fields".into()))?;
-                request.remove("command");
-                let req =
-                    serde_json::from_value::<RuntimeLogs>(Value::Object(std::mem::take(request)))
-                        .map_err(|_| bad("invalid_runtime_log_fields".into()))?;
+                let req: RuntimeLogs = fields(&mut request, "invalid_runtime_log_fields")?;
                 desktop_store::runtime_logs(
                     &profile_path().map_err(bad)?,
                     req.level.as_deref(),
@@ -585,14 +586,8 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                 .map_err(bad)?
             }
             "connection_records" => {
-                let request = request
-                    .as_object_mut()
-                    .ok_or_else(|| bad("invalid_connection_record_fields".into()))?;
-                request.remove("command");
-                let req = serde_json::from_value::<ConnectionRecords>(Value::Object(
-                    std::mem::take(request),
-                ))
-                .map_err(|_| bad("invalid_connection_record_fields".into()))?;
+                let req: ConnectionRecords =
+                    fields(&mut request, "invalid_connection_record_fields")?;
                 let mut records = desktop_store::connection_records(
                     &profile_path().map_err(bad)?,
                     req.status.as_deref(),
@@ -605,26 +600,12 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                 records
             }
             "environment_view" => {
-                let request = request
-                    .as_object_mut()
-                    .ok_or_else(|| bad("invalid_environment_fields".into()))?;
-                request.remove("command");
-                let req = serde_json::from_value::<EnvironmentKey>(Value::Object(std::mem::take(
-                    request,
-                )))
-                .map_err(|_| bad("invalid_environment_fields".into()))?;
+                let req: EnvironmentKey = fields(&mut request, "invalid_environment_fields")?;
                 environment::view(&req.name).map_err(bad)?
             }
             "environment_create" => {
                 require_idle(controller)?;
-                let request = request
-                    .as_object_mut()
-                    .ok_or_else(|| bad("invalid_environment_fields".into()))?;
-                request.remove("command");
-                let req = serde_json::from_value::<EnvironmentCreate>(Value::Object(
-                    std::mem::take(request),
-                ))
-                .map_err(|_| bad("invalid_environment_fields".into()))?;
+                let req: EnvironmentCreate = fields(&mut request, "invalid_environment_fields")?;
                 let target = req.name.clone();
                 start_environment_job("environment_create", target, move || {
                     let environment = environment::create(
@@ -649,14 +630,7 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
             }
             "environment_edit" => {
                 require_idle(controller)?;
-                let request = request
-                    .as_object_mut()
-                    .ok_or_else(|| bad("invalid_environment_fields".into()))?;
-                request.remove("command");
-                let req = serde_json::from_value::<EnvironmentEdit>(Value::Object(std::mem::take(
-                    request,
-                )))
-                .map_err(|_| bad("invalid_environment_fields".into()))?;
+                let req: EnvironmentEdit = fields(&mut request, "invalid_environment_fields")?;
                 let target = req.name.clone();
                 start_environment_job("environment_edit", target, move || {
                     let environment = environment::edit(
@@ -675,14 +649,7 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
             }
             "environment_backup" => {
                 require_idle(controller)?;
-                let request = request
-                    .as_object_mut()
-                    .ok_or_else(|| bad("invalid_environment_fields".into()))?;
-                request.remove("command");
-                let req = serde_json::from_value::<EnvironmentBackup>(Value::Object(
-                    std::mem::take(request),
-                ))
-                .map_err(|_| bad("invalid_environment_fields".into()))?;
+                let req: EnvironmentBackup = fields(&mut request, "invalid_environment_fields")?;
                 let target = req.name.clone();
                 start_environment_job("environment_backup", target, move || {
                     let backup = environment::backup(&req.name, &req.backup_path)?;
@@ -691,14 +658,7 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
             }
             "environment_delete" => {
                 require_idle(controller)?;
-                let request = request
-                    .as_object_mut()
-                    .ok_or_else(|| bad("invalid_environment_fields".into()))?;
-                request.remove("command");
-                let req = serde_json::from_value::<EnvironmentDelete>(Value::Object(
-                    std::mem::take(request),
-                ))
-                .map_err(|_| bad("invalid_environment_fields".into()))?;
+                let req: EnvironmentDelete = fields(&mut request, "invalid_environment_fields")?;
                 let target = req.name.clone();
                 start_environment_job("environment_delete", target, move || {
                     let environment = environment::remove(&req.name)?;

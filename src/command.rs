@@ -461,66 +461,35 @@ pub(crate) fn dispatch_result(
                 .map_err(error)?;
             controller.status().map_err(error)?
         }
-        request @ (Command::Start { .. } | Command::StartScoped { .. }) => {
-            let (target, port, origins, profile, expected_generation) = match request {
-                Command::Start {
-                    target,
-                    port,
-                    profile,
-                    expected_generation,
-                } => (target, port, Vec::new(), Some(profile), expected_generation),
-                Command::StartScoped {
-                    target,
-                    port,
-                    origins,
-                    expected_generation,
-                } => (target, port, origins, None, expected_generation),
-                _ => unreachable!(),
-            };
-            if controller::lifecycle::checked(expected_generation)
-                .map_err(error)?
-                .pending
-                .is_some()
-                || controller::journal::load().map_err(error)?.is_some()
-            {
-                return Err(Failure::new(
-                    "target_already_owned",
-                    "Explicitly stop the previous target before starting",
-                ));
-            }
-            let all = registry()?;
-            let result = preflight(
-                &all,
+        Command::Start {
+            target,
+            port,
+            profile,
+            expected_generation,
+        } => {
+            return start(
+                controller,
                 &target,
                 port,
-                controller.status().map_err(error)?,
-                None,
-            )?;
-            if !result.passed {
-                return Ok((2, serde_json::json!(result)));
-            }
-            let runtime = profile
-                .as_deref()
-                .map(managed::Runtime::from_file)
-                .transpose()
-                .map_err(error)?;
-            let resolver = if runtime.is_some() {
-                Some(managed::resolver(&result.target.snapshot).map_err(error)?)
-            } else {
-                None
-            };
-            let plan = plan::Plan::new(
-                result.target.distribution,
-                &result.target.snapshot,
+                Vec::new(),
+                Some(profile),
+                expected_generation,
+            );
+        }
+        Command::StartScoped {
+            target,
+            port,
+            origins,
+            expected_generation,
+        } => {
+            return start(
+                controller,
+                &target,
                 port,
                 origins,
-                resolver,
-            )
-            .map_err(error)?;
-            controller
-                .start(plan, runtime, expected_generation)
-                .map_err(error)?;
-            controller.status().map_err(error)?
+                None,
+                expected_generation,
+            );
         }
         Command::Stop {
             expected_generation,
@@ -556,6 +525,63 @@ pub(crate) fn dispatch_result(
         }
     };
     Ok((0, response))
+}
+
+/// Starts a managed (`profile`) or scoped (`origins`) takeover. A failed
+/// preflight is returned with exit code 2, as the CLI reports it.
+fn start(
+    controller: &mut controller::Controller,
+    target: &str,
+    port: NonZeroU16,
+    origins: Vec<SocketAddrV4>,
+    profile: Option<PathBuf>,
+    expected_generation: Option<u64>,
+) -> Result<(u8, serde_json::Value), Failure> {
+    let error = |e: String| Failure::new("controller_error", e);
+    if controller::lifecycle::checked(expected_generation)
+        .map_err(error)?
+        .pending
+        .is_some()
+        || controller::journal::load().map_err(error)?.is_some()
+    {
+        return Err(Failure::new(
+            "target_already_owned",
+            "Explicitly stop the previous target before starting",
+        ));
+    }
+    let all = host::distributions().map_err(|e| Failure::new("enumeration_failed", e))?;
+    let result = preflight(
+        &all,
+        target,
+        port,
+        controller.status().map_err(error)?,
+        None,
+    )?;
+    if !result.passed {
+        return Ok((2, serde_json::json!(result)));
+    }
+    let runtime = profile
+        .as_deref()
+        .map(managed::Runtime::from_file)
+        .transpose()
+        .map_err(error)?;
+    let resolver = if runtime.is_some() {
+        Some(managed::resolver(&result.target.snapshot).map_err(error)?)
+    } else {
+        None
+    };
+    let plan = plan::Plan::new(
+        result.target.distribution,
+        &result.target.snapshot,
+        port,
+        origins,
+        resolver,
+    )
+    .map_err(error)?;
+    controller
+        .start(plan, runtime, expected_generation)
+        .map_err(error)?;
+    Ok((0, controller.status().map_err(error)?))
 }
 
 pub(crate) fn dispatch(
