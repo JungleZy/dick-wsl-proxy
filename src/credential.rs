@@ -226,11 +226,7 @@ mod tests {
 
     #[test]
     fn settings_reach_the_auth_packet_byte_for_byte() {
-        for (username, password) in [
-            ("user", "\"q\""),
-            ("'u'", "'lead"),
-            (" spaced ", "p=a#ss "),
-        ] {
+        for (username, password) in [("user", "\"q\""), ("'u'", "'lead"), (" spaced ", "p=a#ss ")] {
             let settings = crate::desktop_store::ResidentialSettings {
                 ip: " 192.0.2.10 ".into(),
                 port: 1080,
@@ -246,7 +242,10 @@ mod tests {
             expected.extend_from_slice(password.as_bytes());
             assert_eq!(&packet[..len], expected.as_slice());
             let back = super::settings(&credential);
-            assert_eq!((back.username.as_str(), back.password.as_str()), (username, password));
+            assert_eq!(
+                (back.username.as_str(), back.password.as_str()),
+                (username, password)
+            );
             wipe(&mut packet);
         }
     }
