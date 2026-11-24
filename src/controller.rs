@@ -380,7 +380,10 @@ impl Controller {
             }
         }
         if let Some((_, i)) = &mut self.live {
-            i.stop()?;
+            // Like `abandon`: an earlier forwarding failure, which `stop` reports
+            // once after joining every worker, is no reason to keep the ports or
+            // the journal. Status already showed it while the takeover ran.
+            let _ = i.stop();
         }
         lease::release(&p)?;
         lifecycle::verify_gone(&p)?;
