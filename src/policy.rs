@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::credential::{self, Residential};
 
+pub(crate) mod domestic;
 pub(crate) mod profile;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_CONFIG: u64 = 1024 * 1024;
@@ -1351,6 +1352,55 @@ mod tests {
         assert!(policy.is_reserved_endpoint(policy.dns_upstream()));
         assert!(policy.chain(policy.first_hop).is_err());
         assert!(policy.chain(policy.residential.endpoint()).is_err());
+    }
+
+    #[test]
+    fn built_in_domestic_suffixes_are_few_canonical_and_spare_the_probe_names() {
+        let suffixes = domestic::DIRECT_SUFFIXES;
+        assert!(!suffixes.is_empty() && suffixes.len() <= 100);
+        for suffix in suffixes {
+            // Stored as written, so the rules page shows what the policy matches.
+            assert_eq!(normalize_domain((*suffix).into()).unwrap(), *suffix);
+            for other in suffixes {
+                if suffix != other {
+                    assert!(
+                        !suffix.ends_with(&format!(".{other}")),
+                        "{suffix} is already covered by {other}"
+                    );
+                }
+            }
+        }
+        let unique: std::collections::HashSet<_> = suffixes.iter().collect();
+        assert_eq!(unique.len(), suffixes.len());
+
+        let mut config = config("127.0.0.1:7892".parse().unwrap());
+        config.direct_ips.clear();
+        config.direct_domains.clear();
+        config.direct_suffixes = suffixes.iter().map(|suffix| (*suffix).into()).collect();
+        let policy = Policy::assemble(
+            Validated::new(config).unwrap(),
+            credential::fixture("198.51.100.9:1080".parse().unwrap()),
+        )
+        .unwrap();
+        for name in [
+            "www.baidu.com",
+            "mirrors.tuna.tsinghua.edu.cn",
+            "registry.npmmirror.com",
+        ] {
+            assert!(policy.allows_domain(name), "{name}");
+        }
+        // Readiness, exit probe and DoH names must stay on the chain, or a fresh
+        // install could not start.
+        for name in [
+            default_health_domain().as_str(),
+            "my.ippure.com",
+            "dns.google",
+            "wpl-0000abcd-udp.example.com",
+            "wpl-0000abcd-tcp.example.com",
+            "notbaidu.com",
+        ] {
+            assert!(!policy.allows_domain(name), "{name}");
+        }
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use crate::{
     credential, host,
     ingress::{FinishedFlow, FlowEvent},
-    policy::{Config, profile::Preferences},
+    policy::{Config, domestic, profile::Preferences},
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -134,12 +134,14 @@ fn default_profile() -> Result<Config, String> {
     serde_json::from_value(serde_json::json!({
         "first_hop":"127.0.0.1:7892",
         "credential":DEFAULT_CREDENTIAL_NAME,
-        "dns_upstream":"223.5.5.5:443",
-        "dns_tls_name":"dns.alidns.com",
+        // A domestic resolver would undo what managed system DNS is for.
+        "dns_upstream":"8.8.8.8:443",
+        "dns_tls_name":"dns.google",
         "health_domain":"ippure.com",
         "direct_ips":[],
         "direct_domains":[],
-        "direct_suffixes":[],
+        // Only a brand-new store starts with these; existing stores keep their rules.
+        "direct_suffixes":domestic::DIRECT_SUFFIXES,
         "allow_loopback_residential":false
     }))
     .map_err(|_| "desktop_store_default_profile_invalid".into())
@@ -1110,6 +1112,39 @@ mod tests {
         assert_eq!(loaded.endpoint().port(), residential.port);
         // The password is part of the SQLite row; no Windows credential is used.
         assert!(load(&path).unwrap().residential == residential);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn only_a_new_store_starts_with_the_built_in_direct_suffixes() {
+        let path = std::env::temp_dir().join(format!(
+            "wpl-default-rules-store-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let initial = ensure(&path).unwrap();
+        initial.profile.validate_draft().unwrap();
+        let profile = serde_json::to_value(&initial.profile).unwrap();
+        assert_eq!(
+            profile["direct_suffixes"],
+            serde_json::json!(domestic::DIRECT_SUFFIXES)
+        );
+        assert_eq!(profile["direct_domains"], serde_json::json!([]));
+        assert_eq!(profile["direct_ips"], serde_json::json!([]));
+
+        // Rules the user saved, even none, are never refilled on a later open.
+        let mut cleared = profile.clone();
+        cleared["direct_suffixes"] = serde_json::json!([]);
+        save(
+            &path,
+            serde_json::from_value(cleared).unwrap(),
+            initial.desktop.clone(),
+            None,
+            None,
+        )
+        .unwrap();
+        let reopened = serde_json::to_value(load(&path).unwrap().profile).unwrap();
+        assert_eq!(reopened["direct_suffixes"], serde_json::json!([]));
         let _ = fs::remove_file(path);
     }
 
