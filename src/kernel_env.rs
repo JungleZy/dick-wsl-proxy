@@ -64,6 +64,31 @@ pub struct TableFailure {
     pub reason: String,
 }
 
+/// The one persistent write: a systemd-modules-load drop-in listing the modules
+/// that were present, so the next WSL boot starts with them already loaded.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Autoload {
+    pub path: String,
+    pub modules: Vec<String>,
+    pub written: bool,
+    pub backup: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// The oneshot that runs the read-only table queries at boot, because loading
+/// the table modules alone does not register the empty tables on this kernel.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootUnit {
+    pub path: String,
+    pub written: bool,
+    pub enabled: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 /// What one preparation changed on the shared kernel. Serialized into the
 /// command response and flattened into the on-disk record.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -82,6 +107,8 @@ pub struct Preparation {
     pub modules_failed: Vec<FailedModule>,
     pub tables: Tables,
     pub table_failures: Vec<TableFailure>,
+    pub autoload: Autoload,
+    pub boot_unit: BootUnit,
 }
 
 /// Loads the fixed module set and registers the empty tables. The guest decides
@@ -306,6 +333,50 @@ fn validate(preparation: &Preparation) -> Result<(), String> {
             return Err("kernel_env_table_failure_invalid".into());
         }
     }
+    let autoload = &preparation.autoload;
+    if autoload.path != "/etc/modules-load.d/wsl-proxy.conf" {
+        return Err("kernel_env_autoload_path_invalid".into());
+    }
+    check_modules(&autoload.modules, "autoload")?;
+    if autoload.modules.is_empty() {
+        return Err("kernel_env_autoload_empty".into());
+    }
+    if autoload.written == autoload.error.is_some() {
+        return Err("kernel_env_autoload_inconsistent".into());
+    }
+    if let Some(backup) = &autoload.backup {
+        let suffix = backup
+            .strip_prefix("/etc/modules-load.d/wsl-proxy.conf.bak-")
+            .unwrap_or_default();
+        if suffix.is_empty()
+            || suffix.len() > 64
+            || !suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err("kernel_env_autoload_backup_invalid".into());
+        }
+    }
+    if let Some(error) = &autoload.error
+        && (error.is_empty() || !text(error, 256))
+    {
+        return Err("kernel_env_autoload_error_invalid".into());
+    }
+    let unit = &preparation.boot_unit;
+    if unit.path != "/etc/systemd/system/wsl-proxy-tables.service" {
+        return Err("kernel_env_boot_unit_path_invalid".into());
+    }
+    if unit.enabled && !unit.written {
+        return Err("kernel_env_boot_unit_not_written".into());
+    }
+    if (!unit.written || !unit.enabled) && unit.error.is_none() {
+        return Err("kernel_env_boot_unit_missing_reason".into());
+    }
+    if let Some(error) = &unit.error
+        && (error.is_empty() || !text(error, 256))
+    {
+        return Err("kernel_env_boot_unit_error_invalid".into());
+    }
     Ok(())
 }
 
@@ -387,7 +458,20 @@ mod tests {
                 "after": {"v4": ["filter", "nat"], "v6": ["filter", "nat"]},
                 "added": {"v4": ["filter"], "v6": ["filter", "nat"]}
             },
-            "table_failures": []
+            "table_failures": [],
+            "autoload": {
+                "path": "/etc/modules-load.d/wsl-proxy.conf",
+                "modules": ["iptable_nat", "xt_cgroup"],
+                "written": true,
+                "backup": null,
+                "error": null
+            },
+            "boot_unit": {
+                "path": "/etc/systemd/system/wsl-proxy-tables.service",
+                "written": true,
+                "enabled": true,
+                "error": null
+            }
         })
     }
 
@@ -406,6 +490,11 @@ mod tests {
             3
         );
         assert!(preparation.modules_failed.is_empty());
+        assert!(preparation.autoload.written);
+        assert_eq!(
+            preparation.autoload.path,
+            "/etc/modules-load.d/wsl-proxy.conf"
+        );
     }
 
     #[test]
@@ -468,6 +557,65 @@ mod tests {
         let mut value = sample();
         value["tables"]["before"]["v6"] = json!(["mangle"]);
         assert!(validate(&serde_json::from_value(value).unwrap()).is_err());
+    }
+
+    #[test]
+    fn rejects_inconsistent_autoload_reports() {
+        for mutation in [
+            json!({"path": "/etc/rc.local"}),
+            json!({"modules": []}),
+            json!({"error": "no_proven_modules"}),
+            json!({"written": false, "error": null}),
+            json!({"backup": "/etc/passwd"}),
+            json!({"error": ""}),
+        ] {
+            let mut value = sample();
+            for (key, field) in mutation.as_object().unwrap() {
+                value["autoload"][key] = field.clone();
+            }
+            assert!(
+                validate(&serde_json::from_value(value).unwrap()).is_err(),
+                "{mutation}"
+            );
+        }
+
+        let mut value = sample();
+        value["autoload"] = json!({
+            "path": "/etc/modules-load.d/wsl-proxy.conf",
+            "modules": ["xt_cgroup"],
+            "written": false,
+            "backup": null,
+            "error": "no_proven_modules"
+        });
+        validate(&serde_json::from_value(value).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn rejects_inconsistent_boot_unit_reports() {
+        for mutation in [
+            json!({"path": "/etc/rc.local"}),
+            json!({"enabled": true, "written": false}),
+            json!({"written": true, "enabled": false, "error": null}),
+            json!({"error": ""}),
+        ] {
+            let mut value = sample();
+            for (key, field) in mutation.as_object().unwrap() {
+                value["boot_unit"][key] = field.clone();
+            }
+            assert!(
+                validate(&serde_json::from_value(value).unwrap()).is_err(),
+                "{mutation}"
+            );
+        }
+
+        let mut value = sample();
+        value["boot_unit"] = json!({
+            "path": "/etc/systemd/system/wsl-proxy-tables.service",
+            "written": true,
+            "enabled": false,
+            "error": "systemctl_enable_failed: exit 1"
+        });
+        validate(&serde_json::from_value(value).unwrap()).unwrap();
     }
 
     #[test]

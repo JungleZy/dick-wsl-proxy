@@ -51,9 +51,9 @@ $ctl = '.\target\release\wsl-proxyctl.exe'
 
 `list` does not start distributions. `preflight` may wake the selected target, but installs no traffic rules. Check `passed` and `blockers` in the JSON output. `passed: true` means the checks passed, not that the proxy is active.
 
-如果阻断项含 `capability.kernel.*` 或 `baseline.ip*tables*`，说明共享 WSL 内核处于冷启动状态。可在桌面总览点「准备内核环境」，或运行下面的命令；它只加载目标发行版里已有的模块并注册空表，不安装软件，WSL 重启后需要重新准备。
+如果阻断项含 `capability.kernel.*` 或 `baseline.ip*tables*`，说明共享 WSL 内核处于冷启动状态。在桌面点「启动接管」时，预检报告这些阻断后会询问是否加载；也可以运行下面的命令。它加载目标发行版里已有的模块、注册空表，并写入发行版的 `/etc/modules-load.d/wsl-proxy.conf` 与 `wsl-proxy-tables.service`，让以后 WSL 启动时自动准备好；不安装软件，删除这两个文件即可取消开机加载。
 
-If the blockers contain `capability.kernel.*` or `baseline.ip*tables*`, the shared WSL kernel is cold. Use **Prepare kernel environment** on the desktop overview, or run the commands below. It only loads modules already shipped with the target and registers empty tables; it installs nothing and must be repeated after a WSL restart.
+If the blockers contain `capability.kernel.*` or `baseline.ip*tables*`, the shared WSL kernel is cold. When the desktop preflight reports them before a start, it asks whether to load them; the commands below do the same. It loads modules already shipped with the target, registers empty tables, and installs a boot-time module list plus a oneshot in the distribution, so later WSL starts are ready without asking; it installs no packages, and deleting those two files restores the prompt.
 
 ```powershell
 & $ctl prepare-kernel WSLProxyLab-Target --confirm

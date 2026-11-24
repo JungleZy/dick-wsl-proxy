@@ -45,6 +45,31 @@ class TableNames(unittest.TestCase):
         self.assertEqual(kernel_env.table_names("/proc/does-not-exist-for-test"), [])
 
 
+class Autoload(unittest.TestCase):
+    def test_content_lists_the_proven_modules_under_a_header(self):
+        text = kernel_env.autoload_content(["ip_tables", "xt_cgroup"])
+        self.assertTrue(text.startswith("#"))
+        self.assertIn("\nip_tables\nxt_cgroup\n", text)
+        self.assertEqual(text.count("wsl-proxyctl"), 1)
+
+    def test_the_persistent_path_is_fixed(self):
+        self.assertEqual(
+            kernel_env.AUTOLOAD,
+            "/etc/modules-load.d/wsl-proxy.conf",
+        )
+
+    def test_the_boot_unit_initializes_tables_without_output(self):
+        self.assertEqual(
+            kernel_env.BOOT_UNIT,
+            "/etc/systemd/system/wsl-proxy-tables.service",
+        )
+        text = kernel_env.BOOT_UNIT_CONTENT
+        self.assertIn("WantedBy=sysinit.target", text)
+        self.assertIn("iptables-legacy -t nat -S", text)
+        self.assertIn("StandardOutput=null", text)
+        self.assertIn("StandardError=null", text)
+
+
 class ModuleState(unittest.TestCase):
     def test_builtin_module_does_not_need_sysfs(self):
         self.assertEqual(

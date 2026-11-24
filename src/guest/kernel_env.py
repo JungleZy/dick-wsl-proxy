@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 
 PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 TIMEOUT = 8
@@ -39,6 +40,36 @@ TABLES = (
     ("v4", "/proc/net/ip_tables_names", "iptables-legacy", ("filter", "nat")),
     ("v6", "/proc/net/ip6_tables_names", "ip6tables-legacy", ("filter", "nat")),
 )
+
+# The one persistent file this helper writes: systemd-modules-load runs it at
+# every boot of this distribution, so a new WSL VM starts with the modules
+# already loaded. Removing the file stops that; nothing else is persisted.
+AUTOLOAD = "/etc/modules-load.d/wsl-proxy.conf"
+AUTOLOAD_HEADER = (
+    "# Written by wsl-proxyctl: kernel capabilities the WSL takeover needs.\n"
+    "# Delete this file to stop loading them at boot.\n"
+)
+
+# The modules load at boot, but this kernel does not register the empty
+# netfilter tables until something asks for them. This oneshot does that query
+# and nothing else, so the read-only preflight finds the tables ready.
+BOOT_UNIT = "/etc/systemd/system/wsl-proxy-tables.service"
+BOOT_UNIT_CONTENT = """[Unit]
+Description=Register empty netfilter tables for the WSL proxy takeover
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+StandardOutput=null
+StandardError=null
+ExecStart=-/usr/sbin/iptables-legacy -t filter -S
+ExecStart=-/usr/sbin/iptables-legacy -t nat -S
+ExecStart=-/usr/sbin/ip6tables-legacy -t filter -S
+ExecStart=-/usr/sbin/ip6tables-legacy -t nat -S
+
+[Install]
+WantedBy=sysinit.target
+"""
 
 TABLE_NAME = re.compile(r"^[a-z][a-z0-9_]{0,15}$")
 
@@ -160,6 +191,95 @@ def register_tables(before):
     return after, added, failures
 
 
+def autoload_content(modules):
+    return AUTOLOAD_HEADER + "".join(name + "\n" for name in modules)
+
+
+def write_autoload(modules):
+    """Persist the proven module set for systemd-modules-load at every boot.
+
+    A differing existing file is copied aside before being replaced. A write
+    failure is reported but does not undo the modules loaded for this session.
+    """
+    result = {
+        "path": AUTOLOAD,
+        "modules": list(modules),
+        "written": False,
+        "backup": None,
+        "error": None,
+    }
+    if not modules:
+        result["error"] = "no_proven_modules"
+        return result
+    content = autoload_content(modules)
+    temporary = AUTOLOAD + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(AUTOLOAD), exist_ok=True)
+        if os.path.exists(AUTOLOAD) and read_text(AUTOLOAD) != content:
+            backup = "{}.bak-{}-{}".format(
+                AUTOLOAD,
+                time.strftime("%Y%m%d%H%M%S", time.gmtime()),
+                os.getpid(),
+            )
+            with open(AUTOLOAD, "rb") as source, open(backup, "wb") as target:
+                shutil.copyfileobj(source, target)
+            result["backup"] = backup
+        with open(temporary, "w", encoding="ascii") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, AUTOLOAD)
+        result["written"] = True
+    except OSError as error:
+        result["error"] = printable("{}: {}".format(type(error).__name__, error))
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+    return result
+
+
+def write_boot_unit():
+    """Install and enable the oneshot that registers empty tables at boot.
+
+    The unit only runs read-only `-S` queries with output discarded; failures
+    are ignored by the unit itself so a cold boot is never marked degraded.
+    """
+    result = {
+        "path": BOOT_UNIT,
+        "written": False,
+        "enabled": False,
+        "error": None,
+    }
+    temporary = BOOT_UNIT + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(BOOT_UNIT), exist_ok=True)
+        with open(temporary, "w", encoding="ascii") as handle:
+            handle.write(BOOT_UNIT_CONTENT)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, BOOT_UNIT)
+        result["written"] = True
+    except OSError as error:
+        result["error"] = printable("{}: {}".format(type(error).__name__, error))
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        return result
+    run(["systemctl", "daemon-reload"])
+    status, error = run(
+        ["systemctl", "enable", "wsl-proxy-tables.service"]
+    )
+    if status == 0:
+        result["enabled"] = True
+    else:
+        result["error"] = printable(
+            "systemctl_enable_failed" + (":" + error if error else "")
+        )
+    return result
+
+
 def main():
     if os.geteuid() != 0:
         print(json.dumps({"ok": False, "error": "root_required"}))
@@ -177,6 +297,10 @@ def main():
     before_tables = {family: table_names(proc) for family, proc, _, _ in TABLES}
     before_modules, added, failed = load_modules(builtin)
     after_tables, added_tables, table_failures = register_tables(before_tables)
+    autoload = write_autoload(
+        [name for name in MODULES if module_state(name, builtin)]
+    )
+    boot_unit = write_boot_unit()
     print(json.dumps({
         "ok": True,
         "kernel_release": release,
@@ -193,6 +317,8 @@ def main():
             "added": added_tables,
         },
         "table_failures": table_failures,
+        "autoload": autoload,
+        "boot_unit": boot_unit,
     }, sort_keys=True))
 
 
