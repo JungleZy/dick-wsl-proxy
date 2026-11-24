@@ -56,6 +56,22 @@ pub fn running_distributions() -> Result<Vec<String>, String> {
     Ok(parse_running(&output))
 }
 
+/// The part of a failed guest run worth showing in status: its last non-empty
+/// line, which for a Python traceback is the exception, capped at 300
+/// characters because the captured stderr can reach a megabyte.
+pub(crate) fn failure_tail(error: &str) -> &str {
+    let line = error
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    match line.char_indices().nth(300) {
+        Some((end, _)) => &line[..end],
+        None => line,
+    }
+}
+
 fn parse_running(output: &str) -> Vec<String> {
     output
         .lines()
@@ -503,6 +519,24 @@ mod tests {
             vec!["Target".to_string(), "Other Name".to_string()]
         );
         assert!(super::parse_running("").is_empty());
+    }
+
+    #[test]
+    fn failure_tail_keeps_the_last_line_within_bounds() {
+        assert_eq!(
+            super::failure_tail(
+                "wsl_exit_failed: exit status: 1: Traceback (most recent call last):\n  \
+                 File \"<stdin>\", line 9, in <module>\nTimeoutError: timed out\n\n"
+            ),
+            "TimeoutError: timed out"
+        );
+        assert_eq!(
+            super::failure_tail("wsl_deadline_exceeded"),
+            "wsl_deadline_exceeded"
+        );
+        assert_eq!(super::failure_tail(""), "");
+        let long = "错".repeat(400);
+        assert_eq!(super::failure_tail(&long).chars().count(), 300);
     }
 
     #[test]

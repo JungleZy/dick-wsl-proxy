@@ -671,7 +671,7 @@ impl Validated {
         let direct_ips = config
             .direct_ips
             .iter()
-            .map(|entry| network(entry))
+            .map(|entry| network(entry).map_err(|e| format!("direct_ips: {e}: {entry:?}")))
             .collect::<Result<_, _>>()?;
         if !MAX_TCP_RANGE.contains(&config.max_tcp_connections) {
             return Err("max_tcp_connections must be between 16 and 1024".into());
@@ -691,19 +691,23 @@ impl Validated {
             first_hop,
             credential: config.credential,
             dns_upstream,
-            dns_tls_name: normalize_domain(config.dns_tls_name)?,
+            dns_tls_name: normalize_domain(config.dns_tls_name)
+                .map_err(|e| format!("dns_tls_name: {e}"))?,
             direct_ips,
             direct_domains: config
                 .direct_domains
                 .into_iter()
                 .map(normalize_domain)
-                .collect::<Result<_, _>>()?,
+                .collect::<Result<_, String>>()
+                .map_err(|e| format!("direct_domains: {e}"))?,
             direct_suffixes: config
                 .direct_suffixes
                 .into_iter()
                 .map(normalize_domain)
-                .collect::<Result<_, _>>()?,
-            health_domain: normalize_domain(config.health_domain)?,
+                .collect::<Result<_, String>>()
+                .map_err(|e| format!("direct_suffixes: {e}"))?,
+            health_domain: normalize_domain(config.health_domain)
+                .map_err(|e| format!("health_domain: {e}"))?,
             allow_loopback_residential: config.allow_loopback_residential,
             limits,
         })
@@ -797,9 +801,12 @@ fn dns_name(name: &str) -> Option<&str> {
 }
 
 fn normalize_domain(mut name: String) -> Result<String, String> {
-    let length = dns_name(&name)
-        .ok_or("policy domain must be an ASCII DNS hostname")?
-        .len();
+    // Policy holds no secrets, so the rejected value may show.
+    let Some(length) = dns_name(&name).map(str::len) else {
+        return Err(format!(
+            "policy domain must be an ASCII DNS hostname: {name:?}"
+        ));
+    };
     name.truncate(length);
     name.make_ascii_lowercase();
     Ok(name)
@@ -1425,6 +1432,29 @@ mod tests {
         config.dns_upstream = "127.0.0.1:43803".into();
         assert!(Validated::new(config).is_ok());
         assert!(remaining(Instant::now() - Duration::from_millis(1)).is_err());
+    }
+
+    #[test]
+    fn validation_errors_name_the_field_and_the_entry() {
+        let first = "127.0.0.1:7892".parse().unwrap();
+        let mut typo = config(first);
+        typo.direct_ips = vec!["192.0.2.0/24".into(), "10.0.0.1/8".into()];
+        let Err(error) = Validated::new(typo) else {
+            panic!("a host address with a prefix must be rejected");
+        };
+        assert_eq!(
+            error,
+            "direct_ips: direct IP CIDR must use its network address: \"10.0.0.1/8\""
+        );
+        let mut domain = config(first);
+        domain.direct_suffixes = vec!["bad_name.example".into()];
+        let Err(error) = Validated::new(domain) else {
+            panic!("an underscore label must be rejected");
+        };
+        assert_eq!(
+            error,
+            "direct_suffixes: policy domain must be an ASCII DNS hostname: \"bad_name.example\""
+        );
     }
 
     #[test]

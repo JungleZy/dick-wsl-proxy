@@ -750,14 +750,21 @@ fn decode_row(row: &rusqlite::Row<'_>) -> Result<Record, rusqlite::Error> {
     let revision: i64 = row.get(0)?;
     let profile_json: String = row.get(1)?;
     let desktop_json: String = row.get(2)?;
-    let profile: Config =
-        serde_json::from_str(&profile_json).map_err(|_| rusqlite::Error::InvalidQuery)?;
-    let desktop: Preferences =
-        serde_json::from_str(&desktop_json).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    // Neither JSON column holds the password, so serde's message may show. The
+    // old `InvalidQuery` mapping displayed as "Query is not read-only".
+    let bad_json = |column, error: serde_json::Error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    };
+    let profile: Config = serde_json::from_str(&profile_json).map_err(|e| bad_json(1, e))?;
+    let desktop: Preferences = serde_json::from_str(&desktop_json).map_err(|e| bad_json(2, e))?;
     Ok(Record {
         revision: revision
             .try_into()
-            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, revision))?,
         profile,
         desktop,
         residential: ResidentialSettings {
@@ -1113,6 +1120,25 @@ mod tests {
         // The password is part of the SQLite row; no Windows credential is used.
         assert!(load(&path).unwrap().residential == residential);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_undecodable_row_reports_the_json_error() {
+        let connection = open(Path::new(":memory:")).unwrap();
+        connection
+            .execute(
+                "INSERT INTO desktop_state (id, revision, profile_json, desktop_json, residential_ip, residential_port, residential_username, residential_password) VALUES (1, 0, '{\"future\":1}', '{}', '', 0, '', '')",
+                [],
+            )
+            .unwrap();
+        let Err(error) = read_optional(&connection) else {
+            panic!("a profile with an unknown field must not decode");
+        };
+        assert!(error.starts_with("desktop_store_read:"), "{error}");
+        assert!(error.contains("index: 1"), "{error}");
+        // What an older version reports for a field a newer one saved, instead
+        // of rusqlite's "Query is not read-only".
+        assert!(error.contains("unknown field `future`"), "{error}");
     }
 
     #[test]

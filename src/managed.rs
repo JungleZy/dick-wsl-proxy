@@ -145,8 +145,10 @@ impl Runtime {
                 include_str!("guest/dns_probe.py")
             );
             let started = Instant::now();
-            let result = host::guest_script(&p.target, &script)
-                .map_err(|_| format!("{label}_dns_probe_failed"))?;
+            // Probe output carries no credentials, only the cause worth seeing.
+            let result = host::guest_script(&p.target, &script).map_err(|error| {
+                format!("{label}_dns_probe_failed: {}", host::failure_tail(&error))
+            })?;
             dns_elapsed = dns_elapsed.saturating_add(started.elapsed());
             if result.trim() != "ok" || !self.dns.probe_seen() {
                 return Err(format!("{label}_dns_not_verified_through_upstream"));
@@ -190,7 +192,12 @@ impl Runtime {
                 Err(_) if attempt + 1 < HTTPS_PROBE_ATTEMPTS => {
                     std::thread::sleep(HTTPS_PROBE_RETRY_DELAY);
                 }
-                Err(_) => return Err("target_https_probe_failed".into()),
+                Err(error) => {
+                    return Err(format!(
+                        "target_https_probe_failed: {}",
+                        host::failure_tail(&error)
+                    ));
+                }
             }
         }
         let response = response.expect("HTTPS probe attempts must be nonzero");
