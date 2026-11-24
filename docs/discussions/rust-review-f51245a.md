@@ -24,6 +24,30 @@
 - 上一轮 `docs/discussions/project-review-f51245a.md` 已经记录的问题，这里不重复。
 - **注意：** 审查期间另一个会话一直在改桌面代码，最后一次改动在 00:44。桌面相关的行号可能漂移，所以同时写了函数名。
 
+## 修复进度（2026-11-24 更新）
+
+第 1–4 条已修：`e41a54b`、`8efb4db`、`6c2d7cb`、`14f2c3f`。第 5–11 条做了局部修复：`2df812c`（第 5 条）、`c5c704c`（第 6 条，含第 10 条的托盘部分）、`152e19c`（第 7 条）、`1f47942`（第 8 条）、`8f907b5`（第 9 条）、`ebcd77f`（第 10 条）、`a60cdc4`（第 11 条）；`2d1cdb9` 是格式修复。都在本地 main 上，**还没推送**。第 7、9、10、11 条里需要改协议或重构的部分没做，见下表。第 12–15 条（Consider）没处理。
+
+**Windows 验证**（Windows 自带的 Rust 1.100，构建的是 `a60cdc4` 的代码）：
+
+- `cargo fmt --all --check`：通过。`e41a54b` 留下的两处格式问题（`src/credential.rs` 的测试）在 `2d1cdb9` 修掉。
+- `cargo clippy --workspace --all-targets --all-features --locked`：0 警告。
+- `cargo test --workspace --locked`：260 项全过（桌面 48、IPC 10、控制器 202）。修复前的基线是 254 项（桌面 48、IPC 10、控制器 196）。
+
+| 条目 | 状态 | 做了什么 | 没做 / 要注意 |
+|---|---|---|---|
+| 1 | 已修 | 用四个字段直接拼 SOCKS5 认证块，用户名和密码按输入的字节原样写入 | — |
+| 2 | 已修 | `retire` 不再因为 `stop` 报告的旧转发错误而中途返回，照常释放租约、清掉恢复日志 | 做法和上文建议不同：直接忽略那条旧错误，和 `abandon` 一致 |
+| 3 | 已修 | 就绪的描述符全都只有 `POLLHUP` 时，睡一个轮询间隔再继续 | — |
+| 4 | 已修 | 只读查看改用 60 秒期限 `INSPECT_DEADLINE` | — |
+| 5 | 已修 | IPv6 的 TCP 转发线程交给 `TcpWorkers` 守卫管理：不管怎么退出，都先关掉客户端连接，再等线程结束。IPv6 入口出错时用新方法 `Shared::record_failure` 记下原因，`health` 能直接报出来 | 故意没用 `fail`：`fail` 会把 IPv4 也停掉，那是行为变化。现在 IPv4 照常转发，状态显示需要恢复，和修复前一样。这条决定已记进 `docs/plans/m5/README.md` |
+| 6 | 已修 | 图标加不上时，托盘窗口不再销毁：每秒重试一次，并处理 `TaskbarCreated`，以管理员身份运行时也放行这条消息。只有图标正在显示时，关窗才藏起主窗口；没有图标就直接关窗（GPUI 在 Windows 上默认最后一个窗口关闭就退出进程），后台保留。图标改用 `LR_SHARED` 加载，重试不会泄漏图标句柄 | **只编译过，没运行过**：没有任何测试覆盖 `tray.rs`，整个文件又是重写的，所以图标显示、双击打开、右键菜单各项（包括「退出」）、关窗收起、再次启动唤起、重启 Explorer 后图标恢复，全都没在 Windows 上实测。`find_main_window` 可能找到 IME 窗口那一点没动，也仍未验证。无图标时关窗的规则已记进 `docs/plans/m4/README.md` 第 5 条，根目录 `README.md` 里「关闭窗口只收进托盘」那句还没加这个例外 |
+| 7 | 部分修 | `report()` 带出内层错误码，例如 `ipc_untrusted_server: ipc_untrusted_server_image`，测试改成精确断言 | `IpcError` 和 `Code` 枚举没做，那是跨 crate 的协议改动。桌面仍靠 `ipc_unavailable: Windows error 2` 和 `ipc_` 前缀判断，这两种字符串这次没变 |
+| 8 | 已修 | 就绪探测失败时，带上 guest 报错的最后一行（新函数 `host::failure_tail`，最多 300 字符）。SQLite 行解码保留 serde 的报错，不再显示 "Query is not read-only"。策略校验带上字段名和出错的那一条 | 坏行无法被覆盖的问题没改：`save()` 会先 `ensure()` 读旧行，这是另一处行为设计 |
+| 9 | 局部修 | 发行版列表里有任何一条格式不对（`id`、`name` 不是字符串，或 `version` 不是数字），`target_missing` 就不判定目标缺失，不会自动清掉目标 | 让两端共用 `Distro` 类型的长期方案没做 |
+| 10 | 部分修 | `tray.rs` 删掉文件级的 `#![allow(unsafe_op_in_unsafe_fn)]`，没有调用前提的函数改成安全函数，每个 unsafe 块都写了 `// SAFETY:`。`lease.rs` 改用 `Default`，并用编译期断言确认 `WSAPROTOCOL_INFOW` 没有填充字节。删掉 4 处过期的 `#[allow(dead_code)]`，`next_v6` 改成 `#[expect(dead_code, reason = …)]` | 其余文件（`src/ipc/windows.rs`、`src/paths.rs`、`src/lease.rs` 的其他部分等）大部分 unsafe 块仍然没有 `// SAFETY:`。也没开 `undocumented_unsafe_blocks` lint |
+| 11 | 部分修 | 新增测试：DoH chunked 分支、生产环境不允许回环地址（显式传入 `false`）、IPv6 转发线程守卫、SQLite 解码报错、策略校验报错、`failure_tail` | Controller 生命周期的替身接口没做。`cfg!(test)` 也还没改成注入参数 |
+
 ## Must fix
 
 ### 1. 住宅密码绕道 `.env` 文本：首尾引号被剥掉，引号开头的密码存不进去（`src/credential.rs:30-38`、`:155-160`）
