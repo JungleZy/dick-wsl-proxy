@@ -51,7 +51,18 @@ impl MetadataLane {
         let worker = thread::Builder::new()
             .name("wsl-metadata".into())
             .spawn(move || {
-                dispatch(receiver, &stopping, |keys| bridge.query_batch(keys));
+                let shared = std::cell::RefCell::new(&mut bridge);
+                dispatch(
+                    receiver,
+                    &stopping,
+                    KEEPALIVE_IDLE,
+                    |keys| shared.borrow_mut().query_batch(keys),
+                    || {
+                        // A failed keepalive closes the helper; the next
+                        // lookup starts a fresh one, as after an idle exit.
+                        let _ = shared.borrow_mut().keepalive();
+                    },
+                );
                 bridge.close()
             })
             .map_err(|e| format!("query_transport_dispatch: {e}"))?;
@@ -101,14 +112,34 @@ impl Drop for MetadataLane {
     }
 }
 
+/// With no lookup for this long, the lane sends the helper an empty
+/// keepalive request. It is well inside the host's 40-second reuse window and
+/// the helper's own 45- and 60-second idle deadlines.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(20);
+
 fn dispatch(
     receiver: Receiver<Job>,
     stopping: &AtomicBool,
+    idle: Duration,
     mut query: impl FnMut(Vec<Lookup>) -> Result<BatchOrigins, String>,
+    mut keepalive: impl FnMut(),
 ) {
     let mut next = None;
     let mut senders = Vec::with_capacity(MAX_LOOKUPS);
-    while let Some(job) = next.take().or_else(|| receiver.recv().ok()) {
+    loop {
+        let job = match next.take() {
+            Some(job) => job,
+            None => match receiver.recv_timeout(idle) {
+                Ok(job) => job,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if !stopping.load(Ordering::Acquire) {
+                        keepalive();
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            },
+        };
         match job {
             Job::Group(keys, send) => {
                 // The whole group was received before enqueue. No timer or split/replay.
@@ -183,6 +214,56 @@ fn observe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dispatch_now(
+        receiver: Receiver<Job>,
+        query: impl FnMut(Vec<Lookup>) -> Result<BatchOrigins, String>,
+    ) {
+        dispatch(
+            receiver,
+            &AtomicBool::new(false),
+            KEEPALIVE_IDLE,
+            query,
+            || {},
+        );
+    }
+
+    #[test]
+    fn an_idle_lane_keeps_its_helper_alive_without_a_lookup() {
+        let (send, recv) = mpsc::sync_channel(4);
+        let keepalives = std::cell::Cell::new(0);
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(120));
+            drop(send);
+        });
+        dispatch(
+            recv,
+            &AtomicBool::new(false),
+            Duration::from_millis(20),
+            |_| panic!("no lookup was submitted"),
+            || keepalives.set(keepalives.get() + 1),
+        );
+        worker.join().unwrap();
+        // Several idle periods passed before the lane closed.
+        assert!(keepalives.get() >= 2, "{}", keepalives.get());
+    }
+
+    #[test]
+    fn a_stopping_lane_sends_no_keepalive() {
+        let (send, recv) = mpsc::sync_channel::<Job>(1);
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(80));
+            drop(send);
+        });
+        dispatch(
+            recv,
+            &AtomicBool::new(true),
+            Duration::from_millis(10),
+            |_| panic!("no lookup was submitted"),
+            || panic!("keepalive while stopping"),
+        );
+        worker.join().unwrap();
+    }
     use std::net::SocketAddrV4;
     #[test]
     fn queued_queries_share_a_fresh_observation_but_not_each_others_result() {
@@ -202,7 +283,7 @@ mod tests {
         }
         drop(send);
         let mut batches = 0;
-        dispatch(recv, &AtomicBool::new(false), |keys| {
+        dispatch_now(recv, |keys| {
             batches += 1;
             Ok(BatchOrigins {
                 origins: keys
@@ -237,7 +318,7 @@ mod tests {
         send.send(Job::Group(vec![key(2), key(3)], group)).unwrap();
         send.send(Job::One(key(4), last)).unwrap();
         drop(send);
-        dispatch(recv, &AtomicBool::new(false), |keys| {
+        dispatch_now(recv, |keys| {
             Ok(BatchOrigins {
                 origins: keys
                     .iter()

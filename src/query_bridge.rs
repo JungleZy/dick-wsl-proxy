@@ -143,7 +143,9 @@ fn origin_allowed(plan: &Plan, origin: SocketAddr) -> bool {
 }
 
 /// A bounded, ordered, read-only stdio batch, never a guest service or listener.
-/// Idle helpers exit and are reaped; the next query starts a fresh guarded batch.
+/// While the ingress runs, an idle lane keeps a live helper with empty requests
+/// ([`QueryBridge::keepalive`]); a helper that exited anyway (its deadline passed,
+/// the target stopped) is reaped, and the next query starts a fresh guarded batch.
 pub struct QueryBridge {
     #[cfg(windows)]
     plan: Plan,
@@ -236,6 +238,37 @@ impl QueryBridge {
         {
             let _ = lookups;
             Err("unsupported_platform: Windows host required".into())
+        }
+    }
+
+    /// Keeps a live helper from reaching its idle deadline with an empty
+    /// request, so the next real lookup does not pay for a new `wsl.exe`,
+    /// Python start and guard. Never starts a helper: when the previous one
+    /// has exited (for example because the target stopped), this does nothing
+    /// and the target is not woken. Returns whether a helper answered.
+    pub fn keepalive(&mut self) -> Result<bool, String> {
+        #[cfg(windows)]
+        {
+            let Some(transport) = self.transport.as_mut().filter(|batch| batch.active()) else {
+                return Ok(false);
+            };
+            let result = transport.query(Vec::new(), &self.plan);
+            // No reopen cooldown: nothing waits on a keepalive, and the next
+            // real lookup should simply start a fresh helper.
+            if let Err(error) = &result
+                && error.starts_with("query_transport_")
+            {
+                let error = error.clone();
+                if let Err(close_error) = self.close() {
+                    return Err(format!("{error}; {close_error}"));
+                }
+                return Err(error);
+            }
+            result.map(|_| true)
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(false)
         }
     }
 

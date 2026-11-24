@@ -52,7 +52,9 @@ try:
         require(isinstance(request, dict) and set(request) == {'id', 'lookups'}, 'invalid_query')
         require(type(request['id']) is int and request['id'] == sequence + 1 and request['id'] <= 0xffffffffffffffff, 'invalid_query_sequence')
         lookups = request['lookups']
-        require(isinstance(lookups, list) and 1 <= len(lookups) <= 16, 'invalid_query_count')
+        # An empty request is the host's idle keepalive: it is answered
+        # without opening a conntrack socket.
+        require(isinstance(lookups, list) and 0 <= len(lookups) <= 16, 'invalid_query_count')
         keys = []
         for item in lookups:
             require(isinstance(item, dict) and set(item) == {'protocol','peer'} and item['protocol'] in ('tcp','udp'), 'invalid_query_item')
@@ -69,16 +71,17 @@ try:
             # snapshot or cached answer. The lookups are interleaved with their
             # decoding, so all of it is reported as kernel read time.
             read_start = time.monotonic_ns()
-            ct = kernel['Conntrack']()
+            origins = []
+            ct = kernel['Conntrack']() if keys else None
             try:
-                origins = []
                 for protocol, peer in keys:
                     if peer.startswith('['):
                         origins.extend(kernel['exact6_queries'](plan, ct, [(protocol, peer)]))
                     else:
                         origins.extend(kernel['exact_queries'](prepared, ct, [(protocol, peer)]))
             finally:
-                ct.close()
+                if ct is not None:
+                    ct.close()
             kernel_read_us = (time.monotonic_ns() - read_start) // 1000
             decode_lookup_us = 0
             require(0 <= kernel_read_us + decode_lookup_us <= 12000000, 'invalid_query_timing')
