@@ -26,13 +26,14 @@
 
 ## 修复进度（2026-11-24 更新）
 
-第 1–4 条已修：`e41a54b`、`8efb4db`、`6c2d7cb`、`14f2c3f`。第 5–11 条做了局部修复：`2df812c`（第 5 条）、`c5c704c`（第 6 条，含第 10 条的托盘部分）、`152e19c`（第 7 条）、`1f47942`（第 8 条）、`8f907b5`（第 9 条）、`ebcd77f`（第 10 条）、`a60cdc4`（第 11 条）；`2d1cdb9` 是格式修复。都在本地 main 上，**还没推送**。第 7、9、10、11 条里需要改协议或重构的部分没做，见下表。第 12–15 条（Consider）没处理。
+第 1–4 条已修：`e41a54b`、`8efb4db`、`6c2d7cb`、`14f2c3f`。第 5–11 条做了局部修复：`2df812c`（第 5 条）、`c5c704c`（第 6 条，含第 10 条的托盘部分）、`152e19c`（第 7 条）、`1f47942`（第 8 条）、`8f907b5`（第 9 条）、`ebcd77f`（第 10 条）、`a60cdc4`（第 11 条）；`2d1cdb9` 是格式修复，以上都已推送。第 7、9、10、11 条里需要改协议或重构的部分没做，见下表。第 12–15 条（Consider）随后也做了：`26d9266`（第 14 条）、`f67d9c9`（第 13 条）、`64876cd`（第 15 条）、`3cbc23b`（第 12 条，只挪代码、不改行为，`ingress::run` 没动），在本地 main 上，**还没推送**。
 
 **Windows 验证**（Windows 自带的 Rust 1.100，构建的是 `a60cdc4` 的代码）：
 
 - `cargo fmt --all --check`：通过。`e41a54b` 留下的两处格式问题（`src/credential.rs` 的测试）在 `2d1cdb9` 修掉。
 - `cargo clippy --workspace --all-targets --all-features --locked`：0 警告。
 - `cargo test --workspace --locked`：260 项全过（桌面 48、IPC 10、控制器 202）。修复前的基线是 254 项（桌面 48、IPC 10、控制器 196）。
+- 第 12–15 条做完后再跑一遍（同样在 Windows 上，构建的是 `3cbc23b` 的代码）：fmt 通过，clippy 0 警告，测试 263 项全过（桌面 49、IPC 10、控制器 204）。
 
 | 条目 | 状态 | 做了什么 | 没做 / 要注意 |
 |---|---|---|---|
@@ -47,6 +48,10 @@
 | 9 | 局部修 | 发行版列表里有任何一条格式不对（`id`、`name` 不是字符串，或 `version` 不是数字），`target_missing` 就不判定目标缺失，不会自动清掉目标 | 让两端共用 `Distro` 类型的长期方案没做 |
 | 10 | 部分修 | `tray.rs` 删掉文件级的 `#![allow(unsafe_op_in_unsafe_fn)]`，没有调用前提的函数改成安全函数，每个 unsafe 块都写了 `// SAFETY:`。`lease.rs` 改用 `Default`，并用编译期断言确认 `WSAPROTOCOL_INFOW` 没有填充字节。删掉 4 处过期的 `#[allow(dead_code)]`，`next_v6` 改成 `#[expect(dead_code, reason = …)]` | 其余文件（`src/ipc/windows.rs`、`src/paths.rs`、`src/lease.rs` 的其他部分等）大部分 unsafe 块仍然没有 `// SAFETY:`。也没开 `undocumented_unsafe_blocks` lint |
 | 11 | 部分修 | 新增测试：DoH chunked 分支、生产环境不允许回环地址（显式传入 `false`）、IPv6 转发线程守卫、SQLite 解码报错、策略校验报错、`failure_tail` | Controller 生命周期的替身接口没做。`cfg!(test)` 也还没改成注入参数 |
+| 12 | 部分做 | 桌面 `tick` 拆成 `handle_reply`、`on_reply_error`、`on_reply_value`、`handle_tray_action`，依赖局部变量和执行顺序的收尾部分原地保留；用忽略缩进的逐行比对确认只是搬移。`dispatch_result` 的 Start 和 StartScoped 各自解构后调用同一个 `start`，去掉了 `unreachable!()`。`desktop_control::handle` 里重复 8 次的请求解析换成 `fields` 函数，报错码不变（`profile_save` 原来「不是对象」时的 `invalid_request` 走不到：能读出 `command` 就一定是对象） | `ingress::run` 没动：数据包处理每一步都要查元数据，单元测试驱动不了，也没有测试覆盖，改了无法验证。命令名分散在 4 处字符串列表的问题没处理。`tick` 的拆分没在桌面上运行过 |
+| 13 | 已修 | `bridge.close()` 前先把 bridge 取出来、放开锁（`stop` 和启动失败的两条路径）。保护检查拆成「持锁取快照 → 不持锁观察 → 持锁写回」，两次拿锁都不等待；写回前确认同一个接管仍在、就绪，且操作代次没变、没有进行中的操作，否则这一轮作废。sleep 醒来先看是否在停止。检查线程崩溃时写一条运行日志。`owned()` 写明了为什么可以恢复中毒的锁 | 「检查已停」没有进 status，只写运行日志。写回作废的判断没有单元测试：需要真实的接管和磁盘上的操作记录。决定已记进 `docs/plans/m5/README.md` |
+| 14 | 已修 | IPv6 UDP 记录补上目的地址；发送前记为 `relay` 阶段；空闲回收计入 `udp_idle_expirations`，记录状态为完成。DNS-over-TCP 两帧之间空闲超时算正常结束；帧中间超时仍算失败，失败信息带上错误类型 | — |
+| 15 | 已修 | 删掉建环境时 UI 线程上的 `exists()`（后台在下载前就会拒绝已存在的目录，报错有中文翻译）。进度文件和安装目录改在后台线程读，同一时间只读一次，结果按操作编号丢弃过期的；界面只读缓存 | 没在桌面上运行过：建环境时的进度显示需要实测 |
 
 ## Must fix
 
