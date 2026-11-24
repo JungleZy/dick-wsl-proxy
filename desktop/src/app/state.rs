@@ -11,8 +11,8 @@ use super::backend::{Job, Kind, Reply};
 use super::drafts::{FailedSaves, SaveScope, Unsaved};
 use super::model::{
     Confirmation, ConnectionFilter, ConnectionHistory, ConnectionRow,
-    EnvironmentDistributionSelectState, EnvironmentEditor, EnvironmentResult, Fields, LogFilter,
-    Page, PendingPrepare, RuntimeLog, TimezoneSelectState, TrafficSample,
+    EnvironmentDistributionSelectState, EnvironmentEditor, EnvironmentProgress, EnvironmentResult,
+    Fields, LogFilter, Page, PendingPrepare, RuntimeLog, TimezoneSelectState, TrafficSample,
 };
 
 pub(crate) struct Desktop {
@@ -104,6 +104,11 @@ pub(crate) struct Desktop {
     pub(crate) environment_selected: Option<String>,
     pub(crate) environment_detail: Option<Value>,
     pub(crate) environment_started: Option<Instant>,
+    /// 最近一次在后台读到的环境操作进度，见 [`EnvironmentProgress`]。
+    pub(crate) environment_progress_snapshot: Option<EnvironmentProgress>,
+    /// 正在后台读进度。同一时间只读一次：路径不可达时一次读取会卡到 SMB 超时，
+    /// 不能每 200 毫秒再叠一个。
+    pub(crate) environment_progress_reading: bool,
     pub(crate) environment_timezone_only: bool,
     pub(crate) loading_dialog_open: bool,
     pub(crate) environment_result_dialog_open: bool,

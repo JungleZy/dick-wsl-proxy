@@ -1023,10 +1023,6 @@ impl Desktop {
                     self.fail("新增环境需要发行版和安装目录。", cx);
                     return;
                 }
-                if std::path::Path::new(&install).exists() {
-                    self.fail("实际环境目录已存在，请选择其他父目录或环境名称。", cx);
-                    return;
-                }
                 if username.is_empty() || password.is_empty() {
                     self.fail("新增环境需要默认用户名和密码。", cx);
                     return;

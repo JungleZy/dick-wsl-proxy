@@ -22,7 +22,10 @@ use super::drafts::{
     FailedSaves, SaveScope, Unsaved, names_target, profile_fields, saved_residential_text,
     saved_text, target_missing,
 };
-use super::model::{EnvironmentResult, Field, Fields, LogFilter, Page, RuntimeLog};
+use super::model::{
+    EnvironmentProgress, EnvironmentResult, Field, Fields, LogFilter, Page, RuntimeLog,
+    progress_marker,
+};
 use super::state::Desktop;
 use super::theme::{RUST, TEAL};
 
@@ -255,6 +258,8 @@ impl Desktop {
             environment_selected: None,
             environment_detail: None,
             environment_started: None,
+            environment_progress_snapshot: None,
+            environment_progress_reading: false,
             environment_timezone_only: false,
             loading_dialog_open: false,
             environment_result_dialog_open: false,
@@ -631,7 +636,64 @@ impl Desktop {
         }
     }
 
+    /// 环境操作进行中时，在后台线程读进度文件和安装目录，结果写进 `environment_progress_snapshot`。
+    /// 字段值和路径在 UI 线程上取好，后台只做文件系统调用。
+    fn refresh_environment_progress(&mut self, cx: &mut Context<Self>) {
+        let creating = self.busy == Some(Kind::EnvironmentCreate);
+        if !creating && self.busy != Some(Kind::EnvironmentEdit)
+            || self.environment_timezone_only
+            || self.environment_progress_reading
+        {
+            return;
+        }
+        let name = if creating {
+            Self::field_value(&self.fields.environment_name, cx)
+        } else {
+            self.environment_edit_target.clone().unwrap_or_default()
+        };
+        if name.is_empty() {
+            return;
+        }
+        let install = if creating {
+            let base = Self::field_value(&self.fields.environment_install, cx);
+            (!base.is_empty()).then(|| Self::environment_install_path(&base, &name))
+        } else {
+            None
+        };
+        // The controller writes this file beside its EXE, which is this EXE's sibling.
+        let progress_file = wsl_proxyctl::paths::data_dir()
+            .ok()
+            .map(|directory| directory.join(format!("environment-progress-{name}.json")));
+        let epoch = self.epoch;
+        self.environment_progress_reading = true;
+        cx.spawn(async move |view, cx| {
+            let progress = cx
+                .background_executor()
+                .spawn(async move {
+                    EnvironmentProgress {
+                        epoch,
+                        target_ready: install
+                            .is_some_and(|path| std::path::Path::new(&path).is_dir()),
+                        marker: progress_file
+                            .and_then(|path| std::fs::read_to_string(path).ok())
+                            .and_then(|text| progress_marker(&text)),
+                    }
+                })
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                this.environment_progress_reading = false;
+                // 读的期间这次操作已经结束或换了一次，结果作废。
+                if progress.epoch == this.epoch && this.busy.is_some() {
+                    this.environment_progress_snapshot = Some(progress);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_environment_progress(cx);
         while let Ok(reply) = self.replies.try_recv() {
             if reply.kind == Kind::Connections {
                 self.accept_connection_history(reply.result, cx);
@@ -667,6 +729,7 @@ impl Desktop {
                 self.busy = None;
                 if matches!(reply.kind, Kind::EnvironmentCreate | Kind::EnvironmentEdit) {
                     self.environment_started = None;
+                    self.environment_progress_snapshot = None;
                 }
             } else {
                 self.reading = false;

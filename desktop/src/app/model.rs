@@ -20,6 +20,26 @@ pub(crate) enum Page {
     Settings,
 }
 
+/// 环境操作的进度：后台写的进度文件，以及安装目录是否已经建好。两者都在后台线程读取，
+/// 界面只读这份结果，免得映射盘或 UNC 路径不可达时卡住 UI 线程。
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct EnvironmentProgress {
+    /// 读的是哪一次操作（`Desktop::epoch`），旧操作的结果不显示。
+    pub(crate) epoch: u64,
+    pub(crate) target_ready: bool,
+    pub(crate) marker: Option<(u8, String, String)>,
+}
+
+/// 解析后台写的进度文件：`percent`（超过 100 按 100 算）、`stage`、`detail`，缺任何一项都当作还没有进度。
+pub(crate) fn progress_marker(text: &str) -> Option<(u8, String, String)> {
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    Some((
+        value["percent"].as_u64()?.min(100) as u8,
+        value["stage"].as_str()?.to_owned(),
+        value["detail"].as_str()?.to_owned(),
+    ))
+}
+
 /// 一次有效状态快照里的速率（字节/秒）。`at` 是桌面端收到快照的时刻，用于标注横轴。
 #[derive(Clone, Copy)]
 pub(crate) struct TrafficSample {
@@ -416,7 +436,26 @@ pub(crate) enum UiAction {
 mod tests {
     use serde_json::json;
 
-    use super::RuntimeLog;
+    use super::{RuntimeLog, progress_marker};
+
+    #[test]
+    fn a_progress_file_needs_all_three_fields() {
+        assert_eq!(
+            progress_marker(r#"{"percent":140,"stage":"安装环境","detail":"apt"}"#),
+            Some((100, "安装环境".into(), "apt".into()))
+        );
+        for partial in [
+            r#"{"stage":"安装环境","detail":"apt"}"#,
+            r#"{"percent":"40","stage":"安装环境","detail":"apt"}"#,
+            r#"{"percent":40,"detail":"apt"}"#,
+            r#"{"percent":40,"stage":"安装环境"}"#,
+            // The controller may be halfway through writing the file.
+            r#"{"percent":40,"stage":"#,
+            "",
+        ] {
+            assert_eq!(progress_marker(partial), None, "{partial}");
+        }
+    }
 
     #[test]
     fn runtime_log_context_joins_target_phase_and_generation() {

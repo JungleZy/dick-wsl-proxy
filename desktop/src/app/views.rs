@@ -15,7 +15,6 @@ use gpui_kit::component::{
 };
 use gpui_kit::{prelude::*, *};
 use serde_json::Value;
-use std::fs;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -508,42 +507,7 @@ impl Desktop {
         )
     }
 
-    fn environment_target_ready(&self, cx: &App) -> bool {
-        if self.busy != Some(Kind::EnvironmentCreate) {
-            return false;
-        }
-        let base = Self::field_value(&self.fields.environment_install, cx);
-        let name = Self::field_value(&self.fields.environment_name, cx);
-        if base.is_empty() || name.is_empty() {
-            return false;
-        }
-        let path = Self::environment_install_path(&base, &name);
-        Path::new(&path).is_dir()
-    }
-
-    fn environment_progress_marker(&self, cx: &App) -> Option<(u8, String, String)> {
-        let creating = self.busy == Some(Kind::EnvironmentCreate);
-        let name = if creating {
-            Self::field_value(&self.fields.environment_name, cx)
-        } else {
-            self.environment_edit_target.clone().unwrap_or_default()
-        };
-        if name.is_empty() {
-            return None;
-        }
-        // The controller writes this file beside its EXE, which is this EXE's sibling.
-        let path = wsl_proxyctl::paths::data_dir()
-            .ok()?
-            .join(format!("environment-progress-{name}.json"));
-        let value = serde_json::from_str::<Value>(&fs::read_to_string(path).ok()?).ok()?;
-        Some((
-            value["percent"].as_u64()?.min(100) as u8,
-            value["stage"].as_str()?.to_owned(),
-            value["detail"].as_str()?.to_owned(),
-        ))
-    }
-
-    fn environment_progress(&self, cx: &App) -> Option<Div> {
+    fn environment_progress(&self) -> Option<Div> {
         let creating = self.busy == Some(Kind::EnvironmentCreate);
         let editing = self.busy == Some(Kind::EnvironmentEdit);
         if !creating && !editing {
@@ -556,11 +520,16 @@ impl Desktop {
             .environment_started
             .map(|started| started.elapsed())
             .unwrap_or_default();
-        let target_ready = self.environment_target_ready(cx);
+        // 文件在后台线程读，这里只用这次操作最近一次读到的结果。
+        let progress = self
+            .environment_progress_snapshot
+            .as_ref()
+            .filter(|progress| progress.epoch == self.epoch);
+        let target_ready = creating && progress.is_some_and(|progress| progress.target_ready);
         let elapsed_seconds = elapsed.as_secs();
         // 只有后台写出的进度文件是真实进度。还没写出来时如实说在等，不按已用时间猜阶段和百分比；
         // 安装目录是否已建好是能直接看到的事实，可以用。
-        let (percent, stage, detail) = match self.environment_progress_marker(cx) {
+        let (percent, stage, detail) = match progress.and_then(|progress| progress.marker.clone()) {
             Some((percent, stage, detail)) => (Some(percent), stage, detail),
             None if creating && target_ready => (
                 None,
@@ -668,8 +637,8 @@ impl Desktop {
         )
     }
 
-    fn loading_dialog_body(&self, cx: &App) -> Div {
-        if let Some(progress) = self.environment_progress(cx) {
+    fn loading_dialog_body(&self) -> Div {
+        if let Some(progress) = self.environment_progress() {
             return progress;
         }
         // 读环境详情不改页面提示，这里显示固定文字，免得把上一条结果当成进展。
@@ -725,7 +694,7 @@ impl Desktop {
                 .overlay_closable(false)
                 .keyboard(false)
                 .close_button(false)
-                .child(this.loading_dialog_body(cx))
+                .child(this.loading_dialog_body())
         });
     }
 
