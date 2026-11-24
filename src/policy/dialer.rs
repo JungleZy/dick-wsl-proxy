@@ -15,15 +15,21 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// The policy's pool settings: at most `max` authenticated tunnels kept
-/// ready (0 turns the pool off), and only while chains were asked for within
-/// `demand_window`. Between the minimum and `max`, the pool follows recent
-/// bursts of chain requests, so a page load that opened eight connections
-/// finds eight ready the next time.
+/// Pool settings. A policy's pool is always adaptive: the ceiling follows
+/// the largest recent burst of chain requests up to `AUTO_MAX`, and the
+/// demand window follows how far apart episodes of activity usually are.
+/// Tests fix either value (a `max` of 0 turns the pool off).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct PoolSettings {
-    pub(super) max: usize,
-    pub(super) demand_window: Duration,
+    pub(super) max: Option<usize>,
+    pub(super) demand_window: Option<Duration>,
+}
+
+impl PoolSettings {
+    pub(super) const ADAPTIVE: Self = Self {
+        max: None,
+        demand_window: None,
+    };
 }
 
 /// The settings a policy's dialer runs with. Unit tests that build a policy
@@ -31,11 +37,25 @@ pub(super) struct PoolSettings {
 /// pool's own tests build a dialer directly.
 pub(super) fn effective(settings: PoolSettings) -> PoolSettings {
     if cfg!(test) {
-        PoolSettings { max: 0, ..settings }
+        PoolSettings {
+            max: Some(0),
+            ..settings
+        }
     } else {
         settings
     }
 }
+
+/// Hard ceiling of an adaptive pool, a guard against runaway growth.
+pub(super) const AUTO_MAX: usize = 64;
+/// An adaptive demand window stays between these.
+const AUTO_DEMAND_MIN: Duration = Duration::from_secs(60);
+const AUTO_DEMAND_MAX: Duration = Duration::from_secs(900);
+/// A quiet spell longer than this separates two episodes of activity; the
+/// lengths of those spells set an adaptive demand window.
+const EPISODE_GAP: Duration = Duration::from_secs(5);
+/// Episode gaps remembered for the adaptive demand window.
+const GAP_HISTORY: usize = 16;
 
 const POOL_MIN: usize = 2;
 /// Chain requests this close together count as one burst.
@@ -77,12 +97,15 @@ pub(super) struct Dialer {
     pub(super) pipeline: AtomicBool,
     /// Upper bound on the pool; 0 disables it.
     max: usize,
-    /// Tunnels are only kept ready this long after the last chain request.
-    demand_window: Duration,
+    adaptive_max: bool,
+    /// A fixed demand window, or `None` to learn it from `gaps`.
+    fixed_demand: Option<Duration>,
+    /// Recent quiet spells between episodes of activity, newest last.
+    gaps: Mutex<VecDeque<Duration>>,
     pool: Mutex<Vec<Pooled>>,
     next_id: AtomicUsize,
     in_flight: AtomicUsize,
-    /// When chains were asked for during the last `demand_window`, oldest first.
+    /// When chains were asked for recently, oldest first.
     demand: Mutex<VecDeque<Instant>>,
     closed: AtomicBool,
     /// The current idle limit in milliseconds; see `POOL_IDLE`.
@@ -125,8 +148,10 @@ impl Dialer {
             first_hop,
             residential,
             pipeline: AtomicBool::new(true),
-            max: settings.max,
-            demand_window: settings.demand_window,
+            max: settings.max.unwrap_or(AUTO_MAX),
+            adaptive_max: settings.max.is_none(),
+            fixed_demand: settings.demand_window,
+            gaps: Mutex::new(VecDeque::new()),
             pool: Mutex::new(Vec::new()),
             next_id: AtomicUsize::new(0),
             in_flight: AtomicUsize::new(0),
@@ -150,7 +175,16 @@ impl Dialer {
             "pooled": self.pool.lock().unwrap_or_else(|e| e.into_inner()).len(),
             "target": self.target(Instant::now()),
             "max": self.max,
-            "demand_window_seconds": self.demand_window.as_secs(),
+            "max_adaptive": self.adaptive_max,
+            "demand_window_seconds": self.demand_window().as_secs(),
+            "demand_window_adaptive": self.fixed_demand.is_none(),
+            "episode_gaps_s": self
+                .gaps
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|gap| gap.as_secs())
+                .collect::<Vec<_>>(),
             "pipelined": self.pipeline.load(Ordering::Relaxed),
             "idle_limit_ms": self.idle_limit_ms.load(Ordering::Relaxed),
             "hits": count(&self.stats.hits),
@@ -286,10 +320,21 @@ impl Dialer {
     }
 
     fn record_demand(&self, now: Instant) {
+        let keep = self.fixed_demand.unwrap_or(AUTO_DEMAND_MAX);
         let mut demand = self.demand.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(previous) = demand.back() {
+            let gap = now.saturating_duration_since(*previous);
+            if gap >= EPISODE_GAP {
+                let mut gaps = self.gaps.lock().unwrap_or_else(|e| e.into_inner());
+                if gaps.len() == GAP_HISTORY {
+                    gaps.pop_front();
+                }
+                gaps.push_back(gap);
+            }
+        }
         while demand
             .front()
-            .is_some_and(|at| now.saturating_duration_since(*at) >= self.demand_window)
+            .is_some_and(|at| now.saturating_duration_since(*at) >= keep)
         {
             demand.pop_front();
         }
@@ -300,18 +345,42 @@ impl Dialer {
         demand.push_back(now);
     }
 
+    /// How long tunnels stay ready after the last chain request: fixed by
+    /// the policy, or 1.2 times the 75th percentile of recent quiet spells
+    /// between episodes of activity, so the next episode usually still finds
+    /// the pool ready. Between `AUTO_DEMAND_MIN` and `AUTO_DEMAND_MAX`.
+    fn demand_window(&self) -> Duration {
+        if let Some(fixed) = self.fixed_demand {
+            return fixed;
+        }
+        let mut gaps: Vec<Duration> = self
+            .gaps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .collect();
+        if gaps.is_empty() {
+            return AUTO_DEMAND_MIN;
+        }
+        gaps.sort();
+        let p75 = gaps[(gaps.len() * 3).div_ceil(4) - 1];
+        p75.mul_f64(1.2).clamp(AUTO_DEMAND_MIN, AUTO_DEMAND_MAX)
+    }
+
     /// How many tunnels to keep ready: the largest burst of chain requests
-    /// within `BURST_WINDOW` during the last `demand_window`, between
-    /// `POOL_MIN` and the maximum. None at all without recent requests.
+    /// within `BURST_WINDOW` during the demand window, between `POOL_MIN`
+    /// and the maximum. None at all without requests in that window.
     fn target(&self, now: Instant) -> usize {
         if self.max == 0 {
             return 0;
         }
+        let window = self.demand_window();
         let demand = self.demand.lock().unwrap_or_else(|e| e.into_inner());
         let recent: Vec<Instant> = demand
             .iter()
             .copied()
-            .filter(|at| now.saturating_duration_since(*at) < self.demand_window)
+            .filter(|at| now.saturating_duration_since(*at) < window)
             .collect();
         if recent.is_empty() {
             return 0;
@@ -630,8 +699,8 @@ mod tests {
 
     fn settings(max: usize) -> PoolSettings {
         PoolSettings {
-            max,
-            demand_window: Duration::from_secs(60),
+            max: Some(max),
+            demand_window: Some(Duration::from_secs(60)),
         }
     }
 
@@ -787,15 +856,55 @@ mod tests {
     }
 
     #[test]
-    fn the_demand_window_comes_from_the_policy() {
+    fn an_adaptive_pool_follows_large_bursts_and_learns_the_gap_between_them() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let residential = crate::credential::fixture(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1));
+        let dialer = Dialer::new(local(&listener), residential, PoolSettings::ADAPTIVE);
+        let start = Instant::now();
+        // A page load of 20 connections: the pool follows it past the old 8.
+        for millis in 0..20 {
+            dialer.record_demand(start + Duration::from_millis(millis * 50));
+        }
+        assert_eq!(dialer.target(start + Duration::from_secs(2)), 20);
+        assert_eq!(dialer.demand_window(), AUTO_DEMAND_MIN);
+        // A burst larger than the hard ceiling is capped.
+        let later = start + Duration::from_secs(10);
+        for millis in 0..100 {
+            dialer.record_demand(later + Duration::from_millis(millis * 10));
+        }
+        assert_eq!(dialer.target(later + Duration::from_secs(1)), AUTO_MAX);
+        // Episodes every 150 s: the window stretches to keep the pool ready
+        // across the quiet spell instead of emptying after 60 s.
+        let mut at = later + Duration::from_secs(1);
+        for _ in 0..4 {
+            at += Duration::from_secs(150);
+            dialer.record_demand(at);
+        }
+        let window = dialer.demand_window();
+        assert_eq!(window, Duration::from_secs(150).mul_f64(1.2));
+        assert!(dialer.target(at + Duration::from_secs(170)) > 0);
+        assert_eq!(dialer.target(at + window), 0);
+        // Very long gaps stop at the ceiling of the window.
+        for _ in 0..GAP_HISTORY {
+            at += Duration::from_secs(3_600);
+            dialer.record_demand(at);
+        }
+        assert_eq!(dialer.demand_window(), AUTO_DEMAND_MAX);
+        let report = dialer.report();
+        assert_eq!(report["max_adaptive"], true);
+        assert_eq!(report["demand_window_adaptive"], true);
+    }
+
+    #[test]
+    fn fixed_settings_override_the_adaptive_ones() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let residential = crate::credential::fixture(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1));
         let dialer = Dialer::new(
             local(&listener),
             residential,
             PoolSettings {
-                max: 4,
-                demand_window: Duration::from_secs(10),
+                max: Some(4),
+                demand_window: Some(Duration::from_secs(10)),
             },
         );
         let start = Instant::now();

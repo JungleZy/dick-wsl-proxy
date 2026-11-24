@@ -58,6 +58,9 @@ pub(crate) enum FieldKind {
     Defaulted(&'static str),
 }
 
+/// 早先一个版本写进策略的预建链路设置；现在预建链路是自适应的，保存设置时去掉。
+const LEGACY_KEYS: [&str; 2] = ["tunnel_pool_max", "tunnel_pool_demand_seconds"];
+
 /// 白名单域名直接问的国内 DoH 上游的默认值，和后台策略的默认值一致。
 pub(crate) const DEFAULT_DIRECT_DNS_UPSTREAM: &str = "223.5.5.5:443";
 pub(crate) const DEFAULT_DIRECT_DNS_TLS_NAME: &str = "dns.alidns.com";
@@ -78,12 +81,10 @@ pub(crate) enum ProfileField {
     MaxTcpConnections,
     TcpIdleTimeout,
     TcpHalfCloseTimeout,
-    TunnelPoolMax,
-    TunnelPoolDemand,
 }
 
 impl ProfileField {
-    pub(crate) const ALL: [Self; 14] = [
+    pub(crate) const ALL: [Self; 12] = [
         Self::FirstHop,
         Self::DnsUpstream,
         Self::DnsTlsName,
@@ -96,8 +97,6 @@ impl ProfileField {
         Self::MaxTcpConnections,
         Self::TcpIdleTimeout,
         Self::TcpHalfCloseTimeout,
-        Self::TunnelPoolMax,
-        Self::TunnelPoolDemand,
     ];
 
     /// 策略里的字段名。
@@ -115,8 +114,6 @@ impl ProfileField {
             Self::MaxTcpConnections => "max_tcp_connections",
             Self::TcpIdleTimeout => "tcp_idle_timeout_seconds",
             Self::TcpHalfCloseTimeout => "tcp_half_close_timeout_seconds",
-            Self::TunnelPoolMax => "tunnel_pool_max",
-            Self::TunnelPoolDemand => "tunnel_pool_demand_seconds",
         }
     }
 
@@ -131,11 +128,9 @@ impl ProfileField {
     pub(crate) fn kind(self) -> FieldKind {
         match self {
             Self::DirectIps | Self::DirectDomains | Self::DirectSuffixes => FieldKind::Lines,
-            Self::MaxTcpConnections
-            | Self::TcpIdleTimeout
-            | Self::TcpHalfCloseTimeout
-            | Self::TunnelPoolMax
-            | Self::TunnelPoolDemand => FieldKind::Number,
+            Self::MaxTcpConnections | Self::TcpIdleTimeout | Self::TcpHalfCloseTimeout => {
+                FieldKind::Number
+            }
             Self::DirectDnsUpstream => FieldKind::Optional(DEFAULT_DIRECT_DNS_UPSTREAM),
             Self::DirectDnsTlsName => FieldKind::Defaulted(DEFAULT_DIRECT_DNS_TLS_NAME),
             _ => FieldKind::Text,
@@ -243,6 +238,12 @@ pub(crate) fn merge_profile(
         }
     }
     profile.insert("credential".into(), json!("desktop-residence"));
+    // Pool settings from one earlier build; the pool is adaptive now.
+    if scope == SaveScope::Settings {
+        for key in LEGACY_KEYS {
+            profile.remove(key);
+        }
+    }
     Value::Object(profile)
 }
 
@@ -479,8 +480,6 @@ mod tests {
             ProfileField::MaxTcpConnections => "",
             ProfileField::TcpIdleTimeout => "600",
             ProfileField::TcpHalfCloseTimeout => "",
-            ProfileField::TunnelPoolMax => "",
-            ProfileField::TunnelPoolDemand => "",
         }
         .to_owned()
     }
@@ -495,6 +494,16 @@ mod tests {
             port: 43531,
         };
         save_request(&record, page, draft)
+    }
+
+    #[test]
+    fn saving_settings_drops_earlier_pool_settings() {
+        let mut profile = saved();
+        profile["tunnel_pool_max"] = json!(4);
+        profile["tunnel_pool_demand_seconds"] = json!(30);
+        let merged = merge_profile(&profile, SaveScope::Settings, draft);
+        assert!(merged.get("tunnel_pool_max").is_none());
+        assert!(merged.get("tunnel_pool_demand_seconds").is_none());
     }
 
     #[test]

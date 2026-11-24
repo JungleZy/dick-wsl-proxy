@@ -380,8 +380,6 @@ pub(crate) struct Fields {
     pub(crate) max_tcp_connections: Field,
     pub(crate) tcp_idle_timeout: Field,
     pub(crate) tcp_half_close_timeout: Field,
-    pub(crate) tunnel_pool_max: Field,
-    pub(crate) tunnel_pool_demand: Field,
     pub(crate) port: Field,
     pub(crate) environment_name: Field,
     pub(crate) environment_distribution: Field,

@@ -2408,16 +2408,6 @@ impl Desktop {
                     &self.fields.tcp_half_close_timeout,
                 ))
                 .footer(|_, _| "下次启动或切换接管时生效。"),
-        )
-        .group(
-            SettingGroup::new()
-                .title("预建链路")
-                .description(
-                    "提前建好已通过住宅代理认证的链路，新连接只需发 CONNECT。数量随最近的突发请求在 2 条和上限之间调整；超过保持时长没有新连接就不再预建。上限填 0 即关闭。每条预建链路都占用一个住宅会话。",
-                )
-                .item(input("预建链路上限（条）", &self.fields.tunnel_pool_max))
-                .item(input("预建保持时长（秒）", &self.fields.tunnel_pool_demand))
-                .footer(|_, _| "下次启动或切换接管时生效。"),
         );
         // 开机自启沿用已经配好主题色的 Checkbox；gpui-kit 的 Switch 颜色没有跟应用主题设置。
         let autostart = self.autostart_enabled;

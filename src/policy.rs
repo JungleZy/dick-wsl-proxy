@@ -66,40 +66,12 @@ pub(crate) struct Config {
         skip_serializing_if = "is_default_direct_dns_tls_name"
     )]
     direct_dns_tls_name: String,
-    // Authenticated residential tunnels kept ready for new chains: at most
-    // this many (0 turns the pool off), and only while chains were asked for
-    // within the demand window. Defaults are not written.
-    #[serde(
-        default = "default_tunnel_pool_max",
-        skip_serializing_if = "is_default_tunnel_pool_max"
-    )]
-    tunnel_pool_max: u32,
-    #[serde(
-        default = "default_tunnel_pool_demand",
-        skip_serializing_if = "is_default_tunnel_pool_demand"
-    )]
-    tunnel_pool_demand_seconds: u64,
-}
-
-const DEFAULT_TUNNEL_POOL_MAX: u32 = 8;
-const DEFAULT_TUNNEL_POOL_DEMAND_SECONDS: u64 = 60;
-const TUNNEL_POOL_MAX_RANGE: std::ops::RangeInclusive<u32> = 0..=16;
-const TUNNEL_POOL_DEMAND_RANGE: std::ops::RangeInclusive<u64> = 10..=600;
-
-fn default_tunnel_pool_max() -> u32 {
-    DEFAULT_TUNNEL_POOL_MAX
-}
-
-fn is_default_tunnel_pool_max(value: &u32) -> bool {
-    *value == DEFAULT_TUNNEL_POOL_MAX
-}
-
-fn default_tunnel_pool_demand() -> u64 {
-    DEFAULT_TUNNEL_POOL_DEMAND_SECONDS
-}
-
-fn is_default_tunnel_pool_demand(value: &u64) -> bool {
-    *value == DEFAULT_TUNNEL_POOL_DEMAND_SECONDS
+    // Pool settings from one earlier build. The pool is adaptive now: they
+    // are still accepted so such a profile loads, but never used or written.
+    #[serde(default, skip_serializing, rename = "tunnel_pool_max")]
+    _legacy_tunnel_pool_max: Option<serde_json::Value>,
+    #[serde(default, skip_serializing, rename = "tunnel_pool_demand_seconds")]
+    _legacy_tunnel_pool_demand: Option<serde_json::Value>,
 }
 
 const DEFAULT_DIRECT_DNS_UPSTREAM: &str = "223.5.5.5:443";
@@ -465,7 +437,7 @@ impl Policy {
         let dialer = Arc::new(Dialer::new(
             config.first_hop,
             residential.clone(),
-            dialer::effective(config.tunnel_pool),
+            dialer::effective(dialer::PoolSettings::ADAPTIVE),
         ));
         Ok(Self {
             credential_ref: config.credential,
@@ -674,7 +646,6 @@ pub(crate) struct Validated {
     allow_loopback_residential: bool,
     limits: Limits,
     direct_dns: Option<(SocketAddrV4, String)>,
-    tunnel_pool: dialer::PoolSettings,
 }
 
 impl Validated {
@@ -723,16 +694,6 @@ impl Validated {
                 Some((upstream, name))
             }
         };
-        if !TUNNEL_POOL_MAX_RANGE.contains(&config.tunnel_pool_max) {
-            return Err("tunnel_pool_max must be between 0 and 16".into());
-        }
-        if !TUNNEL_POOL_DEMAND_RANGE.contains(&config.tunnel_pool_demand_seconds) {
-            return Err("tunnel_pool_demand_seconds must be between 10 and 600".into());
-        }
-        let tunnel_pool = dialer::PoolSettings {
-            max: config.tunnel_pool_max as usize,
-            demand_window: Duration::from_secs(config.tunnel_pool_demand_seconds),
-        };
         let limits = Limits {
             max_tcp: config.max_tcp_connections as usize,
             tcp_idle: Duration::from_secs(config.tcp_idle_timeout_seconds),
@@ -762,7 +723,6 @@ impl Validated {
             allow_loopback_residential: config.allow_loopback_residential,
             limits,
             direct_dns,
-            tunnel_pool,
         })
     }
 }
@@ -1084,31 +1044,22 @@ mod tests {
             tcp_half_close_timeout_seconds: default_half_close(),
             direct_dns_upstream: default_direct_dns_upstream(),
             direct_dns_tls_name: default_direct_dns_tls_name(),
-            tunnel_pool_max: default_tunnel_pool_max(),
-            tunnel_pool_demand_seconds: default_tunnel_pool_demand(),
+            _legacy_tunnel_pool_max: None,
+            _legacy_tunnel_pool_demand: None,
         }
     }
 
     #[test]
-    fn tunnel_pool_settings_default_stay_unwritten_and_reject_out_of_range_values() {
+    fn earlier_pool_settings_still_load_but_are_neither_used_nor_written() {
         let first_hop = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7892);
-        let defaults = config(first_hop);
-        let written = serde_json::to_value(&defaults).unwrap();
+        let mut profile = serde_json::to_value(config(first_hop)).unwrap();
+        profile["tunnel_pool_max"] = 4.into();
+        profile["tunnel_pool_demand_seconds"] = 30.into();
+        let config: Config = serde_json::from_value(profile).unwrap();
+        assert!(Validated::new(config.clone()).is_ok());
+        let written = serde_json::to_value(&config).unwrap();
         assert!(written.get("tunnel_pool_max").is_none());
         assert!(written.get("tunnel_pool_demand_seconds").is_none());
-        let validated = Validated::new(defaults.clone()).unwrap();
-        assert_eq!(validated.tunnel_pool.max, 8);
-        assert_eq!(validated.tunnel_pool.demand_window, Duration::from_secs(60));
-        let mut off = defaults.clone();
-        off.tunnel_pool_max = 0;
-        assert_eq!(serde_json::to_value(&off).unwrap()["tunnel_pool_max"], 0);
-        assert_eq!(Validated::new(off).unwrap().tunnel_pool.max, 0);
-        for (max, demand) in [(17, 60), (8, 9), (8, 601)] {
-            let mut invalid = defaults.clone();
-            invalid.tunnel_pool_max = max;
-            invalid.tunnel_pool_demand_seconds = demand;
-            assert!(Validated::new(invalid).is_err(), "{max} {demand}");
-        }
     }
 
     #[test]
