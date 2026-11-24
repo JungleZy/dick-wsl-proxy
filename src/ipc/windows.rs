@@ -172,9 +172,12 @@ mod inner {
     }
 
     fn report(context: &str, error: io::Error) -> String {
-        match error.raw_os_error() {
-            Some(code) => format!("{context}: Windows error {code}"),
-            None => format!("{context}: {:?}", error.kind()),
+        match (error.raw_os_error(), error.get_ref()) {
+            (Some(code), _) => format!("{context}: Windows error {code}"),
+            // This module's own errors carry fixed codes such as
+            // `ipc_untrusted_peer_sid`, never request data or secrets.
+            (None, Some(inner)) => format!("{context}: {inner}"),
+            (None, None) => format!("{context}: {:?}", error.kind()),
         }
     }
 
@@ -1031,7 +1034,8 @@ mod inner {
                 &serde_json::json!({"env_path": "private"}),
             )
             .unwrap_err();
-            assert!(error.starts_with("ipc_untrusted_server:"));
+            // The inner code says which check failed; the request never leaks.
+            assert_eq!(error, "ipc_untrusted_server: ipc_untrusted_server_image");
             server.join().unwrap();
         }
     }
