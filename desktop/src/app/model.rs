@@ -351,6 +351,8 @@ pub(crate) struct Confirmation {
     pub(crate) request: Value,
     pub(crate) generation: u64,
     pub(crate) message: String,
+    /// 这是托盘「退出」发起的停止：确认执行后才进入退出流程，取消则什么都不变。
+    pub(crate) exit: bool,
 }
 pub(crate) struct PendingPrepare {
     pub(crate) kind: Kind,

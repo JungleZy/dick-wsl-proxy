@@ -70,6 +70,10 @@ pub(crate) struct Desktop {
     pub(crate) autostart_enabled: bool,
     pub(crate) confirmation: Option<Confirmation>,
     pub(crate) confirmation_pending: bool,
+    /// 托盘「退出」进行中：停止接管成功后接着关闭后台，后台关闭后退出程序。
+    pub(crate) exiting: bool,
+    /// 退出时联系不上后台：等加载框关掉后询问是否只退出界面。
+    pub(crate) exit_anyway_pending: bool,
     pub(crate) export_path: Option<String>,
     pub(crate) environment_editor: Option<EnvironmentEditor>,
     pub(crate) environment_edit_target: Option<String>,

@@ -207,12 +207,14 @@ impl Desktop {
             loading_fields: false,
             preflight: None,
             pending_prepare: None,
-            notice: "正在连接后台；关闭窗口不会停止接管。".into(),
+            notice: "正在连接后台；关闭窗口只会收进托盘，从托盘退出才会停止接管并关闭后台。".into(),
             error: false,
             save_error: false,
             autostart_enabled: super::autostart::enabled().unwrap_or(false),
             confirmation: None,
             confirmation_pending: false,
+            exiting: false,
+            exit_anyway_pending: false,
             export_path: None,
             environment_editor: None,
             environment_edit_target: None,
@@ -467,6 +469,11 @@ impl Desktop {
             } else {
                 self.reading = false;
             }
+            if reply.kind == Kind::Shutdown {
+                self.finish_exit(reply.result, cx);
+                cx.notify();
+                continue;
+            }
             let mut status_error = None;
             if let Some(status) = reply.status {
                 match status {
@@ -663,6 +670,8 @@ impl Desktop {
                         self.notice = "DNS 别名记录已清空，下次启动接管时重新分配。".into();
                         self.error = false;
                     }
+                    // 已在循环开头单独处理，不会走到这里。
+                    Kind::Shutdown => {}
                     Kind::Probe => {
                         self.accept_status(value);
                         self.notice = "出口检测完成；仅代表本次结果。".into();
@@ -773,6 +782,9 @@ impl Desktop {
             if let Some(error) = status_error {
                 self.fail(error, cx);
             }
+            if self.exiting && reply.kind == Kind::Stop {
+                self.continue_exit_after_stop(result_succeeded, cx);
+            }
             if environment_operation {
                 self.environment_result_pending = Some(EnvironmentResult {
                     kind: reply.kind,
@@ -814,8 +826,10 @@ impl Desktop {
             }
             cx.notify();
         }
-        if let Some(action) = super::tray::consume_action() {
+        // 退出进行中不再响应托盘动作：后台可能已经关闭。
+        if let Some(action) = super::tray::consume_action().filter(|_| !self.exiting) {
             match action {
+                super::tray::TrayAction::Exit => self.request_exit(cx),
                 super::tray::TrayAction::Refresh => self.refresh_or_reconnect(cx),
                 super::tray::TrayAction::Start => {
                     self.page = Page::Overview;
@@ -841,7 +855,8 @@ impl Desktop {
                 }
             }
         }
-        if self.last_poll.elapsed() >= STATUS_POLL_INTERVAL {
+        // 退出进行中不轮询：后台关闭后再查状态只会报连不上。
+        if !self.exiting && self.last_poll.elapsed() >= STATUS_POLL_INTERVAL {
             self.last_poll = Instant::now();
             self.send(Kind::Status, json!({"command":"status"}), cx);
         }
@@ -855,6 +870,10 @@ impl Desktop {
         if self.confirmation_pending && !self.loading_dialog_open {
             self.confirmation_pending = false;
             self.open_confirmation_dialog(window, cx);
+        }
+        if self.exit_anyway_pending && !self.loading_dialog_open {
+            self.exit_anyway_pending = false;
+            self.open_exit_anyway_dialog(window, cx);
         }
         if self.backup_result_pending
             && !self.loading_dialog_open

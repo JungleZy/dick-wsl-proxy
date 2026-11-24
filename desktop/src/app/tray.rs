@@ -41,12 +41,15 @@ pub(crate) enum TrayAction {
     Start,
     Stop,
     Probe,
+    /// 退出程序：界面先让后台恢复空闲并关闭，再调用 [`quit_application`]。
+    Exit,
 }
 
 const ACTION_REFRESH: u8 = 1;
 const ACTION_START: u8 = 2;
 const ACTION_STOP: u8 = 3;
 const ACTION_PROBE: u8 = 4;
+const ACTION_EXIT: u8 = 5;
 static ACTION: AtomicU8 = AtomicU8::new(0);
 
 pub(crate) fn start() {
@@ -66,7 +69,26 @@ pub(crate) fn consume_action() -> Option<TrayAction> {
         ACTION_START => Some(TrayAction::Start),
         ACTION_STOP => Some(TrayAction::Stop),
         ACTION_PROBE => Some(TrayAction::Probe),
+        ACTION_EXIT => Some(TrayAction::Exit),
         _ => None,
+    }
+}
+
+/// 后台已经关闭后才调用：让主窗口的关闭流程放行，GPUI 在最后一个窗口关闭后退出进程。
+/// 找不到主窗口时返回 false，由调用方直接退出应用。
+pub(crate) fn quit_application() -> bool {
+    unsafe {
+        let main = find_main_window(null_mut());
+        if main.is_null() {
+            return false;
+        }
+        EXIT_REQUESTED.store(true, Ordering::Release);
+        PostMessageW(
+            main,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+            0,
+            0,
+        ) != 0
     }
 }
 
@@ -76,6 +98,7 @@ fn request_action(action: TrayAction) {
         TrayAction::Start => ACTION_START,
         TrayAction::Stop => ACTION_STOP,
         TrayAction::Probe => ACTION_PROBE,
+        TrayAction::Exit => ACTION_EXIT,
     };
     ACTION.store(value, Ordering::Release);
 }
@@ -236,17 +259,10 @@ unsafe fn show_menu(hwnd: HWND) {
             show_main_window();
             request_action(TrayAction::Probe);
         }
+        // 不直接关窗：后台要先停止接管、关闭，界面确认后才真正退出。
         EXIT_COMMAND => {
-            let main = find_main_window(hwnd);
-            if !main.is_null() {
-                EXIT_REQUESTED.store(true, Ordering::Release);
-                PostMessageW(
-                    main,
-                    windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE,
-                    0,
-                    0,
-                );
-            }
+            show_main_window();
+            request_action(TrayAction::Exit);
         }
         _ => {}
     }

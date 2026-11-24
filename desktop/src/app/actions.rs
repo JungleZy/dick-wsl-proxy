@@ -354,6 +354,7 @@ impl Desktop {
             generation,
             request,
             message,
+            exit: false,
         });
         self.confirmation_pending = true;
         cx.notify();
@@ -373,6 +374,7 @@ impl Desktop {
                 generation,
                 request: json!({"command":"abandon","confirm":true,"expected_generation":generation}),
                 message: "目标发行版已不在 WSL 注册表里，无法清理它的规则。将释放本次接管占用的端口并清掉恢复记录。WSL 里可能还残留本次接管的规则：下次启动接管前，请先在终端执行一次 wsl --shutdown（会关闭所有发行版）。".into(),
+                exit: false,
             });
             self.open_confirmation_dialog(window, cx);
             cx.notify();
@@ -386,6 +388,7 @@ impl Desktop {
                 message:
                     "将停止接管并恢复直连。现有 TCP 连接会中断，需要重连；只清理本控制器的规则。"
                         .into(),
+                exit: false,
             });
             self.open_confirmation_dialog(window, cx);
             cx.notify();
@@ -447,6 +450,7 @@ impl Desktop {
             message: format!(
                 "将为 {target_name} 加载发行版里已有的内核模块（含 xt_cgroup、ip6table_nat 等 12 个），并创建空的 filter/nat 表。这会影响同一 WSL 内核上的所有发行版，直到 WSL 重启；不安装软件包、不改 .wslconfig、不启动接管。"
             ),
+            exit: false,
         });
         self.open_confirmation_dialog(window, cx);
         cx.notify();
@@ -474,6 +478,7 @@ impl Desktop {
             generation,
             request: json!({"command":"reset_dns_aliases","confirm":true}),
             message: "将清空白名单域名的 DNS 别名记录（包括没写完的那次修改），只在提示 DNS 别名号段已用完或别名记录异常时使用。重置后旧别名可能分给别的域名：请先确认目标发行版里没有还在用旧解析结果的程序，例如重启目标发行版，或等几分钟再重置。".into(),
+            exit: false,
         });
         self.open_confirmation_dialog(window, cx);
         cx.notify();
@@ -489,6 +494,119 @@ impl Desktop {
             return;
         }
         self.send(confirmation.kind, confirmation.request, cx);
+        // 只有停止真的发出去了才进入退出流程。
+        self.exiting = confirmation.exit && self.busy == Some(confirmation.kind);
+    }
+
+    /// 托盘「退出」。空闲或状态未知时直接请求关闭后台，由后台自己核对是否空闲；
+    /// 接管中或需要恢复时先确认停止并恢复直连，停止成功、后台回到空闲后再关闭后台。
+    /// 任何一步没成功，程序都不退出，并提示原因。
+    pub(crate) fn request_exit(&mut self, cx: &mut Context<Self>) {
+        if self.locked() {
+            self.fail("当前操作还没完成，程序没有退出；完成后再从托盘退出。", cx);
+            return;
+        }
+        if matches!(self.phase(), "idle" | "unknown") {
+            self.send_shutdown(cx);
+            return;
+        }
+        let Some(generation) = self.generation() else {
+            self.fail("后台状态未确认，程序没有退出；请先刷新。", cx);
+            return;
+        };
+        self.confirmation = Some(Confirmation {
+            kind: Kind::Stop,
+            generation,
+            request: json!({"command":"stop","expected_generation":generation}),
+            message: "退出程序会先停止接管并恢复直连，再关闭后台。现有 TCP 连接会中断，需要重连；只清理本控制器的规则。停止没有完成时程序不会退出。".into(),
+            exit: true,
+        });
+        // 由 tick 在加载框关掉后再打开，免得被同一帧关加载框时一并关掉。
+        self.confirmation_pending = true;
+        cx.notify();
+    }
+
+    /// 发出关闭后台请求。连发都发不出去（界面的通信线程已退出）时，
+    /// 后台状态无从确认，交给用户决定是否只退出界面。
+    fn send_shutdown(&mut self, cx: &mut Context<Self>) {
+        self.send(Kind::Shutdown, json!({"command":"shutdown_daemon"}), cx);
+        self.exiting = self.reading;
+        if !self.exiting {
+            self.exit_anyway_pending = true;
+        }
+    }
+
+    /// 退出流程中的停止有了结果。停止成功且后台回到空闲才关闭后台；
+    /// 否则结束退出流程，保留原因提示，程序继续运行。
+    pub(crate) fn continue_exit_after_stop(&mut self, succeeded: bool, cx: &mut Context<Self>) {
+        if succeeded && self.idle() {
+            self.send_shutdown(cx);
+            return;
+        }
+        self.exiting = false;
+        let reason = if succeeded {
+            "停止后后台没有回到空闲状态，请查看总览。".to_owned()
+        } else {
+            self.notice.clone()
+        };
+        self.fail(format!("程序没有退出。{reason}"), cx);
+    }
+
+    /// 关闭后台的结果。成功（或后台本来就不在运行）就退出程序。
+    /// 后台拒绝关闭（仍在接管、需要恢复或有环境操作）时不退出，提示原因并重新读取状态。
+    /// 联系不上后台时无法确认它是否还在运行，由用户决定是否只退出界面，避免程序无法退出。
+    pub(crate) fn finish_exit(&mut self, result: Result<Value, String>, cx: &mut Context<Self>) {
+        match result {
+            Ok(_) => {
+                self.notice = "后台已关闭，正在退出。".into();
+                self.error = false;
+                if !super::tray::quit_application() {
+                    cx.quit();
+                }
+            }
+            // 后台的拒绝已由 `backend::request` 译成中文；`ipc_` 开头的只会是通信失败。
+            Err(error) if error.starts_with("ipc_") => {
+                self.exiting = false;
+                self.fail("联系不上后台，无法确认它是否还在运行，程序没有退出。", cx);
+                self.exit_anyway_pending = true;
+            }
+            Err(error) => {
+                self.exiting = false;
+                self.fail(
+                    format!("程序没有退出。{}", super::backend::humanize_error(&error)),
+                    cx,
+                );
+                self.send(Kind::Status, json!({"command":"status"}), cx);
+            }
+        }
+    }
+
+    pub(crate) fn open_exit_anyway_dialog(&self, window: &mut Window, cx: &mut Context<Self>) {
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            dialog
+                .confirm()
+                .title(
+                    div()
+                        .text_base()
+                        .font_weight(FontWeight::NORMAL)
+                        .child("联系不上后台"),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("仍然退出界面")
+                        .cancel_text("取消"),
+                )
+                .description(div().text_base().child(
+                    "无法确认后台是否还在运行。仍然退出的话，只关闭界面：后台如果还在运行会保留，接管不会停止。之后可以重新打开程序再从托盘退出。",
+                ))
+                .on_ok(move |_, _, cx| {
+                    if !super::tray::quit_application() {
+                        cx.quit();
+                    }
+                    true
+                })
+                .on_cancel(|_, _, _| true)
+        });
     }
 
     pub(crate) fn probe(&mut self, cx: &mut Context<Self>) {

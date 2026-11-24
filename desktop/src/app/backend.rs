@@ -26,6 +26,8 @@ pub(crate) enum Kind {
     EnvironmentDelete,
     ResetDnsAliases,
     Abandon,
+    /// 托盘「退出」的最后一步：关闭空闲的后台。不算变更，回复后不再查询状态。
+    Shutdown,
 }
 
 impl Kind {
@@ -79,6 +81,7 @@ impl Kind {
             Self::EnvironmentDelete => "删除环境",
             Self::ResetDnsAliases => "重置 DNS 别名",
             Self::Abandon => "放弃本次记录",
+            Self::Shutdown => "退出程序",
         }
     }
 }
@@ -195,6 +198,9 @@ fn humanize_code(code: &str, message: &str) -> String {
             "DNS 别名记录有一次没写完的修改，白名单域名暂时解析失败，不会改走直连。请停止接管，在连接页点「重置 DNS 别名」，再重新启动接管。".into()
         }
         "confirmation_required" => "需要先确认才能执行。".into(),
+        "stop_and_restore_before_daemon_shutdown" => {
+            "后台仍在接管或需要恢复，不能关闭；请先停止并恢复直连。".into()
+        }
         "environment_job_running" => {
             "后台正在执行环境操作，请等它完成后再试。".into()
         }
@@ -315,6 +321,18 @@ pub(crate) fn kernel_prepare_notice(value: &Value) -> (String, bool) {
     (message, failed > 0 || blockers > 0 || record_error)
 }
 
+/// 打开命名管道时报「文件不存在」（Windows 错误 2）：当前用户没有后台在运行。
+const DAEMON_ABSENT: &str = "ipc_unavailable: Windows error 2";
+
+/// 关闭后台。后台只在空闲且没有环境任务时接受，否则如实返回拒绝原因；
+/// 后台本来就不在运行时没有东西要关，同样算关闭成功。
+fn shutdown_daemon() -> Result<Value, String> {
+    match request(&json!({"command":"shutdown_daemon"})) {
+        Err(error) if error == DAEMON_ABSENT => Ok(json!({"shutdown":true,"absent":true})),
+        result => result,
+    }
+}
+
 pub(crate) fn request(value: &Value) -> Result<Value, String> {
     let reply = wsl_proxyctl::ipc::request(value)?;
     if let Some(message) = reply.get("message").and_then(Value::as_str)
@@ -374,6 +392,8 @@ pub(crate) fn worker() -> (Sender<Job>, Receiver<Reply>) {
                         "logs": logs
                     }))
                 })
+            } else if job.kind == Kind::Shutdown {
+                shutdown_daemon()
             } else {
                 request(&job.request)
             };
@@ -409,7 +429,8 @@ pub(crate) fn worker() -> (Sender<Job>, Receiver<Reply>) {
                 break;
             }
         }
-        // Dropping a window is deliberately not a stop or daemon shutdown command.
+        // Dropping the window is not a stop command: the tray exit stops the
+        // takeover and shuts the daemon down explicitly before the window closes.
     });
     (send, receive)
 }
@@ -551,6 +572,18 @@ mod tests {
         assert!(
             humanize_error("dns_alias_session_full: this takeover has used all of its DNS aliases")
                 .contains("重新启动")
+        );
+    }
+
+    #[test]
+    fn explains_why_the_daemon_refused_to_shut_down() {
+        assert_eq!(
+            humanize_error("desktop_request_failed · stop_and_restore_before_daemon_shutdown"),
+            "后台仍在接管或需要恢复，不能关闭；请先停止并恢复直连。"
+        );
+        assert_eq!(
+            humanize_error("environment_job_running · environment_create is still running for Dev"),
+            "后台正在执行环境操作，请等它完成后再试。"
         );
     }
 

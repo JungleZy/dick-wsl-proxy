@@ -2038,6 +2038,7 @@ impl Desktop {
                         })),
                 )
                 .child(key_value("关闭窗口", "隐藏到托盘"))
+                .child(key_value("托盘退出", "停止接管并关闭后台"))
                 .child(key_value("配置库", "SQLite"))
                 .child(key_value(
                     "配置状态",
