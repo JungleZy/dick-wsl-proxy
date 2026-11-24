@@ -4,6 +4,7 @@ use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream, UdpSocket,
 };
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -163,6 +164,10 @@ pub struct Policy {
     health_domain: String,
     limits: Limits,
     direct_dns: Option<(SocketAddrV4, String)>,
+    /// Whether residential handshakes still send their three requests in one
+    /// write. Cleared for the rest of this takeover the first time the proxy
+    /// cannot follow that.
+    pipeline_residential: AtomicBool,
 }
 
 /// A nested SOCKS5 UDP relay. The first-hop relay carries an inner SOCKS5
@@ -427,6 +432,7 @@ impl Policy {
             health_domain: config.health_domain,
             limits: config.limits,
             direct_dns: config.direct_dns,
+            pipeline_residential: AtomicBool::new(true),
         })
     }
 
@@ -451,7 +457,49 @@ impl Policy {
         {
             return Err("chain destination is reserved or unsupported".into());
         }
+        self.residential_chain(SocketAddr::V4(dest))
+    }
+
+    /// Establishes the same authenticated chain for an IPv6 literal. The IPv6
+    /// ingress worker uses it for TCP destinations that `direct_ips` does not
+    /// cover (port 53 is refused before routing).
+    pub fn chain_ipv6(&self, dest: SocketAddrV6) -> Result<TcpStream, String> {
+        if !valid_ipv6_endpoint(dest) {
+            return Err("IPv6 chain destination is reserved or unsupported".into());
+        }
+        self.residential_chain(SocketAddr::V6(dest))
+    }
+
+    /// First-hop SOCKS5 -> authenticated residential SOCKS5 -> `dest`. The
+    /// single deadline covers both handshakes, including partial reads and
+    /// writes. A pipelined attempt that the residential proxy cannot follow
+    /// is redialled once without pipelining, which then stays off.
+    fn residential_chain(&self, dest: SocketAddr) -> Result<TcpStream, String> {
         let deadline = Instant::now() + SETUP_TIMEOUT;
+        let pipelined = self.pipeline_residential.load(Ordering::Relaxed);
+        let mut stream = self.open_residential(deadline)?;
+        match self.residential_connect(&mut stream, dest, deadline, pipelined) {
+            Ok(()) => {}
+            Err(Setup::Incompatible(_)) if pipelined => {
+                self.pipeline_residential.store(false, Ordering::Relaxed);
+                stream = self.open_residential(deadline)?;
+                self.residential_connect(&mut stream, dest, deadline, false)
+                    .map_err(Setup::into_message)?;
+            }
+            Err(error) => return Err(error.into_message()),
+        }
+        stream
+            .set_read_timeout(None)
+            .map_err(|_| "cannot configure chain socket")?;
+        stream
+            .set_write_timeout(None)
+            .map_err(|_| "cannot configure chain socket")?;
+        Ok(stream)
+    }
+
+    /// A first-hop tunnel to the residential proxy. No residential bytes,
+    /// least of all credentials, are sent before this outer CONNECT succeeds.
+    fn open_residential(&self, deadline: Instant) -> Result<TcpStream, String> {
         let mut stream =
             TcpStream::connect_timeout(&SocketAddr::V4(self.first_hop), remaining(deadline)?)
                 .map_err(|_| "cannot connect to first-hop SOCKS5 endpoint")?;
@@ -466,76 +514,59 @@ impl Policy {
             "first-hop SOCKS5 method rejected",
         )?;
         connect(&mut stream, self.residential.endpoint(), deadline)?;
-
-        // No residential authentication bytes are emitted until outer CONNECT succeeds.
-        send(&mut stream, &[5, 1, 2], deadline)?;
-        expect(
-            &mut stream,
-            &[5, 2],
-            deadline,
-            "residential SOCKS5 authentication method rejected",
-        )?;
-        {
-            let mut packet = AuthPacket([0; 513]);
-            let len = self.residential.auth_packet(&mut packet.0);
-            send(&mut stream, &packet.0[..len], deadline)?;
-        }
-        expect(
-            &mut stream,
-            &[1, 0],
-            deadline,
-            "residential SOCKS5 authentication rejected",
-        )?;
-        connect_addr(&mut stream, SocketAddr::V4(dest), deadline)?;
-        stream
-            .set_read_timeout(None)
-            .map_err(|_| "cannot configure chain socket")?;
-        stream
-            .set_write_timeout(None)
-            .map_err(|_| "cannot configure chain socket")?;
         Ok(stream)
     }
 
-    /// Establishes the same authenticated chain for an IPv6 literal. The IPv6
-    /// ingress worker uses it for TCP destinations that `direct_ips` does not
-    /// cover (port 53 is refused before routing).
-    pub fn chain_ipv6(&self, dest: SocketAddrV6) -> Result<TcpStream, String> {
-        if !valid_ipv6_endpoint(dest) {
-            return Err("IPv6 chain destination is reserved or unsupported".into());
-        }
-        let deadline = Instant::now() + SETUP_TIMEOUT;
-        let mut stream =
-            TcpStream::connect_timeout(&SocketAddr::V4(self.first_hop), remaining(deadline)?)
-                .map_err(|_| "cannot connect to first-hop SOCKS5 endpoint for IPv6".to_string())?;
-        stream
-            .set_nodelay(true)
-            .map_err(|_| "cannot configure IPv6 chain socket".to_string())?;
-        negotiate_no_auth(&mut stream, deadline)?;
-        connect(&mut stream, self.residential.endpoint(), deadline)?;
-        send(&mut stream, &[5, 1, 2], deadline)?;
+    /// Residential method selection, username/password authentication and
+    /// CONNECT. Pipelined, authentication and CONNECT go out in one write
+    /// once the proxy has selected authentication, saving one residential
+    /// round trip.
+    fn residential_connect(
+        &self,
+        stream: &mut TcpStream,
+        dest: SocketAddr,
+        deadline: Instant,
+        pipelined: bool,
+    ) -> Result<(), Setup> {
+        // Credentials go out only after the proxy has selected
+        // username/password authentication, pipelined or not.
+        send(stream, &[5, 1, 2], deadline).map_err(Setup::Failed)?;
         expect(
-            &mut stream,
+            stream,
             &[5, 2],
             deadline,
-            "residential IPv6 authentication method rejected",
-        )?;
+            "residential SOCKS5 authentication method rejected",
+        )
+        .map_err(Setup::Failed)?;
         let mut packet = AuthPacket([0; 513]);
-        let len = self.residential.auth_packet(&mut packet.0);
-        send(&mut stream, &packet.0[..len], deadline)?;
+        let auth = self.residential.auth_packet(&mut packet.0);
+        if pipelined {
+            let request = connect_request(dest);
+            let mut batch = WipedBytes(Vec::with_capacity(auth + request.len()));
+            batch.0.extend_from_slice(&packet.0[..auth]);
+            batch.0.extend_from_slice(&request);
+            send(stream, &batch.0, deadline).map_err(Setup::Failed)?;
+            // A connection that breaks before the authentication reply means
+            // the proxy could not take CONNECT behind the credentials, not that
+            // either was refused.
+            let mut status = [0; 2];
+            receive(stream, &mut status, deadline).map_err(Setup::Incompatible)?;
+            if status != [1, 0] {
+                return Err(Setup::Failed(
+                    "residential SOCKS5 authentication rejected".into(),
+                ));
+            }
+            return connect_reply(stream, deadline).map_err(Setup::Failed);
+        }
+        send(stream, &packet.0[..auth], deadline).map_err(Setup::Failed)?;
         expect(
-            &mut stream,
+            stream,
             &[1, 0],
             deadline,
-            "residential IPv6 authentication rejected",
-        )?;
-        connect_addr(&mut stream, SocketAddr::V6(dest), deadline)?;
-        stream
-            .set_read_timeout(None)
-            .map_err(|_| "cannot configure IPv6 chain socket")?;
-        stream
-            .set_write_timeout(None)
-            .map_err(|_| "cannot configure IPv6 chain socket")?;
-        Ok(stream)
+            "residential SOCKS5 authentication rejected",
+        )
+        .map_err(Setup::Failed)?;
+        connect_addr(stream, dest, deadline).map_err(Setup::Failed)
     }
 
     /// Establishes a nested SOCKS5 UDP association for a non-whitelisted UDP
@@ -874,6 +905,30 @@ fn normalize_domain(mut name: String) -> Result<String, String> {
     Ok(name)
 }
 
+/// How a residential handshake failed: refused or broken for real, or in a
+/// way that only shows the proxy could not take pipelined requests.
+enum Setup {
+    Failed(String),
+    Incompatible(String),
+}
+
+impl Setup {
+    fn into_message(self) -> String {
+        match self {
+            Self::Failed(message) | Self::Incompatible(message) => message,
+        }
+    }
+}
+
+/// A buffer that held credentials; cleared when dropped.
+struct WipedBytes(Vec<u8>);
+
+impl Drop for WipedBytes {
+    fn drop(&mut self) {
+        credential::wipe(&mut self.0);
+    }
+}
+
 struct AuthPacket([u8; 513]);
 
 impl Drop for AuthPacket {
@@ -1010,6 +1065,11 @@ fn connect(stream: &mut TcpStream, dest: SocketAddrV4, deadline: Instant) -> Res
 }
 
 fn connect_addr(stream: &mut TcpStream, dest: SocketAddr, deadline: Instant) -> Result<(), String> {
+    send(stream, &connect_request(dest), deadline)?;
+    connect_reply(stream, deadline)
+}
+
+fn connect_request(dest: SocketAddr) -> Vec<u8> {
     let mut request = Vec::with_capacity(22);
     request.extend_from_slice(&[5, 1, 0]);
     match dest {
@@ -1024,7 +1084,10 @@ fn connect_addr(stream: &mut TcpStream, dest: SocketAddr, deadline: Instant) -> 
             request.extend_from_slice(&dest.port().to_be_bytes());
         }
     }
-    send(stream, &request, deadline)?;
+    request
+}
+
+fn connect_reply(stream: &mut TcpStream, deadline: Instant) -> Result<(), String> {
     let mut header = [0; 4];
     receive(stream, &mut header, deadline)?;
     if header[0] != 5 || header[1] != 0 || header[2] != 0 {
@@ -1393,6 +1456,107 @@ mod tests {
         assert_eq!(read::<4>(&mut stream), *b"pong");
         drop(stream);
         echo.join().unwrap();
+        inner.join().unwrap();
+        outer.join().unwrap();
+    }
+
+    /// The first hop of every chain in these tests: accept `count` tunnels to
+    /// the residential listener and relay each.
+    fn first_hop_tunnels(
+        first: TcpListener,
+        residential: SocketAddrV4,
+        count: usize,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let mut relays = Vec::new();
+            for _ in 0..count {
+                let mut stream = accept(&first);
+                assert_eq!(read::<3>(&mut stream), [5, 1, 0]);
+                stream.write_all(&[5, 0]).unwrap();
+                request(&mut stream, residential);
+                let target = TcpStream::connect(residential).unwrap();
+                success(&mut stream);
+                relays.push(thread::spawn(move || relay(stream, target)));
+            }
+            for relay in relays {
+                relay.join().unwrap();
+            }
+        })
+    }
+
+    fn read_credentials(stream: &mut TcpStream) {
+        assert_eq!(read::<2>(stream), [1, 12]);
+        assert_eq!(&read::<12>(stream), b"fixture-user");
+        assert_eq!(read::<1>(stream), [16]);
+        assert_eq!(&read::<16>(stream), b"fixture-password");
+    }
+
+    #[test]
+    fn credentials_and_connect_go_out_together_after_method_selection() {
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let residential = TcpListener::bind("127.0.0.1:0").unwrap();
+        let residential_endpoint = endpoint(&residential);
+        let origin: SocketAddrV4 = "192.0.2.1:443".parse().unwrap();
+        let policy = policy(endpoint(&first), residential_endpoint);
+        let outer = first_hop_tunnels(first, residential_endpoint, 1);
+        let inner = thread::spawn(move || {
+            let mut stream = accept(&residential);
+            assert_eq!(read::<3>(&mut stream), [5, 1, 2]);
+            stream.write_all(&[5, 2]).unwrap();
+            // Nothing is answered until CONNECT has arrived as well: a client
+            // that waited for the authentication reply would time out here.
+            read_credentials(&mut stream);
+            request(&mut stream, origin);
+            stream.write_all(&[1, 0]).unwrap();
+            success(&mut stream);
+        });
+        let stream = policy.chain(origin).unwrap();
+        drop(stream);
+        inner.join().unwrap();
+        outer.join().unwrap();
+        assert!(policy.pipeline_residential.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_proxy_that_drops_pipelined_requests_gets_one_sequential_retry_then_no_more_pipelining() {
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let residential = TcpListener::bind("127.0.0.1:0").unwrap();
+        let residential_endpoint = endpoint(&residential);
+        let origin: SocketAddrV4 = "192.0.2.1:443".parse().unwrap();
+        let policy = policy(endpoint(&first), residential_endpoint);
+        let outer = first_hop_tunnels(first, residential_endpoint, 3);
+        let inner = thread::spawn(move || {
+            // First attempt: closes on seeing anything behind the credentials.
+            let mut stream = accept(&residential);
+            assert_eq!(read::<3>(&mut stream), [5, 1, 2]);
+            stream.write_all(&[5, 2]).unwrap();
+            read_credentials(&mut stream);
+            drop(stream);
+            // The retry and every later chain wait for each reply.
+            for _ in 0..2 {
+                let mut stream = accept(&residential);
+                assert_eq!(read::<3>(&mut stream), [5, 1, 2]);
+                stream.write_all(&[5, 2]).unwrap();
+                read_credentials(&mut stream);
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(300)))
+                    .unwrap();
+                let mut early = [0];
+                assert!(
+                    stream.read(&mut early).is_err(),
+                    "CONNECT was sent before the authentication reply"
+                );
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                stream.write_all(&[1, 0]).unwrap();
+                request(&mut stream, origin);
+                success(&mut stream);
+            }
+        });
+        drop(policy.chain(origin).unwrap());
+        assert!(!policy.pipeline_residential.load(Ordering::Relaxed));
+        drop(policy.chain(origin).unwrap());
         inner.join().unwrap();
         outer.join().unwrap();
     }
