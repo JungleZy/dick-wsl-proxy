@@ -298,11 +298,19 @@ pub(crate) fn names_target(distro: &Value, target: &str) -> bool {
 }
 
 /// 保存的接管目标已经不能用了：发行版列表里没有它，或者它不再是 WSL 2。
+///
+/// 列表里只要有一条不是后台的发行版格式（字符串 `id`、`name`，数字 `version`），
+/// 就说明两边协议对不上，判断不了，一律当作「还在」：自动清除会改写用户保存的配置，
+/// 宁可不清。
 pub(crate) fn target_missing(saved: Option<&str>, distributions: &[Value]) -> bool {
+    let well_formed = |distro: &Value| {
+        distro["id"].is_string() && distro["name"].is_string() && distro["version"].is_u64()
+    };
     saved.is_some_and(|target| {
-        !distributions
-            .iter()
-            .any(|distro| names_target(distro, target) && distro["version"] == 2)
+        distributions.iter().all(well_formed)
+            && !distributions
+                .iter()
+                .any(|distro| names_target(distro, target) && distro["version"] == 2)
     })
 }
 
@@ -581,6 +589,14 @@ mod tests {
             &distributions
         ));
         assert!(target_missing(Some("Test-Target"), &[]));
+        // 后台改了字段名或类型：判断不了，不能把用户保存的目标清掉。
+        for drifted in [
+            json!({"id": "{11111111-1111-1111-1111-111111111111}", "name": "Test-Target", "wsl_version": 2}),
+            json!({"id": "{11111111-1111-1111-1111-111111111111}", "name": "Test-Target", "version": "2"}),
+            json!({"distribution_id": "{11111111-1111-1111-1111-111111111111}", "name": "Test-Target", "version": 2}),
+        ] {
+            assert!(!target_missing(Some("Test-Target"), &[drifted]));
+        }
     }
 
     #[test]
