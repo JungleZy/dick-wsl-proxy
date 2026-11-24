@@ -75,9 +75,16 @@ mod windows {
     }
     // WSAPROTOCOL_INFOW is a C wire structure with no pointers. Both processes use the same EXE.
     fn ticket() -> WSAPROTOCOL_INFOW {
-        unsafe { std::mem::zeroed() }
+        WSAPROTOCOL_INFOW::default()
     }
+    // Every field is a 4-byte integer, a GUID of integers or a u16 array, and
+    // they add up to the whole size: no padding byte, so the byte view below
+    // never reads uninitialised memory and any bytes written form a valid value.
+    const _: () = assert!(size_of::<WSAPROTOCOL_INFOW>() == 628);
     fn bytes(info: &mut WSAPROTOCOL_INFOW) -> &mut [u8] {
+        // SAFETY: the slice covers exactly the exclusively borrowed struct, which
+        // has no padding and no invalid bit patterns (see the assertion above),
+        // and it borrows `info` for its whole lifetime.
         unsafe {
             std::slice::from_raw_parts_mut(
                 (info as *mut WSAPROTOCOL_INFOW).cast(),
@@ -150,7 +157,7 @@ mod windows {
     pub fn worker(plan: &Plan) -> Result<(), String> {
         let stop = Event::create(&name(plan, "stop"))?;
         let done = Event::create(&name(plan, "done"))?;
-        let mut data: WSADATA = unsafe { std::mem::zeroed() };
+        let mut data = WSADATA::default();
         if unsafe { WSAStartup(0x0202, &mut data) } != 0 {
             return Err("lease_winsock_start".into());
         }

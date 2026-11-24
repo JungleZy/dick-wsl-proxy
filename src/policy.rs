@@ -458,10 +458,9 @@ impl Policy {
         Ok(stream)
     }
 
-    /// Establishes the same authenticated chain for an IPv6 literal. The
-    /// transparent ingress still needs an IPv6 plan before this path can be
-    /// selected, but the proxy protocol itself now preserves IPv6 destinations.
-    #[allow(dead_code)] // Activated when the IPv6 transparent ingress plan lands.
+    /// Establishes the same authenticated chain for an IPv6 literal. The IPv6
+    /// ingress worker uses it for TCP destinations that `direct_ips` does not
+    /// cover (port 53 is refused before routing).
     pub fn chain_ipv6(&self, dest: SocketAddrV6) -> Result<TcpStream, String> {
         if !valid_ipv6_endpoint(dest) {
             return Err("IPv6 chain destination is reserved or unsupported".into());
@@ -588,7 +587,6 @@ impl Policy {
         })
     }
 
-    #[allow(dead_code)] // Activated when IPv6 route selection reaches ingress.
     pub fn allows_ipv6(&self, ip: Ipv6Addr) -> bool {
         let address = u128::from(ip);
         self.direct_ips.iter().any(|network| {

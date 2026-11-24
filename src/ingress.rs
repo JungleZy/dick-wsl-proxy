@@ -439,7 +439,6 @@ impl Shared {
         self.record_metadata_result(protocol, result);
     }
 
-    #[allow(dead_code)] // Used by the pending IPv6 transparent ingress worker.
     fn record_metadata_v6(&self, protocol: &str, result: &Result<SocketAddrV6, String>) {
         self.record_metadata_result(protocol, result);
     }
@@ -674,7 +673,10 @@ impl DestinationGroup {
         finish_observation(plan, "udp", self.started, observation, shared)
     }
 
-    #[allow(dead_code)] // Used by the pending IPv6 transparent ingress worker.
+    #[expect(
+        dead_code,
+        reason = "the IPv6 worker does not batch UDP observations yet"
+    )]
     fn next_v6(&mut self, plan: &Plan, shared: &Shared) -> Result<SocketAddrV6, String> {
         let observation = match &mut self.observations {
             Ok(observations) => observations
@@ -766,7 +768,6 @@ fn finish_observation(
     result
 }
 
-#[allow(dead_code)] // Used by the pending IPv6 transparent ingress worker.
 fn finish_observation_v6(
     plan: &Plan,
     protocol: &str,
