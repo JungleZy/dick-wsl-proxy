@@ -38,17 +38,56 @@ const CONNECTION_QUEUE: usize = 8192;
 /// target can leave unprotected until the next check.
 const PROTECTION_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Recovers a poisoned lock instead of failing every later command. That is
+/// safe because nothing on the controller path catches unwinds: a panic while
+/// a command holds the lock ends the process, and the next one recovers from
+/// the journal. Only the protection watch, a separate thread, can poison the
+/// lock and leave the process running, and it holds the lock only briefly.
 fn owned(controller: &Mutex<controller::Controller>) -> MutexGuard<'_, controller::Controller> {
     controller
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Runs `Controller::watch_protection` about every 30 seconds. It never waits
-/// behind a command in flight: a busy round is retried a second later.
+/// Checks protection about every 30 seconds. Each round takes the controller
+/// lock twice, briefly, to start and to record, and never waits for it: a busy
+/// lock drops the round, which is retried a second later. The slow observation
+/// in between runs without the lock, so a stop never waits behind it.
 struct ProtectionWatch {
     stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Logs a panic of the watch thread, which `ProtectionWatch::drop` would
+/// otherwise swallow while checks silently stop.
+struct WatchPanicLog<'a>(&'a Option<PathBuf>);
+
+impl Drop for WatchPanicLog<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking()
+            && let Some(path) = self.0
+        {
+            let _ = desktop_store::append_runtime_log(
+                path,
+                "error",
+                "protection",
+                "保护检查意外停止，之后不会再定期确认接管规则是否仍然有效。停止接管后重新启动即可恢复检查。",
+                None,
+                None,
+                None,
+            );
+        }
+    }
+}
+
+fn try_owned(
+    controller: &Mutex<controller::Controller>,
+) -> Option<MutexGuard<'_, controller::Controller>> {
+    match controller.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
+    }
 }
 
 impl ProtectionWatch {
@@ -58,22 +97,33 @@ impl ProtectionWatch {
         let worker = std::thread::Builder::new()
             .name("protection-watch".into())
             .spawn(move || {
+                let _panic_log = WatchPanicLog(&store);
                 let mut next = Instant::now() + PROTECTION_CHECK_INTERVAL;
                 while !stopping.load(Ordering::Acquire) {
                     std::thread::sleep(Duration::from_secs(1));
-                    if Instant::now() < next {
+                    if stopping.load(Ordering::Acquire) || Instant::now() < next {
                         continue;
                     }
-                    let mut guard = match controller.try_lock() {
-                        Ok(guard) => guard,
-                        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-                        Err(TryLockError::WouldBlock) => continue,
+                    let Some(mut guard) = try_owned(&controller) else {
+                        continue;
                     };
-                    let lost = guard.watch_protection();
-                    let target = guard
-                        .live
-                        .as_ref()
-                        .map(|(plan, _)| plan.target.name.clone());
+                    let round = guard.watch_round();
+                    drop(guard);
+                    let Some(round) = round else {
+                        next = Instant::now() + PROTECTION_CHECK_INTERVAL;
+                        continue;
+                    };
+                    let finding = round.observe();
+                    if stopping.load(Ordering::Acquire) {
+                        break;
+                    }
+                    // `ProtectionWatch::drop` joins this thread: never block on
+                    // the lock, so a dropper holding it cannot deadlock.
+                    let Some(mut guard) = try_owned(&controller) else {
+                        continue;
+                    };
+                    let target = round.target().to_owned();
+                    let lost = guard.finish_watch(round, finding);
                     drop(guard);
                     next = Instant::now() + PROTECTION_CHECK_INTERVAL;
                     if let (Some(reason), Some(path)) = (lost, &store) {
@@ -83,7 +133,7 @@ impl ProtectionWatch {
                             "protection",
                             &protection_lost_message(&reason),
                             Some("recovery_required"),
-                            target.as_deref(),
+                            Some(&target),
                             None,
                         );
                     }

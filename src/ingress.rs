@@ -155,7 +155,10 @@ impl Ingress {
             Ok(worker) => worker,
             Err(error) => {
                 shared.request_stop();
-                if let Some(mut bridge) = lock(&shared.bridge).take() {
+                // Take it out first: closing joins the metadata thread, and the
+                // lock must not be held meanwhile.
+                let bridge = lock(&shared.bridge).take();
+                if let Some(mut bridge) = bridge {
                     let _ = bridge.close();
                 }
                 let _ = crate::lease::release(&plan);
@@ -188,7 +191,8 @@ impl Ingress {
                 Err(error) => {
                     shared.request_stop();
                     let _ = worker.join();
-                    if let Some(mut bridge) = lock(&shared.bridge).take() {
+                    let bridge = lock(&shared.bridge).take();
+                    if let Some(mut bridge) = bridge {
                         let _ = bridge.close();
                     }
                     let _ = crate::lease::release(&lease_plan);
@@ -224,7 +228,11 @@ impl Ingress {
                 Err(_) => self.shared.fail("IPv6 ingress worker panicked".into()),
             }
         }
-        if let Some(mut bridge) = lock(&self.shared.bridge).take()
+        // In a 2024 `if let` the scrutinee's guard would live through the whole
+        // block, holding the lock while `close` joins the metadata thread and
+        // ends wsl.exe. Take the bridge out first.
+        let bridge = lock(&self.shared.bridge).take();
+        if let Some(mut bridge) = bridge
             && let Err(error) = bridge.close()
         {
             self.shared.fail(error);

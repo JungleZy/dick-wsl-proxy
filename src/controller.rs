@@ -1,7 +1,7 @@
 //! A single owner and recovery journal for scoped M1 and policy-managed M2 sessions.
 //! The journal is immutable while active: persist intent BEFORE any guest mutation.
 use crate::managed::{Readiness, Runtime};
-use crate::{host, ingress::Ingress, kernel, lease, plan::Plan};
+use crate::{host, ingress::Ingress, kernel, lease, plan::Plan, transition};
 use serde::Deserialize;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
@@ -113,12 +113,65 @@ fn unix_seconds() -> Option<u64> {
         .map(|elapsed| elapsed.as_secs())
 }
 
+/// One protection check, started under the controller lock by
+/// [`Controller::watch_round`] so that its slow part can run without it.
+pub(crate) struct WatchRound {
+    plan: Plan,
+    generation: u64,
+}
+
+/// What [`WatchRound::observe`] found, for [`Controller::finish_watch`].
+pub(crate) struct WatchFinding(Finding);
+
+enum Finding {
+    RegistryUnreadable(String),
+    Unregistered,
+    RunningListFailed(String),
+    NotRunning,
+    Inspected(Observed),
+}
+
+impl WatchRound {
+    pub(crate) fn target(&self) -> &str {
+        &self.plan.target.name
+    }
+
+    /// The slow, read-only part of a check: the registry, `wsl --list
+    /// --running` and a guest inspect, together up to about 40 seconds. It
+    /// holds no controller lock, so a stop never waits behind it. Never mutates
+    /// the guest, and skips a target that WSL does not list as running (no
+    /// traffic can leave it), so the check does not wake a stopped distribution.
+    pub(crate) fn observe(&self) -> WatchFinding {
+        // Registration first: a renamed or unregistered target is no longer
+        // listed under the name this takeover recorded.
+        let current = match host::distributions() {
+            Ok(all) => all
+                .into_iter()
+                .find(|d| d.id.eq_ignore_ascii_case(&self.plan.target.id)),
+            Err(error) => return WatchFinding(Finding::RegistryUnreadable(error)),
+        };
+        let Some(current) = current else {
+            return WatchFinding(Finding::Unregistered);
+        };
+        WatchFinding(match host::running_distributions() {
+            Ok(names)
+                if names
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&current.name)) =>
+            {
+                Finding::Inspected(classify(kernel::inspect_detail(&self.plan)))
+            }
+            Ok(_) => Finding::NotRunning,
+            Err(error) => Finding::RunningListFailed(error),
+        })
+    }
+}
+
 impl Controller {
-    /// Checks the forwarding target once. Never mutates the guest. Skips a
-    /// target that WSL does not list as running (no traffic can leave it),
-    /// so the check does not wake a stopped distribution. Returns the reason
-    /// the first time protection is found lost; the loss stays until stop.
-    pub(crate) fn watch_protection(&mut self) -> Option<String> {
+    /// Starts one protection check of the forwarding target, or returns `None`
+    /// when there is nothing to check: no verified takeover, protection already
+    /// lost, or an operation in flight.
+    pub(crate) fn watch_round(&mut self) -> Option<WatchRound> {
         let plan = match &self.live {
             Some((plan, _)) if self.readiness.as_ref().is_some_and(Result::is_ok) => plan.clone(),
             _ => return None,
@@ -132,41 +185,71 @@ impl Controller {
         if self.watch.lost.is_some() {
             return None;
         }
-        // Registration first: a renamed or unregistered target is no longer
-        // listed under the name this takeover recorded.
-        let current = match host::distributions() {
-            Ok(all) => all
-                .into_iter()
-                .find(|d| d.id.eq_ignore_ascii_case(&plan.target.id)),
-            Err(error) => return self.unverified(format!("registry_read_failed:{error}")),
-        };
-        self.watch.checked_unix_seconds = unix_seconds();
-        let Some(current) = current else {
-            return self.lose(
-                "protection_lost: target_unregistered: the target distribution is no longer registered"
-                    .into(),
-            );
-        };
-        let running = match host::running_distributions() {
-            Ok(names) => names
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(&current.name)),
-            Err(error) => return self.unverified(format!("running_list_failed:{error}")),
-        };
-        self.watch.target_running = Some(running);
-        if !running {
-            self.watch.consecutive_failures = 0;
-            self.watch.last_error = None;
+        let record = transition::load()
+            .ok()
+            .filter(|record| record.pending.is_none())?;
+        Some(WatchRound {
+            plan,
+            generation: record.generation,
+        })
+    }
+
+    /// Records what a round found. Returns the reason the first time
+    /// protection is found lost; the loss stays until stop.
+    ///
+    /// A command may have run while the round observed without the lock, and
+    /// a stop or switch removes the rules mid-inspect. So the finding counts
+    /// only if the same takeover is still live and ready and no operation began
+    /// since the round started: a stop that failed halfway keeps the cookie,
+    /// but not the operation generation.
+    pub(crate) fn finish_watch(
+        &mut self,
+        round: WatchRound,
+        finding: WatchFinding,
+    ) -> Option<String> {
+        let unchanged = matches!(&self.live, Some((plan, _)) if *plan == round.plan)
+            && self.readiness.as_ref().is_some_and(Result::is_ok)
+            && self.watch.cookie == round.plan.cookie
+            && self.watch.lost.is_none()
+            && transition::load().is_ok_and(|record| {
+                record.pending.is_none() && record.generation == round.generation
+            });
+        if !unchanged {
             return None;
         }
-        match classify(kernel::inspect_detail(&plan)) {
-            Observed::Protected => {
+        let finding = finding.0;
+        if !matches!(finding, Finding::RegistryUnreadable(_)) {
+            self.watch.checked_unix_seconds = unix_seconds();
+        }
+        match finding {
+            Finding::RegistryUnreadable(error) => {
+                self.unverified(format!("registry_read_failed:{error}"))
+            }
+            Finding::Unregistered => self.lose(
+                "protection_lost: target_unregistered: the target distribution is no longer registered"
+                    .into(),
+            ),
+            Finding::RunningListFailed(error) => {
+                self.unverified(format!("running_list_failed:{error}"))
+            }
+            Finding::NotRunning => {
+                self.watch.target_running = Some(false);
                 self.watch.consecutive_failures = 0;
                 self.watch.last_error = None;
                 None
             }
-            Observed::Lost(reason) => self.lose(reason),
-            Observed::Unverified(error) => self.unverified(error),
+            Finding::Inspected(observed) => {
+                self.watch.target_running = Some(true);
+                match observed {
+                    Observed::Protected => {
+                        self.watch.consecutive_failures = 0;
+                        self.watch.last_error = None;
+                        None
+                    }
+                    Observed::Lost(reason) => self.lose(reason),
+                    Observed::Unverified(error) => self.unverified(error),
+                }
+            }
         }
     }
 
@@ -481,7 +564,7 @@ mod tests {
     #[test]
     fn an_idle_controller_never_checks_the_guest() {
         let mut controller = Controller::default();
-        assert_eq!(controller.watch_protection(), None);
+        assert!(controller.watch_round().is_none());
         assert_eq!(controller.watch.checked_unix_seconds, None);
     }
 }
