@@ -170,6 +170,8 @@ impl Desktop {
             logs_refresh_pending: false,
             logs_before_id: None,
             logs_loading_more: false,
+            logs_in_flight: false,
+            logs_error: None,
             logs_scroll: gpui_kit::base::VirtualListScrollHandle::new(),
             live_connections: Vec::new(),
             connection_history: Default::default(),
@@ -186,6 +188,7 @@ impl Desktop {
             epoch: 0,
             busy: None,
             reading: false,
+            reading_kind: None,
             refreshing: false,
             last_poll: Instant::now(),
             saved_port: "43531".into(),
@@ -210,6 +213,7 @@ impl Desktop {
             notice: "正在连接后台；关闭窗口只会收进托盘，从托盘退出才会停止接管并关闭后台。".into(),
             error: false,
             save_error: false,
+            dialog_error: None,
             autostart_enabled: super::autostart::enabled().unwrap_or(false),
             confirmation: None,
             confirmation_pending: false,
@@ -273,13 +277,15 @@ impl Desktop {
                 return;
             }
             self.refreshing = true;
-        } else if kind == Kind::Connections {
+        } else if matches!(kind, Kind::Connections | Kind::Logs) {
             // 后台静默读取：不置 reading，不弹加载框，也不改页面提示。
+            // 在途请求各自用 `connection_history.requested` 和 `logs_in_flight` 标记。
         } else {
             if self.reading || self.busy.is_some() {
                 return;
             }
             self.reading = true;
+            self.reading_kind = Some(kind);
         }
         if kind == Kind::Save {
             self.save_error = false;
@@ -295,6 +301,7 @@ impl Desktop {
         {
             self.busy = None;
             self.reading = false;
+            self.reading_kind = None;
             self.refreshing = false;
             self.pending_prepare = None;
             if kind == Kind::EnvironmentEdit {
@@ -306,10 +313,16 @@ impl Desktop {
             }
             if kind == Kind::Logs {
                 self.logs_loading_more = false;
+                self.logs_in_flight = false;
             }
             self.fail("后台通信线程已退出，请重新打开窗口。", cx);
         } else {
-            if !matches!(kind, Kind::Status | Kind::Connections) {
+            // 页面提示文字记录用户操作的进展和结果。读日志、读环境详情是切页面时
+            // 自动发出的，不能覆盖它，否则「预检未通过」这类原因会被冲掉。
+            if !matches!(
+                kind,
+                Kind::Status | Kind::Connections | Kind::Logs | Kind::EnvironmentView
+            ) {
                 self.notice = match kind {
                     Kind::EnvironmentCreate => "正在创建环境并安装组件…".into(),
                     Kind::EnvironmentEdit if self.environment_timezone_only => {
@@ -324,8 +337,10 @@ impl Desktop {
         }
     }
 
+    /// 读取日志第一页。已有请求在途（例如连续输入搜索词）或有操作在执行时只记下
+    /// 「待刷新」，等在途回复或操作结束后再按当前筛选读一次，同一时间最多一个请求。
     pub(crate) fn refresh_logs(&mut self, cx: &mut Context<Self>) {
-        if self.reading || self.busy.is_some() {
+        if self.logs_in_flight || self.busy.is_some() {
             self.logs_refresh_pending = true;
             return;
         }
@@ -335,6 +350,7 @@ impl Desktop {
         let search = Self::field_value(&self.fields.log_search, cx)
             .trim()
             .to_owned();
+        self.logs_in_flight = true;
         self.send(
             Kind::Logs,
             json!({
@@ -348,13 +364,18 @@ impl Desktop {
     }
 
     pub(crate) fn load_more_logs(&mut self, cx: &mut Context<Self>) {
-        if self.logs_loading_more || !self.logs_has_more || self.reading || self.busy.is_some() {
+        if self.logs_loading_more
+            || !self.logs_has_more
+            || self.logs_in_flight
+            || self.busy.is_some()
+        {
             return;
         }
         let search = Self::field_value(&self.fields.log_search, cx)
             .trim()
             .to_owned();
         self.logs_loading_more = true;
+        self.logs_in_flight = true;
         self.send(
             Kind::Logs,
             json!({
@@ -449,10 +470,35 @@ impl Desktop {
         }
     }
 
+    /// 日志读取的回复。失败只写在日志页上，不改全局提示。请求在途时又要求过刷新
+    /// （换了筛选、改了搜索词或有操作完成），这次结果已经过时：丢弃并按当前条件重读。
+    fn accept_logs_reply(&mut self, result: Result<Value, String>, cx: &mut Context<Self>) {
+        self.logs_in_flight = false;
+        let append = std::mem::take(&mut self.logs_loading_more);
+        if self.logs_refresh_pending {
+            if self.busy.is_none() {
+                self.refresh_logs(cx);
+            }
+            return;
+        }
+        match result {
+            Ok(value) => {
+                self.logs_error = None;
+                self.accept_logs(&value, append);
+            }
+            Err(error) => self.logs_error = Some(super::backend::humanize_error(&error)),
+        }
+    }
+
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         while let Ok(reply) = self.replies.try_recv() {
             if reply.kind == Kind::Connections {
                 self.accept_connection_history(reply.result, cx);
+                cx.notify();
+                continue;
+            }
+            if reply.kind == Kind::Logs {
+                self.accept_logs_reply(reply.result, cx);
                 cx.notify();
                 continue;
             }
@@ -468,6 +514,7 @@ impl Desktop {
                 }
             } else {
                 self.reading = false;
+                self.reading_kind = None;
             }
             if reply.kind == Kind::Shutdown {
                 self.finish_exit(reply.result, cx);
@@ -499,9 +546,6 @@ impl Desktop {
                     }
                     if reply.kind == Kind::Preflight {
                         self.pending_prepare = None;
-                    }
-                    if reply.kind == Kind::Logs {
-                        self.logs_loading_more = false;
                     }
                     if reply.kind == Kind::Save {
                         self.save_error = true;
@@ -579,11 +623,8 @@ impl Desktop {
                         self.dirty = self.draft_is_dirty(cx);
                         self.notice = "列表已刷新；未启动 WSL。".into();
                     }
-                    Kind::Logs => {
-                        let append = self.logs_loading_more;
-                        self.logs_loading_more = false;
-                        self.accept_logs(&value, append);
-                    }
+                    // 已在循环开头单独处理，不会走到这里。
+                    Kind::Logs => {}
                     Kind::Save => {
                         self.accept_profile(&value, window, cx);
                         self.save_error = false;
@@ -676,11 +717,8 @@ impl Desktop {
                         self.accept_status(value);
                         self.notice = "出口检测完成；仅代表本次结果。".into();
                     }
-                    Kind::EnvironmentView => {
-                        self.accept_environment_detail(value, window, cx);
-                        self.error = false;
-                        self.notice = "环境详情已刷新。".into();
-                    }
+                    // 读详情是切页面、点列表时自动发出的，不改页面提示，保留之前操作的结果。
+                    Kind::EnvironmentView => self.accept_environment_detail(value, window, cx),
                     Kind::EnvironmentCreate => {
                         self.environment_detail = value.get("environment").cloned();
                         self.environment_selected =
@@ -816,7 +854,7 @@ impl Desktop {
             {
                 self.logs_refresh_pending = true;
             }
-            if self.logs_refresh_pending && self.busy.is_none() && !self.reading {
+            if self.logs_refresh_pending && self.busy.is_none() && !self.logs_in_flight {
                 self.refresh_logs(cx);
             }
             if matches!(reply.kind, Kind::Bootstrap | Kind::List | Kind::Save)

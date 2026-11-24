@@ -23,6 +23,10 @@ pub(crate) struct Desktop {
     pub(crate) logs_refresh_pending: bool,
     pub(crate) logs_before_id: Option<i64>,
     pub(crate) logs_loading_more: bool,
+    /// 日志是后台静默读取：同一时间只有一个在途请求，不置 `reading`，不改页面提示。
+    pub(crate) logs_in_flight: bool,
+    /// 最近一次读取日志失败的原因，只显示在日志页。
+    pub(crate) logs_error: Option<String>,
     pub(crate) logs_scroll: VirtualListScrollHandle,
     /// 由 `accept_status` 从最近一次有效快照解析；状态未确认时页面不显示它们。
     pub(crate) live_connections: Vec<ConnectionRow>,
@@ -43,6 +47,8 @@ pub(crate) struct Desktop {
     pub(crate) epoch: u64,
     pub(crate) busy: Option<Kind>,
     pub(crate) reading: bool,
+    /// `reading` 为真时是哪一种读取；加载框据此显示文字，不借用页面提示。
+    pub(crate) reading_kind: Option<Kind>,
     pub(crate) refreshing: bool,
     pub(crate) last_poll: Instant,
     pub(crate) status: Value,
@@ -67,6 +73,8 @@ pub(crate) struct Desktop {
     pub(crate) notice: String,
     pub(crate) error: bool,
     pub(crate) save_error: bool,
+    /// 备份、时区对话框里的校验错误；显示在对话框内，打开对话框时清空。
+    pub(crate) dialog_error: Option<String>,
     pub(crate) autostart_enabled: bool,
     pub(crate) confirmation: Option<Confirmation>,
     pub(crate) confirmation_pending: bool,

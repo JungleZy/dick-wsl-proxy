@@ -10,6 +10,7 @@ use gpui_kit::component::{
     progress::Progress,
     resizable::{h_resizable, resizable_panel},
     select::Select,
+    tooltip::Tooltip,
 };
 use gpui_kit::{prelude::*, *};
 use serde_json::Value;
@@ -362,7 +363,11 @@ impl Desktop {
             "recovery_required" => ("需要恢复", RUST),
             _ => ("状态未知", MUTED),
         };
-        let storage_color = if self.profile_exists { TEAL } else { MUTED };
+        let (storage_label, storage_color) = if self.profile_exists {
+            ("SQLite 配置已加载", TEAL)
+        } else {
+            ("SQLite 配置待初始化", MUTED)
+        };
         div()
             .h(px(34.))
             .flex()
@@ -396,8 +401,8 @@ impl Desktop {
             .child(
                 Button::new("status-storage")
                     .icon(design_icon("storage", 17., storage_color))
-                    .accessibility_label("SQLite 配置已加载")
-                    .tooltip("SQLite 配置已加载")
+                    .accessibility_label(storage_label)
+                    .tooltip(storage_label)
                     .text_color(rgb(storage_color))
                     .disabled(true)
                     .tab_stop(false)
@@ -413,6 +418,52 @@ impl Desktop {
                     .text_color(rgb(MUTED))
                     .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
             )
+    }
+
+    /// 全局错误条：操作失败的原因在每个页面顶部都能看到，直到用户关掉或下一次操作开始。
+    /// 环境页、连接页、日志页本身没有显示页面提示的位置，没有它这些失败点了像没反应。
+    fn error_banner(&self, cx: &Context<Self>) -> Option<Div> {
+        if !self.error || self.notice.is_empty() {
+            return None;
+        }
+        let tooltip: SharedString = self.notice.clone().into();
+        Some(
+            div()
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap_2()
+                .mx_3()
+                .mt_3()
+                .pl_3()
+                .pr_1()
+                .py_1()
+                .bg(rgb(super::theme::DANGER_BG))
+                .rounded_md()
+                .text_color(rgb(RUST))
+                .child(design_icon("info", 16., RUST))
+                .child(
+                    div()
+                        .id("global-error-text")
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(self.notice.clone())
+                        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx)),
+                )
+                .child(
+                    Button::new("global-error-dismiss")
+                        .icon(design_icon("close", 15., RUST))
+                        .accessibility_label("关闭错误提示")
+                        .tooltip("关闭错误提示")
+                        .ghost()
+                        .compact()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.error = false;
+                            cx.notify();
+                        })),
+                ),
+        )
     }
 
     fn environment_target_ready(&self, cx: &App) -> bool {
@@ -613,6 +664,12 @@ impl Desktop {
         if let Some(progress) = self.environment_progress(cx) {
             return progress;
         }
+        // 读环境详情不改页面提示，这里显示固定文字，免得把上一条结果当成进展。
+        let message = if self.busy.is_none() && self.reading_kind == Some(Kind::EnvironmentView) {
+            "正在读取环境详情…".to_owned()
+        } else {
+            self.notice.clone()
+        };
         div()
             .flex()
             .flex_col()
@@ -623,7 +680,7 @@ impl Desktop {
                     .items_center()
                     .gap_2()
                     .child(status_dot(BLUE))
-                    .child(div().text_base().child(self.notice.clone())),
+                    .child(div().text_base().child(message)),
             )
             .child(
                 Progress::new("operation-loading")
@@ -647,6 +704,7 @@ impl Desktop {
                 Some(Kind::EnvironmentDelete) => "删除环境",
                 Some(_) => "正在处理",
                 None if this.pending_prepare.is_some() => "启动前检查",
+                None if this.reading_kind == Some(Kind::EnvironmentView) => "读取环境详情",
                 None if this.reading => "正在加载",
                 _ => "正在处理",
             };
@@ -733,6 +791,7 @@ impl Desktop {
     }
 
     pub(crate) fn open_backup_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dialog_error = None;
         let view = cx.entity().clone();
         window.open_dialog(cx, move |dialog, _, cx| {
             let this = view.read(cx);
@@ -768,7 +827,10 @@ impl Desktop {
                                         this.environment_pick_backup(window, cx);
                                     });
                                 }),
-                        ),
+                        )
+                        .when_some(this.dialog_error.clone(), |body, error| {
+                            body.child(div().text_base().text_color(rgb(RUST)).child(error))
+                        }),
                 )
                 .footer(
                     DialogFooter::new()
@@ -824,12 +886,20 @@ impl Desktop {
             let reveal_path = path.clone();
             let close_view = view.clone();
             let reveal_view = view.clone();
+            let dismiss_view = view.clone();
             dialog
                 .w(px(520.))
                 .title("备份完成")
                 .overlay(true)
                 .overlay_closable(true)
                 .keyboard(true)
+                // Esc、点遮罩和右上角关闭都走这里；不复位的话之后的备份不会再弹结果框。
+                .on_close(move |_, _, cx| {
+                    dismiss_view.update(cx, |this, cx| {
+                        this.backup_result_dialog_open = false;
+                        cx.notify();
+                    });
+                })
                 .child(
                     div()
                         .flex()
@@ -884,6 +954,7 @@ impl Desktop {
             return;
         }
         self.timezone_dialog_open = true;
+        self.dialog_error = None;
         let current_timezone = Self::field_value(&self.fields.environment_timezone, cx);
         if let Some(current_timezone) = super::timezones::timezone_value(&current_timezone) {
             self.timezone_select.update(cx, |state, cx| {
@@ -925,7 +996,10 @@ impl Desktop {
                                 .accessibility_label("时区")
                                 .menu_width(px(440.))
                                 .menu_max_h(px(360.)),
-                        ),
+                        )
+                        .when_some(this.dialog_error.clone(), |body, error| {
+                            body.child(div().text_base().text_color(rgb(RUST)).child(error))
+                        }),
                 )
                 .footer(
                     DialogFooter::new()
@@ -1767,15 +1841,21 @@ impl Desktop {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_color(rgb(MUTED))
-                .child(if self.reading {
-                    "正在读取运行日志…"
-                } else if self.log_filter == LogFilter::Errors {
-                    "暂无错误记录。"
-                } else if self.log_filter == LogFilter::Warnings {
-                    "暂无警告记录。"
+                .text_color(rgb(if self.logs_error.is_some() {
+                    RUST
                 } else {
-                    "暂无运行日志。"
+                    MUTED
+                }))
+                .child(if self.logs_in_flight {
+                    SharedString::from("正在读取运行日志…")
+                } else if let Some(error) = &self.logs_error {
+                    format!("读取运行日志失败：{error}").into()
+                } else if self.log_filter == LogFilter::Errors {
+                    "暂无错误记录。".into()
+                } else if self.log_filter == LogFilter::Warnings {
+                    "暂无警告记录。".into()
+                } else {
+                    "暂无运行日志。".into()
                 })
                 .into_any_element()
         } else {
@@ -1808,6 +1888,13 @@ impl Desktop {
             )
         } else {
             format!("共 {} 条；最新的在顶部", self.logs_total)
+        };
+        // 刷新失败但还有上次读到的日志：说明下面是旧结果，失败原因只显示在日志页。
+        let (count, count_color) = match &self.logs_error {
+            Some(error) if !self.logs.is_empty() => {
+                (format!("刷新日志失败，下面是上次读到的结果：{error}"), RUST)
+            }
+            _ => (count, MUTED),
         };
         let table_header = div()
             .flex()
@@ -1897,7 +1984,7 @@ impl Desktop {
                                 .small(),
                         ),
                 )
-                .child(div().text_sm().text_color(rgb(MUTED)).child(count))
+                .child(div().text_sm().text_color(rgb(count_color)).child(count))
                 .child(table_header)
                 .child(rows)
                 .child(load_more),
@@ -1928,7 +2015,8 @@ impl Desktop {
         let has_residential_default = self.residential["ip"]
             .as_str()
             .is_some_and(|value| !value.is_empty());
-        let (save_label, save_color, save_background) = if self.error {
+        // 只看保存本身的结果；其他操作失败由全局错误条显示，不能让这里误报「保存失败」。
+        let (save_label, save_color, save_background) = if self.save_error {
             ("保存失败", super::theme::RUST, super::theme::DANGER_BG)
         } else if self.dirty {
             ("草稿未保存", super::theme::RUST, super::theme::WARNING_BG)
@@ -2094,14 +2182,6 @@ impl Desktop {
             )
             .child(limits)
             .child(runtime)
-            .child(if self.error {
-                div()
-                    .text_base()
-                    .text_color(rgb(RUST))
-                    .child(self.notice.clone())
-            } else {
-                div()
-            })
     }
 }
 
@@ -2124,15 +2204,21 @@ impl Render for Desktop {
                     .min_h_0()
                     .child(self.sidebar(compact, cx))
                     .child(
-                        div().flex().flex_col().flex_1().min_w_0().child(
-                            div()
-                                .id("page-scroll")
-                                .flex_1()
-                                .min_h_0()
-                                .overflow_y_scroll()
-                                .p_3()
-                                .child(self.page_content(window, cx)),
-                        ),
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .children(self.error_banner(cx))
+                            .child(
+                                div()
+                                    .id("page-scroll")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .p_3()
+                                    .child(self.page_content(window, cx)),
+                            ),
                     ),
             )
             .child(self.status_bar(cx))

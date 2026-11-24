@@ -1,6 +1,6 @@
 //! 处理用户发起的校验、策略保存、接管、切换、停止和凭据操作。
 
-use gpui_kit::component::{WindowExt, dialog::DialogButtonProps};
+use gpui_kit::component::{WindowExt, button::ButtonVariant, dialog::DialogButtonProps};
 use gpui_kit::{prelude::*, *};
 use serde_json::{Value, json};
 
@@ -64,6 +64,12 @@ impl Desktop {
     pub(crate) fn fail(&mut self, error: impl Into<String>, cx: &mut Context<Self>) {
         self.notice = super::backend::humanize_error(&error.into());
         self.error = true;
+        cx.notify();
+    }
+
+    /// 对话框里的校验错误：显示在对话框内。全局错误条在遮罩后面，用户看不到。
+    fn dialog_fail(&mut self, error: &str, cx: &mut Context<Self>) {
+        self.dialog_error = Some(error.to_owned());
         cx.notify();
     }
     pub(crate) fn phase(&self) -> &str {
@@ -843,12 +849,12 @@ impl Desktop {
                 .as_str()
                 .map(str::to_owned)
         }) else {
-            self.fail("请先选择一个环境。", cx);
+            self.dialog_fail("请先选择一个环境。", cx);
             return false;
         };
         let timezone = Self::field_value(&self.fields.environment_timezone, cx);
         if timezone.is_empty() {
-            self.fail("请填写时区，例如 Asia/Shanghai。", cx);
+            self.dialog_fail("请选择时区。", cx);
             return false;
         }
         self.environment_timezone_only = true;
@@ -888,12 +894,12 @@ impl Desktop {
             return false;
         }
         let Some(name) = self.environment_backup_target.clone() else {
-            self.fail("请先选择一个环境。", cx);
+            self.dialog_fail("请先选择一个环境。", cx);
             return false;
         };
         let path = Self::field_value(&self.fields.environment_backup, cx);
         if path.is_empty() {
-            self.fail("请填写备份文件路径。", cx);
+            self.dialog_fail("请填写备份文件路径。", cx);
             return false;
         }
         self.send(
@@ -929,6 +935,8 @@ impl Desktop {
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("删除")
+                        // 注销发行版并删除其中全部文件，不可恢复：用危险样式。
+                        .ok_variant(ButtonVariant::Danger)
                         .cancel_text("取消"),
                 )
                 .description(div().text_base().child(format!(
