@@ -1,0 +1,423 @@
+# Rust 代码审查：HEAD `f51245a` + 未提交改动
+
+> 审查快照：2026-11-24，工具结果与行号以 00:52 的工作区为准（HEAD `f51245a`，版本 0.1.8，含未跟踪的 `wsl_platform.rs`、`drafts.rs`、`environment_facts.rs`、`residential_probe.rs`）。
+> 审查期间另一个会话在 00:13–00:44 修改桌面代码（`bootstrap`/`views`/`actions`/`drafts`/`state`/`policy`/`chrome`，新增 `environment_facts.rs`）和 `src/environment.rs`；本文行号以 00:52 的工作区为准，桌面行号同时写了函数名。
+> 审查没有改代码、没有启用接管，也没有在任何 WSL 里执行规则操作；唯一的实验是在 Windows 本机 127.0.0.1 上调用 `WSAPoll`（第 3 条）。
+> 与 `project-review-f51245a.md` 的关系：那一份是产品行为审查，本文按 Rust 代码规范（正确性、错误处理、unsafe、惯用法、测试）审查，已记录的问题不重复。
+
+**结论：没发现内存不安全，也没找到外部输入能触发的 panic。** 外部输入指 guest 报文、DNS、SOCKS5 回复、IPC 帧、策略 JSON 和 SQLite 行。必须先修的是 1 个 bug：`credential::from_settings` 会悄悄改写住宅密码。另有 10 条 Should fix，其中两条是确认过的缺陷：转发出错后 `session` 模式退出时恢复不干净（第 2 条）、TCP 转发空转（第 3 条）。其余集中在错误处理（拿字符串当错误码、失败原因被丢掉）和线程、资源的收尾上。
+
+按**应用程序**审查。`lib.rs` 只把 `ipc`、`paths` 导出给同仓的桌面 crate，且 `publish = false`，所以 `#[non_exhaustive]`、`# Errors` 文档这类库规则不要求。Edition 2024，没有声明 `rust-version`。
+
+**工具结果**（在 Windows 上用 Windows 自带的 Rust 1.100 跑，00:52 在当前工作区最后重跑一次）：
+
+- `cargo clippy --workspace --all-targets --all-features --locked`：0 警告。
+- `cargo test --workspace --locked`：248 项全过（桌面 47、IPC 9、控制器 192）。
+- `cargo fmt --all --check`：**不通过**。涉及 3 个未提交文件：`desktop/src/app/actions.rs`、`desktop/src/app/backend.rs`、`src/policy/residential_probe.rs`，都是纯格式问题。
+- 加上 `-W clippy::pedantic` 后约 400 条警告，大头是 FFI 取指针、长数字字面量和按值传参。约 50 处「可能截断」的强转逐个核过，前面都有 `min`/`clamp` 或长度上限，所以不列。
+
+**审查方式和范围：**
+
+- 共 3.3 万行。FFI 部分我自己读完了：`src/ipc/windows.rs`、`src/lease.rs`、`desktop/src/app/tray.rs`、`integrity.rs`、`instance.rs`、`src/paths.rs`。其余分四块交给子审查。
+- 下面每条 Must fix 和 Should fix 的主要触发路径，我都打开源码核对过。只有子审查看过、我没核对的细节，标了「未验证」。第 3 条里 `WSAPoll` 的行为在 Windows 上做了实验确认。
+- 修复片段都是示意，没有编译过。
+- 上一轮 `docs/discussions/project-review-f51245a.md` 已经记录的问题，这里不重复。
+- **注意：** 审查期间另一个会话一直在改桌面代码，最后一次改动在 00:44。桌面相关的行号可能漂移，所以同时写了函数名。
+
+## Must fix
+
+### 1. 住宅密码绕道 `.env` 文本：首尾引号被剥掉，引号开头的密码存不进去（`src/credential.rs:30-38`、`:155-160`）
+
+**规则：** 用类型表达数据，不要让结构化数据绕道一种文本格式再解析回来（Effective Rust 第 1 条 "Use the type system to express your data structures"）。
+
+**问题：** `from_settings` 先把设置页的四个字段 `format!` 成 `ip=…\npassword=…`，再交给 `.env` 解析器。解析器会把首尾同种引号当作 `.env` 的引号剥掉。
+
+- **密码 `"Pa55w0rd"`**：能保存，SQLite 里存的是原样。但接管时 SOCKS5 实际发出的是 `Pa55w0rd`，住宅服务器拒绝登录。界面上显示的密码却是对的，用户没法排查。
+- **以单个引号开头的密码**（例如 `'k9#x`）：`save()` 报英文 `credential file has an unterminated quoted value`。桌面翻译不了这句，只显示「操作失败」，这个密码根本存不进去。
+- **顺带：** `text` 里的明文密码用完没擦除，和第 8 行注释「持有秘密的缓冲区 drop 时都擦除」不符。
+
+**修复：** 结构化设置直接拼凭据块，`.env` 解析只留给导入文件用。
+
+```rust
+pub(crate) fn from_settings(s: &crate::desktop_store::ResidentialSettings) -> Result<Residential, String> {
+    let ip: Ipv4Addr = s.ip.parse().map_err(|_| "credential ip must be literal IPv4")?;
+    build(ip, s.port, s.username.as_bytes(), s.password.as_bytes())
+}
+
+// parse_env 从第 168 行起也改成调用 build
+fn build(ip: Ipv4Addr, port: u16, user: &[u8], password: &[u8]) -> Result<Residential, String> {
+    let len = |v: &[u8]| u8::try_from(v.len()).ok().filter(|n| *n > 0);
+    let (Some(user_len), Some(pass_len)) = (len(user), len(password)) else {
+        return Err("SOCKS5 username and password must each contain 1–255 bytes".into());
+    };
+    let mut blob = Secret(Vec::with_capacity(13 + user.len() + password.len()));
+    blob.0.extend_from_slice(MAGIC);
+    blob.0.extend_from_slice(&ip.octets());
+    blob.0.extend_from_slice(&port.to_be_bytes());
+    blob.0.extend_from_slice(&[user_len, pass_len]);
+    blob.0.extend_from_slice(user);
+    blob.0.extend_from_slice(password);
+    Residential::decode(blob)
+}
+```
+
+注意：`build` 不再做 `parse_env` 的 trim 和 NUL/CR/LF 检查。这些检查本来是 `.env` 格式的需要；如果还想拒绝控制字符，就在 `from_settings` 里显式加上。
+
+再补一个往返测试：密码 `"q"` 和 `'lead` 经过 `from_settings` 后，`auth_packet` 里的字节要和输入完全一致。
+
+## Should fix
+
+### 2. 转发出过错后，第一次 stop 删完规则就返回失败；`session` 模式在输入结束时只 stop 一次，会留下端口租约和恢复日志（`src/controller.rs:382-384`、`src/main.rs:283-288`）
+
+**规则：** 已经报告过的错误不应打断后续清理。这是本仓自己定的规则：`src/controller/lifecycle.rs:221-222` 的 `abandon` 写着 "An earlier forwarding failure is no reason to keep the ports"，`retire` 没有照做。
+
+**有意的部分：** `src/ingress.rs:221-222` 的注释写明，`Ingress::stop()` 只报告一次旧的转发错误，重试一次就能完成释放。所以「桌面上第一次停止失败、再点一次成功」是设计内的行为，不算 bug。
+
+**问题：**
+
+1. 转发 worker 出错时，`Shared::fail` 记下错误（`src/ingress.rs:399-406`）。
+2. 用户停止接管。`retire` 里 `kernel::remove` 先成功，guest 规则已经删掉。接着 `i.stop()?` 把那条旧错误原样返回，于是租约进程继续占着端口，恢复日志（journal）不删。
+3. 设计默认的「重试」在 `session` 模式下不存在：输入结束（EOF）时只调一次 `stop`（`src/main.rs:283-288`），然后以 `restore_failed` 退出，留下 journal 和租约。下次 `start` 会因为 journal 还在，报 `target_already_owned`（`src/command.rs:480-489`）。
+4. 未验证：第二次 `retire` 时规则已经不存在，按 guest 代码是先盘点、再删除，`remove` 应该能直接成功，我没有实机确认。
+
+**修复：** 让 `retire` 照 `abandon` 的规则处理旧错误：
+
+```rust
+let earlier = match &mut self.live {
+    Some((_, i)) => i.stop().err(), // 只报告一次；此时所有 worker 已 join
+    None => None,
+};
+lease::release(&p)?;
+lifecycle::verify_gone(&p)?;
+journal::forget(&p)?;
+// …清理字段…；earlier 写进运行日志，不再让 stop 失败
+```
+
+### 3. TCP 转发在对端半关闭后空转，占满一个 CPU 核（`src/ingress/tcp.rs:282`）：`WSAPoll` 的行为已实测，空转由代码路径推出
+
+**规则：** Windows `WSAPoll` 的 `POLLHUP` 不受订阅事件限制，对端发来 FIN 之后每次调用都会立即返回（Microsoft `WSAPoll` 文档）。
+
+**问题：** guest 先 `shutdown(SHUT_WR)` 半关闭，再慢慢读一个大响应。这时 `request.eof` 为真，`request.wants_read()` 返回 false；response 方向还有没写出去的数据，`wants_write()` 返回 true（`tcp.rs:97-104`）。于是 client 这个 socket 只订阅了 `POLLWRNORM`。
+
+- **实测**（本机 127.0.0.1）：对端半关闭、本端发送缓冲已满时，`WSAPoll(POLLWRNORM, 1000ms)` 连续 3 次都是 0 ms 返回，`revents=POLLHUP`。对照组（不半关闭）每次都正常等满 1 秒。
+- **后果：** `wait_quiet` 立即返回，`pump` 遇到 WouldBlock 没有进展，接着又去 poll，形成空转。guest 每读一点数据都会重置半关闭计时，所以整个下载期间都在空转，最多可以有 `max_tcp` 条连接同时这样。
+
+**修复：**
+
+```rust
+let ready = unsafe { WSAPoll(descriptors.as_mut_ptr(), count as u32, millis) };
+let only_hangup = ready > 0
+    && descriptors[..count].iter().all(|d| d.revents & !POLLHUP == 0);
+if ready == SOCKET_ERROR || only_hangup {
+    thread::sleep(POLL_INTERVAL);
+}
+```
+
+### 4. 只读的环境查看用了 20 分钟期限，还在唯一的 IPC 线程上持着控制器锁（`src/environment.rs:555`）
+
+**规则：** 持锁期间不做长时间阻塞的 IO（Effective Rust 第 17 条 "Be wary of shared-state parallelism"）。
+
+**问题：** `feature_view` 用的是给安装软件准备的 `CONFIGURE_DEADLINE`（20 分钟）。`environment_view` 分支既不走后台任务，也不要求空闲（`src/desktop_control.rs:607-616`）。daemon 在 `serve` 回调里全程持有 Controller 锁（`src/main.rs:236-237`）。
+
+触发路径：正在接管 A 时，在桌面点开环境 B，B 启动卡住。接下来：
+
+- 桌面这次请求 240 秒后报 `ipc_response_uncertain`。
+- IPC 是单实例串行服务，这期间 status、stop 全部报 `ipc_unavailable`。
+- 保护检查线程拿不到锁，检查停摆。
+
+结果是最长 20 分钟里无法停止 A。上一轮 M7 只提到「升级期间还能调这个接口」，没提期限和锁。
+
+**修复：**
+
+```rust
+const INSPECT_DEADLINE: Duration = Duration::from_secs(60);
+fn feature_view(distro: &Distro) -> Result<Value, String> {
+    let output = host::guest_script_with_timeout(distro, inspect_script(), INSPECT_DEADLINE)?;
+```
+
+长期看，view 也应该走 environment job，或者在调用 wsl.exe 之前释放锁。
+
+### 5. IPv6 入口出错退出时，TCP 转发线程被丢下不管，错误也不上报（`src/ingress/ipv6.rs:83-137`、`src/ingress.rs:170-180`）
+
+**规则：** 用 Drop 守卫保证每条退出路径都会清理（Effective Rust 第 11 条 "Implement the Drop trait for RAII patterns"）。
+
+**问题：**
+
+- `ipv6::run` 里任何一个 `?` 提前返回，`Vec<JoinHandle>` 就直接被丢弃，132-137 行的 shutdown 和 join 都被跳过。这些线程会脱离 owner 继续转发。IPv4 用 `TcpWorkers` 的 Drop 守卫（`src/ingress.rs:577-588`）防的正是这种情况，IPv6 没有。
+- IPv6 线程的闭包不调 `shared.fail`（IPv4 的闭包调了），所以运行期间只能看到 "IPv6 ingress worker stopped unexpectedly"，看不到原因。
+- `Ingress::stop()` 返回时，这些线程可能还卡在 3–15 秒的连接期限里，违背了 `stop()` 文档写的 "joins all workers"。
+
+上一轮 M9 讲的是「入口为什么会退出」，这一条讲的是「退出之后没人收尾」。
+
+**修复：** 线程闭包照 IPv4 的写法加上 `if let Err(e) = &result { worker_shared.fail(e.clone()); }`，再把线程句柄收进一个守卫：
+
+```rust
+struct Workers {
+    shared: Arc<Shared>,
+    active: Arc<Mutex<BTreeMap<SocketAddrV6, TcpStream>>>,
+    handles: Vec<JoinHandle<()>>,
+}
+impl Drop for Workers {
+    fn drop(&mut self) {
+        for c in lock(&self.active).values() { let _ = c.shutdown(Shutdown::Both); }
+        for h in self.handles.drain(..) {
+            if h.join().is_err() { self.shared.fail("IPv6 TCP forwarding worker panicked".into()); }
+        }
+    }
+}
+```
+
+### 6. 托盘图标注册失败时不提示，关窗照样把主窗口藏起来，可能再也找不回来（`desktop/src/app/tray.rs:192-195`、`desktop/src/app.rs:55-62`）
+
+**规则：** 通知区图标要处理 `TaskbarCreated` 广播并重新添加（Microsoft `Shell_NotifyIcon` 文档）；失败路径不能静默。
+
+**问题：**
+
+- **注册失败的情况：** Explorer 还没就绪或者忙到超时，`Shell_NotifyIconW(NIM_ADD)` 就会失败。这时 `run()` 销毁托盘窗口后直接 `return`，但关窗回调仍然无条件 `hide_main_window()`。
+  - 窗口藏起来之后，用户再启动一次 EXE 会撞上单实例锁。`activate_running_instance` 用 `FindWindowW(托盘类名)` 找不到窗口，第二个实例静默退出。用户只能去任务管理器结束进程。
+  - `app.rs:33-34` 的注释说明，作者已经为「Low 完整性下托盘注册不了」防过同样的后果，这里是同一个后果的另一个入口。
+- **没有处理 `TaskbarCreated`：** Explorer 重启后，托盘图标会永久消失。窗口本身还在，重新打开 EXE 能找回。
+- **未验证的一点：** `find_main_window` 按进程枚举顶层窗口，只排除了托盘类名。系统给每个 GUI 线程创建的 IME 辅助窗口也是本进程的顶层窗口，没被排除。更稳的做法是在 `open_window` 时记下主窗口的 HWND。这一点我没有实机验证。
+
+**修复**（未编译）：
+
+```rust
+static TRAY_READY: AtomicBool = AtomicBool::new(false);
+pub(crate) fn ready() -> bool { TRAY_READY.load(Ordering::Acquire) }
+// run()：NIM_ADD 成功后
+TRAY_READY.store(true, Ordering::Release);
+// window_proc：先用 RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) 取到消息号存进静态变量，
+// 收到这个消息时 Shell_NotifyIconW(NIM_ADD, &notify_data(hwnd)) 重新加图标
+
+// app.rs 关窗回调
+if tray::consume_exit_request() {
+    true
+} else if tray::ready() {
+    tray::hide_main_window();
+    false
+} else {
+    true // 没有托盘就别藏：直接关窗，后台照旧保留
+}
+```
+
+### 7. 错误靠字符串充当协议：跨 crate 用前缀和整串匹配，内层错误码还被吞掉（`src/ipc.rs:4`、`src/ipc/windows.rs:174-179`、`desktop/src/app/backend.rs:513,519`、`desktop/src/app/actions.rs:711`、`src/command.rs:126-129,275`）
+
+**规则：** 错误类型要有意义、能被调用方匹配（Rust API Guidelines C-GOOD-ERR；Effective Rust 第 4 条 "Prefer idiomatic Error types"）。
+
+**问题：**
+
+- **跨 crate 靠字符串判断：** `ipc::request` 返回 `Result<Value, String>`。桌面靠 `error == "ipc_unavailable: Windows error 2"` 判断「后台没在运行」（`backend.rs:513`），靠 `starts_with("ipc_")` 区分通信失败和后台拒绝（`actions.rs:711`）。控制器一侧只要改一下 `report()` 的输出格式，桌面照样能编译通过，行为却悄悄变了。
+- **内层错误码被吞：** `report()` 遇到非 OS 错误只输出 `ErrorKind`。`verify_process` 返回的 `ipc_untrusted_server_image` 和 `verify_owner` 返回的 `ipc_untrusted_peer_sid`，最后都变成同一句 `ipc_untrusted_server: PermissionDenied`，分不出是镜像不符还是 SID 不符。
+- **控制器层的错误码：** 所有 `String` 错误都折叠成 `controller_error`（`command.rs:275`），真正的码藏在 message 里，分隔符还有三种写法。`main.rs:296` 用 `e.code == "controller_busy"` 决定退出码，这个字符串拼错了编译器也不会报。
+
+**修复：** 先改 `report()`，只动几行：
+
+```rust
+fn report(context: &str, error: io::Error) -> String {
+    match (error.raw_os_error(), error.get_ref()) {
+        (Some(code), _) => format!("{context}: Windows error {code}"),
+        // 本模块的自定义错误都是固定码，不含秘密
+        (None, Some(inner)) => format!("{context}: {inner}"),
+        (None, None) => format!("{context}: {:?}", error.kind()),
+    }
+}
+```
+
+再把 IPC 错误换成枚举。`Display` 输出和今天一样的字符串，桌面改成按变体匹配：
+
+```rust
+#[derive(Debug)]
+pub enum IpcError { DaemonAbsent, Unavailable(String), Untrusted(String), Uncertain(String), Other(String) }
+impl std::fmt::Display for IpcError { /* 输出与现在相同的字符串 */ }
+impl std::error::Error for IpcError {}
+pub fn request(req: &Value) -> Result<Value, IpcError>;
+```
+
+`Failure.code` 同理，改成 `#[derive(Serialize)] #[serde(rename_all = "snake_case")] enum Code`。
+
+### 8. 失败原因被 `map_err(|_| …)` 丢掉（`src/managed.rs:148-149`、`:190-193`；`src/desktop_store.rs:752-759`；`src/policy.rs:670-674`、`:775`、`:800`）
+
+**规则：** 错误要保留来源和出错的值（Effective Rust 第 4 条；Rust API Guidelines C-GOOD-ERR）。
+
+**问题：** 全仓约有 90 处 `map_err(|_| …)`（含文件内的测试模块）。其中凭据、IPC 帧、桌面请求体的解析是有意脱敏，防止错误信息带出密码，这些做得对。下面几处是误丢：
+
+- **就绪探测：** guest 里 Python 抛的 `TimeoutError`、证书校验错误，以及 `wsl_deadline_exceeded`，都被整个丢掉，只剩一句 `udp_dns_probe_failed`。新接管进入恢复状态，却看不出原因。探测输出里没有凭据，不需要脱敏。
+- **SQLite 行解码：** JSON 解析失败被映射成 `rusqlite::Error::InvalidQuery`，它的显示文本是 "Query is not read-only"（rusqlite 0.32 `error.rs:315`），用户最后看到 `desktop_store_read:Query is not read-only`。新版本保存的配置被旧版本读到时就会这样。而且 `save()` 会先 `ensure()` 读旧行，所以界面上没法写一条好数据把坏行覆盖掉。
+- **策略校验：** `10.0.0.1/8` 这种常见笔误只报 "direct IP CIDR must use its network address"，不说是哪一条。四个域名字段共用同一句错误。桌面翻译不了，只显示「操作失败」。
+
+**修复：**
+
+```rust
+// managed.rs:148。stderr 最多可能 1MB，用一个新的小函数 failure_tail 取最后一个非空行并截到 300 字符
+.map_err(|e| format!("{label}_dns_probe_failed: {}", host::failure_tail(&e)))?;
+
+// desktop_store.rs decode_row。这两列 JSON 里没有密码，可以带出 serde 的报错
+let bad_json = |col, e: serde_json::Error|
+    rusqlite::Error::FromSqlConversionFailure(col, rusqlite::types::Type::Text, Box::new(e));
+let profile: Config = serde_json::from_str(&profile_json).map_err(|e| bad_json(1, e))?;
+let revision: u64 = row.get(0)?; // 负数会得到 IntegralValueOutOfRange，信息是准确的
+
+// policy.rs:670。策略里没有秘密，可以带上原值
+.map(|entry| network(entry).map_err(|e| format!("invalid_direct_ip:{entry}: {e}")))
+```
+
+### 9. 桌面把后台协议当无类型 `Value` 读：后台改一个字段名，桌面就会自动清掉用户保存的接管目标（`desktop/src/app/drafts.rs:310-315` 的 `target_missing`、`desktop/src/app/actions.rs:892-907` 的 `clear_missing_target`）
+
+**规则：** 在边界上把数据解析成类型，而不是到处按字段名取值（Effective Rust 第 1 条；"Parse, don't validate"）。
+
+**问题：**
+
+- 桌面里没有一处 `Deserialize`，后台回复全靠 `value["key"]` 读取。大多数读法在缺字段时偏保守，没问题。
+- 但 `target_missing` 用 `distro["version"] == 2` 判断目标是否存在。哪天后台把 `version` 改名或改成字符串，每个发行版都会被判成「缺失」。桌面会自动发 `profile_save`，把 target 清成 null，用户的配置被静默改写。
+- 而这种改名不会让编译失败，现有测试用的是手写 fixture，也照样通过。
+- 同版本配对下今天触发不了，这是维护风险。
+
+**修复：** 局部改法是只有列表格式正确时才算「拿到了列表」，否则不自动清目标：
+
+```rust
+let well_formed = |list: &Value| list.as_array().is_some_and(|items| items.iter()
+    .all(|d| d["id"].is_string() && d["name"].is_string() && d["version"].is_u64()));
+```
+
+长期方向：`src/host.rs:3` 的 `Distro` 已经派生了 `Serialize`/`Deserialize`，把它挪进 `lib.rs` 导出（例如 `wsl_proxyctl::protocol::Distro`），两端共用。这样后台字段一改名，桌面就编译不过。之后用同样的办法处理 status 和配置记录。
+
+### 10. lint 抑制和 unsafe 说明：89 个 unsafe 块只有 1 处 `// SAFETY:`，`tray.rs` 整个文件关掉了 `unsafe_op_in_unsafe_fn`，4 处 `#[allow(dead_code)]` 已经过期（全工作区；`desktop/src/app/tray.rs:2`；`src/policy.rs:463,590`；`src/ingress.rs:434,761`）
+
+**规则：** Effective Rust 第 16 条（每个 unsafe 块写注释、尽量缩小、打开 `unsafe_op_in_unsafe_fn`）；Microsoft M-UNSAFE-IMPLIES-UB（只有误用会导致未定义行为时，函数才标成 `unsafe`）；clippy `undocumented_unsafe_blocks`、`allow_attributes_without_reason`，并改用 `#[expect]` 代替 `#[allow]`。
+
+**问题：**
+
+- **unsafe 没按规范写理由：** 我读过的 FFI 都是健全的：OVERLAPPED 取消后会等内核完成，句柄用 RAII 关闭，token 缓冲区按 usize 对齐。有几处写了普通注释（例如 `windows.rs:68`、`:195`、`:555`，`paths.rs:61`，`lease.rs:76`），但不是 `// SAFETY:` 的写法，也没有挨着每个块。89 个块里只有 `src/ports.rs` 一处是规范写法，多数块没有任何说明。`src/lease.rs:80-87` 的 `bytes()` 是一个把 C 结构体暴露成 `&mut [u8]` 的**安全**函数，它成立的前提（字段全是整数、没有填充字节）也没写出来。
+- **`tray.rs` 的写法：** `run`、`show_menu`、`find_main_window`、`notify_data` 都声明成 `unsafe fn`，但对调用方没有任何前提条件。再加上 `#![allow(unsafe_op_in_unsafe_fn)]`，整个函数体都成了 unsafe 上下文，看不出哪一行才是真正的不安全调用。
+- **不必要的 `zeroed`：** `src/lease.rs:78`、`:153` 用的是 `unsafe { mem::zeroed() }`，而 windows-sys 0.61 已经给 `WSAPROTOCOL_INFOW` 和 `WSADATA` 实现了 `Default`。
+- **过期的 `#[allow(dead_code)]`：** 被抑制的函数其实都在用。`chain_ipv6`、`allows_ipv6`、`finish_observation_v6` 在 `src/ingress/ipv6.rs:251,662,651` 被调用，`record_metadata_v6` 在 `src/ingress.rs:800` 被调用。`chain_ipv6` 的文档还写着 IPv6 路径「还不能被选中」，会让读代码的人低估这条路径的暴露面。真正没人调用的只有 `src/ingress.rs:669` 的 `next_v6`。
+
+**修复：**
+
+```rust
+// tray.rs：删掉 #![allow(...)]；没有调用前提的函数改成安全函数，内部逐个调用加块
+fn show_main_window() {
+    let hwnd = find_main_window(null_mut());
+    if !hwnd.is_null() {
+        // SAFETY: hwnd 来自本进程的 EnumWindows；窗口若已销毁，调用只会返回失败。
+        unsafe { ShowWindow(hwnd, SW_RESTORE) };
+        // SAFETY: 同上。
+        unsafe { SetForegroundWindow(hwnd) };
+    }
+}
+
+// lease.rs
+fn ticket() -> WSAPROTOCOL_INFOW { WSAPROTOCOL_INFOW::default() }
+
+// policy.rs:463 和 :590、ingress.rs:434 和 :761：删掉属性，也删掉过期的文档
+// ingress.rs:669
+#[expect(dead_code, reason = "IPv6 transparent ingress plan not wired yet")]
+```
+
+### 11. 关键状态机和解析分支没有测试（`src/controller.rs`、`src/controller/lifecycle.rs`、`src/managed_dns/http.rs:150-180`、`src/policy.rs:411,513,624`）
+
+**规则：** Effective Rust 第 30 条 "Write more than unit tests"（修 bug 前先写一个会失败的测试）；Microsoft M-TEST-UTIL（mock 和假实现单独放在测试工具里）。
+
+**问题：**
+
+- **Controller 生命周期没有单测：** 包括 `retire` 的执行顺序（remove → stop → release → verify_gone → forget）、安装失败时保留 journal、`activate_and_commit` 只在没有 owner 时才 finish。代码直接调用 `kernel::*`、`lease::*`、`journal::*` 这些自由函数，没有可以替换成假实现的接口。第 2 条这样的 bug 本该被测试抓到。
+- **DoH 直连的 chunked 分支：** 测试里一处都没覆盖，`managed_dns/tests.rs` 里搜 `chunk` 零命中。
+- **回环地址规则：** `valid_endpoint(dest, cfg!(test))` 在测试里永远放行回环地址，所以生产环境「链路目标不能是回环地址」这条规则没有任何测试。另外，靠 `cfg!(test)` 切换生产行为，本身也不好审查。
+- **第 1 条的引号场景：** 没有往返测试。
+
+上一轮 M10 已经记录了 `route_details` 等入口路由没有测试，这里不重复。
+
+**修复：** 给 guest、租约、注册表操作加一层 trait，测试里注入假实现：
+
+```rust
+pub(crate) trait Guest {
+    fn remove(&self, p: &Plan) -> Result<(), String>;
+    fn inspect(&self, p: &Plan) -> Result<kernel::Ownership, String>;
+    fn lease_release(&self, p: &Plan) -> Result<(), String>;
+    // …
+}
+```
+
+chunked 分支和回环规则的测试可以立刻补，不依赖上面的重构。
+
+## Consider
+
+### 12. 超长函数：正确性依赖语句顺序，或者依赖跨一百多行的隐含约定（`desktop/src/app/bootstrap.rs:612` 的 `tick` 约 600 行；`src/ingress.rs:894` 的 `run` 约 300 行；`src/command.rs:270` 的 `dispatch_result` 约 290 行；`src/desktop_control.rs:535` 的 `handle` 约 240 行）
+
+**规则：** clippy `too_many_lines`（pedantic）。
+
+**问题：**
+
+- **`tick`：** 里面混着回复分发、约 20 种按操作类型的结果处理、退出流程、托盘动作和对话框排序，语句顺序靠注释提醒（例如「放在环境结果框记下提示之后」）。
+- **`ingress::run`：** 1104–1179 行有 5 个 `expect`，它们是否安全取决于一条跨约 100 行的约定：「peer 不在 flows 里时，new_stats 一定是 Some」。今天都成立（逐个核过），但改动其中一处就可能 panic。
+- **`dispatch_result`：** Start 和 StartScoped 共用一个分支，里面再写一个 `unreachable!()`（478 行）。
+- **`handle`：** 「取出对象 → 删掉 command → `from_value` → `map_err`」这一串重复了 8 次，命令名分散在 4 处字符串列表里，加一个命令要改 4 处。
+
+**修复：**
+
+- `tick` 拆成 `handle_reply`，下面再按类型拆成 `on_bootstrap`、`on_save` 等。
+- `run` 把 1040–1193 行抽成 `fn dispatch_datagram(..) -> Outcome`，用 `enum Mapping { Existing, New(Flow) }` 代替现在的 `Option` 加 `contains_key`。
+- `handle` 抽出一个公共函数：
+
+```rust
+fn fields<T: DeserializeOwned>(req: &mut Value, code: &'static str) -> Result<T, Failure> {
+    let obj = req.as_object_mut().ok_or_else(|| Failure::new("desktop_request_failed", code))?;
+    obj.remove("command");
+    serde_json::from_value(Value::Object(std::mem::take(obj)))
+        .map_err(|_| Failure::new("desktop_request_failed", code)) // 请求里有密码，有意不带原文
+}
+```
+
+### 13. 锁的持有范围（`src/ingress.rs:221-224`、`src/main.rs:61-92`、`src/main.rs:41-45`）
+
+**规则：** 尽量缩短 MutexGuard 的生命周期（Effective Rust 第 17 条）。
+
+- **`bridge.close()` 期间一直持锁：** 代码是 `if let Some(mut bridge) = lock(&self.shared.bridge).take() && let Err(e) = bridge.close()`。2024 edition 下，条件里产生的临时 guard 会活到 then 块结束，所以 `close()` 期间（join 元数据线程、结束 wsl.exe）锁一直被占着。今天其他使用者都已经 join，不会死锁，但第 5 条那种被丢下的线程会卡在这把锁上。改成先 `let bridge = lock(..).take();`，再判断。
+- **保护检查线程持锁太久：** 它持着 Controller 锁依次读注册表、跑 `wsl --list --running`（10 秒期限）、做 guest inspect（30 秒期限），每轮最长约 40 秒，用户的 Stop 在这期间只能等锁。sleep 醒来后也不重新检查 `stopping`。可以拆成三步：持锁取快照，不持锁观察，再持锁按 cookie 写回结果。
+- **`owned()` 用 `into_inner` 恢复中毒的锁：有意设计，可以接受。** 控制器路径上没有 `catch_unwind`，主线程 panic 会直接结束进程，下一个进程按恢复日志处理。唯一真实的后果是：保护检查线程 panic 后，被 `let _ = worker.join()`（`main.rs:124`）吞掉，检查从此静默停止。建议在 status 里加一个「检查已停」的标志，并在 `owned()` 上用注释写明「没有 catch_unwind」这个前提。
+
+### 14. 连接记录的状态记错了（`src/ingress/ipv6.rs:371-373`、`:402-403`、`:585`；`src/ingress.rs:1313-1318`）
+
+**规则：** Effective Rust 第 1 条。阶段和结束状态都用字符串传给 `stats`，漏设、设错编译器都不会报；正常结束（空闲超时、对端关闭）也不应被归成失败。
+
+- **IPv6 UDP：** 每条映射记录的目的地址都是 null。直连记录的阶段一直停在默认的 `metadata`。空闲回收被记成 `stopped`，而 IPv4 记的是 completed 并计数。
+- **DNS-over-TCP：** 两帧之间空闲满 120 秒（这是我们自己设的读超时）被当成转发失败。`tcp_failures` 加一，`last_error` 被一句不带原因的话覆盖。
+
+**修复：** 在两个 `begin` 后补上 `stats.destination(SocketAddr::V6(origin))`，直连路径补上 `stats.stage("relay")`；空闲回收照 IPv4 的做法计数后直接 drop。DNS TCP 的读取改成：
+
+```rust
+Err(e) if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) => return Ok(false),
+Err(e) => return Err(format!("TCP DNS frame read failed: {:?}", e.kind())),
+```
+
+### 15. UI 线程同步访问用户填写的路径（`desktop/src/app/actions.rs:1037` 的 `environment_submit`；`desktop/src/app/views.rs:520,537`）
+
+**规则：** GPUI 的约定是 IO 放到 `background_executor`，渲染函数只读状态，不做 IO。
+
+- 创建环境时，UI 线程会对安装目录调一次 `exists()`。
+- 创建期间每 200 ms 重绘一次，每次重绘都在 UI 线程上做 `is_dir()` 和 `read_to_string`。
+- 本地盘上感觉不到。映射网络盘或 UNC 路径不可达时，窗口会一直卡到 SMB 超时。
+
+**修复：** `exists()` 那处可以直接删，后台的 `reject_existing_path` 已经做了同样的检查，而且有中文翻译。进度读取挪到后台执行器上，渲染时只读字段。
+
+## 已经做得好的地方
+
+- **IPC 的 overlapped IO**（`src/ipc/windows.rs:547-569`）：超时后先 `CancelIoEx`，再 `GetOverlappedResult(..., TRUE)` 等取消完成，所以函数返回后内核不会再写栈上的 OVERLAPPED 和缓冲区。服务端身份按文件 ID 比对镜像，而不是比较路径（`:311-317`）。裸 `HANDLE` 也没有为了图方便写 `unsafe impl Send`（测试里 `:897-898` 特意注明了这一点）。
+- **DNS 和 HTTP 解析：** `src/managed_dns/wire.rs:46-53` 的压缩指针只许往回指，另有已访问集合和 128 跳上限，所有读取都走 `get()`，指针成环和越界读在结构上就不可能发生。`src/managed_dns/http.rs:105-142` 的 HTTP 分帧对重复的 Content-Length、Content-Length 和 Transfer-Encoding 同时出现、trailer 一律拒绝。
+- **状态持久化**（`src/transition.rs:184-215`、`src/controller/lifecycle.rs:82-93`）：先落盘再改 guest，原子替换带 `MOVEFILE_WRITE_THROUGH`，每次 status 都拿内存状态和盘上的 journal 对比。`src/host.rs:276-304` 用临时文件代替管道接收子进程输出，从根上避免了读线程泄漏。
+- **桌面线程模型：** UI 线程上没有同步 IPC，所有请求都走 worker 加 mpsc；状态回复带请求序号，过期的结果会被丢弃。页面字段用 `ProfileField` 枚举穷尽匹配，漏写对应关系会编译失败。
+
+## lint 配置建议
+
+项目还没有 `[lints]` 表。建议采用 BeautifulRust 的 `lints/lints.toml`：
+
+- 改成 `[workspace.lints]` 放进根 `Cargo.toml`，两个成员各加 `[lints] workspace = true`；`clippy.toml` 放在仓库根目录。
+- 这是应用程序，标了 `[lib]` 的几项可以去掉：`missing_docs`、`missing_errors_doc`、`missing_panics_doc`、`exhaustive_enums`、`print_stdout`、`print_stderr`。其中后两项必须去掉，因为 CLI 本来就要往 stdout 写 JSON。
+
+它能自动抓到本报告里的这些问题：
+
+- 第 10 条的 89 个没写理由的 unsafe 块（`undocumented_unsafe_blocks`），以及 `tray.rs` 的整文件豁免（`unsafe_op_in_unsafe_fn`）。
+- 第 10 条的过期 `#[allow(dead_code)]`。`allow_attributes` 会逼着改成 `#[expect]`，函数一旦被用上，编译器就会提示删掉这个属性。
+- 强转类问题（`as_conversions`、`cast_possible_truncation`）。
+
+注意：只算 pedantic 就有约 400 条警告，再加上 `as_conversions` 和 unsafe 相关的 lint 会更多。FFI 取指针和长数字字面量占大头，建议按 crate 逐步打开。

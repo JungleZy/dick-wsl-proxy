@@ -1,0 +1,240 @@
+# 项目审查：HEAD `f51245a` + 0.1.8 未提交改动
+
+> 审查快照：2026-11-24 13:20–13:40（HEAD `f51245a`，工作区 +3340/−1653，版本 0.1.8）。
+> 审查期间另一个会话在 13:21–13:36 实时重构桌面「每页保存」（新增 `drafts.rs`，改 `state`/`bootstrap`/`actions`/`views`），13:36 后工作区稳定。本文行号以 13:36–13:40 的快照为准；最终验证在 13:38–13:41 重跑。
+> 审查没有改代码、没有启用接管、没有运行 `wsl --update` 或模块加载，也没有在任何 WSL 里执行规则操作。
+>
+> **修订（2026-11-24 13:50）：** 按要求撤销原 M1「升级迁移」——从旧版本升级后需要重新导入住宅凭据，不作为问题；其余编号保持不变，避免引用错位。
+
+**结论：上一轮的高危/中危大多真正修好了，故障不降级这条主线仍然成立。本轮需要处理的是三类：**
+
+1. **发布阻断项还在。** 三个新必需文件未入库（`src/wsl_platform.rs`、`desktop/src/app/drafts.rs`、`docs/plans/m7/README.md`）；发布脚本仍不能证明进包的 EXE 是 Windows 原生 MSVC + 静态 CRT；`docs/plans/m0` 仍在宣传已被删除的「目标/对照发行版」隔离自检。
+2. **0.1.8 新功能的失败路径比成功路径粗糙。** `prepare-kernel` 的 45 秒总期限短于 guest 多次 8 秒命令的最坏总和，全部模块不可用时 Rust 拒绝 guest 的合法输出，但目标里的开机 unit 已经写好；`wsl --update` 的 30 分钟期限和 1MB 输出上限会直接 kill `wsl.exe`；环境/WSL 升级任务把整个桌面锁进最长 70 分钟的 loading，且没有取消。
+3. **IPv6 数据面仍只有部分实现。** IPv6 每包同步查址会让 worker 停摆数分钟；IPv6 TCP 失败被记录成 `completed`；没有 IPv6 就绪验证；计划推导与 guest `guard()` 的 eth0 口径仍不一致，预检仍可能 `passed:true` 后启动失败。
+
+**需要负责人拍板的事：**
+
+| 决策 | 为什么要你定 |
+|---|---|
+| H1：恢复「目标/对照发行版 + 实际匹配自检」，还是登记「不验证跨发行版 cgroup 匹配」并改 `docs/arch`/`decisions`/M0/M5 | 这是产品隔离承诺的核心；两种选择的后续工作量和发布口径完全不同 |
+| M7 `wsl --update` 是否作为长期产品能力 | 它会替换 WSL 包、终止所有发行版；目前没有进 `docs/decisions.md` 和 `docs/arch`，README 却已对外说明 |
+| 0.1.8 发布门禁：先入库三个新文件、补候选包与安装/升级记录，还是只做开发里程碑 | 现在没有 0.1.8 的 ZIP/哈希/安装记录，M5 最新候选包仍是 0.1.3 |
+
+## 审查范围与证据等级
+
+- 五个独立子审查分别覆盖：guest 内核辅助与预检、控制面/CLI/IPC/状态、数据面（TCP/UDP/IPv6/DNS）、桌面 GPUI、文档与发布链；中等及以上发现我逐条对照当前代码复核。
+- 证据等级：**本人复核**（读代码确认）/ **子审未复核**（只有子审查读过）/ **需实机**（取决于 Windows/WSL 内核行为）。
+- 本轮工作区被并发修改，桌面相关结论以 13:36 之后的稳定快照为准；此前 13:23 的中间态（`cargo test -p wsl-proxy-desktop` 32 个编译错误）不作为发现。
+
+### 本次实际跑过的检查（Windows 原生）
+
+| 检查 | 结果 |
+|---|---|
+| `cargo fmt --all -- --check` | **通过**（13:38 稳定快照；13:23 中间态曾被并发重构破坏） |
+| `cargo test --locked` | **9 + 185 passed, 0 failed**（IPC 9 项、控制器 185 项） |
+| `cargo test --locked -p wsl-proxy-desktop` | **30 passed, 0 failed** |
+| `cargo clippy --locked --all-targets -- -D warnings` | 通过（控制器） |
+| `cargo clippy --locked -p wsl-proxy-desktop --all-targets -- -D warnings` | 通过（桌面） |
+| `python src/guest/test_kernel.py` | 64 passed |
+| `python src/guest/test_kernel_env.py` | 12 passed |
+| `python src/guest/test_windows_compat.py` | 3 passed |
+| `python scripts/test_package_windows.py` | 3 passed |
+| `cargo build --locked --release -p wsl-proxyctl` | 通过（11.8s，13:40 最终产物） |
+| `cargo build --locked --release -p wsl-proxy-desktop` | 通过（27.5s，13:39） |
+| `target\release\wsl-proxyctl.exe --version` | `wsl-proxyctl 0.1.8` |
+| 两个 EXE 的 CRT 字符串扫描 | 当前产物无 `VCRUNTIME140` / `api-ms-win-crt` / `ucrtbase.dll`；**打包脚本不做这项检查** |
+| `package-windows.py` 端到端 | **未跑**（缺 build record / cargo metadata 的手工生成步骤） |
+| WSL/接管/桌面交互实机 | **未做**（本轮只做只读审查和本机构建/测试） |
+
+## 发现总表
+
+| 编号 | 严重度 | 问题 | 位置 | 证据 |
+|---|---|---|---|---|
+| H1 | 高 | 跨发行版 cgroup 匹配自检仍不存在，M0/架构/决策/M5 仍按旧设计承诺隔离 | `src/command.rs:20-25`、`src/probe.rs:36-39`、`docs/plans/m0/README.md:13,19,25,28,36-38`、`docs/arch/README.md:3,9`、`docs/decisions.md:7`、`docs/plans/m5/README.md:28,32` | 本人复核 |
+| H2 | 高 | 三个必需新文件未跟踪，按当前改动提交会得到编译失败的树 | `git status`：`src/wsl_platform.rs`、`desktop/src/app/drafts.rs`、`docs/plans/m7/README.md`；引用点 `src/main.rs:20`、`desktop/src/app.rs:12`、`README.md:13` | 本人复核 |
+| H3 | 高 | 发布链不能阻止 GNU 交叉产物或动态 CRT 进包；交叉构建脚本仍自称 native release | `scripts/package-windows.py:41-48,100,113-114`、`scripts/build-desktop-windows.sh:2,153-157`、`AGENTS.md:17-18` | 本人复核；实际产物已抽查 |
+| M2 | 中 | 桌面无法清除住宅代理；清空会被端口校验/`from_settings` 拒绝；CLI `forget-credential` 在 daemon 持锁时不可达 | `desktop/src/app/actions.rs:249-265,721-727`、`src/desktop_store.rs:878-890`、`src/main.rs:174-181` | 本人复核 |
+| M3 | 中 | 预检阻断项仍无页面可见：Start/Switch 的 `passed:false` 只说「请查看阻断项」，`self.preflight` 全仓只写不读 | `desktop/src/app/bootstrap.rs:811,1013-1014,854-856`、`desktop/src/app/state.rs:82` | 本人复核 |
+| M4 | 中 | 环境/WSL 升级任务把整个桌面锁进 loading：最长 70/30 分钟、不可取消、托盘退出被拒；新进程不续轮询 `environment_job` | `desktop/src/app/backend.rs:470-499,526-527`、`desktop/src/app/actions.rs:91-93`、`desktop/src/app/bootstrap.rs:708,1111-1116` | 本人复核；时长需实机 |
+| M5 | 中 | 切换中断后 `stop` 仍可能永久失败：目标仍注册但 WSL/guest 不可达时，`retire`/`verify_restored` 失败，`abandon` 又拒绝已注册目标 | `src/controller.rs:354-381`、`src/controller/lifecycle.rs:41-57,203-216,252-268` | 本人复核；触发需实机 |
+| M6 | 中 | `prepare-kernel` 的失败路径：45s 总期限短于 guest 多次 8s 命令；全部模块失败时 guest 已写开机 unit，Rust 却拒绝合法输出且不写记录；`enabled` 未验证、unit 路径写死 | `src/kernel_env.rs:18,341-343`、`src/guest/kernel_env.py:19,198-240,242-280,300-303`、`src/command.rs:331-337` | 本人复核；systemd 行为需实机 |
+| M7 | 中 | `wsl --update` 的 30 分钟期限/1MB 输出上限会 kill `wsl.exe`；job 结果可被 rpc 抢走、daemon 关闭/崩溃会丢；升级期间 `environment_view` 未被阻止 | `src/wsl_platform.rs:14,252-261`、`src/host.rs:269-273,367-374`、`src/desktop_control.rs:107-131,686-693,702-707` | 本人复核；更新中断状态需实机 |
+| M8 | 中 | IPv6 数据面：逐包同步查址可让 worker 停摆；TCP 失败记成 `completed`；无 IPv6 就绪验证；plan/guard 与预检端口/gateway 口径不一致 | `src/ingress/ipv6.rs:203-215,276-304,502-540`、`src/ingress/flow_stats.rs:396-423`、`src/managed.rs:73-82,135-225`、`src/plan.rs:159-211`、`src/guest/kernel.py:205-227`、`src/ports.rs:86-95` | 本人复核；频率/触发需实机 |
+| M9 | 中 | UDP 收包、`WSAPoll` 描述符错误或 worker panic 仍会让整条入口退出，而不是只拒该流 | `src/ingress.rs:917-918,1011-1032`、`src/ingress/ipv6.rs:300`、`src/ingress/udp_pump.rs:243-259` | 本人复核；错误码需实机 |
+| M10 | 中 | 核心路由/入口行为几乎没有测试：`route_details`/`select_route`/`run()`/阻断路径/IPv6 入口/`chain_ipv6` 均无测试，`command.rs` 0 个测试 | `src/ingress.rs:813-892`、`src/ingress/tests.rs`、`src/ingress/ipv6.rs:723-836`、`src/policy.rs:463-500` | 本人复核（测试清单） |
+| M11 | 中 | 0.1.8 发布/验证记录对不上：M6 说桌面编不过、M7 说 24 项桌面测试和两件 release、实际 30 项；M7 的 release 命令按 `default-members` 只产出控制器；无 0.1.8 候选包/安装升级记录 | `docs/plans/m6/README.md:53-54`、`docs/plans/m7/README.md:73-74`、`docs/plans/m5/README.md:38,122,129,144`、`Cargo.toml:3,7`、`README.md:15-16` | 本人复核 |
+| L1 | 低 | `prepare-kernel --help` 与模块注释仍只写「加载模块、注册空表」，不写会持久写两个 `/etc` 文件 | `src/kernel_env.rs:1-7`、`src/guest/kernel_env.py:1-9`、`src/command.rs:26-27` | 本人复核 |
+| L2 | 低 | 每页保存每次强写 `credential=desktop-residence`，覆盖 CLI `--name` 导入的标签 | `desktop/src/app/drafts.rs:159` | 本人复核 |
+| L3 | 低 | 设置页自动 WSL 检查在后台未就绪时写成「检查失败」并返回，Bootstrap 成功后不重试/不清除 | `desktop/src/app/actions.rs:499-511`、`desktop/src/app/bootstrap.rs:668-718` | 本人复核 |
+| L4 | 低 | WSL 报告里的 `version_error`/`status_error`/`version_supported` 未渲染；升级日志对读不到版本的情况写成「已升级」 | `src/wsl_platform.rs:218-239`、`desktop/src/app/views.rs:2027-2053`、`src/desktop_control.rs:378-392` | 本人复核 |
+| L5 | 低 | 环境备份仍复用 `export_path`，备份后连接页「打开报告位置」打开的是备份 tar（旧 M17 残留） | `desktop/src/app/bootstrap.rs:948-949`、`desktop/src/app/diagnostics.rs:549-559`、`desktop/src/app/chrome.rs:94-98` | 本人复核 |
+| L6 | 低 | 刷新列表后不清右侧环境详情/选中，已删除环境仍显示详情和编辑/删除按钮（旧 L15） | `desktop/src/app/bootstrap.rs:735-751`、`desktop/src/app/views.rs:1586-1608` | 子审未复核 |
+| L7 | 低 | `stale_profile_revision` 提示「刷新后重试」，但状态有效时没有重新读取配置的入口 | `desktop/src/app/backend.rs:214`、`desktop/src/app/bootstrap.rs:265-271` | 子审未复核 |
+| L8 | 低 | 环境/WSL 升级的 alert 确认动作忽略 `send` 是否真正发出；对话框不在 `locked()` 内，托盘并发动作可让确认静默丢弃 | `desktop/src/app/actions.rs:569-578,1126-1141` | 子审未复核 |
+| L9 | 低 | 后台 worker 线程 panic 后没有看门狗，`busy`/`reading` 永不复位，loading 框永久停留 | `desktop/src/app/backend.rs:501-562`、`desktop/src/app/bootstrap.rs:1111-1116` | 子审未复核 |
+| L10 | 低 | 决策 15「持久写入仅限两个文件 + enable 链接」与实现不符：旧 autoload 内容不同会留下 `.bak-<ts>-<pid>` | `docs/decisions.md:21`、`src/guest/kernel_env.py:218-226` | 本人复核 |
+| L11 | 低 | 删除 autoload 文件不会停止 oneshot 的 `-S` 查询，仍可能加载表模块；README 与 M6 的卸载步骤也不一致（缺 `systemctl disable`） | `src/guest/kernel_env.py:48-51`、`README.md:54`、`docs/plans/m6/README.md:70` | 本人复核 |
+| L12 | 低 | 文档陈旧：M4「密码不显示在编辑器中」、M4 连接记录 256/128/5 分钟、M2 的 UDP 探测失败仍写「启动失败」、M5「Windows 凭据」、`rust-gpui-implementation.md` 仍写凭据管理器、`AGENTS.md` 的 `docs/contracts/` 不存在、README 文档表缺 M7 | `docs/plans/m4/README.md:8,23`、`docs/plans/m2/README.md:47`、`docs/plans/m5/README.md:22`、`docs/discussions/rust-gpui-implementation.md:16`、`AGENTS.md:9`、`README.md:66-74` | 本人复核 |
+| L13 | 低 | `profile_get` 仍原样返回明文密码；设计规格允许页面明文查看，但 M4 的相反表述未改；明文库的目录 ACL/`-wal` 删除口径没有写进主要入口 | `src/desktop_store.rs:990-998`、`design/ui-design-spec.md:20,198`、`docs/plans/m4/README.md:8,19`、`src/paths.rs:25-38` | 本人复核 |
+| L14 | 低 | `--profile desktop.sqlite` 需要 revision>0；只用 CLI `import-credential` 后 revision 仍是 0，`load_runtime` 拒绝，而 M2 写「导入或保存都可以」 | `src/desktop_store.rs:918-922,956-958`、`docs/plans/m2/README.md:35` | 本人复核 |
+| L15 | 低 | 桌面所有字段统一 `trim()`，住宅/环境密码首尾空格被静默删除（后端按原样接受空格） | `desktop/src/app/actions.rs:94-96` | 子审未复核 |
+
+## 高严重度详述
+
+### H1 跨发行版隔离自检仍不存在，文档仍在承诺
+
+`Probe`/`Preflight` 现在只有 `target`、`port`（`src/command.rs:20-25`）；`probe.rs` 只有单发行版 `inspect`/`snapshot`，没有第二个发行版、临时计数规则或 `--witness`。`policy/profile.rs` 只保留旧 `witness` 字段用于读旧配置，从不使用。但 `docs/plans/m0/README.md:13,19,25,28,36-38` 仍给出带 `--witness` 的命令、对照结果表和 `isolation_witness_missing` 退出行为；`docs/arch/README.md:3` 仍承诺「其他发行版保持原网络行为」；`docs/decisions.md:7`（决策 01）和 `docs/plans/m5/README.md:28` 仍以「实际匹配/隔离核实」为支持条件。
+
+后果：在 `xt_cgroup --path /` 不能按 caller cgroup namespace 解析的内核上，对照发行版的流量也可能被 DNAT 进住宅出口，而预检不报任何阻断项。这是上一轮 H1 的未处理项，不是新问题；但本轮仍未拍板，且 M0 的文档命令现在会被 clap 直接拒绝。
+
+建议：二选一并在 `docs/decisions.md` 登记——恢复对照自检（目标命中、对照零命中、精确删除），或明确「不验证跨发行版匹配」并把内核版本/发行版范围写成支持矩阵硬条件，同时更新 arch/M0/M5。按 `AGENTS.md`，这项改动不应由实现任务顺手做。
+
+### H2 三个必需新文件未跟踪
+
+`src/main.rs:20` 声明 `mod wsl_platform;`，`desktop/src/app.rs:12` 声明 `mod drafts;`，`README.md:13` 和 `docs/plans/README.md:3,41` 链接 `docs/plans/m7/README.md`；但 `git status --short` 里 `src/wsl_platform.rs`、`desktop/src/app/drafts.rs`、`docs/plans/m7/README.md` 都是 `??`。只提交已跟踪的修改会得到 clean clone 编译失败（缺两个模块）和 README 404。
+
+建议：发布前把三个文件纳入版本控制，并在打包前置检查加一条「工作区无 `??` 且 `git archive HEAD` 可编译」。这是上一轮 M18 的同类问题在新模块上复发。
+
+### H3 发布链不能证明 Windows 原生 MSVC + 静态 CRT
+
+`scripts/package-windows.py:41-48` 的 `pe_x64` 只检查 MZ/PE/AMD64/PE32+/可执行位，不解析导入表；`:100` 的 `target` 检查读的是调用方自报的 build record；`:113-114` 只比对版本与哈希。`scripts/test_package_windows.py:67` 用 `pack.TARGET` 自证，测不出 GNU 记录被拒。`scripts/build-desktop-windows.sh:2` 仍写「WSL/Linux -> native Windows x64 GPUI release」，`:153` 用 `--target x86_64-pc-windows-gnu`，`:157` 打印「Native Windows release」，与 `AGENTS.md:17-18` 和 M5 的声明冲突。
+
+本次两个 release 产物抽查无 `VCRUNTIME140`/`api-ms-win-crt`/`ucrtbase.dll`，但这是构建环境的偶然正确，不是门禁。只要有人用交叉脚本出两件 EXE、再手写一份 `target: x86_64-pc-windows-msvc` 的 build record，脚本就会生成 `kind: release-candidate` 的 ZIP；`RUSTFLAGS` 覆盖 `crt-static` 也会静默通过。
+
+建议：在 `pe_x64` 里解析导入表并拒绝动态 CRT；把 machine/subsystem/imports/CRT 写进 build record 和 `release.json`；把交叉脚本改名为「开发中途检查，禁止进发布包」或删除其 native release 输出；测试补一条 GNU/动态 CRT 输入被拒。
+
+## 中严重度详述
+
+### M2 桌面无法清除住宅代理
+
+设置页的四个住宅字段只能填写，没有「清除」按钮。把字段全部清空会被 `residential_port` 的 `>0` 校验挡住（`desktop/src/app/actions.rs:259-265`）；只清密码/IP 会被 `credential::from_settings` 拒绝（`src/desktop_store.rs:878-890`）。唯一清空入口是 CLI `forget-credential`，但它要取控制器锁（`src/main.rs:174-181`），而桌面 daemon 常驻持锁，开着桌面时只会得到 `controller_busy`。未文档化的 `rpc` 通道可以绕过锁发送 `forget_credential`，但普通用户不会把它当成清除入口。用户必须先退出程序才能用文档里的命令清除。
+
+建议：设置页加「清除住宅代理」并用一次显式保存清空四个字段；后端允许「全空」的住宅块（与新建库默认值一致）；`forget-credential` 的文档写明需先退出桌面。
+
+### M3 预检阻断项仍不可见
+
+Start 触发的首次预检失败会把 `blockers.join("；")` 的机器码写进 `notice`（`desktop/src/app/bootstrap.rs:854-856`）；Start/Switch 操作前的预检失败只提示「操作前预检未通过；请查看阻断项。」（`:1013-1014`），而阻断项本身只存进 `self.preflight`（`:811`、`:1013`），全仓没有一处读取它来渲染。旧 M15 只修了「失败预检不再标绿」，没有修「看不到阻断项」。
+
+建议：把 `blockers` 做成错误条/确认框里的可见列表，至少为端口、身份、capability 三类提供中文说明；Start/Switch 的失败复用同一渲染，不要指向不存在的视图。
+
+### M4 环境/WSL 升级任务锁死整个桌面
+
+daemon 侧已经是异步 job，但桌面 worker 在 `wait_environment_job` 里每秒同步轮询，直到任务结束才清 `busy`（`desktop/src/app/backend.rs:470-499`）。任务期间 `locked()` 为真（`desktop/src/app/actions.rs:91-93`），页面打开 loading 框（`desktop/src/app/bootstrap.rs:1111-1116`），所有按钮禁用、不能取消、托盘「退出」被拒。新建环境合计可达约 70 分钟，`wsl --update` 30 分钟；用户只能强制杀进程。
+
+另外，如果任务期间桌面进程被杀，重新打开后 `status.environment_job` 只被写进 `notice`（`bootstrap.rs:708`），没有恢复轮询的路径；后台 job 结束后结果不会补弹，只能在运行日志里找。
+
+建议：把 job 状态提升为桌面 tick 的一部分，任务进行中允许收起进度、禁用冲突按钮但保留退出；重连时对 `state == "running"` 的 job 恢复轮询，对 `finished` 补结果。
+
+### M5 切换中断后 `stop` 仍可能永久失败
+
+`stop` 在 `releasing_old`/`old_restored`/`starting_new` 阶段都依赖旧目标可 inspect（`src/controller/lifecycle.rs:252-268`）；`retire` 要求目标仍注册并成功执行 `kernel::remove`（`src/controller.rs:354-381`）；`verify_restored` 只在**未注册**时跳过（`lifecycle.rs:41-51`）。`abandon` 又在 `registration_present` 为真时拒绝（`:203-216`），`shutdown_daemon` 在非 idle 时拒绝。
+
+后果：目标仍注册但 WSL 起不来或 guest 工具坏时（例如 M3 记录里的 `ERROR_TIMEOUT`），`stop` 永远失败，phase 卡在 `recovery_required`，产品内没有出路，只能 `wsl --unregister` 或修 WSL。上一轮 M7 只修了「已注销」分支。
+
+建议：给 `abandon` 加「仍注册但无法 inspect」的显式确认分支，只释放 Windows 侧端口/lease/journal，并在确认框和日志里记录 guest 规则可能残留；或为 `stop` 增加持久证明收尾路径。
+
+### M6 内核环境准备的失败路径
+
+- `kernel_env.rs:18` 的 guest 总期限是 45 秒，而 guest 每条命令上限 8 秒（`src/guest/kernel_env.py:19`），12 个模块各两次 `modprobe`、4 张表、`systemctl` 两次，最坏远超 45 秒。被 Windows 杀掉时可能已写 autoload/已加载部分模块，但没有 JSON、没有 `kernel-env.json` 记录。
+- 全部模块不可用时，`write_autoload` 返回 `written=false, error="no_proven_modules"`，但同一段代码仍调用 `write_boot_unit()` 写入并 enable unit（`kernel_env.py:300-303`）；Rust 的 `validate` 先对空模块列表报 `kernel_env_autoload_empty`（`kernel_env.rs:341-343`），`prepare` 返回 Err，`record()` 不执行。用户看到内部错误码，看不到 12 个模块失败原因，而目标里已经多了开机 unit。
+- `boot_unit.enabled` 只来自 `systemctl enable` 的退出码；`daemon-reload` 的失败被丢弃，`ExecStart` 写死 `/usr/sbin/iptables-legacy` 且用 `-` 忽略失败（`kernel_env.py:65-68,242-280`）。`enabled=true` 不代表开机真能工作。
+
+建议：允许「空模块 + error」的合法组合，或在没有可证明模块时跳过两个持久写入；无论准备成功或失败都写审计记录；总期限覆盖 guest 预算或由 guest 自己设总 deadline 并回报已写状态；用运行时解析的绝对路径写 unit，并在 enable 后校验 `is-enabled`/enable 链接。
+
+### M7 `wsl --update` 的中断与结果生命周期
+
+`UPDATE_DEADLINE` 是 30 分钟（`src/wsl_platform.rs:14`），`host::wsl_command` 在超时或输出超过 1MB 时返回错误，`GuestChild::drop` 会 kill `wsl.exe`（`src/host.rs:269-273,367-374`）。更新是否已由 WSL 服务完成无法确认，可能停在半更新状态；文档没有这种失败的处理指引。
+
+job 结果也有丢失路径：全局单槽、`poll_environment_job` 取一次就清空（`src/desktop_control.rs:107-131`）。同账户的 `wsl-proxyctl rpc` 可以发 `environment_job` 抢先领走结果，桌面随后得到 `environment_job_missing` 并误报失败；`shutdown_daemon` 只检查 phase idle，不检查「已结束但未领取」的 job（`:702-707`），此时关 daemon 会丢结果；daemon 在 30 分钟更新中途崩溃也没有持久记录。`environment_view` 只按 `job.target` 阻止，而升级 job 的 target 是 `"WSL"`（`:52-67,689`），所以升级期间仍可通过 rpc 启动一次同步 guest 检查，抢住唯一管道。
+
+建议：job 带随机 id 并绑定发起者，或把结果写入持久日志；`shutdown_daemon` 在任意 job 存在时拒绝；升级期间阻止所有环境查看/修改；更新超时不要直接 kill，至少保留结果和恢复指引。
+
+### M8 IPv6 数据面的性能、状态与就绪
+
+- IPv6 UDP 仍逐包同步查址：`receive_udp` 每包走 `destination_v6`（`src/ingress/ipv6.rs:276-304`），`collect_udp` 每条可读映射的回包各走一次（`:502-540`）。单次查询最长 4 秒，一轮 16 包最坏 64 秒，回包轮最多 128 条约 8.5 分钟；期间 IPv6 TCP accept/UDP 全部停摆，而 `Ingress::health()` 只看线程是否存活，仍报健康。上一轮 M1 的「整条 worker 退出」已修，性能子项未修。
+- IPv6 TCP 的所有失败只调用 `record_error`，没有 `flow.failed()`（`ipv6.rs:203-215`）；`Flow::drop` 把仍为 `active` 的状态改成 `completed`（`src/ingress/flow_stats.rs:396-423`）。连接记录、SQLite、桌面失败筛选都看不到 IPv6 失败。
+- `Readiness` 只有 IPv4 DNS/HTTPS 字段（`src/managed.rs:73-82,135-225`），但 IPv6 在 managed 模式默认绑定并启动；住宅不支持 IPv6 时启动仍显示「已验证」，所有 IPv6 流逐流失败。
+- 计划推导从任意接口/任意路由表取地址和默认路由（`src/plan.rs:159-211`），guest `guard()` 只认 eth0 唯一 global + 主表唯一 default dev=eth0（`src/guest/kernel.py:205-227`）；预检只检查 IPv4 端口（`src/ports.rs:86-95`），也不要求 `network.gateway_route`，因此可能 `passed:true` 后在 `Ingress::bind`/`Plan::new` 失败。
+
+建议：像 v4 一样把 IPv6 收包/回包合成 `submit_group` 或移到独立 lane；`forward_tcp` 失败时显式 `flow.failed()`；在 `verify` 加 IPv6 两跳探针；预检按 `guard()` 同一口径构造 Plan 并检查 IPv6 端口/网关。
+
+### M9 入口资源错误仍会终止整条入口
+
+v4 UDP 的 `recv_from` 非 transient 错误直接 `return Err`（`src/ingress.rs:1011-1032`），IPv6 同样（`src/ingress/ipv6.rs:300`）；`workers.reap()?`/`dns_workers.reap()?` 把 worker panic 冒泡（`src/ingress.rs:917-918`）；`udp_pump::wait_ready` 对 `POLLNVAL` 直接返回 Err（`src/ingress/udp_pump.rs:243-259`）。对比 `accept` 有 `exhausted()` 的 50ms 退避，这些路径没有。一次 `WSAENOBUFS`、一个 origin socket 的 `POLLNVAL` 或一个 panic 就会让 `run()` 返回 Err，整个会话 `recovery_required`，IPv4 TCP 一起停。
+
+建议：把 `exhausted()`/`transient()` 复用到 UDP 收包和 `WSAPoll` 失败上；origin 的 `POLLNVAL` 只退役该流；DNS UDP/IPv6 TCP worker 加 `catch_unwind` 或让 `reap` 只记录错误。
+
+### M10 核心路由/入口行为没有测试
+
+`route_details`/`route`/`select_route`（`src/ingress.rs:813-892`）在全仓测试里没有调用；`run()`/`Ingress::bind`、阻断路径、IPv6 入口、`Policy::chain_ipv6`（`src/policy.rs:463-500`）都没有测试。现有测试主要覆盖辅助函数和不变量（别名不跨名、DoH 校验、UDP 回包授权、半关闭等），但改错 `:53` 检查、保留端点检查或别名失败分支不会让任何测试变红。`command.rs` 也 0 个测试，`stop` 死路和 `wsl_update_ready` 无法触发。
+
+建议：用 `Runtime` + 假 DoH/假 SOCKS5 构造 `route_details` 参数化测试；用可注入的查址源测 `run()` 的阻断路径（断言不创建 Direct socket、不发包）；补 `chain_ipv6`、`answer_tcp`/`serve_dns_tcp` 和 stop 失败路径。
+
+### M11 0.1.8 发布/验证记录对不上
+
+- `docs/plans/m6/README.md:53-54` 说桌面 crate 暂时无法编译；`docs/plans/m7/README.md:73-74` 说桌面 24 项测试通过、`cargo build --release --locked` 产出 CLI 与桌面两件。实际桌面 30 项通过；`Cargo.toml:3` 的 `default-members = ["."]` 让 M7 引用的命令只构建控制器，不可能产出两件。
+- 计数也不一致：M6 183、M7 184+9、M5:144 185；实际 185 控制器 + 9 IPC。桌面 30 而非 24。
+- `docs/plans/m5/README.md:38,122,129` 仍把源码版本写成 0.1.1、把 Windows 构建/打包写成「待在 Windows 上验证」；README 用 0.1.3 性能数据当门面；仓库没有 0.1.8 候选包、ZIP 哈希或安装/升级/降级记录。
+- M7 没有进 `docs/decisions.md`（最新到 16）和 `docs/arch/README.md:15`，M7 文档自己在 `:87` 承认；但 README 已对外承诺。
+
+建议：以当前树重跑并每份记录只保留一组自洽数字；记录确切命令（`-p wsl-proxyctl -p wsl-proxy-desktop`）和 `git rev-parse HEAD`；删除 M6 的过时说明；补 0.1.8 发布小节或明确「尚无候选包」；为 M7 补决策/架构段。
+
+## 旧发现状态
+
+| 旧编号 | 现状 |
+|---|---|
+| **H1** 隔离自检 | **未变，见 H1** |
+| M1 IPv6 UDP worker 退出 | **已修**：逐流退役，`is_stopping` 时返回；性能子项见 M8 |
+| M2 元数据队列容量 | **已修**：`2*max_tcp + 256 + 2`，有常量关系测试 |
+| M3 IPv6 计划 vs guest guard | **未变**，见 M8 |
+| M4 预检 `passed:true` 后启动失败 | **未变**，见 M8 |
+| M5 IPv6 stale-context 不能删规则 | **已修**：`inspect`/`remove` 对任何 `guard` 失败放行，测试覆盖 9 种漂移 |
+| M6 IPv6 支持口径 | **文档已改**；代码仍无就绪门槛，见 M8 |
+| M7 切换中断 stop 死路 | **部分修复**：已注销分支修好；仍注册不可达见 M5 |
+| M8 WAL 硬要求 | **已修**：回退 rollback journal 并写一次警告 |
+| M9 环境操作 240 秒 | **服务端已修**：异步 job；客户端生命周期见 M4 |
+| M10 回滚注销别人的发行版 | **已修**：只注销本次新增且路径匹配的条目，有测试 |
+| M11 编辑超时 dpkg 半配置 | **未变**：`CONFIGURE_DEADLINE` 到点仍 kill `wsl.exe`，错误仍包成 `environment_setup_failed` |
+| M12 非 apt 发行版 | **未变**：M5:138 自己写「审查 M12，尚未处理」 |
+| M13 DNS 别名重置不可达 | **已修**：桌面连接页有确认入口 |
+| M14 后台失联无重连 | **已修**：状态栏/概览「重新连接」，托盘刷新会拉起后台 |
+| M15 预检阻断项/失败标绿 | **部分修复**：失败不再标绿；阻断项仍不可见，见 M3 |
+| M16 密码明文 | **设计已改**为允许明文查看（`design/ui-design-spec.md:20`），但桌面仍无清除入口，见 M2/L13；升级迁移按要求不作为问题 |
+| M17 备份被当诊断导出 | **部分修复**：备份有独立结果框；`export_path` 仍被复用，见 L5 |
+| M18 未跟踪配置/打包 CRT | **部分修复**：`.cargo/config.toml`、`src/paths.rs` 已入库；新文件未跟踪见 H2，CRT 见 H3 |
+| M19 打包脚本编码 | **已修**：UTF-8/UTF-16 读取 |
+| M20 clippy/fmt | **已修**：两个 crate 的 clippy 与 fmt 均通过 |
+| L12 trim 密码 | **未变**，见 L15 |
+| L21 `mark_mentions`/CONNMARK 等 | **未变**：`--save-mark/--restore-mark` 与 nft 规则仍不扫描；low |
+
+## 做得好的地方
+
+- **数据面主线没有退步。** TCP/UDP 选中 `Route::Chain` 后失败只报错，全仓没有失败改直连的路径；系统 DNS 独占 `:53`，其它 `:53` 拒绝；住宅 UDP 探测失败后新链式流直接拒绝，不建直连 socket；白名单 A 记录别名不跨名、不借给 AAAA/HTTPS。这些都有代码路径和部分测试支撑。
+- **上一轮多数修复是真的**：IPv6 worker 退出、元数据队列、IPv6 stale-context、WAL 回退、环境 job、回滚归属、DNS 重置、重连、打包编码、clippy/fmt 都已落地。
+- **本轮新增的持久化写入很克制**：两个路径写死，没有请求数据跨边界；单文件用临时文件 + fsync + `os.replace`；重复执行幂等；没有文件名/模块名注入。
+- **M7 的时序判断是原子的**：`wsl_update_ready` 之后才启动 job，单管道串行 + 控制器锁，CLI 另起进程被锁挡，没有 TOCTOU；`--confirm` 和 idle 检查 CLI/桌面共用。
+- **测试与构建状态在本快照是干净的**：9+185+30 全过、两个 crate clippy `-D warnings` 全过、fmt 通过、Python 64+12+3+3 全过、两个 release EXE 已生成且无动态 CRT 字符串；控制器的 `--version` 可运行，桌面未在本轮启动。
+
+## 本次没有覆盖的
+
+- **没有任何 Windows/WSL 实机测试**：没有启用接管、没有 `wsl --update`、没有加载模块/写开机 unit、没有重启 WSL 或内核、没有点按桌面；M6/M7 的「已实机」记录来自维护者，本轮没有复跑。
+- **没有跑发布链**：`package-windows.py` 端到端（build record / cargo metadata 生成）、ZIP、安装/升级/降级/`-Recover`、两个 EXE 的完整导入表均未在本轮重跑；只抽了 CRT 字符串。
+- **没有做依赖漏洞扫描、许可证审查、性能测量**；没有审 `design/` 的视觉实现与窄窗口/对话框叠放。
+- **H1 的失败模式需实机**：没有旧内核或对照发行版可验证 `xt_cgroup --path /` 的解析行为。
+- 工作区在审查期间被并发重构；若之后还有人继续改，行号需重新核对。
+
+## 建议处理顺序
+
+1. **拍板 H1**：恢复隔离自检，或登记「不验证跨发行版匹配」并同步改 arch/decisions/M0/M5；不然后续所有验收都缺一个前提。
+2. **发布阻断项**：把三个新文件入库；修 M0 的 `--witness` 文档；给打包脚本补导入表/CRT 门禁；在 Windows 上生成 0.1.8 候选包并记录安装/升级/`-Recover` 结果。
+3. **凭据**：桌面加「清除住宅代理」；把明文库目录必须私有的要求写进入口文档；升级后需重新导入住宅凭据的说明按负责人意见处理，不作为缺陷。
+4. **恢复死路**：M5（仍注册但不可达的 stop）和 M4（长任务锁死/结果丢失）——这两项会直接把用户困住。
+5. **新功能失败路径**：M6（45 秒/空模块/unit 验证）、M7（update 中断/结果竞争）。
+6. **IPv6 与入口**：M8（逐包查址、失败记 completed、就绪、plan/预检）、M9（资源错误隔离）。
+7. **测试**：M10 的路由/入口/stop/update 参数化测试；补 M2/M4/M5 的失败路径测试。
+8. **文档并入**：M4 连接记录、M2 UDP 语义、M4 密码表述、M5 版本/发布状态、决策 15 的备份文件与 M7 决策。
+
+## 附：审查期间的并发修改
+
+- 13:21–13:36 另一个会话在桌面 crate 里新增 `drafts.rs`（`SaveScope`/`Unsaved`），把 `UiAction::Save` 改成 tuple variant、`state.dirty` 改成 `unsaved`、`save_error` 改成 `Option<SaveScope>`，并同步 `bootstrap`/`actions`/`views`/`chrome`/`overview`/`policy`。13:23 的中间态不可编译（32 个错误），13:36 后恢复并最终 30 项测试通过、fmt/clippy 通过。
+- 13:32 有人改了 `src/desktop_store.rs`（凭据/SQLite 相关）；13:40 我重建了最终 release 控制器。本文以 13:36–13:40 的快照为准。

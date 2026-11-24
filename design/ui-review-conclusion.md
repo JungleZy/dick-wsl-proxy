@@ -1,5 +1,7 @@
 # WSL Proxy UI 审核结论
 
+> 这是早期的一次审核记录，内容已不代表现状：窗口尺寸、侧栏宽度、字号、状态栏、首页和各页面布局都已变化。现行界面见 [ui-design-spec.md](./ui-design-spec.md)，最近一次审查见 [docs/discussions/desktop-ui-review-48c3aa0.md](../docs/discussions/desktop-ui-review-48c3aa0.md)。
+
 ## 审核范围
 
 本次审核以 `ui-redesign-html.html` 和 `ui-design-spec.md` 为基准，检查桌面外壳、侧边栏、状态栏、首页监控、环境页面、规则、连接、日志和设置页面。
