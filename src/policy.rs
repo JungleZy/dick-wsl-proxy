@@ -100,8 +100,13 @@ impl Default for Limits {
 
 impl Config {
     pub(crate) fn validate_draft(&self) -> Result<(), String> {
-        credential::target_name(&self.credential)?;
+        credential::valid_name(&self.credential)?;
         Validated::new(self.clone()).map(|_| ())
+    }
+
+    /// The credential label is metadata now that the settings live in SQLite.
+    pub(crate) fn set_credential(&mut self, name: String) {
+        self.credential = name;
     }
 }
 
@@ -349,7 +354,8 @@ impl Policy {
         }
         let config = profile::decode_policy(&bytes)?;
         let validated = Validated::new(config)?;
-        let residential = credential::load(&validated.credential)?;
+        // Residential settings live in the local SQLite store, not the policy file.
+        let residential = crate::desktop_store::load_credential()?;
         Self::assemble(validated, residential)
     }
 

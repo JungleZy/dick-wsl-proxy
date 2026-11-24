@@ -23,7 +23,7 @@
 
    可选的转发限制，不写就用默认值，在启动或切换接管时固定：`max_tcp_connections`（并发 TCP 上限，含 TCP 上的 DNS，16–1024，默认 256）、`tcp_idle_timeout_seconds`（两个方向都没有数据多久后断开，30–86400，默认 1800）、`tcp_half_close_timeout_seconds`（一方结束后另一方无数据多久后断开，5–3600，默认 60）。取默认值时不写入桌面端配置库。
 
-2. 用 `wsl-proxyctl.exe import-credential --name my-residence --env-file <文件路径>` 导入现有 `.env`（`ip`、`port`、`username`、`password`）。策略文件只引用名称；凭据仅保存在当前 Windows 用户的凭据管理器，导入不覆盖同名记录。审阅策略后运行 `wsl-proxyctl.exe session`。
+2. 用 `wsl-proxyctl.exe import-credential --name my-residence --env-file <文件路径>` 导入现有 `.env`（`ip`、`port`、`username`、`password`）。设置写入 EXE 同级 `desktop.sqlite` 的住宅字段（含密码，明文）；`--name` 只记入策略的标签，不再按名称查找独立凭据，也不读写 Windows 凭据管理器。审阅策略后运行 `wsl-proxyctl.exe session`。
 3. 在同一会话逐行提交，例如：
 
    ```jsonl
@@ -32,8 +32,10 @@
    {"command":"stop"}
    ```
 
+   `profile` 可指向策略 JSON 或 EXE 同级的 `desktop.sqlite`。指向 JSON 时，住宅服务器设置仍从 `desktop.sqlite` 读取；两种方式都要先导入或在桌面策略页保存住宅字段。`credential` 字段只是标签，不参与凭据查找。
+
    `startup_verified` 是**启动时**的探测结果，不是实时可用性保证。只有来自目标的两个独立未缓存 DNS 探测（UDP、强制 TCP）在 Windows 端经认证上游收到对应回答，以及目标的非白名单 HTTPS 探测经双跳完成，才返回 `forwarding_managed`；任一项失败进入恢复状态，查看状态后显式 `stop` 恢复，不通过删除日志或改成只代理网页来跳过失败。启动时另探测一次双跳 SOCKS5 UDP 关联，只建立并关闭关联、不发送业务数据：住宅端拒绝 UDP 时接管照常，结果记在 `startup_verified.udp_supported`，本次接管期间非白名单 UDP（含 QUIC）一律拒绝、不直连。正常结束拥有活动入口的会话会执行停止；若控制器崩溃，另行运行 `wsl-proxyctl.exe status`、`wsl-proxyctl.exe stop`。
-4. 停止不会删除用户凭据。如不再使用，可运行 `wsl-proxyctl.exe forget-credential --name my-residence`。不得把密码放进命令行或策略文件。
+4. 停止不会删除配置。如不再使用，可运行 `wsl-proxyctl.exe forget-credential --name my-residence` 清空 `desktop.sqlite` 里的住宅字段。不得把密码放进命令行或策略文件。
 
 ## 分流与故障语义
 

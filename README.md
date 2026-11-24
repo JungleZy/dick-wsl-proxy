@@ -15,7 +15,7 @@
 **安装与升级。** Windows x64 候选包采用按用户安装的未签名 ZIP。校验、显式恢复、升级/卸载步骤与已测/未测环境见 [M5 发布说明](docs/plans/m5/README.md)；不要将 ZIP 哈希当作签名。
 `0.1.3` 在保留逐包归属校验的前提下合并 UDP 回包查询：本地 16 并发已连接 UDP 回显 p95 从 348.66 ms 降至 88.55 ms，直连为 6.71 ms。全表均忙时仍拒绝新流。见 [M5 延迟与边界](docs/plans/m5/README.md#013udp-回包并发延迟)。
 
-**从哪里开始？** 先按下方的[只读预检](#preflight)检查目标发行版。预检通过后，按 [M2 配置与启动指南](docs/plans/m2/README.md)准备 Windows 侧策略、导入住宅代理凭据，并在 `session` 中启动接管。策略文件只引用凭据名称，不要把 `.env` 或密码提交到仓库。正常停止时在同一会话发送 `{"command":"stop"}`；如果控制器崩溃，在新的 Windows 进程中依次运行 `wsl-proxyctl.exe status` 和 `wsl-proxyctl.exe stop`，不要把进程退出当作网络已经恢复。
+**从哪里开始？** 先按下方的[只读预检](#preflight)检查目标发行版。预检通过后，按 [M2 配置与启动指南](docs/plans/m2/README.md)准备 Windows 侧策略、导入住宅代理设置（写入 EXE 同级的 `desktop.sqlite`，含明文密码），并在 `session` 中启动接管。策略文件里的 `credential` 只是标签，不要把 `.env` 或密码提交到仓库。正常停止时在同一会话发送 `{"command":"stop"}`；如果控制器崩溃，在新的 Windows 进程中依次运行 `wsl-proxyctl.exe status` 和 `wsl-proxyctl.exe stop`，不要把进程退出当作网络已经恢复。
 
 ## English
 

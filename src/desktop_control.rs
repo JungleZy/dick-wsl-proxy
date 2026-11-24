@@ -365,8 +365,16 @@ fn command_log(command: &str, response: &Value) -> (&'static str, String, String
         "environment_edit" => ("info", "environment".into(), "环境设置已更新".into()),
         "environment_backup" => ("info", "environment".into(), "环境备份完成".into()),
         "environment_delete" => ("info", "environment".into(), "环境已删除".into()),
-        "import_credential" => ("info", "desktop_store".into(), "凭据已保存".into()),
-        "forget_credential" => ("info", "desktop_store".into(), "凭据已删除".into()),
+        "import_credential" => (
+            "info",
+            "desktop_store".into(),
+            "住宅设置已写入本地 SQLite".into(),
+        ),
+        "forget_credential" => (
+            "info",
+            "desktop_store".into(),
+            "本地 SQLite 中的住宅设置已清空".into(),
+        ),
         "reset_dns_aliases" => ("info", "dns".into(), "DNS 别名缓存已重置".into()),
         "abandon" => (
             "warning",

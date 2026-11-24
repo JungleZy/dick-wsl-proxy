@@ -3,7 +3,6 @@ use std::path::Path;
 use std::sync::atomic::{Ordering, compiler_fence};
 
 const MAGIC: &[u8; 5] = b"WSPC1";
-#[cfg(windows)]
 const MAX_ENV: usize = 16 * 1024;
 
 // Volatile stores prevent dead-store removal; all owned secret buffers use this on drop.
@@ -38,7 +37,6 @@ pub(crate) fn from_settings(
     parse_env(text.as_bytes())
 }
 
-#[cfg_attr(test, allow(dead_code))]
 pub(crate) fn settings(residential: &Residential) -> crate::desktop_store::ResidentialSettings {
     let bytes = &residential.blob.0;
     let user_len = bytes[11] as usize;
@@ -99,7 +97,9 @@ fn valid_endpoint(endpoint: SocketAddrV4) -> bool {
         && ip.octets()[0] < 240
 }
 
-pub(crate) fn target_name(name: &str) -> Result<Vec<u16>, String> {
+/// The profile keeps a credential label for compatibility; the settings live in
+/// the local SQLite store, so only the label's shape is checked.
+pub(crate) fn valid_name(name: &str) -> Result<(), String> {
     if name.is_empty()
         || name.len() > 128
         || !name
@@ -108,10 +108,26 @@ pub(crate) fn target_name(name: &str) -> Result<Vec<u16>, String> {
     {
         return Err("credential name must contain 1–128 ASCII letters, digits, dots, underscores or hyphens".into());
     }
-    Ok(format!("wsl-proxyctl/{name}")
-        .encode_utf16()
-        .chain(Some(0))
-        .collect())
+    Ok(())
+}
+
+/// Reads the literal `.env` file once into settings for the SQLite store; the
+/// path is not retained and no Windows credential entry is created.
+pub(crate) fn settings_from_file(
+    path: &Path,
+) -> Result<crate::desktop_store::ResidentialSettings, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|_| "cannot open credential import file")?;
+    let mut bytes = Vec::with_capacity(MAX_ENV + 1);
+    file.take((MAX_ENV + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "cannot read credential import file")?;
+    if bytes.len() > MAX_ENV {
+        return Err("credential import file exceeds size limit".into());
+    }
+    let residential = parse_env(&bytes)?;
+    wipe(&mut bytes);
+    Ok(settings(&residential))
 }
 
 fn parse_env(bytes: &[u8]) -> Result<Residential, String> {
@@ -171,182 +187,6 @@ fn parse_env(bytes: &[u8]) -> Result<Residential, String> {
     Residential::decode(blob)
 }
 
-/// Imports once into the current Windows user's Credential Manager; the file path is not retained.
-/// Values are literal UTF-8, optionally enclosed in matching quotes (no expansion or escapes).
-pub fn import(name: &str, env_file: &Path) -> Result<(), String> {
-    let target = target_name(name)?;
-    #[cfg(windows)]
-    {
-        use std::io::Read;
-        let file =
-            std::fs::File::open(env_file).map_err(|_| "cannot open credential import file")?;
-        let mut source = Secret(Vec::with_capacity(MAX_ENV + 1));
-        file.take((MAX_ENV + 1) as u64)
-            .read_to_end(&mut source.0)
-            .map_err(|_| "cannot read credential import file")?;
-        if source.0.len() > MAX_ENV {
-            return Err("credential import file exceeds size limit".into());
-        }
-        let residential = parse_env(&source.0)?;
-        windows::store(target, residential)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (target, env_file);
-        Err("Windows Credential Manager is available only on Windows".into())
-    }
-}
-
-pub fn remove(name: &str) -> Result<(), String> {
-    let target = target_name(name)?;
-    #[cfg(windows)]
-    {
-        windows::remove(target)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = target;
-        Err("Windows Credential Manager is available only on Windows".into())
-    }
-}
-
-pub(crate) fn load(name: &str) -> Result<Residential, String> {
-    let target = target_name(name)?;
-    #[cfg(windows)]
-    {
-        windows::load(target)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = target;
-        Err("Windows Credential Manager is available only on Windows".into())
-    }
-}
-
-#[cfg_attr(test, allow(dead_code))]
-pub(crate) fn store_settings(
-    name: &str,
-    settings: &crate::desktop_store::ResidentialSettings,
-) -> Result<(), String> {
-    let target = target_name(name)?;
-    let text = format!(
-        "ip={}\nport={}\nusername={}\npassword={}\n",
-        settings.ip, settings.port, settings.username, settings.password
-    );
-    let residential = parse_env(text.as_bytes())?;
-    #[cfg(windows)]
-    {
-        windows::replace(target, residential)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (target, residential);
-        Err("Windows Credential Manager is available only on Windows".into())
-    }
-}
-
-#[cfg(windows)]
-mod windows {
-    use super::*;
-    use windows_sys::Win32::Security::Credentials::{
-        CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredDeleteW, CredFree,
-        CredReadW, CredWriteW,
-    };
-
-    pub(super) fn store(mut target: Vec<u16>, mut residential: Residential) -> Result<(), String> {
-        let credential = credential(&mut target, &mut residential);
-        use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, GetLastError};
-        let mut existing = std::ptr::null_mut();
-        if unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut existing) } != 0 {
-            if !existing.is_null() {
-                drop(ReadCredential(existing));
-            }
-            return Err(
-                "credential name already exists; remove it explicitly before import".into(),
-            );
-        }
-        if unsafe { GetLastError() } != ERROR_NOT_FOUND {
-            return Err("Windows Credential Manager could not check credential name".into());
-        }
-        write(credential)
-    }
-
-    #[cfg_attr(test, allow(dead_code))]
-    pub(super) fn replace(
-        mut target: Vec<u16>,
-        mut residential: Residential,
-    ) -> Result<(), String> {
-        write(credential(&mut target, &mut residential))
-    }
-
-    fn credential<'a>(target: &'a mut [u16], residential: &'a mut Residential) -> CREDENTIALW {
-        CREDENTIALW {
-            Type: CRED_TYPE_GENERIC,
-            TargetName: target.as_mut_ptr(),
-            CredentialBlobSize: residential.blob.0.len() as u32,
-            CredentialBlob: residential.blob.0.as_mut_ptr(),
-            Persist: CRED_PERSIST_LOCAL_MACHINE,
-            ..Default::default()
-        }
-    }
-
-    fn write(credential: CREDENTIALW) -> Result<(), String> {
-        if unsafe { CredWriteW(&credential, 0) } == 0 {
-            return Err("Windows Credential Manager could not store credential".into());
-        }
-        Ok(())
-    }
-
-    pub(super) fn remove(target: Vec<u16>) -> Result<(), String> {
-        if unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) } == 0 {
-            return Err("Windows Credential Manager could not remove credential".into());
-        }
-        Ok(())
-    }
-
-    struct ReadCredential(*mut CREDENTIALW);
-
-    impl Drop for ReadCredential {
-        fn drop(&mut self) {
-            unsafe {
-                let credential = &mut *self.0;
-                if !credential.CredentialBlob.is_null() {
-                    wipe(std::slice::from_raw_parts_mut(
-                        credential.CredentialBlob,
-                        credential.CredentialBlobSize as usize,
-                    ));
-                }
-                CredFree(self.0.cast());
-            }
-        }
-    }
-
-    pub(super) fn load(target: Vec<u16>) -> Result<Residential, String> {
-        let mut pointer = std::ptr::null_mut();
-        if unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut pointer) } == 0 {
-            return Err("Windows Credential Manager could not load credential".into());
-        }
-        if pointer.is_null() {
-            return Err("Windows Credential Manager returned an invalid credential".into());
-        }
-        let owned = ReadCredential(pointer);
-        let credential = unsafe { &*owned.0 };
-        if credential.Type != CRED_TYPE_GENERIC
-            || credential.CredentialBlob.is_null()
-            || !(13..=523).contains(&credential.CredentialBlobSize)
-        {
-            return Err("Windows Credential Manager returned an invalid credential".into());
-        }
-        let blob = unsafe {
-            std::slice::from_raw_parts(
-                credential.CredentialBlob,
-                credential.CredentialBlobSize as usize,
-            )
-        };
-        Residential::decode(Secret(blob.to_vec()))
-    }
-}
-
 #[cfg(test)]
 pub(crate) fn fixture(endpoint: SocketAddrV4) -> Residential {
     parse_env(
@@ -384,6 +224,6 @@ mod tests {
         ] {
             assert!(parse_env(source.as_bytes()).is_err());
         }
-        assert!(target_name("../fixture").is_err());
+        assert!(valid_name("../fixture").is_err());
     }
 }

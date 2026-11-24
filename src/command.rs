@@ -1,5 +1,6 @@
 use crate::{
-    controller, credential, host, kernel_env, managed, managed_dns, plan, ports, probe, transition,
+    controller, credential, desktop_store, host, kernel_env, managed, managed_dns, plan, ports,
+    probe, transition,
 };
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
@@ -61,14 +62,14 @@ pub(crate) enum Command {
         #[arg(long)]
         profile: Option<PathBuf>,
     },
-    /// Store a residential proxy credential in the current user's Windows vault.
+    /// Import a literal .env into the local SQLite store's residential block.
     ImportCredential {
         #[arg(long)]
         name: String,
         #[arg(long)]
         env_file: PathBuf,
     },
-    /// Remove only the named wsl-proxyctl credential from the current user's vault.
+    /// Clear the residential block in the local SQLite store.
     ForgetCredential {
         #[arg(long)]
         name: String,
@@ -302,10 +303,21 @@ pub(crate) fn dispatch_result(
             })
         }
         Command::ImportCredential { name, env_file } => {
-            credential::import(&name, &env_file).map_err(error)?;
-            serde_json::json!({"credential_imported":true})
+            credential::valid_name(&name).map_err(error)?;
+            let settings = credential::settings_from_file(&env_file).map_err(error)?;
+            let record = desktop_store::update_residential(
+                &desktop_store::path().map_err(error)?,
+                Some(name),
+                settings,
+            )
+            .map_err(error)?;
+            serde_json::json!({
+                "credential_imported":true,
+                "revision":record.revision.to_string()
+            })
         }
         Command::ForgetCredential { name } => {
+            credential::valid_name(&name).map_err(error)?;
             if controller::journal::load().map_err(error)?.is_some()
                 || transition::load().map_err(error)?.pending.is_some()
             {
@@ -314,8 +326,16 @@ pub(crate) fn dispatch_result(
                     "Stop before changing stored credentials",
                 ));
             }
-            credential::remove(&name).map_err(error)?;
-            serde_json::json!({"credential_removed":true})
+            let record = desktop_store::update_residential(
+                &desktop_store::path().map_err(error)?,
+                None,
+                desktop_store::ResidentialSettings::default(),
+            )
+            .map_err(error)?;
+            serde_json::json!({
+                "credential_removed":true,
+                "revision":record.revision.to_string()
+            })
         }
         Command::ResetDnsAliases { confirm } => {
             if !confirm {
