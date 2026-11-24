@@ -238,6 +238,27 @@ fn a_reused_guest_port_is_refused_visibly_while_its_previous_connection_drains()
     assert!(lock(&shared.active).is_empty());
 }
 
+#[test]
+fn a_reused_guest_port_is_free_once_the_previous_relay_unregisters() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (ingress, _) = listener.accept().unwrap();
+    let SocketAddr::V4(peer) = client.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let shared = Arc::new(Shared::new());
+    assert!(!shared.peer_registered(peer));
+    let first = shared.register(peer, &ingress).unwrap().unwrap();
+    // The accept loop holds a new connection from this port while this is true.
+    assert!(shared.peer_registered(peer));
+    assert_eq!(lock(&shared.counters).tcp_failures, 0);
+    drop(first);
+    assert!(!shared.peer_registered(peer));
+    let second = shared.register(peer, &ingress).unwrap();
+    assert!(second.is_some());
+    assert_eq!(lock(&shared.counters).tcp_failures, 0);
+}
+
 fn udp_table_peer(index: usize) -> SocketAddrV4 {
     SocketAddrV4::new(Ipv4Addr::LOCALHOST, 20_000 + index as u16)
 }

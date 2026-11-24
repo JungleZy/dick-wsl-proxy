@@ -48,6 +48,10 @@ mod ipv6;
 const LISTEN_BACKLOG: i32 = 128;
 const MAX_UDP: usize = 128;
 const ACCEPT_BATCH: usize = 16;
+/// Guest connections held at once while their source port is still released.
+const MAX_WAITING_TCP: usize = 64;
+/// How long a reused guest source port may wait for the previous relay to finish.
+const PEER_REUSE_WAIT: Duration = Duration::from_millis(200);
 const UDP_BATCH: usize = 16;
 const MAX_DNS_UDP: usize = 256;
 const BUFFER_SIZE: usize = 16 * 1024;
@@ -495,6 +499,17 @@ impl Shared {
         self.record_error("tcp", error);
     }
 
+    fn peer_registered(&self, peer: SocketAddrV4) -> bool {
+        lock(&self.active).contains_key(&peer)
+    }
+
+    fn reject_peer_busy(&self) {
+        self.reject_tcp(
+            "peer_busy",
+            "tcp_peer_still_registered: the previous connection from this guest port is still closing; new connection closed".into(),
+        );
+    }
+
     fn register(
         self: &Arc<Self>,
         peer: SocketAddrV4,
@@ -508,10 +523,7 @@ impl Shared {
             // The guest reused a source port while the previous connection's
             // relay is still draining. Refuse visibly instead of silently.
             drop(active);
-            self.reject_tcp(
-                "peer_busy",
-                "tcp_peer_still_registered: the previous connection from this guest port is still closing; new connection closed".into(),
-            );
+            self.reject_peer_busy();
             return Ok(None);
         }
         if active.len() >= self.limits.max_tcp {
@@ -908,6 +920,71 @@ fn select_route(
     result
 }
 
+/// A guest connection whose source port is still registered to a closing relay.
+struct WaitingTcp {
+    client: TcpStream,
+    peer: SocketAddrV4,
+    since: Instant,
+}
+
+/// Registers an accepted guest connection and starts its forwarding worker.
+fn admit_tcp(
+    client: TcpStream,
+    peer: SocketAddrV4,
+    plan: &Arc<Plan>,
+    shared: &Arc<Shared>,
+    runtime: Option<&Arc<crate::managed::Runtime>>,
+    workers: &mut TcpWorkers,
+) {
+    if workers.handles.len() >= shared.limits.max_tcp {
+        shared.reject_tcp_at_capacity();
+        return;
+    }
+    let registration = match shared.register(peer, &client) {
+        Ok(Some(registration)) => registration,
+        Ok(None) => return,
+        // A handle that cannot be duplicated fails this connection only.
+        Err(error) => {
+            shared.reject_tcp("resource_limit", error);
+            return;
+        }
+    };
+    let plan = Arc::clone(plan);
+    let worker_shared = Arc::clone(shared);
+    let runtime = runtime.cloned();
+    let spawn_failure = registration.flow.failure_marker();
+    let spawned = thread::Builder::new().name("m1-tcp".into()).spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            forward_tcp(&plan, client, &registration, runtime.as_deref())
+        }));
+        if worker_shared.is_stopping() {
+            registration.flow.stopped();
+        }
+        match result {
+            Ok(Err(error)) => {
+                if !worker_shared.is_stopping() {
+                    registration.flow.failed();
+                    worker_shared.record_error("tcp", error);
+                }
+            }
+            Err(_) => {
+                registration.flow.failed();
+                worker_shared.fail("TCP forwarding worker panicked".into());
+            }
+            _ => {}
+        }
+    });
+    match spawned {
+        Ok(worker) => workers.handles.push(worker),
+        // The closure, with the registration and the guest connection,
+        // is dropped: this connection closes, the others keep running.
+        Err(error) => {
+            spawn_failure.refused("resource_limit");
+            shared.record_error("tcp", format!("start TCP forwarding worker: {error}"));
+        }
+    }
+}
+
 fn run(
     plan: Arc<Plan>,
     listener: TcpListener,
@@ -929,10 +1006,35 @@ fn run(
     let mut keys = Vec::with_capacity(UDP_BATCH);
     // Dropped on every exit, including `?`: joins running setups.
     let mut chain_setups: ChainSetups<SocketAddrV4, UdpChain> = ChainSetups::new();
+    // Dropped on exit: the held guest connections close.
+    let mut waiting: Vec<WaitingTcp> = Vec::with_capacity(MAX_WAITING_TCP);
     while !shared.is_stopping() {
         let mut made_progress = false;
         workers.reap()?;
         dns_workers.reap()?;
+        let now = Instant::now();
+        let mut index = 0;
+        while index < waiting.len() {
+            let peer = waiting[index].peer;
+            if !shared.peer_registered(peer) {
+                let entry = waiting.swap_remove(index);
+                made_progress = true;
+                admit_tcp(
+                    entry.client,
+                    peer,
+                    &plan,
+                    &shared,
+                    runtime.as_ref(),
+                    &mut workers,
+                );
+            } else if now.duration_since(waiting[index].since) >= PEER_REUSE_WAIT {
+                waiting.swap_remove(index);
+                made_progress = true;
+                shared.reject_peer_busy();
+            } else {
+                index += 1;
+            }
+        }
         for _ in 0..ACCEPT_BATCH {
             if shared.is_stopping() {
                 break;
@@ -956,53 +1058,22 @@ fn run(
                 Ok(SocketAddr::V4(peer)) if peer.ip() == &plan.guest => peer,
                 _ => continue,
             };
-            if workers.handles.len() >= shared.limits.max_tcp {
-                shared.reject_tcp_at_capacity();
+            // A guest that reuses a source port as soon as its previous
+            // connection closed can reach us before that relay has noticed the
+            // close. Hold the new connection briefly instead of refusing it.
+            if shared.peer_registered(peer) {
+                if waiting.len() < MAX_WAITING_TCP {
+                    waiting.push(WaitingTcp {
+                        client,
+                        peer,
+                        since: Instant::now(),
+                    });
+                } else {
+                    shared.reject_peer_busy();
+                }
                 continue;
             }
-            let registration = match shared.register(peer, &client) {
-                Ok(Some(registration)) => registration,
-                Ok(None) => continue,
-                // A handle that cannot be duplicated fails this connection only.
-                Err(error) => {
-                    shared.reject_tcp("resource_limit", error);
-                    continue;
-                }
-            };
-            let plan = Arc::clone(&plan);
-            let worker_shared = Arc::clone(&shared);
-            let runtime = runtime.clone();
-            let spawn_failure = registration.flow.failure_marker();
-            let spawned = thread::Builder::new().name("m1-tcp".into()).spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    forward_tcp(&plan, client, &registration, runtime.as_deref())
-                }));
-                if worker_shared.is_stopping() {
-                    registration.flow.stopped();
-                }
-                match result {
-                    Ok(Err(error)) => {
-                        if !worker_shared.is_stopping() {
-                            registration.flow.failed();
-                            worker_shared.record_error("tcp", error);
-                        }
-                    }
-                    Err(_) => {
-                        registration.flow.failed();
-                        worker_shared.fail("TCP forwarding worker panicked".into());
-                    }
-                    _ => {}
-                }
-            });
-            match spawned {
-                Ok(worker) => workers.handles.push(worker),
-                // The closure, with the registration and the guest connection,
-                // is dropped: this connection closes, the others keep running.
-                Err(error) => {
-                    spawn_failure.refused("resource_limit");
-                    shared.record_error("tcp", format!("start TCP forwarding worker: {error}"));
-                }
-            }
+            admit_tcp(client, peer, &plan, &shared, runtime.as_ref(), &mut workers);
         }
         keys.clear();
         // A finished setup installs its flow; its held datagram joins this batch
