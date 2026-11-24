@@ -58,7 +58,14 @@ pub(super) fn forward_tcp(
         return Err("TCP mapping changed while connecting to origin".into());
     }
     flow.stage("relay");
-    relay(client, upstream, shared, flow).map_err(|e| format!("relay: {e}"))
+    match relay(client, upstream, shared, flow) {
+        Ok(Ended::ClientReset) => {
+            shared.record_client_reset();
+            Ok(())
+        }
+        Ok(Ended::Closed) => Ok(()),
+        Err(error) => Err(format!("relay: {error}")),
+    }
 }
 
 pub(super) fn transient(error: &io::Error) -> bool {
@@ -119,7 +126,7 @@ impl Pipe {
         target: &mut TcpStream,
         flow: &Flow,
         upload: bool,
-    ) -> io::Result<bool> {
+    ) -> Result<bool, (Side, io::Error)> {
         let mut progressed = false;
         if self.start == self.end && !self.eof {
             match source.read(&mut self.buffer) {
@@ -134,12 +141,12 @@ impl Pipe {
                         error.kind(),
                         io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                     ) => {}
-                Err(error) => return Err(error),
+                Err(error) => return Err((Side::Source, error)),
             }
         }
         if self.start < self.end {
             match target.write(&self.buffer[self.start..self.end]) {
-                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(0) => return Err((Side::Target, io::ErrorKind::WriteZero.into())),
                 Ok(size) => {
                     self.start += size;
                     if upload {
@@ -154,15 +161,46 @@ impl Pipe {
                         error.kind(),
                         io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                     ) => {}
-                Err(error) => return Err(error),
+                Err(error) => return Err((Side::Target, error)),
             }
         }
         if self.eof && self.start == self.end && !self.shutdown {
-            target.shutdown(Shutdown::Write)?;
+            target
+                .shutdown(Shutdown::Write)
+                .map_err(|error| (Side::Target, error))?;
             self.shutdown = true;
             progressed = true;
         }
         Ok(progressed)
+    }
+}
+
+/// Which socket of a pipe an error came from.
+#[derive(Clone, Copy)]
+enum Side {
+    Source,
+    Target,
+}
+
+/// How a relay ended without a failure.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Ended {
+    Closed,
+    /// The guest application reset or aborted its own connection, as clients
+    /// do when they close with unread data or give up on a response. That is
+    /// its choice, not a forwarding failure. A reset from the upstream side is
+    /// still an error.
+    ClientReset,
+}
+
+fn client_ended(error: io::Error) -> io::Result<Ended> {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+    ) {
+        Ok(Ended::ClientReset)
+    } else {
+        Err(error)
     }
 }
 
@@ -171,7 +209,7 @@ pub(super) fn relay(
     mut upstream: TcpStream,
     shared: &Shared,
     flow: &Flow,
-) -> io::Result<()> {
+) -> io::Result<Ended> {
     client.set_nodelay(true)?;
     upstream.set_nodelay(true)?;
     client.set_nonblocking(true)?;
@@ -181,13 +219,22 @@ pub(super) fn relay(
     let mut touched = Instant::now();
     let mut half_closed = None;
     while !shared.is_stopping() {
-        let mut progressed = request.pump(&mut client, &mut upstream, flow, true)?;
+        // The request pipe reads from the client; the response pipe writes to it.
+        let mut progressed = match request.pump(&mut client, &mut upstream, flow, true) {
+            Ok(progressed) => progressed,
+            Err((Side::Source, error)) => return client_ended(error),
+            Err((Side::Target, error)) => return Err(error),
+        };
         if shared.is_stopping() {
             break;
         }
-        progressed |= response.pump(&mut upstream, &mut client, flow, false)?;
+        progressed |= match response.pump(&mut upstream, &mut client, flow, false) {
+            Ok(progressed) => progressed,
+            Err((Side::Target, error)) => return client_ended(error),
+            Err((Side::Source, error)) => return Err(error),
+        };
         if request.shutdown && response.shutdown {
-            return Ok(());
+            return Ok(Ended::Closed);
         }
         let now = Instant::now();
         if progressed {
@@ -234,7 +281,7 @@ pub(super) fn relay(
     }
     let _ = client.shutdown(Shutdown::Both);
     let _ = upstream.shutdown(Shutdown::Both);
-    Ok(())
+    Ok(Ended::Closed)
 }
 
 /// Waits until one side can be read or written as `request` and `response`

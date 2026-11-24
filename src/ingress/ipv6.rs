@@ -278,7 +278,14 @@ fn forward_tcp(
             .map_err(|e| format!("IPv6 two-hop chain failed: {e}"))?
     };
     flow.stage("relay");
-    super::tcp::relay(client, upstream, &shared, &flow).map_err(|e| format!("IPv6 relay: {e}"))
+    match super::tcp::relay(client, upstream, &shared, &flow) {
+        Ok(super::tcp::Ended::ClientReset) => {
+            shared.record_client_reset();
+            Ok(())
+        }
+        Ok(super::tcp::Ended::Closed) => Ok(()),
+        Err(error) => Err(format!("IPv6 relay: {error}")),
+    }
 }
 
 fn receive_udp(

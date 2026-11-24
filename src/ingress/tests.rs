@@ -773,3 +773,44 @@ fn a_quiet_connection_closes_at_the_configured_idle_deadline() {
         "{elapsed:?}"
     );
 }
+
+#[test]
+fn a_guest_reset_ends_the_relay_without_a_failure() {
+    let (client, ingress) = tcp_pair();
+    let (upstream, mut origin) = tcp_pair();
+    let shared = Arc::new(Shared::new());
+    let flow = shared.flows.begin("tcp");
+    let relay_shared = Arc::clone(&shared);
+    let worker = thread::spawn(move || relay(ingress, upstream, &relay_shared, &flow));
+    // The origin sends a response the guest never reads; the guest then
+    // closes, which resets the connection because data is left unread.
+    origin.write_all(&[7; 64 * 1024]).unwrap();
+    thread::sleep(Duration::from_millis(200));
+    drop(client);
+    let ended = worker.join().unwrap().unwrap();
+    assert_eq!(ended, super::tcp::Ended::ClientReset);
+}
+
+#[test]
+fn an_upstream_reset_is_still_a_relay_error() {
+    let (mut client, ingress) = tcp_pair();
+    let (upstream, origin) = tcp_pair();
+    let shared = Arc::new(Shared::new());
+    let flow = shared.flows.begin("tcp");
+    let relay_shared = Arc::clone(&shared);
+    let worker = thread::spawn(move || relay(ingress, upstream, &relay_shared, &flow));
+    // The guest sends a request the origin never reads; the origin then
+    // closes with it unread, resetting the upstream side.
+    client.write_all(&[7; 64 * 1024]).unwrap();
+    thread::sleep(Duration::from_millis(200));
+    drop(origin);
+    let error = worker.join().unwrap().unwrap_err();
+    assert!(
+        matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+        ),
+        "{error:?}"
+    );
+    drop(client);
+}

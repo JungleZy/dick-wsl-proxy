@@ -336,6 +336,8 @@ struct HealthCounters {
     metadata_udp_failures: u64,
     metadata_transport_failures: u64,
     tcp_failures: u64,
+    /// Relayed TCP connections the guest application itself reset or aborted.
+    tcp_client_resets: u64,
     udp_failures: u64,
     direct_tcp: u64,
     direct_udp: u64,
@@ -489,6 +491,11 @@ impl Shared {
                 self.limits.max_tcp
             ),
         );
+    }
+
+    fn record_client_reset(&self) {
+        let mut counters = lock(&self.counters);
+        counters.tcp_client_resets = counters.tcp_client_resets.saturating_add(1);
     }
 
     fn reject_tcp(&self, reason: &'static str, error: String) {

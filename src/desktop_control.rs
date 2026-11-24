@@ -508,6 +508,7 @@ fn sanitized(s: &Value) -> Value {
         "metadata_successes",
         "metadata_transport_failures",
         "tcp_failures",
+        "tcp_client_resets",
         "udp_failures",
     ] {
         if let Some(n) = s["forwarding"]["counters"][k].as_u64() {

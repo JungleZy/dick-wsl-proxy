@@ -12,4 +12,14 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as raw:
         tls.sendall(('HEAD / HTTP/1.1\r\nHost: ' + name + '\r\nConnection: close\r\n\r\n').encode('ascii'))
         response = HTTPResponse(tls)
         response.begin()
-        print(peer[0], response.status)
+        print(peer[0], response.status, flush=True)
+        # Read the server's close before closing: a socket closed with unread
+        # data is reset, which the forwarding path counts as an aborted
+        # connection.
+        try:
+            tls.settimeout(2)
+            response.read()
+            while tls.recv(4096):
+                pass
+        except (ssl.SSLError, OSError):
+            pass
