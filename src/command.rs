@@ -39,6 +39,20 @@ pub(crate) enum Command {
         #[arg(long)]
         confirm: bool,
     },
+    /// Lab diagnostic: time CONNECT by address and by name through the
+    /// configured first hop and residential proxy, on tunnels authenticated
+    /// beforehand. Sends nothing through the tunnels; needs no takeover.
+    #[command(hide = true)]
+    ChainProbe {
+        #[arg(long = "name", required = true)]
+        names: Vec<String>,
+        #[arg(long, default_value = "443")]
+        #[serde(default = "default_probe_port")]
+        port: u16,
+        #[arg(long, default_value = "5")]
+        #[serde(default = "default_probe_rounds")]
+        rounds: u32,
+    },
     /// Enable the single-target policy including protected system DNS.
     Start {
         target: String,
@@ -362,6 +376,11 @@ pub(crate) fn dispatch_result(
                 Failure::new(code, error)
             })?
         }
+        Command::ChainProbe {
+            names,
+            port,
+            rounds,
+        } => chain_probe(&names, port, rounds.clamp(1, 20)).map_err(error)?,
         Command::ImportCredential { name, env_file } => {
             credential::valid_name(&name).map_err(error)?;
             let settings = credential::settings_from_file(&env_file).map_err(error)?;
@@ -591,4 +610,72 @@ pub(crate) fn dispatch(
     let (rc, response) = dispatch_result(request, controller)?;
     emit(&response)?;
     Ok(rc)
+}
+
+fn default_probe_port() -> u16 {
+    443
+}
+
+fn default_probe_rounds() -> u32 {
+    5
+}
+
+/// Times CONNECT by address and by name, alternating which goes first, for
+/// each non-allowlisted name. Credentials stay inside the policy.
+fn chain_probe(names: &[String], port: u16, rounds: u32) -> Result<serde_json::Value, String> {
+    use crate::policy::ProbeTarget;
+    use std::net::{SocketAddr, SocketAddrV4};
+    let runtime = managed::Runtime::from_file(&desktop_store::path()?)?;
+    let mut results = Vec::new();
+    for name in names {
+        if runtime.policy.allows_domain(name) {
+            results.push(serde_json::json!({"name": name, "skipped": "allowlisted"}));
+            continue;
+        }
+        let address = match runtime.dns.resolve_ipv4(name) {
+            Ok(addresses) if !addresses.is_empty() => addresses[0],
+            Ok(_) => {
+                results.push(serde_json::json!({"name": name, "error": "no A record"}));
+                continue;
+            }
+            Err(error) => {
+                results.push(serde_json::json!({"name": name, "error": error}));
+                continue;
+            }
+        };
+        let by_address = ProbeTarget::Address(SocketAddr::V4(SocketAddrV4::new(address, port)));
+        let by_name = ProbeTarget::Name(name.clone(), port);
+        let (mut address_ms, mut name_ms, mut errors) = (Vec::new(), Vec::new(), Vec::new());
+        for round in 0..rounds {
+            let order = if round % 2 == 0 {
+                [(&by_address, true), (&by_name, false)]
+            } else {
+                [(&by_name, false), (&by_address, true)]
+            };
+            for (target, is_address) in order {
+                match runtime.policy.probe_connect(target) {
+                    Ok(elapsed) => {
+                        let ms = elapsed.as_secs_f64() * 1000.0;
+                        if is_address {
+                            address_ms.push(ms);
+                        } else {
+                            name_ms.push(ms);
+                        }
+                    }
+                    Err(error) => errors.push(serde_json::json!({
+                        "by": if is_address { "address" } else { "name" },
+                        "error": error,
+                    })),
+                }
+            }
+        }
+        results.push(serde_json::json!({
+            "name": name,
+            "address": address.to_string(),
+            "by_address_ms": address_ms,
+            "by_name_ms": name_ms,
+            "errors": errors,
+        }));
+    }
+    Ok(serde_json::json!({ "chain_probe": results }))
 }

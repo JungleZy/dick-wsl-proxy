@@ -89,6 +89,24 @@ impl ManagedDns {
     pub fn report(&self) -> serde_json::Value {
         self.resolver.report()
     }
+
+    /// Diagnostic only: the A records the managed path returns for `name`,
+    /// session aliases left out.
+    pub(crate) fn resolve_ipv4(&self, name: &str) -> Result<Vec<Ipv4Addr>, String> {
+        let mut query = vec![0x51, 0x70, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        wire::put_name(&mut query, name);
+        query.extend_from_slice(&[0, 1, 0, 1]);
+        Message::query(&query)?;
+        let response = self.answer_tcp(&query)?;
+        let parsed = Message::parse(&response)?;
+        Ok(parsed
+            .answers
+            .iter()
+            .filter(|record| record.kind == 1)
+            .filter_map(|record| wire::a_address(&response, record).ok())
+            .filter(|address| !reserved(*address))
+            .collect())
+    }
 }
 
 /// The state behind `ManagedDns`, shared with background refreshes.

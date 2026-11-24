@@ -517,6 +517,52 @@ impl Dialer {
     }
 }
 
+/// Where a diagnostic CONNECT goes: a literal address, or a name the
+/// residential proxy resolves itself (SOCKS5 address type 3).
+pub(crate) enum ProbeTarget {
+    Address(SocketAddr),
+    Name(String, u16),
+}
+
+impl Dialer {
+    /// Diagnostic only: builds an authenticated tunnel without timing it,
+    /// then times one CONNECT to `target` from request to reply. The tunnel
+    /// is closed without sending anything through it.
+    pub(super) fn probe_connect(&self, target: &ProbeTarget) -> Result<Duration, String> {
+        let deadline = Instant::now() + SETUP_TIMEOUT;
+        let mut stream = self.open_residential(deadline)?;
+        authenticate(&mut stream, &self.residential, deadline).map_err(Setup::into_message)?;
+        let request = match target {
+            ProbeTarget::Address(address) => connect_request(*address),
+            ProbeTarget::Name(name, port) => {
+                let bytes = name.as_bytes();
+                if bytes.is_empty() || bytes.len() > 255 || !name.is_ascii() {
+                    return Err("probe name must be 1-255 ASCII bytes".into());
+                }
+                let mut request = vec![5, 1, 0, 3, bytes.len() as u8];
+                request.extend_from_slice(bytes);
+                request.extend_from_slice(&port.to_be_bytes());
+                request
+            }
+        };
+        let started = Instant::now();
+        send(&mut stream, &request, deadline)?;
+        let mut header = [0; 4];
+        receive(&mut stream, &mut header, deadline)?;
+        if header[0] != 5 {
+            return Err("probe CONNECT reply is not SOCKS5".into());
+        }
+        if header[1] != 0 {
+            return Err(format!(
+                "probe CONNECT refused with reply code {}",
+                header[1]
+            ));
+        }
+        let elapsed = started.elapsed();
+        Ok(elapsed)
+    }
+}
+
 /// Credentials go out only after the proxy has selected username/password
 /// authentication.
 fn select_authentication(stream: &mut TcpStream, deadline: Instant) -> Result<(), Setup> {

@@ -18,6 +18,7 @@ pub(crate) mod domestic;
 pub(crate) mod profile;
 mod residential_probe;
 use dialer::Dialer;
+pub(crate) use dialer::ProbeTarget;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_CONFIG: u64 = 1024 * 1024;
 
@@ -477,6 +478,19 @@ impl Policy {
             return Err("chain destination is reserved or unsupported".into());
         }
         self.dialer.chain(SocketAddr::V4(dest))
+    }
+
+    /// Diagnostic only: one CONNECT on an already authenticated residential
+    /// tunnel, timed from request to reply (see `chain-probe`).
+    pub(crate) fn probe_connect(&self, target: &dialer::ProbeTarget) -> Result<Duration, String> {
+        if let dialer::ProbeTarget::Address(SocketAddr::V4(dest)) = target
+            && (*dest == self.first_hop
+                || *dest == self.residential.endpoint()
+                || !valid_endpoint(*dest, false))
+        {
+            return Err("probe destination is reserved or unsupported".into());
+        }
+        self.dialer.probe_connect(target)
     }
 
     /// Establishes the same authenticated chain for an IPv6 literal. The IPv6
