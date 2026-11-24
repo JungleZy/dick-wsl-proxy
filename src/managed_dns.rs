@@ -21,7 +21,9 @@ const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// An idle DoH connection is reused only this long; upstreams and proxy hops
 /// close quiet keep-alives on their own schedule.
 const UPSTREAM_IDLE: Duration = Duration::from_secs(30);
-const MAX_IDLE_UPSTREAMS: usize = 4;
+/// As many as one route runs exchanges at once, so a burst's connections
+/// stay ready for the next one.
+const MAX_IDLE_UPSTREAMS: usize = flights::MAX_ACTIVE;
 /// Queries per connection before a fresh chain is built.
 const MAX_UPSTREAM_USES: u32 = 100;
 const ALIAS_START: u32 = u32::from_be_bytes([198, 18, 0, 1]);
@@ -37,6 +39,8 @@ mod ledger;
 use ledger::AliasLedger;
 mod cache;
 use cache::{Cache, Key};
+mod flights;
+use flights::{Flights, Slots};
 
 pub fn reset_aliases() -> Result<(), String> {
     AliasLedger::reset()
@@ -57,6 +61,11 @@ pub struct ManagedDns {
     direct_upstreams: IdlePool<Upstream>,
     /// Validated upstream answers, reused until their TTL runs out.
     answers: Cache,
+    /// Identical queries in flight share one exchange.
+    flights: Flights,
+    /// Exchanges at once on the chain and on the direct upstream.
+    chain_slots: Slots,
+    direct_slots: Slots,
 }
 
 /// Where a query is sent. Whitelisted names go to the direct DoH upstream so
@@ -144,6 +153,9 @@ impl ManagedDns {
             upstreams: IdlePool::new(),
             direct_upstreams: IdlePool::new(),
             answers: Cache::default(),
+            flights: Flights::default(),
+            chain_slots: Slots::default(),
+            direct_slots: Slots::default(),
         })
     }
 
@@ -210,20 +222,11 @@ impl ManagedDns {
         let fresh = cached.is_none();
         let response_wire = match cached {
             Some(response_wire) => response_wire,
-            None => match self
-                .policy
-                .direct_dns()
-                .filter(|_| self.policy.allows_domain(&query.question.name))
-            {
-                // A direct upstream that fails or answers something unusable
-                // falls back to the chain, never to a local resolver.
-                Some((upstream, name)) => self
-                    .exchange_via(Route::Direct(upstream, name), wire)
-                    .ok()
-                    .filter(|answer| Message::response(answer, &query).is_ok())
-                    .map_or_else(|| self.exchange_via(Route::Chain, wire), Ok)?,
-                None => self.exchange_via(Route::Chain, wire)?,
-            },
+            // The probe must make its own trip through the chain.
+            None if probing => self.ask_upstream(&query, wire)?,
+            None => self
+                .flights
+                .run(&key, wire, || self.ask_upstream(&query, wire))?,
         };
         let response = Message::response(&response_wire, &query)?;
         let answer = finish_answer(
@@ -257,6 +260,23 @@ impl ManagedDns {
             .lookup(ip, Instant::now())
     }
 
+    fn ask_upstream(&self, query: &Message, wire: &[u8]) -> Result<Vec<u8>, String> {
+        match self
+            .policy
+            .direct_dns()
+            .filter(|_| self.policy.allows_domain(&query.question.name))
+        {
+            // A direct upstream that fails or answers something unusable
+            // falls back to the chain, never to a local resolver.
+            Some((upstream, name)) => self
+                .exchange_via(Route::Direct(upstream, name), wire)
+                .ok()
+                .filter(|answer| Message::response(answer, query).is_ok())
+                .map_or_else(|| self.exchange_via(Route::Chain, wire), Ok),
+            None => self.exchange_via(Route::Chain, wire),
+        }
+    }
+
     fn pool(&self, route: Route) -> &IdlePool<Upstream> {
         match route {
             Route::Chain => &self.upstreams,
@@ -272,6 +292,12 @@ impl ManagedDns {
     }
 
     fn exchange_via(&self, route: Route, wire: &[u8]) -> Result<Vec<u8>, String> {
+        // A bounded number of exchanges per route: a later query takes the
+        // connection an earlier one hands back instead of opening its own.
+        let _slot = match route {
+            Route::Chain => self.chain_slots.acquire(),
+            Route::Direct(..) => self.direct_slots.acquire(),
+        };
         if let Some(upstream) = self.pool(route).take(Instant::now())
             && let Ok(answer) = self.exchange_on(route, upstream, wire, REUSED_IO_DEADLINE)
         {

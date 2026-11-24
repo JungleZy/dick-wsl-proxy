@@ -58,14 +58,7 @@ impl Cache {
         if elapsed >= entry.seconds {
             return None;
         }
-        let mut wire = entry.wire.clone();
-        // Same question, so the same uncompressed length right after the header.
-        let question_end = 12 + question_length(query)?;
-        if wire.len() < question_end || query.len() < question_end {
-            return None;
-        }
-        wire[..2].copy_from_slice(&query[..2]);
-        wire[12..question_end].copy_from_slice(&query[12..question_end]);
+        let mut wire = with_query_identity(&entry.wire, query)?;
         for &at in &entry.ttl_offsets {
             let ttl =
                 (u32::from(word(&wire, at).ok()?) << 16) | u32::from(word(&wire, at + 2).ok()?);
@@ -125,6 +118,20 @@ impl Cache {
     pub(super) fn len(&self) -> usize {
         self.entries.lock().unwrap().len()
     }
+}
+
+/// `response` re-addressed to `query`: its ID and question bytes, letter
+/// case included. `None` unless both carry the same-length question.
+pub(super) fn with_query_identity(response: &[u8], query: &[u8]) -> Option<Vec<u8>> {
+    // Same question, so the same uncompressed length right after the header.
+    let question_end = 12 + question_length(query)?;
+    if response.len() < question_end || query.len() < question_end {
+        return None;
+    }
+    let mut wire = response.to_vec();
+    wire[..2].copy_from_slice(&query[..2]);
+    wire[12..question_end].copy_from_slice(&query[12..question_end]);
+    Some(wire)
 }
 
 /// Bytes of the question name plus type and class in an uncompressed query.
