@@ -249,7 +249,7 @@ fn wait_quiet(
 ) {
     use std::os::windows::io::AsRawSocket;
     use windows_sys::Win32::Networking::WinSock::{
-        POLLRDNORM, POLLWRNORM, SOCKET_ERROR, WSAPOLLFD, WSAPoll,
+        POLLHUP, POLLRDNORM, POLLWRNORM, SOCKET_ERROR, WSAPOLLFD, WSAPoll,
     };
     let interest = |read: bool, write: bool| {
         (if read { POLLRDNORM } else { 0 }) | (if write { POLLWRNORM } else { 0 })
@@ -277,9 +277,18 @@ fn wait_quiet(
         return;
     }
     let millis = timeout.as_millis().clamp(1, i32::MAX as u128) as i32;
-    // Both sockets belong to this thread for the whole call. Readiness, an
-    // error or a hang-up all end the wait; the next pump finds out which.
-    if unsafe { WSAPoll(descriptors.as_mut_ptr(), count as u32, millis) } == SOCKET_ERROR {
+    // SAFETY: `descriptors` is a live local array and `count` never exceeds its
+    // length; both sockets belong to this thread for the whole call.
+    let ready = unsafe { WSAPoll(descriptors.as_mut_ptr(), count as u32, millis) };
+    // Readiness, an error or a hang-up all end the wait; the next pump finds out
+    // which. WSAPoll reports POLLHUP whatever was asked for, so after a peer's
+    // half-close it returns at once on every call: a wait that saw nothing but
+    // hang-ups sleeps instead of spinning while the other direction drains.
+    let only_hangup = ready > 0
+        && descriptors[..count]
+            .iter()
+            .all(|descriptor| descriptor.revents & !POLLHUP == 0);
+    if ready == SOCKET_ERROR || only_hangup {
         thread::sleep(POLL_INTERVAL);
     }
 }
