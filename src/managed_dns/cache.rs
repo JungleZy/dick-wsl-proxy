@@ -1,4 +1,5 @@
-//! Validated upstream answers, reused until their TTL runs out. A hit stands in
+//! Validated upstream answers, reused until their TTL runs out, and for a while
+//! after that as stale answers while a refresh runs (RFC 8767). A hit stands in
 //! for the upstream exchange only: the caller still matches, validates and
 //! rewrites it like a fresh response, so whitelist aliases are granted the same
 //! way. Nothing is cached across controller sessions.
@@ -10,6 +11,16 @@ use std::time::{Duration, Instant};
 /// Upper bound on how long any answer is reused, whatever its TTL.
 const MAX_CACHE_SECONDS: u32 = 3600;
 const MAX_ENTRIES: usize = 4096;
+/// How long after expiry an answer may still be served stale.
+const STALE_WINDOW: u32 = 3600;
+/// The TTL a stale answer carries, as RFC 8767 recommends.
+const STALE_TTL: u32 = 30;
+
+/// A cached answer for a query, and whether it had already expired.
+pub(super) struct Hit {
+    pub(super) wire: Vec<u8>,
+    pub(super) stale: bool,
+}
 
 /// Question plus the query bits that change what an upstream returns:
 /// recursion desired, checking disabled and DNSSEC OK.
@@ -47,24 +58,39 @@ pub(super) struct Cache {
 }
 
 impl Cache {
+    /// `lookup` without stale answers.
+    #[cfg(test)]
+    pub(super) fn get(&self, key: &Key, query: &[u8], now: Instant) -> Option<Vec<u8>> {
+        self.lookup(key, query, now)
+            .filter(|hit| !hit.stale)
+            .map(|hit| hit.wire)
+    }
+
     /// A copy of the cached response for `query`: its ID and question bytes
     /// (including letter case) taken from the query, every TTL reduced by the
-    /// whole seconds it has been cached. `None` once fewer than one second of
-    /// its lifetime is left.
-    pub(super) fn get(&self, key: &Key, query: &[u8], now: Instant) -> Option<Vec<u8>> {
+    /// whole seconds it has been cached. An answer that expired less than
+    /// `STALE_WINDOW` ago comes back marked stale, every TTL then set to
+    /// `STALE_TTL`; the caller refreshes it.
+    pub(super) fn lookup(&self, key: &Key, query: &[u8], now: Instant) -> Option<Hit> {
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let entry = entries.get(key)?;
         let elapsed = u32::try_from(now.saturating_duration_since(entry.stored).as_secs()).ok()?;
-        if elapsed >= entry.seconds {
+        let stale = elapsed >= entry.seconds;
+        if stale && elapsed - entry.seconds >= STALE_WINDOW {
             return None;
         }
         let mut wire = with_query_identity(&entry.wire, query)?;
         for &at in &entry.ttl_offsets {
             let ttl =
                 (u32::from(word(&wire, at).ok()?) << 16) | u32::from(word(&wire, at + 2).ok()?);
-            wire[at..at + 4].copy_from_slice(&ttl.saturating_sub(elapsed).to_be_bytes());
+            let left = if stale {
+                STALE_TTL
+            } else {
+                ttl.saturating_sub(elapsed)
+            };
+            wire[at..at + 4].copy_from_slice(&left.to_be_bytes());
         }
-        Some(wire)
+        Some(Hit { wire, stale })
     }
 
     /// Keeps a response that already passed validation for its query. Answers
@@ -89,7 +115,7 @@ impl Cache {
         if entries.len() >= MAX_ENTRIES && !entries.contains_key(&key) {
             entries.retain(|_, entry| {
                 now.saturating_duration_since(entry.stored)
-                    < Duration::from_secs(u64::from(entry.seconds))
+                    < Duration::from_secs(u64::from(entry.seconds) + u64::from(STALE_WINDOW))
             });
             if entries.len() >= MAX_ENTRIES {
                 let oldest = entries

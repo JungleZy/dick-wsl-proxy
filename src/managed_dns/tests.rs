@@ -464,7 +464,15 @@ fn idle_upstreams_expire_and_stay_bounded() {
         pool.put(index, start);
     }
     // The newest kept connection comes back first; extras beyond the cap were dropped.
-    assert_eq!(pool.take(start), Some(MAX_IDLE_UPSTREAMS - 1));
+    assert_eq!(
+        pool.take(start),
+        Some((MAX_IDLE_UPSTREAMS - 1, Duration::ZERO))
+    );
+    // It reports how long it was idle.
+    assert_eq!(
+        pool.take(start + Duration::from_secs(3)),
+        Some((MAX_IDLE_UPSTREAMS - 2, Duration::from_secs(3)))
+    );
     pool.put(99, start);
     assert_eq!(pool.take(start + UPSTREAM_IDLE), None);
 }
@@ -820,5 +828,47 @@ fn a_cached_whitelisted_answer_still_gets_its_alias() {
             .lookup(alias(&second), Instant::now())
             .unwrap(),
         Some(true_ip)
+    );
+}
+
+#[test]
+fn an_expired_answer_is_served_stale_for_a_while_with_a_short_ttl() {
+    let cache = Cache::default();
+    let q = query("stale.example");
+    let now = Instant::now();
+    cache.put(
+        key_for(&q),
+        &response(&q, Ipv4Addr::new(93, 184, 216, 34)),
+        now,
+    );
+    // Still fresh: counted down, not stale.
+    let fresh = cache
+        .lookup(&key_for(&q), &q, now + Duration::from_secs(50))
+        .unwrap();
+    assert!(!fresh.stale);
+    assert_eq!(ttl_of_first_answer(&fresh.wire), 10);
+    // Past its 60 s TTL: a plain get misses, a lookup serves it stale.
+    let later = now + Duration::from_secs(61);
+    assert!(cache.get(&key_for(&q), &q, later).is_none());
+    let stale = cache.lookup(&key_for(&q), &q, later).unwrap();
+    assert!(stale.stale);
+    assert_eq!(ttl_of_first_answer(&stale.wire), 30);
+    assert!(Message::response(&stale.wire, &Message::query(&q).unwrap()).is_ok());
+    // A stale whitelisted answer still gets an alias.
+    let aliases = Mutex::new(Aliases::default());
+    let rewritten = resolve(&q, Ok(stale.wire), true, &aliases).unwrap();
+    assert!(reserved(
+        a_address(&rewritten, &Message::parse(&rewritten).unwrap().answers[0]).unwrap()
+    ));
+    // An hour after expiry it is gone.
+    assert!(
+        cache
+            .lookup(&key_for(&q), &q, now + Duration::from_secs(60 + 3600))
+            .is_none()
+    );
+    assert!(
+        cache
+            .lookup(&key_for(&q), &q, now + Duration::from_secs(60 + 3599))
+            .is_some()
     );
 }

@@ -4,6 +4,7 @@
 //! connections those finish with instead of opening their own.
 use super::cache::{Key, with_query_identity};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -25,6 +26,7 @@ struct Flight {
 #[derive(Default)]
 pub(super) struct Flights {
     running: Mutex<HashMap<Key, Arc<Flight>>>,
+    joined: AtomicU64,
 }
 
 /// Ends a flight however its exchange ended, a panic included, so waiting
@@ -53,6 +55,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Flights {
+    /// Queries that waited for an identical one instead of asking.
+    pub(super) fn joined(&self) -> u64 {
+        self.joined.load(Ordering::Relaxed)
+    }
+
     /// The upstream response for `query`: from `ask` when no identical query
     /// is in flight, otherwise the one that query gets, re-addressed to this
     /// query's ID and question. An error is shared the same way.
@@ -73,6 +80,7 @@ impl Flights {
             }
         };
         if let Some(flight) = joined {
+            self.joined.fetch_add(1, Ordering::Relaxed);
             let deadline = Instant::now() + FLIGHT_WAIT;
             let mut result = lock(&flight.result);
             while result.is_none() {
@@ -156,7 +164,7 @@ impl Slots {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
     use std::thread;
 
     fn key(name: &str) -> Key {

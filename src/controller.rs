@@ -360,7 +360,7 @@ impl Controller {
                     })
                     .or_else(|| self.watch_lost(p));
                 Ok(
-                    json!({"phase":if issue.is_some(){"recovery_required"}else if p.system_dns.is_some(){"forwarding_managed"}else{"forwarding_scoped"},"active_target":p.target.name,"config_generation":p.cookie,"ingress":p.ingress,"origins":p.origins,"issue":issue,"forwarding":ingress.diagnostics(),"dns_managed":p.system_dns.is_some() && issue.is_none(),"startup_verified":self.readiness.as_ref().and_then(|r|r.as_ref().ok()),"active_policy":self.runtime.as_ref().map(|r|r.policy.public_summary()),"recent_exit":self.recent_exit,"protection_check":self.watch_view(p),"target_registered":issue.is_some().then(|| lifecycle::registration_present(p).ok()).flatten()}),
+                    json!({"phase":if issue.is_some(){"recovery_required"}else if p.system_dns.is_some(){"forwarding_managed"}else{"forwarding_scoped"},"active_target":p.target.name,"config_generation":p.cookie,"ingress":p.ingress,"origins":p.origins,"issue":issue,"forwarding":ingress.diagnostics(),"dns_managed":p.system_dns.is_some() && issue.is_none(),"startup_verified":self.readiness.as_ref().and_then(|r|r.as_ref().ok()),"active_policy":self.runtime.as_ref().map(|r|r.policy.public_summary()),"dns_stats":self.runtime.as_ref().map(|r|r.dns.report()),"recent_exit":self.recent_exit,"protection_check":self.watch_view(p),"target_registered":issue.is_some().then(|| lifecycle::registration_present(p).ok()).flatten()}),
                 )
             }
             (None, Some(d)) => Ok(

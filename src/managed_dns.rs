@@ -1,6 +1,7 @@
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::collections::{HashMap, HashSet, VecDeque, hash_map::Entry};
 use std::io::BufReader;
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,8 +20,10 @@ const REUSED_IO_DEADLINE: Duration = Duration::from_secs(4);
 /// the query goes through the chain instead.
 const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// An idle DoH connection is reused only this long; upstreams and proxy hops
-/// close quiet keep-alives on their own schedule.
-const UPSTREAM_IDLE: Duration = Duration::from_secs(30);
+/// close quiet keep-alives on their own schedule. Connections idle for 21-26 s
+/// were measured to still work over the real chain; one that a hop has closed
+/// fails on reuse and the query goes out once more on a fresh connection.
+const UPSTREAM_IDLE: Duration = Duration::from_secs(120);
 /// As many as one route runs exchanges at once, so a burst's connections
 /// stay ready for the next one.
 const MAX_IDLE_UPSTREAMS: usize = flights::MAX_ACTIVE;
@@ -52,6 +55,44 @@ pub fn reset_aliases() -> Result<(), String> {
 /// DNSSEC records. A durable digest ledger prevents alias reuse across different
 /// name/IP pairs while allowing the same pair to reclaim its prior alias.
 pub struct ManagedDns {
+    resolver: Arc<Resolver>,
+}
+
+impl ManagedDns {
+    pub fn new(policy: Arc<crate::policy::Policy>) -> Result<Self, String> {
+        Ok(Self {
+            resolver: Arc::new(Resolver::new(policy)?),
+        })
+    }
+
+    pub fn arm_probe(&self, name: &str) -> Result<(), String> {
+        self.resolver.arm_probe(name)
+    }
+
+    pub fn probe_seen(&self) -> bool {
+        self.resolver.probe_seen()
+    }
+
+    pub fn answer(&self, wire: &[u8]) -> Result<Vec<u8>, String> {
+        self.resolver.answer_for(wire, true)
+    }
+
+    pub fn answer_tcp(&self, wire: &[u8]) -> Result<Vec<u8>, String> {
+        self.resolver.answer_for(wire, false)
+    }
+
+    pub fn direct_alias(&self, ip: Ipv4Addr) -> Result<Option<Ipv4Addr>, String> {
+        self.resolver.direct_alias(ip)
+    }
+
+    /// What managed DNS did since this takeover started.
+    pub fn report(&self) -> serde_json::Value {
+        self.resolver.report()
+    }
+}
+
+/// The state behind `ManagedDns`, shared with background refreshes.
+struct Resolver {
     policy: Arc<crate::policy::Policy>,
     tls: TlsConnector,
     aliases: Mutex<Aliases>,
@@ -66,6 +107,41 @@ pub struct ManagedDns {
     /// Exchanges at once on the chain and on the direct upstream.
     chain_slots: Slots,
     direct_slots: Slots,
+    stats: Stats,
+    /// Questions whose stale answer is being refreshed in the background.
+    refreshing: Mutex<HashSet<Key>>,
+}
+
+/// What managed DNS did, for the status report.
+#[derive(Default)]
+struct Stats {
+    cache_hits: AtomicU64,
+    /// Expired answers served while a refresh ran.
+    stale_served: AtomicU64,
+    refreshes: AtomicU64,
+    refresh_failures: AtomicU64,
+    upstream_asks: AtomicU64,
+    reused: AtomicU64,
+    /// Idle connections that failed when reused; a fresh one followed.
+    stale_reuses: AtomicU64,
+    fresh_connections: AtomicU64,
+    connect_failures: AtomicU64,
+    /// The latest upstream exchanges, newest last.
+    recent: Mutex<VecDeque<serde_json::Value>>,
+}
+
+impl Stats {
+    fn record(&self, entry: serde_json::Value) {
+        let mut recent = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        if recent.len() == 32 {
+            recent.pop_front();
+        }
+        recent.push_back(entry);
+    }
+}
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Where a query is sent. Whitelisted names go to the direct DoH upstream so
@@ -95,13 +171,15 @@ impl<T> IdlePool<T> {
         }
     }
 
-    fn take(&self, now: Instant) -> Option<T> {
+    /// The most recent idle item and how long it was idle.
+    fn take(&self, now: Instant) -> Option<(T, Duration)> {
         let mut idle = self
             .idle
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         idle.retain(|(_, since)| now.saturating_duration_since(*since) < UPSTREAM_IDLE);
-        idle.pop().map(|(item, _)| item)
+        idle.pop()
+            .map(|(item, since)| (item, now.saturating_duration_since(since)))
     }
 
     fn put(&self, item: T, now: Instant) {
@@ -138,8 +216,8 @@ struct Alias {
     expires: Instant,
 }
 
-impl ManagedDns {
-    pub fn new(policy: Arc<crate::policy::Policy>) -> Result<Self, String> {
+impl Resolver {
+    fn new(policy: Arc<crate::policy::Policy>) -> Result<Self, String> {
         let mut builder = TlsConnector::builder();
         builder.min_protocol_version(Some(Protocol::Tlsv12));
         let tls = builder
@@ -156,10 +234,12 @@ impl ManagedDns {
             flights: Flights::default(),
             chain_slots: Slots::default(),
             direct_slots: Slots::default(),
+            stats: Stats::default(),
+            refreshing: Mutex::new(HashSet::new()),
         })
     }
 
-    pub fn arm_probe(&self, name: &str) -> Result<(), String> {
+    fn arm_probe(&self, name: &str) -> Result<(), String> {
         let name = name.trim_end_matches('.').to_ascii_lowercase();
         if name.is_empty()
             || name.len() > 253
@@ -179,19 +259,11 @@ impl ManagedDns {
         Ok(())
     }
 
-    pub fn probe_seen(&self) -> bool {
+    fn probe_seen(&self) -> bool {
         self.probe.lock().map(|probe| probe.seen).unwrap_or(false)
     }
 
-    pub fn answer(&self, wire: &[u8]) -> Result<Vec<u8>, String> {
-        self.answer_for(wire, true)
-    }
-
-    pub fn answer_tcp(&self, wire: &[u8]) -> Result<Vec<u8>, String> {
-        self.answer_for(wire, false)
-    }
-
-    fn answer_for(&self, wire: &[u8], udp: bool) -> Result<Vec<u8>, String> {
+    fn answer_for(self: &Arc<Self>, wire: &[u8], udp: bool) -> Result<Vec<u8>, String> {
         let query = Message::query(wire)?;
         let direct = query.question.kind == 1
             && !query.dnssec
@@ -217,9 +289,20 @@ impl ManagedDns {
         let cached = if probing {
             None
         } else {
-            self.answers.get(&key, wire, now)
+            self.answers.lookup(&key, wire, now)
         };
         let fresh = cached.is_none();
+        let cached = cached.map(|hit| {
+            if hit.stale {
+                // Answer now with the expired record and refresh it once in
+                // the background, rather than make this query wait for it.
+                self.stats.stale_served.fetch_add(1, Ordering::Relaxed);
+                self.refresh(key.clone(), wire.to_vec());
+            } else {
+                self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            hit.wire
+        });
         let response_wire = match cached {
             Some(response_wire) => response_wire,
             // The probe must make its own trip through the chain.
@@ -253,7 +336,54 @@ impl ManagedDns {
         Ok(answer)
     }
 
-    pub fn direct_alias(&self, ip: Ipv4Addr) -> Result<Option<Ipv4Addr>, String> {
+    /// Asks the upstream again for a question whose cached answer has
+    /// expired, at most once at a time, and caches what comes back.
+    fn refresh(self: &Arc<Self>, key: Key, wire: Vec<u8>) {
+        if !self
+            .refreshing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone())
+        {
+            return;
+        }
+        let resolver = Arc::clone(self);
+        let refreshed = key.clone();
+        let spawned = std::thread::Builder::new()
+            .name("dns-refresh".into())
+            .spawn(move || {
+                let key = refreshed;
+                let outcome = (|| {
+                    let query = Message::query(&wire)?;
+                    let answer = resolver
+                        .flights
+                        .run(&key, &wire, || resolver.ask_upstream(&query, &wire))?;
+                    Message::response(&answer, &query)?;
+                    resolver.answers.put(key.clone(), &answer, Instant::now());
+                    Ok::<(), String>(())
+                })();
+                let counter = if outcome.is_ok() {
+                    &resolver.stats.refreshes
+                } else {
+                    &resolver.stats.refresh_failures
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+                resolver
+                    .refreshing
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&key);
+            });
+        if spawned.is_err() {
+            self.stats.refresh_failures.fetch_add(1, Ordering::Relaxed);
+            self.refreshing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+        }
+    }
+
+    fn direct_alias(&self, ip: Ipv4Addr) -> Result<Option<Ipv4Addr>, String> {
         self.aliases
             .lock()
             .map_err(|_| "DNS alias table lock poisoned".to_string())?
@@ -261,6 +391,7 @@ impl ManagedDns {
     }
 
     fn ask_upstream(&self, query: &Message, wire: &[u8]) -> Result<Vec<u8>, String> {
+        self.stats.upstream_asks.fetch_add(1, Ordering::Relaxed);
         match self
             .policy
             .direct_dns()
@@ -294,18 +425,74 @@ impl ManagedDns {
     fn exchange_via(&self, route: Route, wire: &[u8]) -> Result<Vec<u8>, String> {
         // A bounded number of exchanges per route: a later query takes the
         // connection an earlier one hands back instead of opening its own.
+        let waiting = Instant::now();
         let _slot = match route {
             Route::Chain => self.chain_slots.acquire(),
             Route::Direct(..) => self.direct_slots.acquire(),
         };
-        if let Some(upstream) = self.pool(route).take(Instant::now())
-            && let Ok(answer) = self.exchange_on(route, upstream, wire, REUSED_IO_DEADLINE)
-        {
-            return Ok(answer);
+        let started = Instant::now();
+        let slot_wait = started.saturating_duration_since(waiting);
+        let name = match route {
+            Route::Chain => "chain",
+            Route::Direct(..) => "direct",
+        };
+        let mut stale = None;
+        if let Some((upstream, idle)) = self.pool(route).take(started) {
+            match self.exchange_on(route, upstream, wire, REUSED_IO_DEADLINE) {
+                Ok(answer) => {
+                    self.stats.reused.fetch_add(1, Ordering::Relaxed);
+                    self.stats.record(serde_json::json!({
+                        "route": name, "kind": "reused", "ms": millis(started.elapsed()),
+                        "idle_ms": millis(idle), "slot_wait_ms": millis(slot_wait),
+                    }));
+                    return Ok(answer);
+                }
+                Err(_) => {
+                    self.stats.stale_reuses.fetch_add(1, Ordering::Relaxed);
+                    stale = Some((idle, started.elapsed()));
+                }
+            }
         }
         // No idle connection, or the upstream or a proxy hop closed it while it
         // was idle. A DNS query is idempotent: send it once more on a fresh connection.
-        self.exchange_on(route, self.connect_upstream(route)?, wire, IO_DEADLINE)
+        self.stats.fresh_connections.fetch_add(1, Ordering::Relaxed);
+        let result = self
+            .connect_upstream(route)
+            .inspect_err(|_| {
+                self.stats.connect_failures.fetch_add(1, Ordering::Relaxed);
+            })
+            .and_then(|upstream| self.exchange_on(route, upstream, wire, IO_DEADLINE));
+        self.stats.record(serde_json::json!({
+            "route": name,
+            "kind": if stale.is_some() { "stale_then_fresh" } else { "fresh" },
+            "ms": millis(started.elapsed()),
+            "stale_idle_ms": stale.map(|(idle, _)| millis(idle)),
+            "stale_wasted_ms": stale.map(|(_, wasted)| millis(wasted)),
+            "slot_wait_ms": millis(slot_wait),
+            "ok": result.is_ok(),
+        }));
+        result
+    }
+
+    fn report(&self) -> serde_json::Value {
+        let count = |value: &AtomicU64| value.load(Ordering::Relaxed);
+        let idle =
+            |pool: &IdlePool<Upstream>| pool.idle.lock().unwrap_or_else(|e| e.into_inner()).len();
+        serde_json::json!({
+            "cache_hits": count(&self.stats.cache_hits),
+            "stale_served": count(&self.stats.stale_served),
+            "refreshes": count(&self.stats.refreshes),
+            "refresh_failures": count(&self.stats.refresh_failures),
+            "shared_waits": self.flights.joined(),
+            "upstream_asks": count(&self.stats.upstream_asks),
+            "reused": count(&self.stats.reused),
+            "stale_reuses": count(&self.stats.stale_reuses),
+            "fresh_connections": count(&self.stats.fresh_connections),
+            "connect_failures": count(&self.stats.connect_failures),
+            "idle_chain": idle(&self.upstreams),
+            "idle_direct": idle(&self.direct_upstreams),
+            "recent": self.stats.recent.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect::<Vec<_>>(),
+        })
     }
 
     fn connect_upstream(&self, route: Route) -> Result<Upstream, String> {
