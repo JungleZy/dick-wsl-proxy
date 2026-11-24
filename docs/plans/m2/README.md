@@ -23,6 +23,8 @@
 
    可选的转发限制，不写就用默认值，在启动或切换接管时固定：`max_tcp_connections`（并发 TCP 上限，含 TCP 上的 DNS，16–1024，默认 256）、`tcp_idle_timeout_seconds`（两个方向都没有数据多久后断开，30–86400，默认 1800）、`tcp_half_close_timeout_seconds`（一方结束后另一方无数据多久后断开，5–3600，默认 60）。取默认值时不写入桌面端配置库。
 
+   可选的 `fake_ip`（默认 `true`，取默认值时不写入）：开启时白名单以外的域名在本地拿到假地址，连接时由住宅代理按域名解析；设为 `false` 时照旧经代理链问 `dns_upstream`。行为见[接管架构](../../arch/README.md)。
+
 2. 用 `wsl-proxyctl.exe import-credential --name my-residence --env-file <文件路径>` 导入现有 `.env`（`ip`、`port`、`username`、`password`）。设置写入 EXE 同级 `desktop.sqlite` 的住宅字段（含密码，明文）；`--name` 只记入策略的标签，不再按名称查找独立凭据，也不读写 Windows 凭据管理器。审阅策略后运行 `wsl-proxyctl.exe session`。
 3. 在同一会话逐行提交，例如：
 
@@ -34,7 +36,7 @@
 
    `profile` 可指向策略 JSON 或 EXE 同级的 `desktop.sqlite`。指向 JSON 时，住宅服务器设置仍从 `desktop.sqlite` 读取；两种方式都要先导入或在桌面策略页保存住宅字段。`credential` 字段只是标签，不参与凭据查找。
 
-   `startup_verified` 是**启动时**的探测结果，不是实时可用性保证。只有来自目标的两个独立未缓存 DNS 探测（UDP、强制 TCP）在 Windows 端经认证上游收到对应回答，以及目标的非白名单 HTTPS 探测经双跳完成，才返回 `forwarding_managed`；任一项失败进入恢复状态，查看状态后显式 `stop` 恢复，不通过删除日志或改成只代理网页来跳过失败。启动时另探测一次双跳 SOCKS5 UDP 关联，只建立并关闭关联、不发送业务数据：住宅端拒绝 UDP 时接管照常，结果记在 `startup_verified.udp_supported`，本次接管期间非白名单 UDP（含 QUIC）一律拒绝、不直连。正常结束拥有活动入口的会话会执行停止；若控制器崩溃，另行运行 `wsl-proxyctl.exe status`、`wsl-proxyctl.exe stop`。
+   `startup_verified` 是**启动时**的探测结果，不是实时可用性保证。只有来自目标的两个独立未缓存 DNS 探测（UDP、强制 TCP）在 Windows 端经认证上游收到对应回答，以及目标的非白名单 HTTPS 探测经双跳完成，才返回 `forwarding_managed`；任一项失败进入恢复状态，查看状态后显式 `stop` 恢复，不通过删除日志或改成只代理网页来跳过失败。启动时另探测一次双跳 SOCKS5 UDP 关联，只建立并关闭关联、不发送业务数据：住宅端拒绝 UDP 时接管照常，结果记在 `startup_verified.udp_supported`，本次接管期间非白名单 UDP（含 QUIC）一律拒绝、不直连。策略开启 `fake_ip` 时，HTTPS 探测之前还探测一次住宅代理是否接受域名形式的 CONNECT：结果记在 `startup_verified.fake_ip`，不启用的原因记在 `startup_verified.fake_ip_reason`，不启用时接管照常、按原方式解析；启用时 HTTPS 探测本身就走假地址和按域名连接。正常结束拥有活动入口的会话会执行停止；若控制器崩溃，另行运行 `wsl-proxyctl.exe status`、`wsl-proxyctl.exe stop`。
 4. 停止不会删除配置。如不再使用，可运行 `wsl-proxyctl.exe forget-credential --name my-residence` 清空 `desktop.sqlite` 里的住宅字段。不得把密码放进命令行或策略文件。
 
 ## 分流与故障语义
@@ -43,14 +45,14 @@
 |---|---|
 | 精确 IP / IPv4 CIDR 白名单 | Windows 直接拨号；不会覆盖宿主已有 VPN/TUN 的路由。 |
 | 域名 / 后缀白名单 | 通过受管 DNS 的有效正向 A 回答建立专用合成地址关联。只凭已核实的关联走直连；不从客户端 Host 猜目标，不把共享同一 CDN IP 的其他域名整体放行。域名白名单不豁免 DNS。 |
-| 其他 IPv4 TCP | 先从宿主机已有 SOCKS5 客户端拨住宅服务器，再在同一隧道内完成住宅认证、CONNECT 原目标。任一跳失败就失败，不退化成单跳或直连。 |
+| 其他 IPv4 TCP | 先从宿主机已有 SOCKS5 客户端拨住宅服务器，再在同一隧道内完成住宅认证、CONNECT 原目标；原目标是 fake-ip 假地址时 CONNECT 对应的域名。任一跳失败就失败，不退化成单跳或直连。 |
 | UDP / QUIC | 受管 DNS 由专用处理路径接收；白名单业务 UDP 可直连。其余业务 UDP 通过嵌套 SOCKS5 UDP 关联走双跳；任一住宅端拒绝关联或链路失败，启动和新流量均失败，不用裸 UDP 补发。 |
 | 系统 DNS | Target 解析器 UDP/TCP 53 在同一组规则下接管，必要时仅对已转向入口的这类流量做 SNAT。上游 DoH 使用经过住宅链的已连接 socket 和系统信任根，禁止明文/本机 DNS 回退。应用自带 DoH/DoT 是普通业务连接，不等于使用指定解析器。 |
 | IPv6 / 非支持环境 | 目标存在全局 IPv6 地址和默认 IPv6 路由时启用受管 IPv6 入口、规则、TCP 和 UDP 链路。缺少这些证据时对目标外部 IPv6 出站作受限阻断，保留本地回环和非目标发行版。预检不认识的布局拒绝启动，不改整台机的网络设置。 |
 
 Windows 在读取应用数据前核对内核的连接标记、正反向地址/端口及目标所属实例。M2 的恢复日志只含网络归属，不含住宅配置或密码。关窗、上游故障及强杀控制器均不是恢复直连的命令。主动停止后检查自有 IPv4、IPv6 规则及映射，确认新请求和系统 DNS 回原路径；UDP 只清本次已核实的映射，TCP 不能无缝迁移，需要重新连接。
 
-域名白名单只对有认证来源的可安全映射的公网 A 答案发放 `198.18.0.0/15` 合成地址。响应 TTL 为零，运行期授权不超过上游有效期；已有应用若自行长期保留合成地址，停止后须重查域名。Windows 用户目录下 `dns-alias.highwater` 记录地址高水位，`dns-alias.map` 只保存名称/IP 摘要与别名偏移，不保存域名、原 IP 或凭据；相同名称/IP 可跨会话复用原别名，不同名称/IP 永不共享。返回私网地址的名称不会因 DNS 白名单获得别名。普通 DNSSEC 查询不篡改签名以强制直连。
+域名白名单只对有认证来源的可安全映射的公网 A 答案发放 `198.18.0.0/15` 合成地址；开启 fake-ip 时只用该网段下半段，上半段留给假地址。响应 TTL 为零，运行期授权不超过上游有效期；已有应用若自行长期保留合成地址，停止后须重查域名。Windows 用户目录下 `dns-alias.highwater` 记录地址高水位，`dns-alias.map` 只保存名称/IP 摘要与别名偏移，不保存域名、原 IP 或凭据；相同名称/IP 可跨会话复用原别名，不同名称/IP 永不共享。返回私网地址的名称不会因 DNS 白名单获得别名。普通 DNSSEC 查询不篡改签名以强制直连。
 
 ## 已实测的公网链路
 

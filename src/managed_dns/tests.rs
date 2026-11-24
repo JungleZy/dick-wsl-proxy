@@ -872,3 +872,120 @@ fn an_expired_answer_is_served_stale_for_a_while_with_a_short_ttl() {
             .is_some()
     );
 }
+
+fn fake_ip_policy(fake_ip: bool) -> Arc<crate::policy::Policy> {
+    let config: crate::policy::Config = serde_json::from_value(serde_json::json!({
+        "first_hop": "127.0.0.1:19",
+        "credential": "fixture",
+        "dns_upstream": "8.8.8.8:443",
+        "dns_tls_name": "dns.google",
+        "direct_ips": [],
+        "direct_domains": ["allowed.example"],
+        "direct_suffixes": [],
+        "allow_loopback_residential": true,
+        "fake_ip": fake_ip
+    }))
+    .unwrap();
+    Arc::new(
+        crate::policy::Policy::assemble_for_store(
+            crate::policy::Validated::new(config).unwrap(),
+            crate::credential::fixture(std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9)),
+        )
+        .unwrap(),
+    )
+}
+
+fn typed(host: &str, kind: u16) -> Vec<u8> {
+    let mut wire = query(host);
+    let at = wire.len() - 4;
+    wire[at..at + 2].copy_from_slice(&kind.to_be_bytes());
+    wire
+}
+
+#[test]
+fn fake_ip_answers_a_with_a_stand_in_and_aaaa_https_with_no_data() {
+    let dns = ManagedDns::new(fake_ip_policy(true)).unwrap();
+    assert_eq!(dns.fake_pool_unavailable(), None);
+    // The alias ledger stays in the lower half while fake-ip may be used.
+    assert_eq!(
+        dns.resolver.aliases.lock().unwrap().ledger.limit,
+        Some(fake::LEDGER_FLOOR)
+    );
+    dns.set_fake_ip(true).unwrap();
+    assert!(dns.fake_ip_active());
+
+    let wire = query("media.example.com");
+    let answer = dns.answer(&wire).unwrap();
+    let parsed = Message::parse(&answer).unwrap();
+    assert_eq!(&answer[..2], &wire[..2]);
+    assert_eq!(parsed.answers.len(), 1);
+    let address = a_address(&answer, &parsed.answers[0]).unwrap();
+    assert!(reserved(address) && dns.is_fake(address));
+    assert_eq!(parsed.answers[0].ttl, 1);
+    assert_eq!(dns.fake_name(address).as_deref(), Some("media.example.com"));
+    // A fake address is chained by name, never treated as a direct alias.
+    assert_eq!(dns.direct_alias(address).unwrap(), None);
+    // Same name, same address, over TCP too.
+    let again = dns.answer_tcp(&wire).unwrap();
+    let parsed = Message::parse(&again).unwrap();
+    assert_eq!(a_address(&again, &parsed.answers[0]).unwrap(), address);
+
+    // Letter case does not make another name.
+    let upper = dns.answer(&query("Media.Example.COM")).unwrap();
+    let parsed = Message::parse(&upper).unwrap();
+    assert_eq!(a_address(&upper, &parsed.answers[0]).unwrap(), address);
+    for name in ["NAS.Local", "Printer.LAN"] {
+        assert!(fake::excluded(
+            &Message::query(&query(name)).unwrap().question.name,
+            &[]
+        ));
+    }
+
+    for kind in [28, 64, 65] {
+        let wire = typed("media.example.com", kind);
+        let empty = dns.answer(&wire).unwrap();
+        let parsed = Message::response(&empty, &Message::query(&wire).unwrap()).unwrap();
+        assert!(parsed.answers.is_empty(), "type {kind}");
+        assert_eq!(parsed.flags & 0x000f, 0);
+    }
+    {
+        let (name, lease) = dns.fake_lease(address).unwrap();
+        assert_eq!(name, "media.example.com");
+        drop(lease);
+    }
+    let report = dns.report();
+    assert_eq!(report["fake_ip"]["active"], true);
+    assert_eq!(report["fake_ip"]["answers"], 3);
+    assert_eq!(report["fake_ip"]["empty_answers"], 3);
+}
+
+#[test]
+fn fake_ip_off_in_policy_keeps_the_whole_alias_range() {
+    let dns = ManagedDns::new(fake_ip_policy(false)).unwrap();
+    assert_eq!(
+        dns.fake_pool_unavailable().as_deref(),
+        Some("fake_ip_off_in_policy")
+    );
+    assert!(dns.set_fake_ip(true).is_err());
+    assert!(!dns.fake_ip_active());
+    assert_eq!(dns.resolver.aliases.lock().unwrap().ledger.limit, None);
+    assert!(!dns.is_fake(Ipv4Addr::new(198, 19, 255, 254)));
+}
+
+#[test]
+fn a_capped_alias_ledger_stops_at_its_limit() {
+    let owner = AliasLedger::default();
+    let path = owner.path.as_ref().unwrap().clone();
+    write_highwater(&path, 64);
+    let mut ledger = AliasLedger::at(path.clone());
+    ledger.limit = Some(64);
+    assert!(ledger.allocate(1).is_err());
+    assert_eq!(read_alias_highwater(&path).unwrap(), 64);
+    let mut ledger = AliasLedger::at(path.clone());
+    ledger.limit = Some(65);
+    assert_eq!(
+        ledger.allocate(1).unwrap(),
+        vec![Ipv4Addr::from(ALIAS_START + 64)]
+    );
+    assert_eq!(read_alias_highwater(&path).unwrap(), 65);
+}

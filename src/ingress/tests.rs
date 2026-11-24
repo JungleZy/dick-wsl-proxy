@@ -814,3 +814,55 @@ fn an_upstream_reset_is_still_a_relay_error() {
     );
     drop(client);
 }
+
+#[test]
+fn fake_addresses_route_by_name_and_unknown_ones_are_refused() {
+    let guest = Ipv4Addr::new(172, 20, 0, 2);
+    let plan = Plan {
+        target: crate::host::Distro {
+            id: "test-id".into(),
+            name: "test-distro".into(),
+            base_path: "test-path".into(),
+            version: 2,
+        },
+        cgroup_ns: "test-cgroup-ns".into(),
+        cgroup_root: "/test-cgroup".into(),
+        boot_id: "test-boot".into(),
+        guest,
+        ingress: SocketAddrV4::new(Ipv4Addr::new(172, 20, 0, 1), 18080),
+        origins: Vec::new(),
+        system_dns: Some(Ipv4Addr::new(10, 255, 255, 254)),
+        cookie: 1,
+        ipv6: None,
+    };
+    let runtime = crate::managed::Runtime::for_test(true);
+    runtime.dns.set_fake_ip(true).unwrap();
+    let fake = runtime.dns.assign_fake("media.example.com").unwrap();
+    for protocol in ["tcp", "udp"] {
+        assert_eq!(
+            route_details(
+                &plan,
+                Some(&runtime),
+                protocol,
+                SocketAddrV4::new(fake, 443)
+            ),
+            Ok((Route::ChainName, "fake_ip"))
+        );
+    }
+    // In the fake range but standing for no name: refused, never chained
+    // or dialled as an address.
+    let unknown = SocketAddrV4::new(Ipv4Addr::new(198, 19, 0, 9), 443);
+    assert!(route_details(&plan, Some(&runtime), "tcp", unknown).is_err());
+    // Port 53 to a fake address is still alternate plaintext DNS.
+    assert!(route_details(&plan, Some(&runtime), "udp", SocketAddrV4::new(fake, 53)).is_err());
+    // An ordinary address is unaffected.
+    assert_eq!(
+        route_details(
+            &plan,
+            Some(&runtime),
+            "tcp",
+            SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 443)
+        ),
+        Ok((Route::Chain, "default_chain"))
+    );
+}

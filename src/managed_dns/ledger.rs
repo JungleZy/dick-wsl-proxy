@@ -23,6 +23,9 @@ pub(super) struct AliasLedger {
     pub(super) mapping_path: Option<PathBuf>,
     pub(super) next: u32,
     pub(super) end: u32,
+    /// Offsets this session may allocate below; the rest of the range is
+    /// left to fake-ip. `None` means the whole range.
+    pub(super) limit: Option<u32>,
     assignments: HashMap<[u8; 32], u32>,
     used: HashMap<u32, [u8; 32]>,
     loaded: bool,
@@ -45,6 +48,7 @@ impl Default for AliasLedger {
             mapping_path: Some(root.join("dns-alias.map")),
             next: 0,
             end: 0,
+            limit: None,
             assignments: HashMap::new(),
             used: HashMap::new(),
             loaded: false,
@@ -61,6 +65,7 @@ impl AliasLedger {
             path: Some(path),
             next: 0,
             end: 0,
+            limit: None,
             assignments: HashMap::new(),
             used: HashMap::new(),
             loaded: false,
@@ -204,7 +209,8 @@ impl AliasLedger {
                 Err(e) => return Err(format!("inspect DNS alias ledger pending commit: {e}")),
             }
             let high = read_alias_highwater(path)?;
-            if count > ALIAS_SPACE - high {
+            let space = self.limit.unwrap_or(ALIAS_SPACE).min(ALIAS_SPACE);
+            if high > space || count > space - high {
                 return Err(
                     "durable DNS alias range exhausted; automatic reset is forbidden".into(),
                 );
@@ -213,7 +219,7 @@ impl AliasLedger {
                 + count
                     .div_ceil(ALIAS_BLOCK)
                     .saturating_mul(ALIAS_BLOCK)
-                    .min(ALIAS_SPACE - high);
+                    .min(space - high);
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -328,6 +334,16 @@ fn read_alias_map(path: &Path, high: u32) -> Result<AliasMaps, String> {
         }
     }
     Ok((assignments, used))
+}
+
+/// The ledger's current high-water offset from the controller's state
+/// directory, 0 when there is no ledger yet.
+pub(super) fn current_high() -> Result<u32, String> {
+    // Tests never read the real controller's ledger.
+    if cfg!(test) {
+        return Ok(0);
+    }
+    read_alias_highwater(&crate::host::state_dir()?.join("dns-alias.highwater"))
 }
 
 pub(super) fn read_alias_highwater(path: &Path) -> Result<u32, String> {

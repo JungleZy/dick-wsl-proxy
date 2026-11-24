@@ -66,6 +66,7 @@ fn reason_label(reason: Option<&str>) -> &'static str {
         Some("domain_alias") => "域名例外",
         Some("ip_or_cidr") => "IP / CIDR 例外",
         Some("default_chain") => "默认双跳",
+        Some("fake_ip") => "双跳，住宅解析域名",
         Some("system_dns") => "系统 DNS",
         Some("policy_reject") => "策略拒绝",
         Some("metadata_unavailable") => "目标未识别",

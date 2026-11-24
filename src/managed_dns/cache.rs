@@ -161,7 +161,7 @@ pub(super) fn with_query_identity(response: &[u8], query: &[u8]) -> Option<Vec<u
 }
 
 /// Bytes of the question name plus type and class in an uncompressed query.
-fn question_length(wire: &[u8]) -> Option<usize> {
+pub(super) fn question_length(wire: &[u8]) -> Option<usize> {
     let mut at = 12;
     loop {
         let length = usize::from(*wire.get(at)?);

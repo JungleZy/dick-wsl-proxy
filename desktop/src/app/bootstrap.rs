@@ -19,8 +19,8 @@ use serde_json::{Value, json};
 use super::backend::{Job, Kind, Reply, worker};
 use super::components::design_icon;
 use super::drafts::{
-    FailedSaves, SaveScope, Unsaved, names_target, profile_fields, saved_residential_text,
-    saved_text, target_missing,
+    FailedSaves, SaveScope, Unsaved, names_target, profile_fields, saved_fake_ip,
+    saved_residential_text, saved_text, target_missing,
 };
 use super::model::{
     EnvironmentProgress, EnvironmentResult, Field, Fields, LogFilter, Page, RuntimeLog,
@@ -251,6 +251,7 @@ impl Desktop {
             failed_saves: FailedSaves::default(),
             dialog_error: None,
             autostart_enabled: super::autostart::enabled().unwrap_or(false),
+            fake_ip_draft: true,
             confirmation: None,
             confirmation_pending: false,
             kernel_prepare_offered: false,
@@ -1481,6 +1482,7 @@ impl Desktop {
                 self.fields
                     .port
                     .set_value(self.saved_port.clone(), window, cx);
+                self.fake_ip_draft = saved_fake_ip(&self.profile);
                 for (field, key) in self.residential_inputs() {
                     let value = saved_residential_text(&self.residential, key);
                     field.set_value(value, window, cx);

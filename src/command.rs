@@ -467,6 +467,9 @@ pub(crate) fn dispatch_result(
             }
             .map_err(error)?;
             let resolver = managed::resolver(&result.target.snapshot).map_err(error)?;
+            runtime
+                .dns
+                .set_search_suffixes(managed::search_suffixes(&result.target.snapshot));
             let new = plan::Plan::new(
                 result.target.distribution,
                 &result.target.snapshot,
@@ -584,10 +587,14 @@ fn start(
         .map(managed::Runtime::from_file)
         .transpose()
         .map_err(error)?;
-    let resolver = if runtime.is_some() {
-        Some(managed::resolver(&result.target.snapshot).map_err(error)?)
-    } else {
-        None
+    let resolver = match &runtime {
+        Some(runtime) => {
+            runtime
+                .dns
+                .set_search_suffixes(managed::search_suffixes(&result.target.snapshot));
+            Some(managed::resolver(&result.target.snapshot).map_err(error)?)
+        }
+        None => None,
     };
     let plan = plan::Plan::new(
         result.target.distribution,
@@ -623,7 +630,7 @@ fn default_probe_rounds() -> u32 {
 /// Times CONNECT by address and by name, alternating which goes first, for
 /// each non-allowlisted name. Credentials stay inside the policy.
 fn chain_probe(names: &[String], port: u16, rounds: u32) -> Result<serde_json::Value, String> {
-    use crate::policy::ProbeTarget;
+    use crate::policy::ChainTarget;
     use std::net::{SocketAddr, SocketAddrV4};
     let runtime = managed::Runtime::from_file(&desktop_store::path()?)?;
     let mut results = Vec::new();
@@ -643,8 +650,8 @@ fn chain_probe(names: &[String], port: u16, rounds: u32) -> Result<serde_json::V
                 continue;
             }
         };
-        let by_address = ProbeTarget::Address(SocketAddr::V4(SocketAddrV4::new(address, port)));
-        let by_name = ProbeTarget::Name(name.clone(), port);
+        let by_address = ChainTarget::Address(SocketAddr::V4(SocketAddrV4::new(address, port)));
+        let by_name = ChainTarget::Name(name.clone(), port);
         let (mut address_ms, mut name_ms, mut errors) = (Vec::new(), Vec::new(), Vec::new());
         for round in 0..rounds {
             let order = if round % 2 == 0 {

@@ -37,6 +37,8 @@ pub(super) fn forward_tcp(
         return Ok(());
     }
     flow.stage("connect");
+    // Keeps a fake address bound to its name until the relay ends.
+    let mut fake_lease = None;
     let upstream = match selected {
         Route::Direct(target) => {
             TcpStream::connect_timeout(&SocketAddr::V4(target), CONNECT_TIMEOUT)
@@ -47,6 +49,18 @@ pub(super) fn forward_tcp(
             .policy
             .chain(origin)
             .map_err(|_| "two-hop TCP chain connect failed".to_string())?,
+        Route::ChainName => {
+            let runtime = runtime.expect("fake-ip route requires M2 runtime");
+            let (name, lease) = runtime
+                .dns
+                .fake_lease(*origin.ip())
+                .ok_or("fake address reclaimed before connecting")?;
+            fake_lease = Some(lease);
+            runtime
+                .policy
+                .chain_name(&name, origin.port())
+                .map_err(|_| "two-hop TCP chain connect by name failed".to_string())?
+        }
         Route::Dns => unreachable!("DNS handled internally"),
     };
     registration.attach_origin(&upstream)?;
@@ -58,7 +72,9 @@ pub(super) fn forward_tcp(
         return Err("TCP mapping changed while connecting to origin".into());
     }
     flow.stage("relay");
-    match relay(client, upstream, shared, flow) {
+    let ended = relay(client, upstream, shared, flow);
+    drop(fake_lease);
+    match ended {
         Ok(Ended::ClientReset) => {
             shared.record_client_reset();
             Ok(())

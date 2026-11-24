@@ -2395,6 +2395,31 @@ impl Desktop {
                     )
                     .item(input("国内 DoH 上游 IPv4:端口", &self.fields.direct_dns_upstream))
                     .item(input("国内 DoH TLS 主机名", &self.fields.direct_dns_tls_name)),
+            )
+            .group(
+                SettingGroup::new()
+                    .title("远端解析")
+                    .description(
+                        "白名单以外的域名先回一个占位地址，连接时把域名交给住宅代理解析，省掉一次经代理链的 DNS 往返。住宅代理不支持按域名连接时自动不启用。下次启动或切换接管时生效。",
+                    )
+                    .item(SettingItem::new(
+                        "白名单以外的域名由住宅代理解析",
+                        SettingField::render({
+                            let view = view.clone();
+                            let checked = self.fake_ip_draft;
+                            move |_, _, _| {
+                                let view = view.clone();
+                                Checkbox::new("settings-fake-ip")
+                                    .checked(checked)
+                                    .disabled(locked)
+                                    .on_click(move |checked: &bool, _, cx: &mut App| {
+                                        view.update(cx, |this, cx| {
+                                            this.set_fake_ip_draft(*checked, cx)
+                                        });
+                                    })
+                            }
+                        }),
+                    )),
             );
         let limits = SettingPage::new("转发限制").resettable(false).group(
             SettingGroup::new()

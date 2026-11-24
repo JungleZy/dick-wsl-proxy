@@ -17,8 +17,8 @@ mod dialer;
 pub(crate) mod domestic;
 pub(crate) mod profile;
 mod residential_probe;
+pub(crate) use dialer::ChainTarget;
 use dialer::Dialer;
-pub(crate) use dialer::ProbeTarget;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_CONFIG: u64 = 1024 * 1024;
 
@@ -67,6 +67,14 @@ pub(crate) struct Config {
         skip_serializing_if = "is_default_direct_dns_tls_name"
     )]
     direct_dns_tls_name: String,
+    // fake-ip: names outside the whitelist get a stand-in address and are
+    // resolved by the residential proxy. On unless set to false; the default
+    // is not written.
+    #[serde(
+        default = "default_fake_ip",
+        skip_serializing_if = "is_default_fake_ip"
+    )]
+    fake_ip: bool,
     // Pool settings from one earlier build. The pool is adaptive now: they
     // are still accepted so such a profile loads, but never used or written.
     #[serde(default, skip_serializing, rename = "tunnel_pool_max")]
@@ -92,6 +100,14 @@ fn default_direct_dns_tls_name() -> String {
 
 fn is_default_direct_dns_tls_name(value: &String) -> bool {
     value == DEFAULT_DIRECT_DNS_TLS_NAME
+}
+
+fn default_fake_ip() -> bool {
+    true
+}
+
+fn is_default_fake_ip(value: &bool) -> bool {
+    *value
 }
 
 fn default_health_domain() -> String {
@@ -175,6 +191,7 @@ pub struct Policy {
     health_domain: String,
     limits: Limits,
     direct_dns: Option<(SocketAddrV4, String)>,
+    fake_ip: bool,
     /// Builds the TCP chains and keeps a few authenticated tunnels ready.
     dialer: Arc<Dialer>,
 }
@@ -191,14 +208,77 @@ impl Drop for Policy {
 pub(crate) struct UdpChain {
     socket: UdpSocket,
     residential_relay: SocketAddrV4,
-    target: SocketAddr,
+    target: UdpTarget,
+    /// Kept alive as long as the association, e.g. a fake-ip lease.
+    _held: Option<Box<dyn std::any::Any + Send + Sync>>,
     // Keep both TCP UDP-ASSOCIATE control channels alive for the lifetime of
     // the UDP mapping. They are intentionally opaque after the handshake.
     _first_control: TcpStream,
     _residential_control: TcpStream,
 }
 
+/// Where a chained UDP mapping sends. A name is resolved by the residential
+/// proxy; its replies then come from the address it chose, which the first
+/// reply on the target port pins for the rest of the mapping.
+enum UdpTarget {
+    Address(SocketAddr),
+    Name {
+        name: String,
+        port: u16,
+        pinned: std::sync::Mutex<Option<SocketAddr>>,
+    },
+}
+
+/// Where a residential UDP reply says it came from. Some proxies echo the
+/// name a datagram was sent to instead of the address they resolved.
+enum ReplySource<'a> {
+    Address(SocketAddr),
+    Name(&'a [u8], u16),
+}
+
+impl UdpTarget {
+    fn accepts(&self, source: ReplySource<'_>) -> bool {
+        let origin = match (self, source) {
+            (Self::Name { name, port, .. }, ReplySource::Name(echoed, echoed_port)) => {
+                return echoed_port == *port && echoed.eq_ignore_ascii_case(name.as_bytes());
+            }
+            (_, ReplySource::Name(..)) => return false,
+            (_, ReplySource::Address(origin)) => origin,
+        };
+        match self {
+            Self::Address(address) => same_endpoint(origin, *address),
+            Self::Name { port, pinned, .. } => {
+                if origin.port() != *port {
+                    return false;
+                }
+                let mut pinned = pinned.lock().unwrap_or_else(|e| e.into_inner());
+                match *pinned {
+                    Some(previous) => same_endpoint(origin, previous),
+                    None => {
+                        *pinned = Some(origin);
+                        true
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl UdpChain {
+    pub(crate) fn holding(mut self, held: Box<dyn std::any::Any + Send + Sync>) -> Self {
+        self._held = Some(held);
+        self
+    }
+
+    fn named_packet(name: &str, port: u16, payload: &[u8]) -> Vec<u8> {
+        let mut packet = Vec::with_capacity(7 + name.len() + payload.len());
+        packet.extend_from_slice(&[0, 0, 0, 3, name.len() as u8]);
+        packet.extend_from_slice(name.as_bytes());
+        packet.extend_from_slice(&port.to_be_bytes());
+        packet.extend_from_slice(payload);
+        packet
+    }
+
     fn packet(destination: impl Into<SocketAddr>, payload: &[u8]) -> Vec<u8> {
         let destination = destination.into();
         let capacity = match destination {
@@ -223,13 +303,12 @@ impl UdpChain {
         packet
     }
 
-    fn parse_packet(
+    /// The residential reply inside a first-hop reply: where it came from,
+    /// and its payload.
+    fn split_packet(
         bytes: &[u8],
-        expected_source: impl Into<SocketAddr>,
-        expected_destination: impl Into<SocketAddr>,
-    ) -> io::Result<&[u8]> {
-        let expected_source = expected_source.into();
-        let expected_destination = expected_destination.into();
+        expected_source: SocketAddr,
+    ) -> io::Result<(ReplySource<'_>, &[u8])> {
         if bytes.len() < 4 || bytes[..3] != [0, 0, 0] {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -251,14 +330,38 @@ impl UdpChain {
                 "invalid residential SOCKS5 UDP response",
             ));
         }
-        let (destination, destination_end) = decode_udp_address(inner, 3)?;
-        if !same_endpoint(destination, expected_destination) {
+        if inner[3] == 3 {
+            let length = usize::from(*inner.get(4).unwrap_or(&0));
+            let end = 5 + length + 2;
+            if length == 0 || inner.len() < end {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated residential SOCKS5 UDP name",
+                ));
+            }
+            let port = u16::from_be_bytes([inner[end - 2], inner[end - 1]]);
+            return Ok((
+                ReplySource::Name(&inner[5..5 + length], port),
+                &inner[end..],
+            ));
+        }
+        let (origin, origin_end) = decode_udp_address(inner, 3)?;
+        Ok((ReplySource::Address(origin), &inner[origin_end..]))
+    }
+
+    fn parse_packet<'a>(
+        bytes: &'a [u8],
+        expected_source: impl Into<SocketAddr>,
+        target: &UdpTarget,
+    ) -> io::Result<&'a [u8]> {
+        let (source, payload) = Self::split_packet(bytes, expected_source.into())?;
+        if !target.accepts(source) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unexpected residential SOCKS5 UDP destination",
             ));
         }
-        Ok(&inner[destination_end..])
+        Ok(payload)
     }
 
     pub(crate) fn send(&self, payload: &[u8]) -> io::Result<usize> {
@@ -268,7 +371,10 @@ impl UdpChain {
                 "nested SOCKS5 UDP payload is too large",
             ));
         }
-        let inner = Self::packet(self.target, payload);
+        let inner = match &self.target {
+            UdpTarget::Address(address) => Self::packet(*address, payload),
+            UdpTarget::Name { name, port, .. } => Self::named_packet(name, *port, payload),
+        };
         let outer = Self::packet(SocketAddr::V4(self.residential_relay), &inner);
         let sent = self.socket.send(&outer)?;
         if sent == outer.len() {
@@ -287,7 +393,7 @@ impl UdpChain {
         let payload = Self::parse_packet(
             &packet[..size],
             SocketAddr::V4(self.residential_relay),
-            self.target,
+            &self.target,
         )?;
         if payload.len() > buffer.len() {
             return Err(io::Error::new(
@@ -452,6 +558,7 @@ impl Policy {
             health_domain: config.health_domain,
             limits: config.limits,
             direct_dns: config.direct_dns,
+            fake_ip: config.fake_ip,
             dialer,
         })
     }
@@ -477,13 +584,24 @@ impl Policy {
         {
             return Err("chain destination is reserved or unsupported".into());
         }
-        self.dialer.chain(SocketAddr::V4(dest))
+        self.dialer
+            .chain(&ChainTarget::Address(SocketAddr::V4(dest)))
+    }
+
+    /// The same chain to a name the residential proxy resolves itself
+    /// (fake-ip). The local destination checks of `chain` cannot apply: the
+    /// residential side decides what the name means.
+    pub fn chain_name(&self, name: &str, port: u16) -> Result<TcpStream, String> {
+        if !valid_chain_name(name) || port == 0 {
+            return Err("chain name is not a valid host name".into());
+        }
+        self.dialer.chain(&ChainTarget::Name(name.to_owned(), port))
     }
 
     /// Diagnostic only: one CONNECT on an already authenticated residential
     /// tunnel, timed from request to reply (see `chain-probe`).
-    pub(crate) fn probe_connect(&self, target: &dialer::ProbeTarget) -> Result<Duration, String> {
-        if let dialer::ProbeTarget::Address(SocketAddr::V4(dest)) = target
+    pub(crate) fn probe_connect(&self, target: &ChainTarget) -> Result<Duration, String> {
+        if let ChainTarget::Address(SocketAddr::V4(dest)) = target
             && (*dest == self.first_hop
                 || *dest == self.residential.endpoint()
                 || !valid_endpoint(*dest, false))
@@ -500,12 +618,26 @@ impl Policy {
         if !valid_ipv6_endpoint(dest) {
             return Err("IPv6 chain destination is reserved or unsupported".into());
         }
-        self.dialer.chain(SocketAddr::V6(dest))
+        self.dialer
+            .chain(&ChainTarget::Address(SocketAddr::V6(dest)))
     }
 
     /// Establishes a nested SOCKS5 UDP association for a non-whitelisted UDP
     /// destination. The first relay transports the residential relay's own
     /// SOCKS5 UDP envelope, so neither hop is bypassed.
+    /// The same nested association to a name the residential proxy resolves
+    /// itself (fake-ip).
+    pub(crate) fn chain_udp_name(&self, name: &str, port: u16) -> Result<UdpChain, String> {
+        if !valid_chain_name(name) || port == 0 {
+            return Err("UDP chain name is not a valid host name".into());
+        }
+        self.associate(UdpTarget::Name {
+            name: name.to_owned(),
+            port,
+            pinned: std::sync::Mutex::new(None),
+        })
+    }
+
     pub(crate) fn chain_udp(&self, dest: impl Into<SocketAddr>) -> Result<UdpChain, String> {
         let dest = dest.into();
         let valid = match dest {
@@ -520,6 +652,10 @@ impl Policy {
         if !valid {
             return Err("UDP chain destination is reserved or unsupported".into());
         }
+        self.associate(UdpTarget::Address(dest))
+    }
+
+    fn associate(&self, target: UdpTarget) -> Result<UdpChain, String> {
         let deadline = Instant::now() + SETUP_TIMEOUT;
         let mut first_control =
             TcpStream::connect_timeout(&SocketAddr::V4(self.first_hop), remaining(deadline)?)
@@ -576,7 +712,8 @@ impl Policy {
         Ok(UdpChain {
             socket,
             residential_relay,
-            target: dest,
+            target,
+            _held: None,
             _first_control: first_control,
             _residential_control: residential_control,
         })
@@ -639,6 +776,11 @@ impl Policy {
         &self.health_domain
     }
 
+    /// Whether the policy asks for fake-ip answers.
+    pub(crate) fn fake_ip(&self) -> bool {
+        self.fake_ip
+    }
+
     /// The DoH upstream and TLS name whitelisted names are resolved through,
     /// dialled directly rather than through the chain; `None` when disabled.
     pub fn direct_dns(&self) -> Option<(SocketAddrV4, &str)> {
@@ -660,6 +802,7 @@ pub(crate) struct Validated {
     allow_loopback_residential: bool,
     limits: Limits,
     direct_dns: Option<(SocketAddrV4, String)>,
+    fake_ip: bool,
 }
 
 impl Validated {
@@ -737,6 +880,7 @@ impl Validated {
             allow_loopback_residential: config.allow_loopback_residential,
             limits,
             direct_dns,
+            fake_ip: config.fake_ip,
         })
     }
 }
@@ -751,6 +895,19 @@ fn valid_endpoint(endpoint: SocketAddrV4, allow_loopback: bool) -> bool {
         && (allow_loopback || !ip.is_loopback())
         && ip.octets()[0] != 0
         && ip.octets()[0] < 240
+}
+
+/// A host name a chain may carry: 1-253 bytes of dot-separated labels of
+/// letters, digits, hyphens and underscores, with at least one dot.
+pub(crate) fn valid_chain_name(name: &str) -> bool {
+    (1..=253).contains(&name.len())
+        && name.contains('.')
+        && name.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
 }
 
 fn valid_ipv6_endpoint(endpoint: SocketAddrV6) -> bool {
@@ -1058,6 +1215,7 @@ mod tests {
             tcp_half_close_timeout_seconds: default_half_close(),
             direct_dns_upstream: default_direct_dns_upstream(),
             direct_dns_tls_name: default_direct_dns_tls_name(),
+            fake_ip: default_fake_ip(),
             _legacy_tunnel_pool_max: None,
             _legacy_tunnel_pool_demand: None,
         }
@@ -1195,12 +1353,52 @@ mod tests {
         let payload = b"udp-payload";
         let inner = UdpChain::packet(target, payload);
         let outer = UdpChain::packet(relay, &inner);
+        let expected = UdpTarget::Address(SocketAddr::V4(target));
         assert_eq!(
-            UdpChain::parse_packet(&outer, relay, target).unwrap(),
+            UdpChain::parse_packet(&outer, relay, &expected).unwrap(),
             payload
         );
         let wrong: SocketAddrV4 = "198.51.100.8:53000".parse().unwrap();
-        assert!(UdpChain::parse_packet(&outer, wrong, target).is_err());
+        assert!(UdpChain::parse_packet(&outer, wrong, &expected).is_err());
+    }
+
+    #[test]
+    fn named_udp_target_pins_the_first_reply_source_on_its_port() {
+        let relay: SocketAddrV4 = "198.51.100.7:53000".parse().unwrap();
+        let target = UdpTarget::Name {
+            name: "media.example.com".into(),
+            port: 443,
+            pinned: std::sync::Mutex::new(None),
+        };
+        let reply = |source: &str| {
+            let source: SocketAddrV4 = source.parse().unwrap();
+            UdpChain::packet(relay, &UdpChain::packet(source, b"reply"))
+        };
+        // Another port never pins.
+        assert!(UdpChain::parse_packet(&reply("203.0.113.9:444"), relay, &target).is_err());
+        assert_eq!(
+            UdpChain::parse_packet(&reply("203.0.113.9:443"), relay, &target).unwrap(),
+            b"reply"
+        );
+        assert!(UdpChain::parse_packet(&reply("203.0.113.10:443"), relay, &target).is_err());
+        assert!(UdpChain::parse_packet(&reply("203.0.113.9:443"), relay, &target).is_ok());
+        // A proxy that echoes the name is accepted on the name and port.
+        let echoed = UdpChain::named_packet("Media.Example.com", 443, b"named");
+        let outer = UdpChain::packet(relay, &echoed);
+        assert_eq!(
+            UdpChain::parse_packet(&outer, relay, &target).unwrap(),
+            b"named"
+        );
+        let other = UdpChain::packet(relay, &UdpChain::named_packet("other.example", 443, b"x"));
+        assert!(UdpChain::parse_packet(&other, relay, &target).is_err());
+    }
+
+    #[test]
+    fn named_udp_packet_carries_the_name_and_port() {
+        assert_eq!(
+            UdpChain::named_packet("a.example", 53, b"q"),
+            [&[0, 0, 0, 3, 9][..], b"a.example", &[0, 53], b"q"].concat()
+        );
     }
 
     #[test]
@@ -1211,7 +1409,12 @@ mod tests {
         let inner = UdpChain::packet(SocketAddr::V6(target), payload);
         let outer = UdpChain::packet(SocketAddr::V4(relay), &inner);
         assert_eq!(
-            UdpChain::parse_packet(&outer, SocketAddr::V4(relay), SocketAddr::V6(target)).unwrap(),
+            UdpChain::parse_packet(
+                &outer,
+                SocketAddr::V4(relay),
+                &UdpTarget::Address(SocketAddr::V6(target))
+            )
+            .unwrap(),
             payload
         );
     }

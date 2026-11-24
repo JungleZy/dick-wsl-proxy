@@ -842,6 +842,8 @@ enum Route {
     Dns,
     Direct(SocketAddrV4),
     Chain,
+    /// A fake-ip address: chained by the name it stands for.
+    ChainName,
 }
 
 // This runs only after the kernel metadata bridge has authorized the peer and
@@ -863,6 +865,15 @@ fn route_details(
     }
     if original == plan.ingress || runtime.policy.is_reserved_endpoint(original) {
         return Err("reserved business endpoint rejected".into());
+    }
+    // Before aliases: a fake address must never be chained or dialled as an
+    // address. One no name stands behind any more is refused.
+    if runtime.dns.is_fake(*original.ip()) {
+        return runtime
+            .dns
+            .fake_name(*original.ip())
+            .map(|_| (Route::ChainName, "fake_ip"))
+            .ok_or_else(|| "unknown or reclaimed fake address rejected".into());
     }
     let alias = runtime
         .dns
@@ -903,7 +914,7 @@ fn select_route(
             match route {
                 Route::Dns => "dns",
                 Route::Direct(_) => "direct",
-                Route::Chain => "chain",
+                Route::Chain | Route::ChainName => "chain",
             },
             reason,
         );
@@ -918,8 +929,8 @@ fn select_route(
         (Ok(Route::Dns), _) => &mut counters.dns_udp,
         (Ok(Route::Direct(_)), "tcp") => &mut counters.direct_tcp,
         (Ok(Route::Direct(_)), _) => &mut counters.direct_udp,
-        (Ok(Route::Chain), "tcp") => &mut counters.chain_tcp,
-        (Ok(Route::Chain), _) => &mut counters.chain_udp,
+        (Ok(Route::Chain | Route::ChainName), "tcp") => &mut counters.chain_tcp,
+        (Ok(Route::Chain | Route::ChainName), _) => &mut counters.chain_udp,
         (Err(_), "tcp") => &mut counters.rejected_tcp,
         (Err(_), _) => &mut counters.rejected_udp,
     };
@@ -1203,7 +1214,7 @@ fn run(
                         }
                         continue;
                     }
-                    Ok(Route::Chain) => (None, true),
+                    Ok(Route::Chain | Route::ChainName) => (None, true),
                     Err(error) => {
                         flows.remove(&peer);
                         shared.record_error("udp", error);

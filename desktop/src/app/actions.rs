@@ -8,7 +8,7 @@ use super::backend::Kind;
 use super::components::text;
 use super::drafts::{
     PageDraft, ProfileField, SaveScope, Saved, Unsaved, names_target, profile_changed,
-    residential_value, save_request, saved_residential_text, target_missing,
+    residential_value, save_request, saved_fake_ip, saved_residential_text, target_missing,
 };
 use super::model::{Confirmation, EnvironmentEditor, Field, PendingPrepare};
 use super::state::Desktop;
@@ -137,6 +137,13 @@ impl Desktop {
         }
     }
 
+    /// 勾选或取消设置页的「远端解析」。
+    pub(crate) fn set_fake_ip_draft(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.fake_ip_draft = enabled;
+        self.input_edited(Some(SaveScope::Settings), cx);
+        cx.notify();
+    }
+
     pub(crate) fn residential_inputs(&self) -> [(&Field, &'static str); 4] {
         [
             (&self.fields.residential_ip, "ip"),
@@ -150,6 +157,7 @@ impl Desktop {
     pub(crate) fn draft_unsaved(&self, cx: &App) -> Unsaved {
         let draft = |field| Self::field_value(self.profile_input(field), cx);
         let settings = Self::field_value(&self.fields.port, cx) != self.saved_port
+            || self.fake_ip_draft != saved_fake_ip(&self.profile)
             || profile_changed(&self.profile, SaveScope::Settings, draft)
             || self.residential_inputs().into_iter().any(|(field, key)| {
                 Self::field_value(field, cx) != saved_residential_text(&self.residential, key)
@@ -773,6 +781,7 @@ impl Desktop {
                     Ok(PageDraft::Settings {
                         port: self.port(cx)?,
                         residential: self.residential_draft(cx)?,
+                        fake_ip: self.fake_ip_draft,
                     })
                 });
                 // 校验结果和保存结果一样，用保存结果通知弹出。

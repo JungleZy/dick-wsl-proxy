@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque, hash_map::Entry};
 use std::io::BufReader;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -44,6 +44,8 @@ mod cache;
 use cache::{Cache, Key};
 mod flights;
 use flights::{Flights, Slots};
+mod fake;
+use fake::FakePool;
 
 pub fn reset_aliases() -> Result<(), String> {
     AliasLedger::reset()
@@ -51,8 +53,11 @@ pub fn reset_aliases() -> Result<(), String> {
 
 /// Session-local DNS through the authenticated proxy chain. Ordinary IN queries,
 /// including AAAA, pass through; IPv6 blocking belongs to the Target kernel rules.
-/// Only proven whitelisted A answers with DO=0 get aliases; these carry no AD or
-/// DNSSEC records. A durable digest ledger prevents alias reuse across different
+/// With fake-ip on, non-whitelisted A queries are answered here with a fake
+/// address that the ingress chains by name, and their AAAA, SVCB and HTTPS
+/// queries with no data; excluded names, probes and DO queries still pass
+/// through. Only proven whitelisted A answers with DO=0 get aliases; these
+/// carry no AD or DNSSEC records. A durable digest ledger prevents alias reuse across different
 /// name/IP pairs while allowing the same pair to reclaim its prior alias.
 pub struct ManagedDns {
     resolver: Arc<Resolver>,
@@ -90,6 +95,76 @@ impl ManagedDns {
         self.resolver.report()
     }
 
+    /// Search suffixes from the target's resolver configuration: names under
+    /// them keep real resolution.
+    pub(crate) fn set_search_suffixes(&self, suffixes: Vec<String>) {
+        *lock(&self.resolver.search) = suffixes;
+    }
+
+    /// Starts or stops answering with fake addresses. Starting fails, with
+    /// the reason, when the alias ledger leaves too little room.
+    pub(crate) fn set_fake_ip(&self, enabled: bool) -> Result<(), String> {
+        if enabled && lock(&self.resolver.fake).is_none() {
+            return Err(lock(&self.resolver.fake_unavailable)
+                .clone()
+                .unwrap_or_else(|| "fake-ip unavailable".into()));
+        }
+        self.resolver.fake_enabled.store(enabled, Ordering::Release);
+        Ok(())
+    }
+
+    /// Why fake-ip cannot start in this session, if it cannot.
+    pub(crate) fn fake_pool_unavailable(&self) -> Option<String> {
+        if lock(&self.resolver.fake).is_some() {
+            return None;
+        }
+        Some(
+            lock(&self.resolver.fake_unavailable)
+                .clone()
+                .unwrap_or_else(|| "fake-ip unavailable".into()),
+        )
+    }
+
+    /// The fake address `name` gets, as an A query for it would.
+    #[cfg(test)]
+    pub(crate) fn assign_fake(&self, name: &str) -> Option<Ipv4Addr> {
+        lock(&self.resolver.fake)
+            .as_mut()?
+            .assign(name, Instant::now())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fake_ip_active(&self) -> bool {
+        self.resolver.fake_enabled.load(Ordering::Acquire)
+    }
+
+    /// Whether `address` is in this session's fake range.
+    pub(crate) fn is_fake(&self, address: Ipv4Addr) -> bool {
+        self.resolver.is_fake(address)
+    }
+
+    /// The name behind a fake address, marking it used.
+    pub(crate) fn fake_name(&self, address: Ipv4Addr) -> Option<String> {
+        lock(&self.resolver.fake)
+            .as_mut()?
+            .name(address, Instant::now())
+    }
+
+    /// The name behind a fake address, kept from reclamation while the
+    /// returned lease lives.
+    pub(crate) fn fake_lease(&self, address: Ipv4Addr) -> Option<(String, FakeLease)> {
+        let name = lock(&self.resolver.fake)
+            .as_mut()?
+            .lease(address, Instant::now())?;
+        Some((
+            name,
+            FakeLease {
+                resolver: Arc::clone(&self.resolver),
+                address,
+            },
+        ))
+    }
+
     /// Diagnostic only: the A records the managed path returns for `name`,
     /// session aliases left out.
     pub(crate) fn resolve_ipv4(&self, name: &str) -> Result<Vec<Ipv4Addr>, String> {
@@ -107,6 +182,25 @@ impl ManagedDns {
             .filter(|address| !reserved(*address))
             .collect())
     }
+}
+
+/// Keeps a fake address from being handed to another name while a relayed
+/// connection uses it.
+pub(crate) struct FakeLease {
+    resolver: Arc<Resolver>,
+    address: Ipv4Addr,
+}
+
+impl Drop for FakeLease {
+    fn drop(&mut self) {
+        if let Some(pool) = lock(&self.resolver.fake).as_mut() {
+            pool.release(self.address, Instant::now());
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The state behind `ManagedDns`, shared with background refreshes.
@@ -128,6 +222,12 @@ struct Resolver {
     stats: Stats,
     /// Questions whose stale answer is being refreshed in the background.
     refreshing: Mutex<HashSet<Key>>,
+    /// fake-ip: the address pool, whether answers use it now, and why it is
+    /// unavailable when it is.
+    fake: Mutex<Option<FakePool>>,
+    fake_enabled: AtomicBool,
+    fake_unavailable: Mutex<Option<String>>,
+    search: Mutex<Vec<String>>,
 }
 
 /// What managed DNS did, for the status report.
@@ -144,6 +244,10 @@ struct Stats {
     stale_reuses: AtomicU64,
     fresh_connections: AtomicU64,
     connect_failures: AtomicU64,
+    fake_answers: AtomicU64,
+    fake_empty: AtomicU64,
+    fake_excluded: AtomicU64,
+    fake_exhausted: AtomicU64,
     /// The latest upstream exchanges, newest last.
     recent: Mutex<VecDeque<serde_json::Value>>,
 }
@@ -241,10 +345,38 @@ impl Resolver {
         let tls = builder
             .build()
             .map_err(|e| format!("build DNS TLS connector: {e}"))?;
+        // Fake addresses take the upper half of the reserved range, and the
+        // durable alias ledger stays in the lower half for this session.
+        // Only when fake-ip may be used: otherwise, or when the ledger has
+        // already gone past the lower half, the ledger keeps the whole range.
+        let mut aliases = Aliases::default();
+        let (fake, fake_unavailable) = if !policy.fake_ip() {
+            (None, Some("fake_ip_off_in_policy".to_owned()))
+        } else {
+            match ledger::current_high() {
+                Ok(high) if high <= fake::LEDGER_FLOOR => {
+                    match FakePool::above(fake::LEDGER_FLOOR) {
+                        Some(pool) => {
+                            aliases.ledger.limit = Some(fake::LEDGER_FLOOR);
+                            (Some(pool), None)
+                        }
+                        None => (None, Some("fake_ip_range_unavailable".to_owned())),
+                    }
+                }
+                Ok(_) => (
+                    None,
+                    Some(
+                        "fake_ip_range_in_use: the DNS alias ledger already uses the upper half"
+                            .to_owned(),
+                    ),
+                ),
+                Err(error) => (None, Some(format!("fake_ip_ledger_unreadable: {error}"))),
+            }
+        };
         Ok(Self {
             policy,
             tls,
-            aliases: Mutex::new(Aliases::default()),
+            aliases: Mutex::new(aliases),
             probe: Mutex::new(Probe::default()),
             upstreams: IdlePool::new(),
             direct_upstreams: IdlePool::new(),
@@ -254,7 +386,55 @@ impl Resolver {
             direct_slots: Slots::default(),
             stats: Stats::default(),
             refreshing: Mutex::new(HashSet::new()),
+            fake: Mutex::new(fake),
+            fake_enabled: AtomicBool::new(false),
+            fake_unavailable: Mutex::new(fake_unavailable),
+            search: Mutex::new(Vec::new()),
         })
+    }
+
+    fn is_fake(&self, address: Ipv4Addr) -> bool {
+        lock(&self.fake)
+            .as_ref()
+            .is_some_and(|pool| pool.contains(address))
+    }
+
+    /// An answer made here instead of upstream: a fake address for a
+    /// non-allowlisted A query, or no data for its AAAA, SVCB and HTTPS
+    /// queries. `None` leaves the query to the upstream path.
+    fn fake_answer(&self, query: &Message, wire: &[u8]) -> Option<Vec<u8>> {
+        if !self.fake_enabled.load(Ordering::Acquire)
+            || query.question.class != 1
+            || query.dnssec
+            || !matches!(query.question.kind, 1 | 28 | 64 | 65)
+            || self.policy.allows_domain(&query.question.name)
+        {
+            return None;
+        }
+        // Names the chain could not carry keep real resolution too.
+        if fake::excluded(&query.question.name, &lock(&self.search))
+            || !crate::policy::valid_chain_name(&query.question.name)
+        {
+            self.stats.fake_excluded.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        if query.question.kind != 1 {
+            self.stats.fake_empty.fetch_add(1, Ordering::Relaxed);
+            return fake::empty_answer(wire, query);
+        }
+        let address = lock(&self.fake)
+            .as_mut()?
+            .assign(&query.question.name, Instant::now());
+        match address {
+            Some(address) => {
+                self.stats.fake_answers.fetch_add(1, Ordering::Relaxed);
+                fake::address_answer(wire, query, address)
+            }
+            None => {
+                self.stats.fake_exhausted.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
     }
 
     fn arm_probe(&self, name: &str) -> Result<(), String> {
@@ -296,6 +476,9 @@ impl Resolver {
             .name
             .as_deref()
             == Some(query.question.name.as_str());
+        if !probing && let Some(answer) = self.fake_answer(&query, wire) {
+            return Ok(answer);
+        }
         let key = Key::new(
             &query.question.name,
             query.question.kind,
@@ -402,6 +585,10 @@ impl Resolver {
     }
 
     fn direct_alias(&self, ip: Ipv4Addr) -> Result<Option<Ipv4Addr>, String> {
+        // A fake address is not an alias: it is chained by name, never direct.
+        if self.is_fake(ip) {
+            return Ok(None);
+        }
         self.aliases
             .lock()
             .map_err(|_| "DNS alias table lock poisoned".to_string())?
@@ -507,6 +694,17 @@ impl Resolver {
             "stale_reuses": count(&self.stats.stale_reuses),
             "fresh_connections": count(&self.stats.fresh_connections),
             "connect_failures": count(&self.stats.connect_failures),
+            "fake_ip": {
+                "active": self.fake_enabled.load(Ordering::Acquire),
+                "unavailable": lock(&self.fake_unavailable).clone(),
+                "capacity": lock(&self.fake).as_ref().map(FakePool::capacity),
+                "in_use": lock(&self.fake).as_ref().map(FakePool::in_use),
+                "reclaimed": lock(&self.fake).as_ref().map(FakePool::reclaimed),
+                "answers": count(&self.stats.fake_answers),
+                "empty_answers": count(&self.stats.fake_empty),
+                "excluded": count(&self.stats.fake_excluded),
+                "exhausted": count(&self.stats.fake_exhausted),
+            },
             "idle_chain": idle(&self.upstreams),
             "idle_direct": idle(&self.direct_upstreams),
             "recent": self.stats.recent.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect::<Vec<_>>(),

@@ -145,6 +145,11 @@ pub(crate) fn profile_fields(scope: SaveScope) -> impl Iterator<Item = ProfileFi
         .filter(move |field| field.scope() == scope)
 }
 
+/// 已保存的策略开没开远端解析（fake-ip）。策略里没有这个字段就是开着。
+pub(crate) fn saved_fake_ip(saved: &Value) -> bool {
+    saved["fake_ip"].as_bool().unwrap_or(true)
+}
+
 /// 已保存的值在输入框里显示成什么文字；也用来判断输入框有没有改过。
 pub(crate) fn saved_text(saved: &Value, field: ProfileField) -> String {
     let value = &saved[field.key()];
@@ -295,8 +300,13 @@ pub(crate) enum PageDraft {
     Environment(Option<String>),
     /// 规则页：直连规则全在策略里，由 `draft` 给出。
     Policy,
-    /// 设置页：Windows 入口端口和住宅代理，其余字段在策略里，由 `draft` 给出。
-    Settings { port: u16, residential: Value },
+    /// 设置页：Windows 入口端口、住宅代理和远端解析开关，其余字段在策略里，由 `draft`
+    /// 给出。
+    Settings {
+        port: u16,
+        residential: Value,
+        fake_ip: bool,
+    },
 }
 
 impl PageDraft {
@@ -316,12 +326,26 @@ pub(crate) fn save_request(
     page: PageDraft,
     draft: impl Fn(ProfileField) -> String,
 ) -> Value {
-    let profile = merge_profile(saved.profile, page.scope(), draft);
+    let mut profile = merge_profile(saved.profile, page.scope(), draft);
     let saved_target = saved.target.map(str::to_owned);
     let (target, port, residential) = match page {
         PageDraft::Environment(target) => (target, saved.port, None),
         PageDraft::Policy => (saved_target, saved.port, None),
-        PageDraft::Settings { port, residential } => (saved_target, port, Some(residential)),
+        PageDraft::Settings {
+            port,
+            residential,
+            fake_ip,
+        } => {
+            // 开着是默认值，不写。
+            if let Some(profile) = profile.as_object_mut() {
+                if fake_ip {
+                    profile.remove("fake_ip");
+                } else {
+                    profile.insert("fake_ip".into(), Value::Bool(false));
+                }
+            }
+            (saved_target, port, Some(residential))
+        }
     };
     let mut request = json!({
         "command": "profile_save",
@@ -446,8 +470,8 @@ mod tests {
 
     use super::{
         FailedSaves, PageDraft, ProfileField, SaveScope, Saved, Unsaved, merge_profile,
-        profile_changed, residential_value, save_request, saved_residential_text, saved_text,
-        target_missing,
+        profile_changed, residential_value, save_request, saved_fake_ip, saved_residential_text,
+        saved_text, target_missing,
     };
 
     fn saved() -> Value {
@@ -608,6 +632,7 @@ mod tests {
         let request = request(PageDraft::Settings {
             port: 44000,
             residential: residential.clone(),
+            fake_ip: true,
         });
         assert_eq!(
             request["desktop"],
@@ -616,6 +641,39 @@ mod tests {
         assert_eq!(request["residential"], residential);
         assert_eq!(request["profile"]["first_hop"], "127.0.0.1:1080");
         assert_eq!(request["profile"]["direct_ips"], json!(["192.0.2.0/24"]));
+    }
+
+    #[test]
+    fn the_fake_ip_switch_is_written_only_when_off_and_only_by_the_settings_page() {
+        let residential = json!({"ip": "", "port": 0, "username": "", "password": ""});
+        let off = request(PageDraft::Settings {
+            port: 44000,
+            residential: residential.clone(),
+            fake_ip: false,
+        });
+        assert_eq!(off["profile"]["fake_ip"], json!(false));
+        let on = request(PageDraft::Settings {
+            port: 44000,
+            residential,
+            fake_ip: true,
+        });
+        assert!(on["profile"].get("fake_ip").is_none());
+        assert!(saved_fake_ip(&json!({})));
+        assert!(!saved_fake_ip(&json!({"fake_ip": false})));
+        // Other pages keep a saved `false` as it is.
+        let mut profile = saved();
+        profile["fake_ip"] = json!(false);
+        let revision = json!("7");
+        let record = Saved {
+            profile: &profile,
+            revision: &revision,
+            target: Some("{11111111-1111-1111-1111-111111111111}"),
+            port: 43531,
+        };
+        for page in [PageDraft::Policy, PageDraft::Environment(None)] {
+            let request = save_request(&record, page, draft);
+            assert_eq!(request["profile"]["fake_ip"], json!(false));
+        }
     }
 
     #[test]

@@ -3,8 +3,8 @@
 //! tunnel only needs its CONNECT, which saves the first-hop CONNECT and the
 //! residential method and authentication round trips of a fresh chain.
 use super::{
-    AuthPacket, SETUP_TIMEOUT, WipedBytes, connect, connect_addr, connect_reply, connect_request,
-    expect, receive, remaining, send,
+    AuthPacket, SETUP_TIMEOUT, WipedBytes, connect, connect_reply, connect_request, expect,
+    receive, remaining, send,
 };
 use crate::credential::Residential;
 use std::collections::VecDeque;
@@ -118,6 +118,8 @@ pub(super) struct Dialer {
 struct Stats {
     hits: AtomicU64,
     fresh: AtomicU64,
+    /// Chains asked for by name (fake-ip) rather than by address.
+    by_name: AtomicU64,
     /// Pooled tunnels found closed, talking or too old when taken.
     discarded: AtomicU64,
     /// Pooled tunnels that broke on their CONNECT.
@@ -189,6 +191,7 @@ impl Dialer {
             "idle_limit_ms": self.idle_limit_ms.load(Ordering::Relaxed),
             "hits": count(&self.stats.hits),
             "fresh": count(&self.stats.fresh),
+            "by_name": count(&self.stats.by_name),
             "discarded": count(&self.stats.discarded),
             "stale_on_connect": count(&self.stats.stale_on_connect),
             "prepared": count(&self.stats.prepared),
@@ -208,13 +211,16 @@ impl Dialer {
 
     /// A chain to `dest`: on a pooled tunnel when one is alive, otherwise a
     /// fresh one. The single deadline covers every handshake.
-    pub(super) fn chain(self: &Arc<Self>, dest: SocketAddr) -> Result<TcpStream, String> {
+    pub(super) fn chain(self: &Arc<Self>, target: &ChainTarget) -> Result<TcpStream, String> {
         let deadline = Instant::now() + SETUP_TIMEOUT;
         self.record_demand(Instant::now());
+        if matches!(target, ChainTarget::Name(..)) {
+            self.stats.by_name.fetch_add(1, Ordering::Relaxed);
+        }
         let pooled = self.take();
         self.refill();
         if let Some((mut stream, idle)) = pooled {
-            match pooled_connect(&mut stream, dest, deadline) {
+            match pooled_connect(&mut stream, target, deadline) {
                 Ok(()) => {
                     self.stats.hits.fetch_add(1, Ordering::Relaxed);
                     return finish(stream);
@@ -228,18 +234,18 @@ impl Dialer {
             }
         }
         self.stats.fresh.fetch_add(1, Ordering::Relaxed);
-        self.fresh(dest, deadline).and_then(finish)
+        self.fresh(target, deadline).and_then(finish)
     }
 
-    fn fresh(&self, dest: SocketAddr, deadline: Instant) -> Result<TcpStream, String> {
+    fn fresh(&self, target: &ChainTarget, deadline: Instant) -> Result<TcpStream, String> {
         let pipelined = self.pipeline.load(Ordering::Relaxed);
         let mut stream = self.open_residential(deadline)?;
-        match self.residential_connect(&mut stream, dest, deadline, pipelined) {
+        match self.residential_connect(&mut stream, target, deadline, pipelined) {
             Ok(()) => Ok(stream),
             Err(Setup::Incompatible(_)) if pipelined => {
                 self.pipeline.store(false, Ordering::Relaxed);
                 let mut stream = self.open_residential(deadline)?;
-                self.residential_connect(&mut stream, dest, deadline, false)
+                self.residential_connect(&mut stream, target, deadline, false)
                     .map_err(Setup::into_message)?;
                 Ok(stream)
             }
@@ -487,18 +493,19 @@ impl Dialer {
     fn residential_connect(
         &self,
         stream: &mut TcpStream,
-        dest: SocketAddr,
+        target: &ChainTarget,
         deadline: Instant,
         pipelined: bool,
     ) -> Result<(), Setup> {
+        let request = target_request(target).map_err(Setup::Failed)?;
         if !pipelined {
             authenticate(stream, &self.residential, deadline)?;
-            return connect_addr(stream, dest, deadline).map_err(Setup::Failed);
+            send(stream, &request, deadline).map_err(Setup::Failed)?;
+            return connect_reply(stream, deadline).map_err(Setup::Failed);
         }
         select_authentication(stream, deadline)?;
         let mut packet = AuthPacket([0; 513]);
         let auth = self.residential.auth_packet(&mut packet.0);
-        let request = connect_request(dest);
         let mut batch = WipedBytes(Vec::with_capacity(auth + request.len()));
         batch.0.extend_from_slice(&packet.0[..auth]);
         batch.0.extend_from_slice(&request);
@@ -517,34 +524,39 @@ impl Dialer {
     }
 }
 
-/// Where a diagnostic CONNECT goes: a literal address, or a name the
-/// residential proxy resolves itself (SOCKS5 address type 3).
-pub(crate) enum ProbeTarget {
+/// Where a chain goes: a literal address, or a name the residential proxy
+/// resolves itself (SOCKS5 address type 3).
+pub(crate) enum ChainTarget {
     Address(SocketAddr),
     Name(String, u16),
+}
+
+/// The CONNECT request for `target`.
+pub(super) fn target_request(target: &ChainTarget) -> Result<Vec<u8>, String> {
+    match target {
+        ChainTarget::Address(address) => Ok(connect_request(*address)),
+        ChainTarget::Name(name, port) => {
+            let bytes = name.as_bytes();
+            if bytes.is_empty() || bytes.len() > 255 || !name.is_ascii() {
+                return Err("chain name must be 1-255 ASCII bytes".into());
+            }
+            let mut request = vec![5, 1, 0, 3, bytes.len() as u8];
+            request.extend_from_slice(bytes);
+            request.extend_from_slice(&port.to_be_bytes());
+            Ok(request)
+        }
+    }
 }
 
 impl Dialer {
     /// Diagnostic only: builds an authenticated tunnel without timing it,
     /// then times one CONNECT to `target` from request to reply. The tunnel
     /// is closed without sending anything through it.
-    pub(super) fn probe_connect(&self, target: &ProbeTarget) -> Result<Duration, String> {
+    pub(super) fn probe_connect(&self, target: &ChainTarget) -> Result<Duration, String> {
         let deadline = Instant::now() + SETUP_TIMEOUT;
         let mut stream = self.open_residential(deadline)?;
         authenticate(&mut stream, &self.residential, deadline).map_err(Setup::into_message)?;
-        let request = match target {
-            ProbeTarget::Address(address) => connect_request(*address),
-            ProbeTarget::Name(name, port) => {
-                let bytes = name.as_bytes();
-                if bytes.is_empty() || bytes.len() > 255 || !name.is_ascii() {
-                    return Err("probe name must be 1-255 ASCII bytes".into());
-                }
-                let mut request = vec![5, 1, 0, 3, bytes.len() as u8];
-                request.extend_from_slice(bytes);
-                request.extend_from_slice(&port.to_be_bytes());
-                request
-            }
-        };
+        let request = target_request(target)?;
         let started = Instant::now();
         send(&mut stream, &request, deadline)?;
         let mut header = [0; 4];
@@ -598,10 +610,11 @@ fn authenticate(
 /// before any reply went stale while pooled; a reply that refuses is final.
 fn pooled_connect(
     stream: &mut TcpStream,
-    dest: SocketAddr,
+    target: &ChainTarget,
     deadline: Instant,
 ) -> Result<(), Setup> {
-    if send(stream, &connect_request(dest), deadline).is_err() {
+    let request = target_request(target).map_err(Setup::Failed)?;
+    if send(stream, &request, deadline).is_err() {
         return Err(Setup::Incompatible("pooled tunnel closed".into()));
     }
     let mut first = [0; 1];
@@ -689,10 +702,40 @@ mod tests {
         let _ = forward.join();
     }
 
+    /// A CONNECT request after its first four bytes, by address type.
+    fn read_target(stream: &mut TcpStream, header: [u8; 4]) -> Option<Vec<u8>> {
+        let rest = match header[3] {
+            1 => 6,
+            4 => 18,
+            3 => {
+                let mut length = [0];
+                stream.read_exact(&mut length).ok()?;
+                let mut name = vec![0; usize::from(length[0]) + 2];
+                stream.read_exact(&mut name).ok()?;
+                return Some([&header[..], &length, &name].concat());
+            }
+            _ => return None,
+        };
+        let mut bytes = vec![0; rest];
+        stream.read_exact(&mut bytes).ok()?;
+        Some([&header[..], &bytes].concat())
+    }
+
     /// A first hop that tunnels every connection to `residential`, and a
     /// residential proxy that records whether each CONNECT arrived together
     /// with the credentials ("fresh") or later on an idle tunnel ("pooled").
     fn proxies() -> (SocketAddrV4, Arc<Mutex<Vec<&'static str>>>) {
+        let (first, log, _) = proxies_with_requests();
+        (first, log)
+    }
+
+    /// `proxies`, also keeping each CONNECT request the residential side read.
+    #[allow(clippy::type_complexity)]
+    fn proxies_with_requests() -> (
+        SocketAddrV4,
+        Arc<Mutex<Vec<&'static str>>>,
+        Arc<Mutex<Vec<Vec<u8>>>>,
+    ) {
         let first = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let residential = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let first_endpoint = local(&first);
@@ -712,10 +755,13 @@ mod tests {
         });
         let log = Arc::new(Mutex::new(Vec::new()));
         let record = Arc::clone(&log);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let keep = Arc::clone(&requests);
         thread::spawn(move || {
             for stream in residential.incoming() {
                 let mut stream = stream.unwrap();
                 let record = Arc::clone(&record);
+                let keep = Arc::clone(&keep);
                 thread::spawn(move || {
                     assert_eq!(read_exact::<3>(&mut stream), [5, 1, 2]);
                     stream.write_all(&[5, 2]).unwrap();
@@ -726,10 +772,14 @@ mod tests {
                     let together = stream.peek(&mut peek).is_ok_and(|n| n > 0);
                     stream.set_nonblocking(false).unwrap();
                     stream.write_all(&[1, 0]).unwrap();
-                    let mut request = [0; 10];
-                    if stream.read_exact(&mut request).is_err() {
+                    let mut header = [0; 4];
+                    if stream.read_exact(&mut header).is_err() {
                         return; // A pooled tunnel closed unused.
                     }
+                    let Some(request) = read_target(&mut stream, header) else {
+                        return;
+                    };
+                    keep.lock().unwrap().push(request);
                     record
                         .lock()
                         .unwrap()
@@ -740,7 +790,7 @@ mod tests {
                 });
             }
         });
-        (first_endpoint, log)
+        (first_endpoint, log, requests)
     }
 
     fn settings(max: usize) -> PoolSettings {
@@ -770,9 +820,9 @@ mod tests {
         // CONNECT to the fake residential proxy whatever it names.
         let dialer = dialer(first_hop);
         let destination = SocketAddr::V4("192.0.2.1:443".parse().unwrap());
-        drop(dialer.chain(destination).unwrap());
+        drop(dialer.chain(&ChainTarget::Address(destination)).unwrap());
         wait_for_pool(&dialer, 2);
-        drop(dialer.chain(destination).unwrap());
+        drop(dialer.chain(&ChainTarget::Address(destination)).unwrap());
         let deadline = Instant::now() + Duration::from_secs(3);
         while log.lock().unwrap().len() < 2 {
             assert!(Instant::now() < deadline);
@@ -781,6 +831,35 @@ mod tests {
         assert_eq!(*log.lock().unwrap(), ["fresh", "pooled"]);
         dialer.close();
         assert!(dialer.pool.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_name_target_is_sent_as_a_domain_connect_fresh_and_pooled() {
+        let (first_hop, log, requests) = proxies_with_requests();
+        let dialer = dialer(first_hop);
+        let target = ChainTarget::Name("media.example.com".into(), 443);
+        drop(dialer.chain(&target).unwrap());
+        wait_for_pool(&dialer, 2);
+        drop(dialer.chain(&target).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while log.lock().unwrap().len() < 2 {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(*log.lock().unwrap(), ["fresh", "pooled"]);
+        let expected = [&[5, 1, 0, 3, 17][..], b"media.example.com", &[1, 187]].concat();
+        assert_eq!(*requests.lock().unwrap(), [expected.clone(), expected]);
+        dialer.close();
+    }
+
+    #[test]
+    fn name_requests_carry_the_name_and_reject_unusable_ones() {
+        assert_eq!(
+            target_request(&ChainTarget::Name("a.example".into(), 80)).unwrap(),
+            [&[5, 1, 0, 3, 9][..], b"a.example", &[0, 80]].concat()
+        );
+        assert!(target_request(&ChainTarget::Name(String::new(), 80)).is_err());
+        assert!(target_request(&ChainTarget::Name("a".repeat(256), 80)).is_err());
     }
 
     #[test]

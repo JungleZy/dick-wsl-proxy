@@ -3,7 +3,7 @@ use crate::{
     host,
     managed_dns::ManagedDns,
     plan::Plan,
-    policy::{Policy, UdpChain},
+    policy::{ChainTarget, Policy, UdpChain},
     probe::Snapshot,
 };
 use serde::Serialize;
@@ -60,6 +60,38 @@ fn parse_resolver(contents: &str) -> Result<Ipv4Addr, String> {
     result.ok_or_else(|| "system_resolver_missing".into())
 }
 
+/// The `search` and `domain` suffixes in a resolv.conf, lower case without a
+/// trailing dot. Names under them are local names and keep real resolution.
+fn parse_search_suffixes(contents: &str) -> Vec<String> {
+    let mut suffixes = Vec::new();
+    for line in contents.lines() {
+        let mut fields = line
+            .split(['#', ';'])
+            .next()
+            .unwrap_or_default()
+            .split_ascii_whitespace();
+        if !matches!(fields.next(), Some("search" | "domain")) {
+            continue;
+        }
+        for suffix in fields {
+            let suffix = suffix.trim_end_matches('.').to_ascii_lowercase();
+            if !suffix.is_empty() && !suffixes.contains(&suffix) {
+                suffixes.push(suffix);
+            }
+        }
+    }
+    suffixes
+}
+
+/// The target's resolver search suffixes; none when the baseline is missing.
+pub fn search_suffixes(s: &Snapshot) -> Vec<String> {
+    s.evidence
+        .get("baseline.resolv_conf")
+        .filter(|e| e.status == "ok")
+        .map(|item| parse_search_suffixes(&item.value))
+        .unwrap_or_default()
+}
+
 pub fn resolver(s: &Snapshot) -> Result<Ipv4Addr, String> {
     let item = s
         .evidence
@@ -78,6 +110,9 @@ pub struct Readiness {
     pub dns_latency_ms: u32,
     pub https_host: String,
     pub https_status: u16,
+    /// Whether names outside the whitelist get fake addresses, and if not, why.
+    pub fake_ip: bool,
+    pub fake_ip_reason: Option<String>,
     pub checked_unix_seconds: u64,
 }
 
@@ -98,6 +133,29 @@ impl Runtime {
         Self::with_policy(Arc::clone(&self.policy))
     }
 
+    /// A runtime over a fixture policy whose hops are never reached.
+    #[cfg(test)]
+    pub(crate) fn for_test(fake_ip: bool) -> Arc<Self> {
+        let config: crate::policy::Config = serde_json::from_value(serde_json::json!({
+            "first_hop": "127.0.0.1:19",
+            "credential": "fixture",
+            "dns_upstream": "8.8.8.8:443",
+            "dns_tls_name": "dns.google",
+            "direct_ips": [],
+            "direct_domains": [],
+            "direct_suffixes": [],
+            "allow_loopback_residential": true,
+            "fake_ip": fake_ip
+        }))
+        .unwrap();
+        let policy = Policy::assemble_for_store(
+            crate::policy::Validated::new(config).unwrap(),
+            crate::credential::fixture(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9)),
+        )
+        .unwrap();
+        Self::with_policy(Arc::new(policy)).unwrap()
+    }
+
     fn with_policy(policy: Arc<Policy>) -> Result<Arc<Self>, String> {
         let dns = ManagedDns::new(Arc::clone(&policy))?;
         Ok(Arc::new(Self {
@@ -105,6 +163,29 @@ impl Runtime {
             dns,
             udp_chain_unsupported: AtomicBool::new(false),
         }))
+    }
+
+    /// Turns fake-ip on when the policy asks for it, the address pool has
+    /// room and the residential proxy accepts CONNECT by name, checked with
+    /// the health domain. Otherwise leaves it off and says why.
+    fn enable_fake_ip(&self, health_domain: &str) -> Option<String> {
+        let reason = if !self.policy.fake_ip() {
+            Some("fake_ip_off_in_policy".to_owned())
+        } else if let Some(reason) = self.dns.fake_pool_unavailable() {
+            Some(reason)
+        } else if let Err(error) = self
+            .policy
+            .probe_connect(&ChainTarget::Name(health_domain.to_owned(), 443))
+        {
+            Some(format!("residential_name_connect_failed: {error}"))
+        } else {
+            self.dns.set_fake_ip(true).err()
+        };
+        if reason.is_some() {
+            // Turning it off cannot fail.
+            let _ = self.dns.set_fake_ip(false);
+        }
+        reason
     }
 
     fn record_udp_capability(&self, supported: bool) {
@@ -127,6 +208,19 @@ impl Runtime {
     pub(crate) fn chain_udp(&self, dest: impl Into<SocketAddr>) -> Result<UdpChain, String> {
         if self.udp_chain_unsupported.load(Ordering::Acquire) {
             return Err(UDP_CHAIN_UNSUPPORTED.into());
+        }
+        let dest = dest.into();
+        if let SocketAddr::V4(address) = dest
+            && self.dns.is_fake(*address.ip())
+        {
+            let (name, lease) = self
+                .dns
+                .fake_lease(*address.ip())
+                .ok_or("fake address reclaimed before the UDP chain started")?;
+            return Ok(self
+                .policy
+                .chain_udp_name(&name, address.port())?
+                .holding(Box::new(lease)));
         }
         self.policy.chain_udp(dest)
     }
@@ -169,6 +263,9 @@ impl Runtime {
         if self.policy.allows_domain(host) {
             return Err("health_domain_is_direct_not_chain".into());
         }
+        // Before the HTTPS probe, so that probe goes the way ordinary traffic
+        // will: by fake address and name when fake-ip is on.
+        let fake_ip_reason = self.enable_fake_ip(host);
         // No shell interpolation of a user-configured hostname, no curl proxy environment.
         let encoded = host
             .as_bytes()
@@ -207,6 +304,11 @@ impl Runtime {
             .ok_or("bad_https_probe_output")?;
         let addr = ip.parse::<Ipv4Addr>().map_err(|_| "bad_probe_address")?;
         let status = code.parse::<u16>().map_err(|_| "bad_probe_status")?;
+        // A fake address is chained by name; one no name stands behind
+        // could not have been connected through.
+        if self.dns.is_fake(addr) && self.dns.fake_name(addr).is_none() {
+            return Err("https_probe_unknown_fake_address".into());
+        }
         if !(200..400).contains(&status)
             || self.policy.allows_ip(addr)
             || self.dns.direct_alias(addr)?.is_some()
@@ -224,6 +326,8 @@ impl Runtime {
             dns_latency_ms: average_dns_latency_ms(dns_elapsed),
             https_host: host.to_string(),
             https_status: status,
+            fake_ip: fake_ip_reason.is_none(),
+            fake_ip_reason,
             checked_unix_seconds: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|_| "invalid_clock")?
@@ -251,6 +355,17 @@ mod tests {
         ] {
             assert!(parse_resolver(unsound).is_err());
         }
+    }
+
+    #[test]
+    fn reads_search_and_domain_suffixes() {
+        assert_eq!(
+            parse_search_suffixes(
+                "nameserver 10.255.255.254\nsearch Corp.Example. lab.example # note\ndomain corp.example\n# search ignored.example\n"
+            ),
+            ["corp.example", "lab.example"]
+        );
+        assert!(parse_search_suffixes("nameserver 10.0.0.1\n").is_empty());
     }
 
     #[test]

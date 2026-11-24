@@ -90,6 +90,8 @@ pub(crate) struct Desktop {
     /// 备份、时区对话框里的校验错误；显示在对话框内，打开对话框时清空。
     pub(crate) dialog_error: Option<String>,
     pub(crate) autostart_enabled: bool,
+    /// 设置页「远端解析」勾选框的当前值；保存设置时写进策略的 `fake_ip`。
+    pub(crate) fake_ip_draft: bool,
     pub(crate) confirmation: Option<Confirmation>,
     pub(crate) confirmation_pending: bool,
     /// 本次启动尝试已经就缺少的内核能力问过一次；避免预检失败后反复弹框。
