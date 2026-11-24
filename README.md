@@ -6,7 +6,7 @@
 
 `wsl-proxyctl` 是一个 Windows 命令行工具：它只代理一个 WSL2 发行版中本地进程新建的出站连接，包括已在运行的后台服务。应用不用单独配置代理；其他发行版和 Windows 原生进程保留原有网络路径。工具不修改 Windows 系统代理或 WSL 共享的 `resolv.conf`。
 
-**流量怎么走？** 命中 IP、CIDR、域名或域名后缀白名单的业务连接由 Windows 直连。其余 IPv4 TCP 连接先经过宿主机已有的 SOCKS5 代理，再经过住宅 SOCKS5 出口；任一跳失败都不会改走直连。目标发行版的系统 DNS（UDP/TCP 53）始终经双跳访问指定的 DNS-over-HTTPS 上游，白名单不豁免 DNS 查询。
+**流量怎么走？** 命中 IP、CIDR、域名或域名后缀白名单的业务连接由 Windows 直连。其余 IPv4 TCP 连接先经过宿主机已有的 SOCKS5 代理，再经过住宅 SOCKS5 出口；任一跳失败都不会改走直连。目标发行版的系统 DNS（UDP/TCP 53）经双跳访问指定的 DNS-over-HTTPS 上游；命中域名白名单的查询改由 Windows 直接问国内 DoH 上游（默认阿里 DNS，可在策略中更换或关闭），使直连站点拿到国内地址，国内上游失败时仍经双跳。
 
 **适用范围。** Windows x64 原生桌面控制台与 CLI，后端按 WSL2 NAT 验证，不是通用 VPN。目标具备全局 IPv6 地址和默认路由时启用受管 IPv6，否则阻断目标外部 IPv6。非白名单普通 UDP（含 QUIC）经住宅代理的 UDP Associate 转发；启动时这项探测不通过（例如住宅代理不支持 UDP），接管仍会启动，但本次接管期间这类 UDP 一律拒绝、不会直连，界面显示“UDP 已阻断”，下次启动或切换时重新探测。同一 Windows 账户一次只接管一个发行版；切换前先确认旧目标已恢复，不迁移既有 TCP 连接。
 
@@ -21,7 +21,7 @@
 
 `wsl-proxyctl` is a Windows CLI that proxies new outbound connections from local processes in **one WSL2 distribution**, including services that were already running. Applications need no proxy settings. Other distributions and native Windows processes keep their original routes; the controller changes neither the Windows system proxy nor WSL’s shared `resolv.conf`.
 
-**Where does traffic go?** Windows connects directly for application traffic matching an allowlisted IP, CIDR, domain, or domain suffix. Other IPv4 TCP connections use the host’s existing SOCKS5 proxy and then a residential SOCKS5 proxy. If either hop fails, the connection fails rather than going direct. The target’s system DNS (UDP/TCP port 53) uses the same two hops to reach the configured DNS-over-HTTPS upstream, even for allowlisted domains.
+**Where does traffic go?** Windows connects directly for application traffic matching an allowlisted IP, CIDR, domain, or domain suffix. Other IPv4 TCP connections use the host’s existing SOCKS5 proxy and then a residential SOCKS5 proxy. If either hop fails, the connection fails rather than going direct. The target’s system DNS (UDP/TCP port 53) uses the same two hops to reach the configured DNS-over-HTTPS upstream. Queries for allowlisted domains instead go directly from Windows to a domestic DoH upstream (AliDNS by default; configurable or off in the policy), so direct sites get nearby addresses; if that upstream fails, the query still goes through the two hops.
 
 **Supported scope.** The Windows x64 native desktop and CLI share the controller tested on WSL2 NAT. It is not a general-purpose VPN. A target with a global IPv6 address and default route uses managed IPv6 interception, while external IPv6 is blocked when those prerequisites are absent. Non-allowlisted application UDP, including QUIC, uses the residential UDP Associate. If that startup probe fails (for example, the residential proxy lacks UDP support), takeover still starts, but such UDP is refused, never sent direct, for the rest of that session; the desktop shows UDP as blocked, and the next start or switch probes again. Only one distribution per account can be active. Switching restores the old target before enabling the new one; existing TCP connections do not migrate.
 

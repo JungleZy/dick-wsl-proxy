@@ -47,6 +47,39 @@ pub(crate) struct Config {
         skip_serializing_if = "is_default_half_close"
     )]
     tcp_half_close_timeout_seconds: u64,
+    // DoH upstream for whitelisted names, dialled directly from Windows so
+    // they resolve to the addresses the direct path should use. `null` turns
+    // it off (whitelisted names then resolve through the chain like others).
+    // Defaults are not written, like the limits above.
+    #[serde(
+        default = "default_direct_dns_upstream",
+        skip_serializing_if = "is_default_direct_dns_upstream"
+    )]
+    direct_dns_upstream: Option<String>,
+    #[serde(
+        default = "default_direct_dns_tls_name",
+        skip_serializing_if = "is_default_direct_dns_tls_name"
+    )]
+    direct_dns_tls_name: String,
+}
+
+const DEFAULT_DIRECT_DNS_UPSTREAM: &str = "223.5.5.5:443";
+const DEFAULT_DIRECT_DNS_TLS_NAME: &str = "dns.alidns.com";
+
+fn default_direct_dns_upstream() -> Option<String> {
+    Some(DEFAULT_DIRECT_DNS_UPSTREAM.into())
+}
+
+fn is_default_direct_dns_upstream(value: &Option<String>) -> bool {
+    value.as_deref() == Some(DEFAULT_DIRECT_DNS_UPSTREAM)
+}
+
+fn default_direct_dns_tls_name() -> String {
+    DEFAULT_DIRECT_DNS_TLS_NAME.into()
+}
+
+fn is_default_direct_dns_tls_name(value: &String) -> bool {
+    value == DEFAULT_DIRECT_DNS_TLS_NAME
 }
 
 fn default_health_domain() -> String {
@@ -129,6 +162,7 @@ pub struct Policy {
     direct_suffixes: Vec<String>,
     health_domain: String,
     limits: Limits,
+    direct_dns: Option<(SocketAddrV4, String)>,
 }
 
 /// A nested SOCKS5 UDP relay. The first-hop relay carries an inner SOCKS5
@@ -375,6 +409,9 @@ impl Policy {
         if config.first_hop == residential.endpoint()
             || config.dns_upstream == config.first_hop
             || config.dns_upstream == residential.endpoint()
+            || config.direct_dns.as_ref().is_some_and(|(upstream, _)| {
+                *upstream == config.first_hop || *upstream == residential.endpoint()
+            })
         {
             return Err("policy contains an endpoint loop".into());
         }
@@ -389,6 +426,7 @@ impl Policy {
             direct_suffixes: config.direct_suffixes,
             health_domain: config.health_domain,
             limits: config.limits,
+            direct_dns: config.direct_dns,
         })
     }
 
@@ -635,6 +673,14 @@ impl Policy {
     pub fn health_domain(&self) -> &str {
         &self.health_domain
     }
+
+    /// The DoH upstream and TLS name whitelisted names are resolved through,
+    /// dialled directly rather than through the chain; `None` when disabled.
+    pub fn direct_dns(&self) -> Option<(SocketAddrV4, &str)> {
+        self.direct_dns
+            .as_ref()
+            .map(|(upstream, name)| (*upstream, name.as_str()))
+    }
 }
 
 pub(crate) struct Validated {
@@ -648,6 +694,7 @@ pub(crate) struct Validated {
     health_domain: String,
     allow_loopback_residential: bool,
     limits: Limits,
+    direct_dns: Option<(SocketAddrV4, String)>,
 }
 
 impl Validated {
@@ -680,6 +727,22 @@ impl Validated {
         if !HALF_CLOSE_RANGE.contains(&config.tcp_half_close_timeout_seconds) {
             return Err("tcp_half_close_timeout_seconds must be between 5 and 3600".into());
         }
+        let direct_dns = match &config.direct_dns_upstream {
+            None => None,
+            Some(upstream) => {
+                let upstream: SocketAddrV4 = upstream.parse().map_err(
+                    |_| "direct_dns_upstream must be a literal public IPv4:port or null",
+                )?;
+                if !valid_endpoint(upstream, false) || upstream == first_hop {
+                    return Err(
+                        "direct_dns_upstream must be a literal public IPv4:port or null".into(),
+                    );
+                }
+                let name = normalize_domain(config.direct_dns_tls_name.clone())
+                    .map_err(|e| format!("direct_dns_tls_name: {e}"))?;
+                Some((upstream, name))
+            }
+        };
         let limits = Limits {
             max_tcp: config.max_tcp_connections as usize,
             tcp_idle: Duration::from_secs(config.tcp_idle_timeout_seconds),
@@ -708,6 +771,7 @@ impl Validated {
                 .map_err(|e| format!("health_domain: {e}"))?,
             allow_loopback_residential: config.allow_loopback_residential,
             limits,
+            direct_dns,
         })
     }
 }
@@ -1010,6 +1074,56 @@ mod tests {
             max_tcp_connections: default_max_tcp(),
             tcp_idle_timeout_seconds: default_tcp_idle(),
             tcp_half_close_timeout_seconds: default_half_close(),
+            direct_dns_upstream: default_direct_dns_upstream(),
+            direct_dns_tls_name: default_direct_dns_tls_name(),
+        }
+    }
+
+    #[test]
+    fn whitelisted_names_resolve_through_a_direct_doh_upstream_by_default() {
+        let first_hop = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7892);
+        let defaults = config(first_hop);
+        let written = serde_json::to_value(&defaults).unwrap();
+        // Defaults stay unwritten, so older builds still read the profile.
+        assert!(written.get("direct_dns_upstream").is_none());
+        assert!(written.get("direct_dns_tls_name").is_none());
+        let validated = Validated::new(defaults.clone()).unwrap();
+        assert_eq!(
+            validated.direct_dns,
+            Some((
+                SocketAddrV4::new(Ipv4Addr::new(223, 5, 5, 5), 443),
+                "dns.alidns.com".into()
+            ))
+        );
+        // `null` turns it off; an explicit value is kept and normalized.
+        let mut off: serde_json::Value = written.clone();
+        off["direct_dns_upstream"] = serde_json::Value::Null;
+        let off: Config = serde_json::from_value(off).unwrap();
+        assert_eq!(
+            serde_json::to_value(&off).unwrap()["direct_dns_upstream"],
+            serde_json::Value::Null
+        );
+        assert_eq!(Validated::new(off).unwrap().direct_dns, None);
+        let mut custom = defaults.clone();
+        custom.direct_dns_upstream = Some("119.29.29.29:443".into());
+        custom.direct_dns_tls_name = "DoH.Pub".into();
+        assert_eq!(
+            Validated::new(custom).unwrap().direct_dns,
+            Some((
+                SocketAddrV4::new(Ipv4Addr::new(119, 29, 29, 29), 443),
+                "doh.pub".into()
+            ))
+        );
+        for bad in [
+            "127.0.0.1:443",
+            "0.0.0.0:443",
+            "223.5.5.5:0",
+            "dns.alidns.com:443",
+            "224.0.0.1:443",
+        ] {
+            let mut invalid = defaults.clone();
+            invalid.direct_dns_upstream = Some(bad.into());
+            assert!(Validated::new(invalid).is_err(), "{bad}");
         }
     }
 

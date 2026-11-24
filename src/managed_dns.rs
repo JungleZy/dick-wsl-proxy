@@ -15,6 +15,9 @@ const IO_DEADLINE: Duration = Duration::from_secs(10);
 /// hold the query for the whole I/O deadline before the fresh retry; guest
 /// resolvers give up after about five seconds.
 const REUSED_IO_DEADLINE: Duration = Duration::from_secs(4);
+/// A direct upstream that does not accept quickly is treated as failed, and
+/// the query goes through the chain instead.
+const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// An idle DoH connection is reused only this long; upstreams and proxy hops
 /// close quiet keep-alives on their own schedule.
 const UPSTREAM_IDLE: Duration = Duration::from_secs(30);
@@ -50,8 +53,19 @@ pub struct ManagedDns {
     aliases: Mutex<Aliases>,
     probe: Mutex<Probe>,
     upstreams: IdlePool<Upstream>,
+    /// Connections to the direct DoH upstream for whitelisted names.
+    direct_upstreams: IdlePool<Upstream>,
     /// Validated upstream answers, reused until their TTL runs out.
     answers: Cache,
+}
+
+/// Where a query is sent. Whitelisted names go to the direct DoH upstream so
+/// they resolve to the addresses the direct path should use; everything else,
+/// and a whitelisted name whose direct upstream fails, goes through the chain.
+#[derive(Clone, Copy)]
+enum Route<'a> {
+    Chain,
+    Direct(std::net::SocketAddrV4, &'a str),
 }
 
 /// One verified DoH connection over the proxy chain, kept for the next query.
@@ -128,6 +142,7 @@ impl ManagedDns {
             aliases: Mutex::new(Aliases::default()),
             probe: Mutex::new(Probe::default()),
             upstreams: IdlePool::new(),
+            direct_upstreams: IdlePool::new(),
             answers: Cache::default(),
         })
     }
@@ -195,7 +210,20 @@ impl ManagedDns {
         let fresh = cached.is_none();
         let response_wire = match cached {
             Some(response_wire) => response_wire,
-            None => self.exchange(wire)?,
+            None => match self
+                .policy
+                .direct_dns()
+                .filter(|_| self.policy.allows_domain(&query.question.name))
+            {
+                // A direct upstream that fails or answers something unusable
+                // falls back to the chain, never to a local resolver.
+                Some((upstream, name)) => self
+                    .exchange_via(Route::Direct(upstream, name), wire)
+                    .ok()
+                    .filter(|answer| Message::response(answer, &query).is_ok())
+                    .map_or_else(|| self.exchange_via(Route::Chain, wire), Ok)?,
+                None => self.exchange_via(Route::Chain, wire)?,
+            },
         };
         let response = Message::response(&response_wire, &query)?;
         let answer = finish_answer(
@@ -229,28 +257,53 @@ impl ManagedDns {
             .lookup(ip, Instant::now())
     }
 
-    fn exchange(&self, wire: &[u8]) -> Result<Vec<u8>, String> {
-        if let Some(upstream) = self.upstreams.take(Instant::now())
-            && let Ok(answer) = self.exchange_on(upstream, wire, REUSED_IO_DEADLINE)
+    fn pool(&self, route: Route) -> &IdlePool<Upstream> {
+        match route {
+            Route::Chain => &self.upstreams,
+            Route::Direct(..) => &self.direct_upstreams,
+        }
+    }
+
+    fn tls_name<'a>(&'a self, route: Route<'a>) -> &'a str {
+        match route {
+            Route::Chain => self.policy.dns_tls_name(),
+            Route::Direct(_, name) => name,
+        }
+    }
+
+    fn exchange_via(&self, route: Route, wire: &[u8]) -> Result<Vec<u8>, String> {
+        if let Some(upstream) = self.pool(route).take(Instant::now())
+            && let Ok(answer) = self.exchange_on(route, upstream, wire, REUSED_IO_DEADLINE)
         {
             return Ok(answer);
         }
         // No idle connection, or the upstream or a proxy hop closed it while it
-        // was idle. A DNS query is idempotent: send it once more on a fresh chain.
-        self.exchange_on(self.connect_upstream()?, wire, IO_DEADLINE)
+        // was idle. A DNS query is idempotent: send it once more on a fresh connection.
+        self.exchange_on(route, self.connect_upstream(route)?, wire, IO_DEADLINE)
     }
 
-    fn connect_upstream(&self) -> Result<Upstream, String> {
-        let socket = self.policy.chain(self.policy.dns_upstream())?;
-        let stream = DeadlineStream {
-            socket,
-            deadline: Instant::now() + IO_DEADLINE,
+    fn connect_upstream(&self, route: Route) -> Result<Upstream, String> {
+        let deadline = Instant::now() + IO_DEADLINE;
+        let socket = match route {
+            Route::Chain => self.policy.chain(self.policy.dns_upstream())?,
+            Route::Direct(upstream, _) => {
+                let socket = std::net::TcpStream::connect_timeout(
+                    &std::net::SocketAddr::V4(upstream),
+                    DIRECT_CONNECT_TIMEOUT,
+                )
+                .map_err(|_| "cannot connect to the direct DNS upstream".to_string())?;
+                socket
+                    .set_nodelay(true)
+                    .map_err(|_| "cannot configure the direct DNS socket".to_string())?;
+                socket
+            }
         };
-        // This is a preconnected literal-address chain stream. The DNS hostname
-        // is used only for SNI, certificate verification, and the HTTP Host field.
+        let stream = DeadlineStream { socket, deadline };
+        // This is a preconnected literal-address stream. The DNS hostname is
+        // used only for SNI, certificate verification, and the HTTP Host field.
         let tls = self
             .tls
-            .connect(self.policy.dns_tls_name(), stream)
+            .connect(self.tls_name(route), stream)
             .map_err(|_| "DNS TLS verification/handshake failed".to_string())?;
         Ok(Upstream {
             reader: BufReader::new(tls),
@@ -260,20 +313,21 @@ impl ManagedDns {
 
     fn exchange_on(
         &self,
+        route: Route,
         mut upstream: Upstream,
         wire: &[u8],
         budget: Duration,
     ) -> Result<Vec<u8>, String> {
         // Each query gets its own I/O budget, also on a connection kept from earlier.
         upstream.reader.get_mut().get_mut().deadline = Instant::now() + budget;
-        let response = post_query(&mut upstream.reader, self.policy.dns_tls_name(), wire)?;
+        let response = post_query(&mut upstream.reader, self.tls_name(route), wire)?;
         upstream.uses += 1;
         // Reuse only an exactly framed HTTP/1.1 exchange with nothing left over.
         if response.keep_alive
             && upstream.reader.buffer().is_empty()
             && upstream.uses < MAX_UPSTREAM_USES
         {
-            self.upstreams.put(upstream, Instant::now());
+            self.pool(route).put(upstream, Instant::now());
         }
         Ok(response.body)
     }
