@@ -17,6 +17,7 @@ mod ports;
 mod probe;
 mod query_bridge;
 mod transition;
+mod wsl_platform;
 
 use std::io::{self, BufRead};
 use std::path::PathBuf;

@@ -1,6 +1,6 @@
 use crate::{
     controller, credential, desktop_store, host, kernel_env, managed, managed_dns, plan, ports,
-    probe, transition,
+    probe, transition, wsl_platform,
 };
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,15 @@ pub(crate) enum Command {
     /// legacy tables. Run only while idle; never installs packages.
     PrepareKernel {
         target: String,
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Read-only report of the WSL platform: `wsl.exe`, its kernel and the
+    /// registered distributions. Starts no distribution and changes nothing.
+    WslPlatform,
+    /// Run `wsl --update`. It replaces the WSL package and may restart WSL, so
+    /// it requires idle state and an explicit `--confirm`.
+    WslPlatformUpdate {
         #[arg(long)]
         confirm: bool,
     },
@@ -220,6 +229,44 @@ fn preflight<'a>(
     })
 }
 
+/// `wsl --update` replaces the WSL package and may restart WSL, which drops the
+/// rules of a live takeover. The CLI and the desktop channel share this check so
+/// both refuse in the same situations.
+pub(crate) fn wsl_update_ready(
+    controller: &mut controller::Controller,
+    confirm: bool,
+) -> Result<(), Failure> {
+    if !confirm {
+        return Err(Failure::new(
+            "confirmation_required",
+            "Pass --confirm: wsl --update restarts WSL and stops every distribution",
+        ));
+    }
+    let state = controller
+        .status()
+        .map_err(|error| Failure::new("controller_error", error))?;
+    if state["phase"] != "idle" {
+        return Err(Failure::new(
+            "wsl_update_requires_idle",
+            "Stop the target and restore direct networking first",
+        ));
+    }
+    if controller::journal::load()
+        .map_err(|error| Failure::new("controller_error", error))?
+        .is_some()
+        || transition::load()
+            .map_err(|error| Failure::new("controller_error", error))?
+            .pending
+            .is_some()
+    {
+        return Err(Failure::new(
+            "target_already_owned",
+            "Restore the recorded target before updating WSL",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn dispatch_result(
     request: Command,
     controller: &mut controller::Controller,
@@ -301,6 +348,19 @@ pub(crate) fn dispatch_result(
                 "blockers": blockers,
                 "inspection_error": inspection_error,
             })
+        }
+        Command::WslPlatform => {
+            wsl_platform::inspect().map_err(|error| Failure::new("wsl_platform_failed", error))?
+        }
+        Command::WslPlatformUpdate { confirm } => {
+            wsl_update_ready(controller, confirm)?;
+            wsl_platform::update().map_err(|error| {
+                let code = match error.as_str() {
+                    "wsl_not_installed" => "wsl_not_installed",
+                    _ => "wsl_update_failed",
+                };
+                Failure::new(code, error)
+            })?
         }
         Command::ImportCredential { name, env_file } => {
             credential::valid_name(&name).map_err(error)?;

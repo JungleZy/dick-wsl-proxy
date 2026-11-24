@@ -4,6 +4,7 @@ use crate::{
     environment::{self, InstallOptions},
     host,
     policy::{Config, profile::Preferences},
+    wsl_platform,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -61,6 +62,7 @@ fn blocked_by_environment_job(command: &str, request: &Value, target: &str) -> b
             | "environment_edit"
             | "environment_backup"
             | "environment_delete"
+            | "wsl_platform_update"
     ) || (command == "environment_view" && request["name"].as_str() == Some(target))
 }
 
@@ -313,9 +315,17 @@ fn log_command(command: &str) -> bool {
     )
 }
 
+/// 运行日志的来源。WSL 平台检查与升级统一记为 `wsl`，失败时不显示成命令名。
+fn log_source(command: &str) -> String {
+    match command {
+        "wsl_platform" | "wsl_platform_update" => "wsl".into(),
+        other => other.to_owned(),
+    }
+}
+
 fn command_log(command: &str, response: &Value) -> (&'static str, String, String) {
     if let Some(code) = response.get("code").and_then(Value::as_str) {
-        return ("error", command.to_owned(), format!("操作失败（{code}）"));
+        return ("error", log_source(command), format!("操作失败（{code}）"));
     }
     if matches!(command, "start" | "switch" | "stop") && response["passed"] == false {
         let blockers = response["blockers"].as_array().map_or(0, Vec::len);
@@ -365,6 +375,22 @@ fn command_log(command: &str, response: &Value) -> (&'static str, String, String
         "environment_edit" => ("info", "environment".into(), "环境设置已更新".into()),
         "environment_backup" => ("info", "environment".into(), "环境备份完成".into()),
         "environment_delete" => ("info", "environment".into(), "环境已删除".into()),
+        "wsl_platform_update" => {
+            let update = &response["update"];
+            let before = update["before"]["version"].as_str().unwrap_or("未知");
+            let after = update["after"]["version"].as_str().unwrap_or("未知");
+            let (level, message) = if update["updated"] == true {
+                ("info", format!("WSL 已升级：{before} → {after}"))
+            } else if before == "未知" || after == "未知" {
+                (
+                    "warning",
+                    "WSL 升级命令已执行，但没有读到版本变化，无法确认是否升级".to_owned(),
+                )
+            } else {
+                ("info", format!("WSL 已是最新（{after}）"))
+            };
+            (level, "wsl".into(), message)
+        }
         "import_credential" => (
             "info",
             "desktop_store".into(),
@@ -657,6 +683,14 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                 })?
             }
             "environment_job" => poll_environment_job()?,
+            "wsl_platform_update" => {
+                let confirm = request["confirm"].as_bool().unwrap_or(false);
+                crate::command::wsl_update_ready(controller, confirm)?;
+                start_environment_job("wsl_platform_update", "WSL".into(), || {
+                    let update = wsl_platform::update()?;
+                    Ok(json!({"update":update}))
+                })?
+            }
             "export_diagnostics" => export(controller).map_err(bad)?,
             "probe_exit" => {
                 let generation = request["expected_generation"]
@@ -673,7 +707,7 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
             }
             "list" | "status" | "preflight" | "prepare_kernel" | "import_credential"
             | "forget_credential" | "start" | "switch" | "stop" | "abandon"
-            | "reset_dns_aliases" => {
+            | "reset_dns_aliases" | "wsl_platform" => {
                 if matches!(&*cmd, "start" | "switch" | "stop" | "abandon")
                     && request["expected_generation"].as_u64().is_none()
                 {

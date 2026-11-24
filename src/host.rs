@@ -27,6 +27,24 @@ pub use windows::{
     state_dir, wsl_command, wsl_executable,
 };
 
+/// Whether this process runs with the administrator elevation token. Only the
+/// platform check reports it: `wsl --update` may ask Windows for elevation.
+pub fn elevated() -> bool {
+    #[cfg(windows)]
+    {
+        windows::elevated()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg(not(windows))]
+pub fn wsl_executable() -> Result<std::path::PathBuf, String> {
+    Err("unsupported_platform: Windows host required".into())
+}
+
 /// Registered names of the distributions WSL reports as running. Listing does
 /// not start a stopped distribution.
 pub fn running_distributions() -> Result<Vec<String>, String> {
@@ -185,6 +203,42 @@ mod windows {
 
     pub fn wsl_executable() -> Result<PathBuf, String> {
         Ok(system_directory()?.join("wsl.exe"))
+    }
+
+    /// Reads the current process token's elevation flag. An unreadable token is
+    /// reported as "not elevated": the check only uses this to warn that the
+    /// update may ask Windows for administrator rights.
+    pub fn elevated() -> bool {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        struct Token(HANDLE);
+        impl Drop for Token {
+            fn drop(&mut self) {
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+
+        let mut raw = std::ptr::null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) } == 0 {
+            return false;
+        }
+        let token = Token(raw);
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut needed = 0u32;
+        let read = unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenElevation,
+                (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut needed,
+            )
+        };
+        read != 0 && elevation.TokenIsElevated != 0
     }
 
     fn system_directory() -> Result<PathBuf, String> {
