@@ -14,6 +14,9 @@ const IMPORT_DEADLINE: Duration = Duration::from_secs(10 * 60);
 const CONFIGURE_DEADLINE: Duration = Duration::from_secs(20 * 60);
 const EXPORT_DEADLINE: Duration = Duration::from_secs(30 * 60);
 const DOWNLOAD_DEADLINE: Duration = Duration::from_secs(30 * 60);
+/// The read-only feature view runs inline while the daemon holds the controller
+/// lock, so status and stop wait behind it. Enough for a cold distro start.
+const INSPECT_DEADLINE: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct InstallOptions {
@@ -552,7 +555,7 @@ printf '"default_user":"%s","wslg":%s,"x11_socket":%s,"disk_total_kb":"%s","disk
 }
 
 fn feature_view(distro: &Distro) -> Result<Value, String> {
-    let output = host::guest_script_with_timeout(distro, inspect_script(), CONFIGURE_DEADLINE)?;
+    let output = host::guest_script_with_timeout(distro, inspect_script(), INSPECT_DEADLINE)?;
     let line = output
         .lines()
         .find(|line| line.trim_start().starts_with('{'))
