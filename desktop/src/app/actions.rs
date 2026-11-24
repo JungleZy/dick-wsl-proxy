@@ -134,6 +134,8 @@ impl Desktop {
             ProfileField::MaxTcpConnections => &self.fields.max_tcp_connections,
             ProfileField::TcpIdleTimeout => &self.fields.tcp_idle_timeout,
             ProfileField::TcpHalfCloseTimeout => &self.fields.tcp_half_close_timeout,
+            ProfileField::TunnelPoolMax => &self.fields.tunnel_pool_max,
+            ProfileField::TunnelPoolDemand => &self.fields.tunnel_pool_demand,
         }
     }
 

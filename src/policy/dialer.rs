@@ -15,10 +15,28 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Most authenticated tunnels kept ready. The pool follows recent bursts of
-/// chain requests between `POOL_MIN` and this, so a page load that opened
-/// eight connections finds eight ready the next time.
-pub(super) const POOL_MAX: usize = if cfg!(test) { 0 } else { 8 };
+/// The policy's pool settings: at most `max` authenticated tunnels kept
+/// ready (0 turns the pool off), and only while chains were asked for within
+/// `demand_window`. Between the minimum and `max`, the pool follows recent
+/// bursts of chain requests, so a page load that opened eight connections
+/// finds eight ready the next time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PoolSettings {
+    pub(super) max: usize,
+    pub(super) demand_window: Duration,
+}
+
+/// The settings a policy's dialer runs with. Unit tests that build a policy
+/// exercise exact handshake sequences, so the pool stays off for them; the
+/// pool's own tests build a dialer directly.
+pub(super) fn effective(settings: PoolSettings) -> PoolSettings {
+    if cfg!(test) {
+        PoolSettings { max: 0, ..settings }
+    } else {
+        settings
+    }
+}
+
 const POOL_MIN: usize = 2;
 /// Chain requests this close together count as one burst.
 const BURST_WINDOW: Duration = Duration::from_secs(3);
@@ -28,8 +46,6 @@ const BURST_WINDOW: Duration = Duration::from_secs(3);
 /// was seen to close one, but never below `MIN_POOL_IDLE`.
 const POOL_IDLE: Duration = Duration::from_secs(20);
 const MIN_POOL_IDLE: Duration = Duration::from_secs(2);
-/// Tunnels are only kept ready this long after the last chain was opened.
-const DEMAND_WINDOW: Duration = Duration::from_secs(60);
 
 /// How a residential handshake failed: refused or broken for real, or in a
 /// way that only shows the proxy could not take pipelined requests.
@@ -61,10 +77,12 @@ pub(super) struct Dialer {
     pub(super) pipeline: AtomicBool,
     /// Upper bound on the pool; 0 disables it.
     max: usize,
+    /// Tunnels are only kept ready this long after the last chain request.
+    demand_window: Duration,
     pool: Mutex<Vec<Pooled>>,
     next_id: AtomicUsize,
     in_flight: AtomicUsize,
-    /// When chains were asked for during the last `DEMAND_WINDOW`, oldest first.
+    /// When chains were asked for during the last `demand_window`, oldest first.
     demand: Mutex<VecDeque<Instant>>,
     closed: AtomicBool,
     /// The current idle limit in milliseconds; see `POOL_IDLE`.
@@ -98,12 +116,17 @@ fn remember(ages: &Mutex<VecDeque<u64>>, age: Duration) {
 }
 
 impl Dialer {
-    pub(super) fn new(first_hop: SocketAddrV4, residential: Residential, max: usize) -> Self {
+    pub(super) fn new(
+        first_hop: SocketAddrV4,
+        residential: Residential,
+        settings: PoolSettings,
+    ) -> Self {
         Self {
             first_hop,
             residential,
             pipeline: AtomicBool::new(true),
-            max,
+            max: settings.max,
+            demand_window: settings.demand_window,
             pool: Mutex::new(Vec::new()),
             next_id: AtomicUsize::new(0),
             in_flight: AtomicUsize::new(0),
@@ -126,6 +149,8 @@ impl Dialer {
         serde_json::json!({
             "pooled": self.pool.lock().unwrap_or_else(|e| e.into_inner()).len(),
             "target": self.target(Instant::now()),
+            "max": self.max,
+            "demand_window_seconds": self.demand_window.as_secs(),
             "pipelined": self.pipeline.load(Ordering::Relaxed),
             "idle_limit_ms": self.idle_limit_ms.load(Ordering::Relaxed),
             "hits": count(&self.stats.hits),
@@ -264,7 +289,7 @@ impl Dialer {
         let mut demand = self.demand.lock().unwrap_or_else(|e| e.into_inner());
         while demand
             .front()
-            .is_some_and(|at| now.saturating_duration_since(*at) >= DEMAND_WINDOW)
+            .is_some_and(|at| now.saturating_duration_since(*at) >= self.demand_window)
         {
             demand.pop_front();
         }
@@ -276,7 +301,7 @@ impl Dialer {
     }
 
     /// How many tunnels to keep ready: the largest burst of chain requests
-    /// within `BURST_WINDOW` during the last `DEMAND_WINDOW`, between
+    /// within `BURST_WINDOW` during the last `demand_window`, between
     /// `POOL_MIN` and the maximum. None at all without recent requests.
     fn target(&self, now: Instant) -> usize {
         if self.max == 0 {
@@ -286,7 +311,7 @@ impl Dialer {
         let recent: Vec<Instant> = demand
             .iter()
             .copied()
-            .filter(|at| now.saturating_duration_since(*at) < DEMAND_WINDOW)
+            .filter(|at| now.saturating_duration_since(*at) < self.demand_window)
             .collect();
         if recent.is_empty() {
             return 0;
@@ -603,9 +628,16 @@ mod tests {
         (first_endpoint, log)
     }
 
+    fn settings(max: usize) -> PoolSettings {
+        PoolSettings {
+            max,
+            demand_window: Duration::from_secs(60),
+        }
+    }
+
     fn dialer(first_hop: SocketAddrV4) -> Arc<Dialer> {
         let residential = crate::credential::fixture(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1));
-        Arc::new(Dialer::new(first_hop, residential, 2))
+        Arc::new(Dialer::new(first_hop, residential, settings(2)))
     }
 
     fn wait_for_pool(dialer: &Dialer, size: usize) {
@@ -754,8 +786,28 @@ mod tests {
         assert_eq!(dialer.target(start + Duration::from_secs(100)), 0);
     }
 
+    #[test]
+    fn the_demand_window_comes_from_the_policy() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let residential = crate::credential::fixture(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1));
+        let dialer = Dialer::new(
+            local(&listener),
+            residential,
+            PoolSettings {
+                max: 4,
+                demand_window: Duration::from_secs(10),
+            },
+        );
+        let start = Instant::now();
+        dialer.record_demand(start);
+        assert_eq!(dialer.target(start + Duration::from_secs(9)), 2);
+        assert_eq!(dialer.target(start + Duration::from_secs(10)), 0);
+        assert_eq!(dialer.report()["max"], 4);
+        assert_eq!(dialer.report()["demand_window_seconds"], 10);
+    }
+
     fn dialer_with_target(first_hop: SocketAddrV4, target: usize) -> Arc<Dialer> {
         let residential = crate::credential::fixture(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1));
-        Arc::new(Dialer::new(first_hop, residential, target))
+        Arc::new(Dialer::new(first_hop, residential, settings(target)))
     }
 }
