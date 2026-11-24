@@ -12,6 +12,7 @@ use crate::credential::{self, Residential};
 
 pub(crate) mod domestic;
 pub(crate) mod profile;
+mod residential_probe;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_CONFIG: u64 = 1024 * 1024;
 

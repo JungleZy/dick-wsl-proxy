@@ -277,6 +277,21 @@ fn profile_path() -> Result<PathBuf, String> {
     desktop_store::path()
 }
 
+/// 用已保存的配置检测住宅代理：直连和经宿主 SOCKS5 各走一遍。只读配置库，不碰接管状态。
+/// 结果带上检测时的配置版本，桌面端据此判断结果是否已经过时。
+fn residential_probe() -> Result<Value, String> {
+    let path = profile_path()?;
+    let revision = desktop_store::revision(&path)?;
+    let (config, residential) = desktop_store::load_runtime(&path)?;
+    let policy = crate::policy::Policy::assemble_for_store(
+        crate::policy::Validated::new(config)?,
+        residential,
+    )?;
+    let mut report = policy.probe_residential();
+    report["revision"] = json!(revision.to_string());
+    Ok(json!({"residential_probe": report}))
+}
+
 fn sqlite_view(path: &Path) -> Result<Value, String> {
     let record = desktop_store::ensure(path)?;
     Ok(desktop_store::view(path, &record))
@@ -303,6 +318,7 @@ fn log_command(command: &str) -> bool {
             | "switch"
             | "stop"
             | "probe_exit"
+            | "residential_probe"
             | "export_diagnostics"
             | "environment_create"
             | "environment_edit"
@@ -370,6 +386,17 @@ fn command_log(command: &str, response: &Value) -> (&'static str, String, String
         "switch" => ("info", "lifecycle".into(), "已切换接管目标".into()),
         "stop" => ("info", "lifecycle".into(), "已停止接管并恢复直连".into()),
         "probe_exit" => ("info", "diagnostics".into(), "出口检测完成".into()),
+        // 只记结论，不记服务器地址和账号。
+        "residential_probe" => {
+            let (level, text) = match response["residential_probe"]["verdict"].as_str() {
+                Some("both") => ("info", "直连和经宿主 SOCKS5 都能用"),
+                Some("needs_first_hop") => ("info", "需要经宿主 SOCKS5，直连不通"),
+                Some("direct_only") => ("warning", "只能直连，经宿主 SOCKS5 不通"),
+                Some("credential_rejected") => ("warning", "住宅服务器拒绝了登录"),
+                _ => ("warning", "直连和经宿主 SOCKS5 都不通"),
+            };
+            (level, "residential".into(), format!("住宅代理检测：{text}"))
+        }
         "export_diagnostics" => ("info", "diagnostics".into(), "诊断报告已导出".into()),
         "environment_create" => ("info", "environment".into(), "环境创建完成".into()),
         "environment_edit" => ("info", "environment".into(), "环境设置已更新".into()),
@@ -692,6 +719,7 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                 })?
             }
             "export_diagnostics" => export(controller).map_err(bad)?,
+            "residential_probe" => residential_probe().map_err(bad)?,
             "probe_exit" => {
                 let generation = request["expected_generation"]
                     .as_u64()
