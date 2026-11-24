@@ -302,6 +302,87 @@ fn https_requires_dns_content_type_and_unambiguous_bounded_framing() {
 }
 
 #[test]
+fn chunked_https_bodies_join_and_stop_at_their_own_end() {
+    let body = query("test.example");
+    let (head, tail) = body.split_at(5);
+    let response = |headers: &str, chunks: &[u8]| {
+        let mut http =
+            format!("HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\n{headers}\r\n")
+                .into_bytes();
+        http.extend_from_slice(chunks);
+        http
+    };
+    let chunks = |end: &[u8]| {
+        let mut bytes = format!("{:x}\r\n", head.len()).into_bytes();
+        bytes.extend_from_slice(head);
+        bytes.extend_from_slice(format!("\r\n{:X}\r\n", tail.len()).as_bytes());
+        bytes.extend_from_slice(tail);
+        bytes.extend_from_slice(end);
+        bytes
+    };
+
+    // Two chunks make one body; the next response on a kept-alive connection
+    // is left unread.
+    let mut next = chunks(b"\r\n0\r\n\r\n");
+    next.extend_from_slice(b"HTTP/1.1 200 OK");
+    let mut reader = io::Cursor::new(response("Transfer-Encoding: chunked\r\n", &next));
+    let reply = read_http(&mut reader).unwrap();
+    assert_eq!(reply.body, body);
+    assert!(reply.keep_alive);
+    let mut rest = String::new();
+    reader.read_to_string(&mut rest).unwrap();
+    assert_eq!(rest, "HTTP/1.1 200 OK");
+
+    let complete = chunks(b"\r\n0\r\n\r\n");
+    for (headers, chunks) in [
+        // Two framings for one body.
+        (
+            "Transfer-Encoding: chunked\r\nContent-Length: 12\r\n",
+            complete.clone(),
+        ),
+        ("Transfer-Encoding: gzip, chunked\r\n", complete.clone()),
+        (
+            "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n",
+            complete.clone(),
+        ),
+        // No framing at all.
+        ("", complete.clone()),
+        // A trailer could restate the content type or length.
+        (
+            "Transfer-Encoding: chunked\r\n",
+            chunks(b"\r\n0\r\nContent-Type: text/html\r\n\r\n"),
+        ),
+        // The chunk data must end with CRLF.
+        ("Transfer-Encoding: chunked\r\n", chunks(b"XX0\r\n\r\n")),
+        // Chunk sizes are bare hex: no extensions, no sign, at most 8 digits.
+        (
+            "Transfer-Encoding: chunked\r\n",
+            b"5;ext=1\r\nhello\r\n0\r\n\r\n".to_vec(),
+        ),
+        ("Transfer-Encoding: chunked\r\n", b"\r\n".to_vec()),
+        (
+            "Transfer-Encoding: chunked\r\n",
+            b"000000001\r\nx\r\n0\r\n\r\n".to_vec(),
+        ),
+        // Larger than one DNS message.
+        ("Transfer-Encoding: chunked\r\n", b"10000\r\n".to_vec()),
+        // A complete but too short body.
+        (
+            "Transfer-Encoding: chunked\r\n",
+            b"3\r\nabc\r\n0\r\n\r\n".to_vec(),
+        ),
+        // Cut off before the last chunk.
+        ("Transfer-Encoding: chunked\r\n", chunks(b"\r\n")),
+    ] {
+        assert!(
+            read_http(&mut io::Cursor::new(response(headers, &chunks))).is_err(),
+            "{headers:?} {:?}",
+            String::from_utf8_lossy(&chunks)
+        );
+    }
+}
+
+#[test]
 fn only_an_http11_response_without_close_keeps_the_connection() {
     let body = query("test.example");
     let reply = |status: &str, extra: &str| {

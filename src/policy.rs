@@ -1433,6 +1433,33 @@ mod tests {
     }
 
     #[test]
+    fn production_endpoints_never_include_loopback() {
+        // `chain`, `chain_udp` and `is_reserved_endpoint` pass `cfg!(test)` so
+        // the other tests can reach local servers; only here does the
+        // production value `false` run.
+        for local in ["127.0.0.1:443", "127.255.255.254:8080"] {
+            let local: SocketAddrV4 = local.parse().unwrap();
+            assert!(!valid_endpoint(local, false), "{local}");
+            assert!(valid_endpoint(local, true), "{local}");
+        }
+        assert!(valid_endpoint("192.0.2.1:443".parse().unwrap(), false));
+        for reserved in [
+            "0.0.0.0:443",
+            "192.0.2.1:0",
+            "224.0.0.1:443",
+            "255.255.255.255:443",
+            "169.254.1.1:443",
+            "0.1.2.3:443",
+            "240.0.0.1:443",
+        ] {
+            assert!(
+                !valid_endpoint(reserved.parse().unwrap(), true),
+                "{reserved}"
+            );
+        }
+    }
+
+    #[test]
     fn validation_errors_name_the_field_and_the_entry() {
         let first = "127.0.0.1:7892".parse().unwrap();
         let mut typo = config(first);
