@@ -4,16 +4,20 @@ use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream, UdpSocket,
 };
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use crate::credential::{self, Residential};
 
+mod dialer;
 pub(crate) mod domestic;
 pub(crate) mod profile;
 mod residential_probe;
+use dialer::Dialer;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_CONFIG: u64 = 1024 * 1024;
 
@@ -164,10 +168,14 @@ pub struct Policy {
     health_domain: String,
     limits: Limits,
     direct_dns: Option<(SocketAddrV4, String)>,
-    /// Whether residential handshakes still send their three requests in one
-    /// write. Cleared for the rest of this takeover the first time the proxy
-    /// cannot follow that.
-    pipeline_residential: AtomicBool,
+    /// Builds the TCP chains and keeps a few authenticated tunnels ready.
+    dialer: Arc<Dialer>,
+}
+
+impl Drop for Policy {
+    fn drop(&mut self) {
+        self.dialer.close();
+    }
 }
 
 /// A nested SOCKS5 UDP relay. The first-hop relay carries an inner SOCKS5
@@ -420,6 +428,11 @@ impl Policy {
         {
             return Err("policy contains an endpoint loop".into());
         }
+        let dialer = Arc::new(Dialer::new(
+            config.first_hop,
+            residential.clone(),
+            dialer::POOL_TARGET,
+        ));
         Ok(Self {
             credential_ref: config.credential,
             first_hop: config.first_hop,
@@ -432,7 +445,7 @@ impl Policy {
             health_domain: config.health_domain,
             limits: config.limits,
             direct_dns: config.direct_dns,
-            pipeline_residential: AtomicBool::new(true),
+            dialer,
         })
     }
 
@@ -457,7 +470,7 @@ impl Policy {
         {
             return Err("chain destination is reserved or unsupported".into());
         }
-        self.residential_chain(SocketAddr::V4(dest))
+        self.dialer.chain(SocketAddr::V4(dest))
     }
 
     /// Establishes the same authenticated chain for an IPv6 literal. The IPv6
@@ -467,106 +480,7 @@ impl Policy {
         if !valid_ipv6_endpoint(dest) {
             return Err("IPv6 chain destination is reserved or unsupported".into());
         }
-        self.residential_chain(SocketAddr::V6(dest))
-    }
-
-    /// First-hop SOCKS5 -> authenticated residential SOCKS5 -> `dest`. The
-    /// single deadline covers both handshakes, including partial reads and
-    /// writes. A pipelined attempt that the residential proxy cannot follow
-    /// is redialled once without pipelining, which then stays off.
-    fn residential_chain(&self, dest: SocketAddr) -> Result<TcpStream, String> {
-        let deadline = Instant::now() + SETUP_TIMEOUT;
-        let pipelined = self.pipeline_residential.load(Ordering::Relaxed);
-        let mut stream = self.open_residential(deadline)?;
-        match self.residential_connect(&mut stream, dest, deadline, pipelined) {
-            Ok(()) => {}
-            Err(Setup::Incompatible(_)) if pipelined => {
-                self.pipeline_residential.store(false, Ordering::Relaxed);
-                stream = self.open_residential(deadline)?;
-                self.residential_connect(&mut stream, dest, deadline, false)
-                    .map_err(Setup::into_message)?;
-            }
-            Err(error) => return Err(error.into_message()),
-        }
-        stream
-            .set_read_timeout(None)
-            .map_err(|_| "cannot configure chain socket")?;
-        stream
-            .set_write_timeout(None)
-            .map_err(|_| "cannot configure chain socket")?;
-        Ok(stream)
-    }
-
-    /// A first-hop tunnel to the residential proxy. No residential bytes,
-    /// least of all credentials, are sent before this outer CONNECT succeeds.
-    fn open_residential(&self, deadline: Instant) -> Result<TcpStream, String> {
-        let mut stream =
-            TcpStream::connect_timeout(&SocketAddr::V4(self.first_hop), remaining(deadline)?)
-                .map_err(|_| "cannot connect to first-hop SOCKS5 endpoint")?;
-        stream
-            .set_nodelay(true)
-            .map_err(|_| "cannot configure chain socket")?;
-        send(&mut stream, &[5, 1, 0], deadline)?;
-        expect(
-            &mut stream,
-            &[5, 0],
-            deadline,
-            "first-hop SOCKS5 method rejected",
-        )?;
-        connect(&mut stream, self.residential.endpoint(), deadline)?;
-        Ok(stream)
-    }
-
-    /// Residential method selection, username/password authentication and
-    /// CONNECT. Pipelined, authentication and CONNECT go out in one write
-    /// once the proxy has selected authentication, saving one residential
-    /// round trip.
-    fn residential_connect(
-        &self,
-        stream: &mut TcpStream,
-        dest: SocketAddr,
-        deadline: Instant,
-        pipelined: bool,
-    ) -> Result<(), Setup> {
-        // Credentials go out only after the proxy has selected
-        // username/password authentication, pipelined or not.
-        send(stream, &[5, 1, 2], deadline).map_err(Setup::Failed)?;
-        expect(
-            stream,
-            &[5, 2],
-            deadline,
-            "residential SOCKS5 authentication method rejected",
-        )
-        .map_err(Setup::Failed)?;
-        let mut packet = AuthPacket([0; 513]);
-        let auth = self.residential.auth_packet(&mut packet.0);
-        if pipelined {
-            let request = connect_request(dest);
-            let mut batch = WipedBytes(Vec::with_capacity(auth + request.len()));
-            batch.0.extend_from_slice(&packet.0[..auth]);
-            batch.0.extend_from_slice(&request);
-            send(stream, &batch.0, deadline).map_err(Setup::Failed)?;
-            // A connection that breaks before the authentication reply means
-            // the proxy could not take CONNECT behind the credentials, not that
-            // either was refused.
-            let mut status = [0; 2];
-            receive(stream, &mut status, deadline).map_err(Setup::Incompatible)?;
-            if status != [1, 0] {
-                return Err(Setup::Failed(
-                    "residential SOCKS5 authentication rejected".into(),
-                ));
-            }
-            return connect_reply(stream, deadline).map_err(Setup::Failed);
-        }
-        send(stream, &packet.0[..auth], deadline).map_err(Setup::Failed)?;
-        expect(
-            stream,
-            &[1, 0],
-            deadline,
-            "residential SOCKS5 authentication rejected",
-        )
-        .map_err(Setup::Failed)?;
-        connect_addr(stream, dest, deadline).map_err(Setup::Failed)
+        self.dialer.chain(SocketAddr::V6(dest))
     }
 
     /// Establishes a nested SOCKS5 UDP association for a non-whitelisted UDP
@@ -903,21 +817,6 @@ fn normalize_domain(mut name: String) -> Result<String, String> {
     name.truncate(length);
     name.make_ascii_lowercase();
     Ok(name)
-}
-
-/// How a residential handshake failed: refused or broken for real, or in a
-/// way that only shows the proxy could not take pipelined requests.
-enum Setup {
-    Failed(String),
-    Incompatible(String),
-}
-
-impl Setup {
-    fn into_message(self) -> String {
-        match self {
-            Self::Failed(message) | Self::Incompatible(message) => message,
-        }
-    }
 }
 
 /// A buffer that held credentials; cleared when dropped.
@@ -1514,7 +1413,7 @@ mod tests {
         drop(stream);
         inner.join().unwrap();
         outer.join().unwrap();
-        assert!(policy.pipeline_residential.load(Ordering::Relaxed));
+        assert!(policy.dialer.pipeline.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -1555,7 +1454,7 @@ mod tests {
             }
         });
         drop(policy.chain(origin).unwrap());
-        assert!(!policy.pipeline_residential.load(Ordering::Relaxed));
+        assert!(!policy.dialer.pipeline.load(Ordering::Relaxed));
         drop(policy.chain(origin).unwrap());
         inner.join().unwrap();
         outer.join().unwrap();

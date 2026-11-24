@@ -27,6 +27,17 @@ pub(crate) struct Residential {
     blob: Secret,
 }
 
+/// A copy for the connection pool's background dialer. The copied bytes are
+/// wiped on drop like the original.
+impl Clone for Residential {
+    fn clone(&self) -> Self {
+        Self {
+            endpoint: self.endpoint,
+            blob: Secret(self.blob.0.clone()),
+        }
+    }
+}
+
 /// Builds the credential from the four settings fields exactly as typed: the
 /// username and password bytes go into the SOCKS5 packet unchanged, quotes and
 /// surrounding spaces included. Only the address is trimmed.
