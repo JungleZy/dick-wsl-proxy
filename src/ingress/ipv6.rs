@@ -80,8 +80,13 @@ pub(super) fn run(
         .as_ref()
         .ok_or("IPv6 ingress plan missing")?
         .clone();
-    let mut tcp_workers = Vec::new();
-    let active = Arc::new(Mutex::new(BTreeMap::<SocketAddrV6, TcpStream>::new()));
+    // Dropped on every exit, including `?`: shuts the clients down and joins
+    // every relay.
+    let mut tcp_workers = TcpWorkers {
+        shared: Arc::clone(&shared),
+        active: Arc::new(Mutex::new(BTreeMap::new())),
+        handles: Vec::new(),
+    };
     let mut udp_flows = BTreeMap::new();
     // Dropped on every exit, including `?`: joins running setups.
     let mut chain_setups = ChainSetups::new();
@@ -92,7 +97,7 @@ pub(super) fn run(
         .set_nonblocking(true)
         .map_err(|e| format!("configure IPv6 UDP ingress: {e}"))?;
     while !shared.is_stopping() {
-        reap_tcp(&mut tcp_workers)?;
+        tcp_workers.reap()?;
         let mut progressed = accept_tcp(
             &plan,
             &ipv6,
@@ -100,7 +105,6 @@ pub(super) fn run(
             &shared,
             runtime.clone(),
             &mut tcp_workers,
-            &active,
         )?;
         progressed |= receive_udp(
             &plan,
@@ -129,27 +133,49 @@ pub(super) fn run(
     for flow in udp_flows.into_values() {
         flow.stats.stopped();
     }
-    for client in lock(&active).values() {
-        let _ = client.shutdown(std::net::Shutdown::Both);
-    }
-    for worker in tcp_workers {
-        let _ = worker.join();
-    }
     Ok(())
 }
 
-fn reap_tcp(workers: &mut Vec<thread::JoinHandle<()>>) -> Result<(), String> {
-    let mut index = 0;
-    while index < workers.len() {
-        if workers[index].is_finished() {
-            if workers.swap_remove(index).join().is_err() {
-                return Err("IPv6 TCP forwarding worker panicked".into());
+/// The IPv6 TCP relay threads and the client handles that interrupt them.
+/// `Shared::request_stop` only reaches the IPv4 clients, so this guard shuts
+/// these down itself when `run` returns, `?` and panics included: no relay
+/// outlives the ingress that `Ingress::stop` reports as joined.
+struct TcpWorkers {
+    shared: Arc<Shared>,
+    active: Arc<Mutex<BTreeMap<SocketAddrV6, TcpStream>>>,
+    handles: Vec<thread::JoinHandle<()>>,
+}
+
+impl TcpWorkers {
+    fn reap(&mut self) -> Result<(), String> {
+        let mut index = 0;
+        while index < self.handles.len() {
+            if self.handles[index].is_finished() {
+                if self.handles.swap_remove(index).join().is_err() {
+                    return Err("IPv6 TCP forwarding worker panicked".into());
+                }
+            } else {
+                index += 1;
             }
-        } else {
-            index += 1;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TcpWorkers {
+    fn drop(&mut self) {
+        // The guard is a temporary of this statement: each relay locks `active`
+        // to deregister, so it must be released before the joins below.
+        for client in lock(&self.active).values() {
+            let _ = client.shutdown(std::net::Shutdown::Both);
+        }
+        for handle in self.handles.drain(..) {
+            if handle.join().is_err() {
+                self.shared
+                    .record_failure("IPv6 TCP forwarding worker panicked".into());
+            }
         }
     }
-    Ok(())
 }
 
 fn accept_tcp(
@@ -158,9 +184,9 @@ fn accept_tcp(
     listener: &TcpListener,
     shared: &Arc<Shared>,
     runtime: Option<Arc<crate::managed::Runtime>>,
-    workers: &mut Vec<thread::JoinHandle<()>>,
-    active: &Arc<Mutex<BTreeMap<SocketAddrV6, TcpStream>>>,
+    workers: &mut TcpWorkers,
 ) -> Result<bool, String> {
+    let active = &workers.active;
     let mut progressed = false;
     for _ in 0..super::ACCEPT_BATCH {
         let (client, peer) = match listener.accept() {
@@ -182,7 +208,7 @@ fn accept_tcp(
             }
             Err(error) => return Err(format!("IPv6 TCP ingress accept failed: {error}")),
         };
-        if workers.len() >= shared.limits.max_tcp {
+        if workers.handles.len() >= shared.limits.max_tcp {
             shared.reject_tcp_at_capacity();
             continue;
         }
@@ -214,7 +240,7 @@ fn accept_tcp(
                 }
             });
         match spawned {
-            Ok(worker) => workers.push(worker),
+            Ok(worker) => workers.handles.push(worker),
             Err(error) => {
                 lock(active).remove(&peer);
                 shared.reject_tcp(
@@ -823,6 +849,51 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(2));
         assert!(flows.contains_key(&peer));
         assert_eq!(lock(&shared.counters).udp_failures, 0);
+    }
+
+    #[test]
+    fn dropped_tcp_workers_shut_their_relays_down_and_join_them() {
+        use std::io::Read;
+        let shared = Arc::new(Shared::new());
+        let listener = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (relay, SocketAddr::V6(peer)) = listener.accept().unwrap() else {
+            unreachable!("an IPv6 listener accepts IPv6 peers");
+        };
+        let mut workers = TcpWorkers {
+            shared: Arc::clone(&shared),
+            active: Arc::new(Mutex::new(BTreeMap::new())),
+            handles: Vec::new(),
+        };
+        lock(&workers.active).insert(peer, relay.try_clone().unwrap());
+        let active = Arc::clone(&workers.active);
+        // Like `forward_tcp`: wait on the client in short steps until it is
+        // shut down, then deregister. Left alone it would run for 30 seconds.
+        workers.handles.push(thread::spawn(move || {
+            let mut relay = relay;
+            relay
+                .set_read_timeout(Some(Duration::from_millis(20)))
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut byte = [0];
+            while Instant::now() < deadline {
+                match relay.read(&mut byte) {
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) => {}
+                    _ => break,
+                }
+            }
+            lock(&active).remove(&peer);
+        }));
+        let active = Arc::clone(&workers.active);
+        let started = Instant::now();
+        drop(workers);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(lock(&active).is_empty());
+        assert!(lock(&shared.failure).is_none());
     }
 
     #[test]

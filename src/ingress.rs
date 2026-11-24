@@ -170,13 +170,19 @@ impl Ingress {
             match thread::Builder::new()
                 .name("m1-ingress-ipv6".into())
                 .spawn(move || {
-                    ipv6::run(
+                    let result = ipv6::run(
                         worker_plan,
                         tcp6.into(),
                         udp6.into(),
-                        worker_shared,
+                        Arc::clone(&worker_shared),
                         runtime,
-                    )
+                    );
+                    // IPv4 keeps forwarding; `health` reports this cause
+                    // instead of a bare "stopped unexpectedly".
+                    if let Err(error) = &result {
+                        worker_shared.record_failure(error.clone());
+                    }
+                    result
                 }) {
                 Ok(worker) => Some(worker),
                 Err(error) => {
@@ -396,12 +402,14 @@ impl Shared {
         }
     }
 
+    /// Keeps the first failure for `health` and `stop` without stopping the
+    /// other workers.
+    fn record_failure(&self, error: String) {
+        lock(&self.failure).get_or_insert(error);
+    }
+
     fn fail(&self, error: String) {
-        let mut failure = lock(&self.failure);
-        if failure.is_none() {
-            *failure = Some(error);
-        }
-        drop(failure);
+        self.record_failure(error);
         self.request_stop();
     }
 
