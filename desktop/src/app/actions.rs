@@ -126,6 +126,8 @@ impl Desktop {
             ProfileField::DnsUpstream => &self.fields.dns_upstream,
             ProfileField::DnsTlsName => &self.fields.dns_tls_name,
             ProfileField::HealthDomain => &self.fields.health_domain,
+            ProfileField::DirectDnsUpstream => &self.fields.direct_dns_upstream,
+            ProfileField::DirectDnsTlsName => &self.fields.direct_dns_tls_name,
             ProfileField::DirectIps => &self.fields.direct_ips,
             ProfileField::DirectDomains => &self.fields.direct_domains,
             ProfileField::DirectSuffixes => &self.fields.direct_suffixes,

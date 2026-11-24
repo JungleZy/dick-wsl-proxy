@@ -2386,6 +2386,15 @@ impl Desktop {
                     .item(input("DoH 上游 IPv4:端口", &self.fields.dns_upstream))
                     .item(input("TLS 主机名", &self.fields.dns_tls_name))
                     .item(input("健康检查域名", &self.fields.health_domain)),
+            )
+            .group(
+                SettingGroup::new()
+                    .title("白名单域名解析")
+                    .description(
+                        "命中域名白名单的查询由 Windows 直接问这个国内 DoH，让直连站点拿到国内地址；连不上时仍经代理链。上游留空即关闭，全部经代理链解析。",
+                    )
+                    .item(input("国内 DoH 上游 IPv4:端口", &self.fields.direct_dns_upstream))
+                    .item(input("国内 DoH TLS 主机名", &self.fields.direct_dns_tls_name)),
             );
         let limits = SettingPage::new("转发限制").resettable(false).group(
             SettingGroup::new()

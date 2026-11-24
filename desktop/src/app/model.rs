@@ -372,6 +372,8 @@ pub(crate) struct Fields {
     pub(crate) dns_upstream: Field,
     pub(crate) dns_tls_name: Field,
     pub(crate) health_domain: Field,
+    pub(crate) direct_dns_upstream: Field,
+    pub(crate) direct_dns_tls_name: Field,
     pub(crate) direct_ips: Field,
     pub(crate) direct_domains: Field,
     pub(crate) direct_suffixes: Field,

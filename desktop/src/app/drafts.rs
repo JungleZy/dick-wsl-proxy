@@ -51,7 +51,16 @@ pub(crate) enum FieldKind {
     Lines,
     /// 整数；留空表示用后台默认值，策略里不写这个字段。
     Number,
+    /// 有默认值、可以关闭的文字：策略里没有这个字段时显示默认值；填默认值不写；
+    /// 留空写 `null`，表示关闭。
+    Optional(&'static str),
+    /// 有默认值的文字：策略里没有这个字段时显示默认值；留空或填默认值都不写。
+    Defaulted(&'static str),
 }
+
+/// 白名单域名直接问的国内 DoH 上游的默认值，和后台策略的默认值一致。
+pub(crate) const DEFAULT_DIRECT_DNS_UPSTREAM: &str = "223.5.5.5:443";
+pub(crate) const DEFAULT_DIRECT_DNS_TLS_NAME: &str = "dns.alidns.com";
 
 /// 写进策略的字段。用枚举而不是字段名字符串：输入框的对应关系由穷尽匹配给出，
 /// 新增字段漏写对应关系时编译不过，而不是运行时才出错。
@@ -61,6 +70,8 @@ pub(crate) enum ProfileField {
     DnsUpstream,
     DnsTlsName,
     HealthDomain,
+    DirectDnsUpstream,
+    DirectDnsTlsName,
     DirectIps,
     DirectDomains,
     DirectSuffixes,
@@ -70,11 +81,13 @@ pub(crate) enum ProfileField {
 }
 
 impl ProfileField {
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 12] = [
         Self::FirstHop,
         Self::DnsUpstream,
         Self::DnsTlsName,
         Self::HealthDomain,
+        Self::DirectDnsUpstream,
+        Self::DirectDnsTlsName,
         Self::DirectIps,
         Self::DirectDomains,
         Self::DirectSuffixes,
@@ -90,6 +103,8 @@ impl ProfileField {
             Self::DnsUpstream => "dns_upstream",
             Self::DnsTlsName => "dns_tls_name",
             Self::HealthDomain => "health_domain",
+            Self::DirectDnsUpstream => "direct_dns_upstream",
+            Self::DirectDnsTlsName => "direct_dns_tls_name",
             Self::DirectIps => "direct_ips",
             Self::DirectDomains => "direct_domains",
             Self::DirectSuffixes => "direct_suffixes",
@@ -113,6 +128,8 @@ impl ProfileField {
             Self::MaxTcpConnections | Self::TcpIdleTimeout | Self::TcpHalfCloseTimeout => {
                 FieldKind::Number
             }
+            Self::DirectDnsUpstream => FieldKind::Optional(DEFAULT_DIRECT_DNS_UPSTREAM),
+            Self::DirectDnsTlsName => FieldKind::Defaulted(DEFAULT_DIRECT_DNS_TLS_NAME),
             _ => FieldKind::Text,
         }
     }
@@ -140,12 +157,22 @@ pub(crate) fn saved_text(saved: &Value, field: ProfileField) -> String {
                     .join("\n")
             })
             .unwrap_or_default(),
-        FieldKind::Text | FieldKind::Number => value
-            .as_str()
-            .map(str::trim)
-            .map(str::to_owned)
-            .or_else(|| value.as_u64().map(|value| value.to_string()))
-            .unwrap_or_default(),
+        FieldKind::Optional(default) | FieldKind::Defaulted(default) if value.is_null() => {
+            // 没有这个字段（用默认值）和显式 `null`（关闭）在 JSON 里不同。
+            if saved.get(field.key()).is_some() {
+                String::new()
+            } else {
+                default.to_owned()
+            }
+        }
+        FieldKind::Text | FieldKind::Number | FieldKind::Optional(_) | FieldKind::Defaulted(_) => {
+            value
+                .as_str()
+                .map(str::trim)
+                .map(str::to_owned)
+                .or_else(|| value.as_u64().map(|value| value.to_string()))
+                .unwrap_or_default()
+        }
     }
 }
 
@@ -182,6 +209,17 @@ pub(crate) fn merge_profile(
                             .collect::<Vec<_>>()
                     ),
                 );
+            }
+            FieldKind::Optional(_) if text.is_empty() => {
+                profile.insert(key.into(), Value::Null);
+            }
+            FieldKind::Optional(default) | FieldKind::Defaulted(default)
+                if text.is_empty() || text == default =>
+            {
+                profile.remove(key);
+            }
+            FieldKind::Optional(_) | FieldKind::Defaulted(_) => {
+                profile.insert(key.into(), json!(text));
             }
             FieldKind::Number if text.is_empty() => {
                 // 空着就用后台的默认值。
@@ -425,6 +463,8 @@ mod tests {
             ProfileField::DnsUpstream => "223.5.5.5:443",
             ProfileField::DnsTlsName => "dns.alidns.com",
             ProfileField::HealthDomain => "example.com",
+            ProfileField::DirectDnsUpstream => "223.5.5.5:443",
+            ProfileField::DirectDnsTlsName => "dns.alidns.com",
             ProfileField::DirectIps => "192.0.2.0/24\n 198.51.100.7 \n\n",
             ProfileField::DirectDomains => "",
             ProfileField::DirectSuffixes => "example.org",
@@ -445,6 +485,41 @@ mod tests {
             port: 43531,
         };
         save_request(&record, page, draft)
+    }
+
+    #[test]
+    fn direct_dns_fields_keep_default_off_and_custom_apart() {
+        let upstream = ProfileField::DirectDnsUpstream;
+        let name = ProfileField::DirectDnsTlsName;
+        // 没写这两个字段：显示默认值，原样保存时也不写进策略。
+        let profile = saved();
+        assert_eq!(saved_text(&profile, upstream), "223.5.5.5:443");
+        assert_eq!(saved_text(&profile, name), "dns.alidns.com");
+        let unchanged = |field| saved_text(&profile, field);
+        assert!(!profile_changed(&profile, SaveScope::Settings, unchanged));
+        let merged = merge_profile(&profile, SaveScope::Settings, draft);
+        assert!(merged.get("direct_dns_upstream").is_none());
+        assert!(merged.get("direct_dns_tls_name").is_none());
+        // 上游留空就是关闭，写成 null；读回来仍是空。
+        let off = merge_profile(&profile, SaveScope::Settings, |field| match field {
+            ProfileField::DirectDnsUpstream => String::new(),
+            other => draft(other),
+        });
+        assert_eq!(off["direct_dns_upstream"], Value::Null);
+        assert!(off.get("direct_dns_upstream").is_some());
+        assert_eq!(saved_text(&off, upstream), "");
+        // 自定义值原样写入；TLS 名称留空回到默认（不写）。
+        let custom = merge_profile(&profile, SaveScope::Settings, |field| match field {
+            ProfileField::DirectDnsUpstream => "119.29.29.29:443".into(),
+            ProfileField::DirectDnsTlsName => String::new(),
+            other => draft(other),
+        });
+        assert_eq!(custom["direct_dns_upstream"], json!("119.29.29.29:443"));
+        assert!(custom.get("direct_dns_tls_name").is_none());
+        assert_eq!(saved_text(&custom, upstream), "119.29.29.29:443");
+        // 这两个字段属于设置页。
+        assert_eq!(upstream.scope(), SaveScope::Settings);
+        assert_eq!(name.scope(), SaveScope::Settings);
     }
 
     #[test]
