@@ -1317,13 +1317,24 @@ fn schedule_dns_udp(
 
 fn read_dns_query(client: &mut impl Read, request: &mut Vec<u8>) -> Result<bool, String> {
     // Clean EOF is valid only between frames, never inside the two-byte prefix.
+    // So is our own idle deadline: a client that sends nothing more for
+    // `DNS_TCP_IDLE_TIMEOUT` has finished, not failed. A timeout inside a frame
+    // still is a failure.
     let mut length = [0u8; 2];
     loop {
         match client.read(&mut length[..1]) {
             Ok(0) => return Ok(false),
             Ok(_) => break,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => return Err("TCP DNS frame read failed".into()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(format!("TCP DNS frame read failed: {:?}", error.kind())),
         }
     }
     client

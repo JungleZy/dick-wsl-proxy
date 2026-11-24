@@ -581,6 +581,45 @@ fn dns_tcp_rejects_partial_prefix_partial_payload_and_short_query() {
 }
 
 #[test]
+fn dns_tcp_idle_between_frames_ends_cleanly_but_not_inside_one() {
+    /// Yields `bytes`, then fails every read with `kind`, like a socket whose
+    /// read deadline passed.
+    struct Stalled {
+        bytes: io::Cursor<Vec<u8>>,
+        kind: io::ErrorKind,
+    }
+    impl Read for Stalled {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            match self.bytes.read(buffer)? {
+                0 => Err(io::Error::from(self.kind)),
+                read => Ok(read),
+            }
+        }
+    }
+    let stalled = |bytes: &[u8], kind| Stalled {
+        bytes: io::Cursor::new(bytes.to_vec()),
+        kind,
+    };
+    // Windows reports the read deadline as TimedOut, Unix as WouldBlock.
+    for kind in [io::ErrorKind::TimedOut, io::ErrorKind::WouldBlock] {
+        assert_eq!(
+            read_dns_query(&mut stalled(&[], kind), &mut Vec::new()),
+            Ok(false)
+        );
+        // Inside the length prefix or the query, the client stopped mid-frame.
+        assert!(read_dns_query(&mut stalled(&[0], kind), &mut Vec::new()).is_err());
+        assert!(read_dns_query(&mut stalled(&[0, 12, 1], kind), &mut Vec::new()).is_err());
+    }
+    assert_eq!(
+        read_dns_query(
+            &mut stalled(&[], io::ErrorKind::ConnectionReset),
+            &mut Vec::new()
+        ),
+        Err("TCP DNS frame read failed: ConnectionReset".into())
+    );
+}
+
+#[test]
 fn dns_udp_slot_releases_capacity_when_unwinding() {
     let shared = Arc::new(Shared::new());
     shared.dns_udp_active.store(1, Ordering::Release);

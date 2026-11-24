@@ -395,6 +395,7 @@ fn handle_udp(
         }
         if chained {
             let stats = shared.flows.begin("udp");
+            stats.destination(SocketAddr::V6(origin));
             stats.selected("chain", "default_chain");
             stats.stage("connect");
             if shared.is_stopping() {
@@ -426,6 +427,7 @@ fn handle_udp(
             return;
         }
         let stats = shared.flows.begin("udp");
+        stats.destination(SocketAddr::V6(origin));
         stats.selected("direct", "ip_or_cidr");
         flows.insert(
             peer,
@@ -440,6 +442,7 @@ fn handle_udp(
         );
     }
     if let Some(flow) = flows.get_mut(&peer) {
+        flow.stats.stage("relay");
         match flow.socket.send(datagram) {
             Ok(sent) if sent == datagram.len() => {
                 flow.stats.tx(sent);
@@ -606,13 +609,15 @@ fn collect_udp(
             flows.remove(&peer);
         }
     }
+    // An idle mapping ended normally: count it like an IPv4 one and let the
+    // dropped flow record itself as completed.
     flows.retain(|_, flow| {
-        if now.duration_since(flow.touched) > UDP_IDLE_TIMEOUT {
-            flow.stats.stopped();
-            false
-        } else {
-            true
+        let live = now.duration_since(flow.touched) <= UDP_IDLE_TIMEOUT;
+        if !live {
+            let mut counters = lock(&shared.counters);
+            counters.udp_idle_expirations = counters.udp_idle_expirations.saturating_add(1);
         }
+        live
     });
     progressed
 }
@@ -894,6 +899,26 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(lock(&active).is_empty());
         assert!(lock(&shared.failure).is_none());
+    }
+
+    #[test]
+    fn an_idle_ipv6_mapping_completes_and_is_counted() {
+        let shared = Arc::new(Shared::new());
+        let plan = plan();
+        let ipv6 = plan.ipv6.clone().unwrap();
+        let ingress = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
+        let origin = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
+        let peer = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 45_003, 0, 0);
+        let mut flow = direct_flow(&shared, peer, &origin);
+        flow.socket.set_nonblocking(true).unwrap();
+        flow.touched = Instant::now() - UDP_IDLE_TIMEOUT - Duration::from_secs(1);
+        let mut flows = BTreeMap::from([(peer, flow)]);
+        collect_udp(&plan, &ipv6, &ingress, &shared, None, &mut flows);
+        assert!(flows.is_empty());
+        assert_eq!(lock(&shared.counters).udp_idle_expirations, 1);
+        let (connections, _) = shared.flows.snapshot();
+        assert_eq!(connections["recent"][0]["status"], "completed");
+        assert_eq!(lock(&shared.counters).udp_failures, 0);
     }
 
     #[test]
