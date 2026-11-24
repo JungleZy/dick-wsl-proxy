@@ -32,6 +32,8 @@ mod wire;
 use wire::{Message, finish_answer, reserved};
 mod ledger;
 use ledger::AliasLedger;
+mod cache;
+use cache::{Cache, Key};
 
 pub fn reset_aliases() -> Result<(), String> {
     AliasLedger::reset()
@@ -48,6 +50,8 @@ pub struct ManagedDns {
     aliases: Mutex<Aliases>,
     probe: Mutex<Probe>,
     upstreams: IdlePool<Upstream>,
+    /// Validated upstream answers, reused until their TTL runs out.
+    answers: Cache,
 }
 
 /// One verified DoH connection over the proxy chain, kept for the next query.
@@ -124,6 +128,7 @@ impl ManagedDns {
             aliases: Mutex::new(Aliases::default()),
             probe: Mutex::new(Probe::default()),
             upstreams: IdlePool::new(),
+            answers: Cache::default(),
         })
     }
 
@@ -165,7 +170,33 @@ impl ManagedDns {
             && !query.dnssec
             && self.policy.allows_domain(&query.question.name);
         let limit = if udp { query.udp_size } else { MAX_DNS };
-        let response_wire = self.exchange(wire)?;
+        // The readiness probe must reach the upstream through the chain, so
+        // its name never comes from the cache.
+        let probing = self
+            .probe
+            .lock()
+            .map_err(|_| "DNS probe lock poisoned")?
+            .name
+            .as_deref()
+            == Some(query.question.name.as_str());
+        let key = Key::new(
+            &query.question.name,
+            query.question.kind,
+            query.question.class,
+            query.flags,
+            query.dnssec,
+        );
+        let now = Instant::now();
+        let cached = if probing {
+            None
+        } else {
+            self.answers.get(&key, wire, now)
+        };
+        let fresh = cached.is_none();
+        let response_wire = match cached {
+            Some(response_wire) => response_wire,
+            None => self.exchange(wire)?,
+        };
         let response = Message::response(&response_wire, &query)?;
         let answer = finish_answer(
             &query,
@@ -175,6 +206,9 @@ impl ManagedDns {
             &self.aliases,
             limit,
         )?;
+        if fresh {
+            self.answers.put(key, &response_wire, now);
+        }
         if !direct
             && query.question.kind == 1
             && matches!(response.flags & 15, 0 | 3)

@@ -458,3 +458,59 @@ fn public_destination(ip: Ipv4Addr) -> bool {
         || (a == 100 && (64..=127).contains(&b))
         || reserved(ip))
 }
+
+/// Where a validated upstream response keeps its TTLs, and how long it may be
+/// reused. Every record except EDNS OPT is listed, so a cached copy can count
+/// all of them down together. A positive answer lives as long as its shortest
+/// TTL. An empty answer (NXDOMAIN or no data) lives as long as the SOA in its
+/// authority section allows (RFC 2308), and is not reused without one.
+pub(super) struct Lifetime {
+    pub(super) ttl_offsets: Vec<usize>,
+    pub(super) seconds: u32,
+}
+
+pub(super) fn lifetime(wire: &[u8]) -> Result<Option<Lifetime>, String> {
+    let counts = [word(wire, 6)?, word(wire, 8)?, word(wire, 10)?];
+    let mut cursor = 12;
+    name(wire, &mut cursor)?;
+    cursor += 4;
+    let mut ttl_offsets = Vec::new();
+    let mut shortest = u32::MAX;
+    let mut negative = None::<u32>;
+    for (section, count) in counts.into_iter().enumerate() {
+        for _ in 0..count {
+            name(wire, &mut cursor)?;
+            let kind = word(wire, cursor)?;
+            let ttl =
+                (u32::from(word(wire, cursor + 4)?) << 16) | u32::from(word(wire, cursor + 6)?);
+            let length = usize::from(word(wire, cursor + 8)?);
+            let start = cursor + 10;
+            let end = start
+                .checked_add(length)
+                .filter(|end| *end <= wire.len())
+                .ok_or("truncated DNS RDATA")?;
+            if kind != 41 {
+                ttl_offsets.push(cursor + 4);
+                shortest = shortest.min(ttl);
+                if section == 1 && kind == 6 && length >= 20 {
+                    let minimum =
+                        (u32::from(word(wire, end - 4)?) << 16) | u32::from(word(wire, end - 2)?);
+                    negative = Some(negative.unwrap_or(u32::MAX).min(ttl.min(minimum)));
+                }
+            }
+            cursor = end;
+        }
+    }
+    let seconds = if counts[0] > 0 {
+        shortest
+    } else {
+        match negative {
+            Some(seconds) => seconds.min(shortest),
+            None => return Ok(None),
+        }
+    };
+    Ok((seconds > 0).then_some(Lifetime {
+        ttl_offsets,
+        seconds,
+    }))
+}

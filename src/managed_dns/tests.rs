@@ -666,3 +666,159 @@ fn synthetic_wire_ttl_zero_does_not_shorten_authenticated_session_grant() {
     );
     assert!(table.lookup(alias, now + Duration::from_secs(61)).is_err());
 }
+
+fn ttl_of_first_answer(wire: &[u8]) -> u32 {
+    let parsed = Message::parse(wire).unwrap();
+    parsed.answers[0].ttl
+}
+
+fn negative(query_wire: &[u8], rcode: u16, soa_ttl: u32, minimum: u32) -> Vec<u8> {
+    let mut wire = query_wire.to_vec();
+    wire[2..4].copy_from_slice(&(0x8180u16 | rcode).to_be_bytes());
+    wire[8..10].copy_from_slice(&1u16.to_be_bytes());
+    let mut rdata = Vec::new();
+    put_name(&mut rdata, "ns.example");
+    put_name(&mut rdata, "admin.example");
+    for value in [1u32, 7200, 900, 1_209_600, minimum] {
+        rdata.extend_from_slice(&value.to_be_bytes());
+    }
+    put_name(&mut wire, "example");
+    wire.extend_from_slice(&[0, 6, 0, 1]);
+    wire.extend_from_slice(&soa_ttl.to_be_bytes());
+    wire.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+    wire.extend_from_slice(&rdata);
+    wire
+}
+
+fn key_for(query_wire: &[u8]) -> cache::Key {
+    let query = Message::query(query_wire).unwrap();
+    cache::Key::new(
+        &query.question.name,
+        query.question.kind,
+        query.question.class,
+        query.flags,
+        query.dnssec,
+    )
+}
+
+#[test]
+fn a_cached_answer_counts_its_ttl_down_and_answers_the_new_query() {
+    let cache = Cache::default();
+    let first = query("cached.example");
+    let now = Instant::now();
+    cache.put(
+        key_for(&first),
+        &response(&first, Ipv4Addr::new(93, 184, 216, 34)),
+        now,
+    );
+    // A later query with another ID and letter case.
+    let mut second = query("CaChEd.example");
+    second[..2].copy_from_slice(&0x4242u16.to_be_bytes());
+    let hit = cache
+        .get(&key_for(&second), &second, now + Duration::from_secs(25))
+        .unwrap();
+    assert_eq!(&hit[..2], &0x4242u16.to_be_bytes());
+    assert_eq!(&hit[12..12 + 16], &second[12..12 + 16]);
+    assert_eq!(ttl_of_first_answer(&hit), 35);
+    let query = Message::query(&second).unwrap();
+    assert!(Message::response(&hit, &query).is_ok());
+    // Gone once the shortest TTL has run out.
+    assert!(
+        cache
+            .get(&key_for(&second), &second, now + Duration::from_secs(60))
+            .is_none()
+    );
+    assert!(
+        cache
+            .get(&key_for(&second), &second, now + Duration::from_secs(59))
+            .is_some()
+    );
+}
+
+#[test]
+fn unusable_answers_are_never_cached() {
+    let cache = Cache::default();
+    let now = Instant::now();
+    let q = query("nope.example");
+    let mut zero = response(&q, Ipv4Addr::new(93, 184, 216, 34));
+    let at = zero.len() - 10;
+    zero[at..at + 4].copy_from_slice(&0u32.to_be_bytes());
+    cache.put(key_for(&q), &zero, now);
+    let mut truncated = response(&q, Ipv4Addr::new(93, 184, 216, 34));
+    truncated[2..4].copy_from_slice(&0x83a0u16.to_be_bytes());
+    cache.put(key_for(&q), &truncated, now);
+    let mut servfail = response(&q, Ipv4Addr::new(93, 184, 216, 34));
+    servfail[2..4].copy_from_slice(&0x81a2u16.to_be_bytes());
+    cache.put(key_for(&q), &servfail, now);
+    // An empty answer without an SOA has no negative lifetime.
+    let mut empty = q.clone();
+    empty[2..4].copy_from_slice(&0x8183u16.to_be_bytes());
+    cache.put(key_for(&q), &empty, now);
+    assert_eq!(cache.len(), 0);
+}
+
+#[test]
+fn negative_answers_live_as_long_as_their_soa_allows() {
+    let cache = Cache::default();
+    let now = Instant::now();
+    let q = query("missing.example");
+    cache.put(key_for(&q), &negative(&q, 3, 600, 45), now);
+    assert!(
+        cache
+            .get(&key_for(&q), &q, now + Duration::from_secs(44))
+            .is_some()
+    );
+    assert!(
+        cache
+            .get(&key_for(&q), &q, now + Duration::from_secs(45))
+            .is_none()
+    );
+    // NODATA (NOERROR, no answer) is cached the same way, e.g. a missing AAAA.
+    let mut aaaa = query("v4only.example");
+    let len = aaaa.len();
+    aaaa[len - 4..len - 2].copy_from_slice(&28u16.to_be_bytes());
+    cache.put(key_for(&aaaa), &negative(&aaaa, 0, 30, 300), now);
+    let hit = cache
+        .get(&key_for(&aaaa), &aaaa, now + Duration::from_secs(10))
+        .unwrap();
+    let parsed = Message::response(&hit, &Message::query(&aaaa).unwrap()).unwrap();
+    assert!(parsed.answers.is_empty());
+}
+
+#[test]
+fn query_bits_that_change_the_answer_are_part_of_the_key() {
+    let plain = query("keyed.example");
+    let mut checking_disabled = plain.clone();
+    checking_disabled[2..4].copy_from_slice(&0x0110u16.to_be_bytes());
+    assert_ne!(key_for(&plain), key_for(&checking_disabled));
+    let mut case = query("KEYED.example");
+    case[..2].copy_from_slice(&[9, 9]);
+    assert_eq!(key_for(&plain), key_for(&case));
+}
+
+#[test]
+fn a_cached_whitelisted_answer_still_gets_its_alias() {
+    let aliases = Mutex::new(Aliases::default());
+    let cache = Cache::default();
+    let now = Instant::now();
+    let white = query("allowed.example");
+    let true_ip = Ipv4Addr::new(93, 184, 216, 34);
+    let upstream = response(&white, true_ip);
+    let first = resolve(&white, Ok(upstream.clone()), true, &aliases).unwrap();
+    cache.put(key_for(&white), &upstream, now);
+    let hit = cache
+        .get(&key_for(&white), &white, now + Duration::from_secs(5))
+        .unwrap();
+    let second = resolve(&white, Ok(hit), true, &aliases).unwrap();
+    let alias = |wire: &[u8]| a_address(wire, &Message::parse(wire).unwrap().answers[0]).unwrap();
+    assert!(reserved(alias(&first)));
+    assert_eq!(alias(&first), alias(&second));
+    assert_eq!(
+        aliases
+            .lock()
+            .unwrap()
+            .lookup(alias(&second), Instant::now())
+            .unwrap(),
+        Some(true_ip)
+    );
+}
