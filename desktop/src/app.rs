@@ -55,9 +55,13 @@ pub fn run() {
                 window.on_window_should_close(cx, |_window, _cx| {
                     if tray::consume_exit_request() {
                         true
-                    } else {
+                    } else if tray::ready() {
                         tray::hide_main_window();
                         false
+                    } else {
+                        // 托盘图标没显示：藏起来就找不回窗口，所以照常关闭。
+                        // 后台留着，再次打开 EXE 会重新连上。
+                        true
                     }
                 });
                 cx.new(|cx| Desktop::new(window, cx))
