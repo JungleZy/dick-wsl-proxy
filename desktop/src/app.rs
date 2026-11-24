@@ -10,6 +10,8 @@ mod chrome;
 mod components;
 mod diagnostics;
 mod distributions;
+mod drafts;
+mod environment_facts;
 mod instance;
 mod integrity;
 mod model;

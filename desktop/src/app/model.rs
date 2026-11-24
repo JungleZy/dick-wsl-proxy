@@ -292,8 +292,29 @@ impl RuntimeLog {
             generation: value["operation_generation"].as_u64(),
         })
     }
+
+    /// 一行上下文「目标 · 阶段 · 代次」，日志页和首页时间线共用；都没有时为空。
+    pub(crate) fn context(&self) -> String {
+        let phase = self.phase.as_deref().map(|phase| match phase {
+            "idle" => "空闲",
+            "forwarding_managed" => "接管中",
+            "forwarding_scoped" => "诊断转发",
+            "recovery_required" => "需要恢复",
+            _ => phase,
+        });
+        let mut parts = Vec::new();
+        parts.extend(self.target.clone());
+        parts.extend(phase.map(str::to_owned));
+        parts.extend(
+            self.generation
+                .map(|generation| format!("代次 {generation}")),
+        );
+        parts.join(" · ")
+    }
 }
 
+/// 输入框的状态句柄。克隆只复制句柄，指向同一个输入框。
+#[derive(Clone)]
 pub(crate) enum Field {
     Single(Entity<InputState>),
     Multi(Entity<TextareaState>),
@@ -369,10 +390,10 @@ pub(crate) struct EnvironmentResult {
 #[derive(Clone)]
 pub(crate) enum UiAction {
     List,
-    Save,
+    /// 只保存这一页的输入。
+    Save(super::drafts::SaveScope),
     Probe,
     Prepare(Kind),
-    KernelPrepare,
     Reveal,
     EnvironmentCreate,
     EnvironmentSubmit,
@@ -383,7 +404,45 @@ pub(crate) enum UiAction {
     LogFilter(LogFilter),
     Export,
     ResetDnsAliases,
+    WslPlatformCheck,
+    WslUpdate,
+    ResidentialProbe,
     ConnectionFilter(ConnectionFilter),
     ConnectionEnvironment(Option<String>),
     ConnectionLoadMore,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::RuntimeLog;
+
+    #[test]
+    fn runtime_log_context_joins_target_phase_and_generation() {
+        let log = |extra: serde_json::Value| {
+            let mut value = json!({
+                "id": 1, "occurred_at": "2026-11-23 21:16:13", "level": "info",
+                "source": "status", "message": "已进入接管状态",
+            });
+            value
+                .as_object_mut()
+                .expect("object")
+                .extend(extra.as_object().expect("object").clone());
+            RuntimeLog::from_value(&value).expect("valid log")
+        };
+        let full = log(json!({
+            "target": "Test-Target", "phase": "forwarding_managed", "operation_generation": 7,
+        }));
+        assert_eq!(full.context(), "Test-Target · 接管中 · 代次 7");
+        assert_eq!(
+            log(json!({"phase": "idle", "operation_generation": 3})).context(),
+            "空闲 · 代次 3"
+        );
+        assert_eq!(
+            log(json!({"phase": "unknown_phase"})).context(),
+            "unknown_phase"
+        );
+        assert_eq!(log(json!({})).context(), "");
+    }
 }

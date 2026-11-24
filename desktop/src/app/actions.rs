@@ -6,6 +6,10 @@ use serde_json::{Value, json};
 
 use super::backend::Kind;
 use super::components::text;
+use super::drafts::{
+    PageDraft, ProfileField, SaveScope, Saved, Unsaved, names_target, profile_changed,
+    residential_value, save_request, saved_residential_text, target_missing,
+};
 use super::model::{Confirmation, EnvironmentEditor, Field, PendingPrepare};
 use super::state::Desktop;
 use std::path::Path;
@@ -115,55 +119,69 @@ impl Desktop {
                 .unwrap_or_default()
         }
     }
-    pub(crate) fn draft_is_dirty(&self, cx: &App) -> bool {
-        if self.selected != self.saved_selected
-            || Self::field_value(&self.fields.port, cx) != self.saved_port
-        {
-            return true;
+    /// 策略字段对应的输入框。
+    pub(crate) fn profile_input(&self, field: ProfileField) -> &Field {
+        match field {
+            ProfileField::FirstHop => &self.fields.first_hop,
+            ProfileField::DnsUpstream => &self.fields.dns_upstream,
+            ProfileField::DnsTlsName => &self.fields.dns_tls_name,
+            ProfileField::HealthDomain => &self.fields.health_domain,
+            ProfileField::DirectIps => &self.fields.direct_ips,
+            ProfileField::DirectDomains => &self.fields.direct_domains,
+            ProfileField::DirectSuffixes => &self.fields.direct_suffixes,
+            ProfileField::MaxTcpConnections => &self.fields.max_tcp_connections,
+            ProfileField::TcpIdleTimeout => &self.fields.tcp_idle_timeout,
+            ProfileField::TcpHalfCloseTimeout => &self.fields.tcp_half_close_timeout,
         }
-        for (field, key, array) in [
-            (&self.fields.first_hop, "first_hop", false),
-            (&self.fields.dns_upstream, "dns_upstream", false),
-            (&self.fields.dns_tls_name, "dns_tls_name", false),
-            (&self.fields.health_domain, "health_domain", false),
-            (&self.fields.direct_ips, "direct_ips", true),
-            (&self.fields.direct_domains, "direct_domains", true),
-            (&self.fields.direct_suffixes, "direct_suffixes", true),
-            (
-                &self.fields.max_tcp_connections,
-                "max_tcp_connections",
-                false,
-            ),
-            (
-                &self.fields.tcp_idle_timeout,
-                "tcp_idle_timeout_seconds",
-                false,
-            ),
-            (
-                &self.fields.tcp_half_close_timeout,
-                "tcp_half_close_timeout_seconds",
-                false,
-            ),
-        ] {
-            if Self::field_value(field, cx) != Self::profile_field_value(&self.profile, key, array)
-            {
-                return true;
-            }
-        }
-        for (field, key) in [
+    }
+
+    pub(crate) fn residential_inputs(&self) -> [(&Field, &'static str); 4] {
+        [
             (&self.fields.residential_ip, "ip"),
             (&self.fields.residential_port, "port"),
             (&self.fields.residential_username, "username"),
             (&self.fields.residential_password, "password"),
-        ] {
-            if Self::field_value(field, cx)
-                != Self::profile_field_value(&self.residential, key, false)
-            {
-                return true;
-            }
-        }
-        false
+        ]
     }
+
+    /// 规则页、设置页各自有没有改过还没保存的输入。
+    pub(crate) fn draft_unsaved(&self, cx: &App) -> Unsaved {
+        let draft = |field| Self::field_value(self.profile_input(field), cx);
+        let settings = Self::field_value(&self.fields.port, cx) != self.saved_port
+            || profile_changed(&self.profile, SaveScope::Settings, draft)
+            || self.residential_inputs().into_iter().any(|(field, key)| {
+                Self::field_value(field, cx) != saved_residential_text(&self.residential, key)
+            });
+        Unsaved {
+            policy: profile_changed(&self.profile, SaveScope::Policy, draft),
+            settings,
+        }
+    }
+
+    /// 编辑了某一页的输入框：重算各页的未保存状态；改的是保存失败那一页时，
+    /// 标签从「保存失败」回到「有未保存修改」。
+    pub(crate) fn input_edited(&mut self, scope: Option<SaveScope>, cx: &App) {
+        self.preflight = None;
+        self.pending_prepare = None;
+        self.unsaved = self.draft_unsaved(cx);
+        if let Some(scope) = scope {
+            self.failed_saves.remove(scope);
+        }
+    }
+
+    /// 启动接管前还没保存的内容；全部保存过时为 `None`。
+    pub(crate) fn unsaved_message(&self) -> Option<String> {
+        if let Some(pages) = self.unsaved.pages() {
+            Some(format!(
+                "{pages}有未保存的修改，请先在该页保存。未保存的内容不会生效。"
+            ))
+        } else if !self.profile_exists || self.profile_path.is_none() {
+            Some("配置还没有保存过，请先到环境页设定接管目标。".into())
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn port(&self, cx: &App) -> Result<u16, &'static str> {
         Self::field_value(&self.fields.port, cx)
             .parse::<u16>()
@@ -176,55 +194,13 @@ impl Desktop {
         Ok((target, self.port(cx)?))
     }
 
-    fn environment_display_name(&self, target: &str) -> String {
+    pub(crate) fn environment_display_name(&self, target: &str) -> String {
         self.distributions
             .iter()
-            .find(|distro| distro["id"].as_str() == Some(target))
+            .find(|distro| names_target(distro, target))
             .and_then(|distro| distro["name"].as_str())
             .unwrap_or(target)
             .to_owned()
-    }
-    pub(crate) fn draft(&self, cx: &App) -> Value {
-        let mut profile = self.profile.as_object().cloned().unwrap_or_default();
-        for (field, key, array) in [
-            (&self.fields.first_hop, "first_hop", false),
-            (&self.fields.dns_upstream, "dns_upstream", false),
-            (&self.fields.dns_tls_name, "dns_tls_name", false),
-            (&self.fields.health_domain, "health_domain", false),
-            (&self.fields.direct_ips, "direct_ips", true),
-            (&self.fields.direct_domains, "direct_domains", true),
-            (&self.fields.direct_suffixes, "direct_suffixes", true),
-        ] {
-            let text = Self::field_value(field, cx);
-            profile.insert(
-                key.into(),
-                if array {
-                    json!(
-                        text.lines()
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .collect::<Vec<_>>()
-                    )
-                } else {
-                    json!(text)
-                },
-            );
-        }
-        for (field, key, _, _) in self.limit_fields() {
-            let text = Self::field_value(field, cx);
-            if text.is_empty() {
-                // 空着就用后台的默认值。
-                profile.remove(key);
-            } else {
-                profile.insert(
-                    key.into(),
-                    text.parse::<u64>()
-                        .map_or_else(|_| json!(text), |value| json!(value)),
-                );
-            }
-        }
-        profile.insert("credential".into(), json!("desktop-residence"));
-        Value::Object(profile)
     }
 
     /// 转发限制的输入框、策略字段名、允许范围和出错提示。
@@ -265,22 +241,14 @@ impl Desktop {
         Ok(())
     }
 
+    /// 住宅代理四项都空时按「还没配置」保存，否则端口必须有效。
     pub(crate) fn residential_draft(&self, cx: &App) -> Result<Value, &'static str> {
-        let port = self.residential_port(cx)?;
-        Ok(json!({
-            "ip": Self::field_value(&self.fields.residential_ip, cx),
-            "port": port,
-            "username": Self::field_value(&self.fields.residential_username, cx),
-            "password": Self::field_value(&self.fields.residential_password, cx),
-        }))
-    }
-
-    pub(crate) fn residential_port(&self, cx: &App) -> Result<u16, &'static str> {
-        Self::field_value(&self.fields.residential_port, cx)
-            .parse::<u16>()
-            .ok()
-            .filter(|port| *port > 0)
-            .ok_or("住宅服务器端口需为 1–65535 的整数。")
+        residential_value(
+            &Self::field_value(&self.fields.residential_ip, cx),
+            &Self::field_value(&self.fields.residential_port, cx),
+            &Self::field_value(&self.fields.residential_username, cx),
+            &Self::field_value(&self.fields.residential_password, cx),
+        )
     }
 
     pub(crate) fn open_confirmation_dialog(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -288,24 +256,25 @@ impl Desktop {
             return;
         };
         let message = confirmation.message.clone();
+        let kernel_prompt = confirmation.kind == Kind::PrepareKernel;
+        let (title, ok_text) = if kernel_prompt {
+            ("准备内核环境", "加载并继续")
+        } else {
+            ("确认保护操作", "确认并执行")
+        };
         let view = cx.entity().clone();
         window.open_alert_dialog(cx, move |dialog, _, _| {
             let ok_view = view.clone();
             let cancel_view = view.clone();
             dialog
                 .confirm()
-                .title(
-                    div()
-                        .text_base()
-                        .font_weight(FontWeight::NORMAL)
-                        .child("确认保护操作"),
-                )
+                .title(div().text_sm().font_weight(FontWeight::NORMAL).child(title))
                 .button_props(
                     DialogButtonProps::default()
-                        .ok_text("确认并执行")
+                        .ok_text(ok_text)
                         .cancel_text("取消"),
                 )
-                .description(div().text_base().child(message.clone()))
+                .description(div().text_sm().child(message.clone()))
                 .on_ok(move |_, _, cx| {
                     ok_view.update(cx, |this, cx| this.confirm(cx));
                     true
@@ -313,6 +282,11 @@ impl Desktop {
                 .on_cancel(move |_, _, cx| {
                     cancel_view.update(cx, |this, cx| {
                         this.confirmation = None;
+                        if kernel_prompt {
+                            this.pending_prepare = None;
+                            this.notice = "已取消加载内核能力；缺少这些能力时无法启动接管。".into();
+                            this.error = true;
+                        }
                         cx.notify();
                     });
                     true
@@ -400,11 +374,12 @@ impl Desktop {
             cx.notify();
             return;
         }
-        if self.dirty || !self.profile_exists || self.profile_path.is_none() {
-            self.fail("请先保存策略和目标选择。未保存内容不会生效。", cx);
+        if let Some(message) = self.unsaved_message() {
+            self.fail(message, cx);
             return;
         }
         self.pending_prepare = None;
+        self.kernel_prepare_offered = false;
         let (target, port) = match self.selection(cx) {
             Ok(value) => value,
             Err(error) => {
@@ -426,39 +401,42 @@ impl Desktop {
         );
     }
 
-    /// 只在空闲时可用。只加载目标发行版里已经存在的模块，但影响共享内核，
-    /// 所以要用户确认；不安装软件包、不启动接管。
-    pub(crate) fn prepare_kernel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.locked() {
-            return;
-        }
-        if !self.idle() {
-            self.fail("请先停止接管并恢复直连，再准备内核环境。", cx);
-            return;
-        }
-        let Some(generation) = self.generation() else {
-            self.fail("后台状态未确认，请先刷新。", cx);
-            return;
-        };
-        let Some(target) = self.selected.clone() else {
-            self.fail("请先选择目标 WSL。", cx);
-            return;
-        };
+    /// 启动前预检发现目标内核缺少所需能力时，把「加载目标已有模块」作为一次
+    /// 确认，而不是常驻按钮；确认后由 PrepareKernel 的结果处理重新预检。
+    pub(crate) fn prompt_kernel_prepare(
+        &mut self,
+        pending: PendingPrepare,
+        cx: &mut Context<Self>,
+    ) {
+        let PendingPrepare {
+            kind,
+            generation,
+            target,
+            port,
+        } = pending;
         let target_name = self.environment_display_name(&target);
+        self.notice = format!("预检未通过：{target_name} 的内核缺少所需能力。");
+        self.error = true;
         self.confirmation = Some(Confirmation {
             kind: Kind::PrepareKernel,
             generation,
             request: json!({
                 "command":"prepare_kernel",
-                "target":target,
+                "target":target.clone(),
                 "confirm":true
             }),
             message: format!(
-                "将为 {target_name} 加载发行版里已有的内核模块（含 xt_cgroup、ip6table_nat 等 12 个），并创建空的 filter/nat 表。这会影响同一 WSL 内核上的所有发行版，直到 WSL 重启；不安装软件包、不改 .wslconfig、不启动接管。"
+                "预检发现 {target_name} 缺少所需的内核能力（例如 xt_cgroup、ip6table_nat）。是否现在加载发行版里已有的模块、创建空的 filter/nat 表，并写入开机配置（/etc/modules-load.d/wsl-proxy.conf 和一个注册空表的 systemd oneshot），让以后 WSL 启动时自动准备好？这些文件会保留在发行版里，可手工删除；不安装软件包，也不启动接管。"
             ),
             exit: false,
         });
-        self.open_confirmation_dialog(window, cx);
+        self.pending_prepare = Some(PendingPrepare {
+            kind,
+            generation,
+            target,
+            port,
+        });
+        self.confirmation_pending = true;
         cx.notify();
     }
 
@@ -502,6 +480,158 @@ impl Desktop {
         self.send(confirmation.kind, confirmation.request, cx);
         // 只有停止真的发出去了才进入退出流程。
         self.exiting = confirmation.exit && self.busy == Some(confirmation.kind);
+    }
+
+    /// 检查 WSL 平台：进入设置页和点「检查」时调用。只读，不占界面，不发页面提示。
+    pub(crate) fn check_wsl_platform(&mut self, cx: &mut Context<Self>) {
+        if self.wsl_platform_checking || self.busy.is_some() {
+            return;
+        }
+        // 后台状态未确认时检查发不出去；在卡片上说明原因，免得「检查」按钮点了没反应。
+        if !self.status_valid {
+            self.wsl_platform_error =
+                Some("后台状态未确认，暂时无法检查；请先点底部状态栏的后台图标重新连接。".into());
+            cx.notify();
+            return;
+        }
+        self.send(Kind::WslPlatform, json!({"command":"wsl_platform"}), cx);
+    }
+
+    /// 升级 WSL 会替换 WSL 包并可能重启 WSL，先说明影响再交给后台任务。
+    pub(crate) fn prompt_wsl_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.locked() {
+            return;
+        }
+        if !self.idle() {
+            self.fail("请先停止接管并恢复直连，再升级 WSL。", cx);
+            return;
+        }
+        let report = self.wsl_platform.clone();
+        if report
+            .as_ref()
+            .is_some_and(|report| report["wsl"]["installed"].as_bool() == Some(false))
+        {
+            self.fail(
+                "没有找到 wsl.exe，请先安装 Windows Subsystem for Linux。",
+                cx,
+            );
+            return;
+        }
+        let version = report
+            .as_ref()
+            .and_then(|report| report["wsl"]["version"].as_str())
+            .unwrap_or("未读取");
+        // 没检查过平台时不知道权限，不能当成标准用户。
+        let elevated = report
+            .as_ref()
+            .and_then(|report| report["elevated"].as_bool());
+        let mut message = format!(
+            "将运行 wsl --update 升级 WSL 平台（当前 WSL {version}）。它会替换 WSL 包，并可能重启 WSL：所有发行版里的程序和后台服务都会停止。不修改发行版里的文件和配置，也不启动接管。"
+        );
+        match elevated {
+            Some(false) => {
+                message.push_str("当前以标准用户运行，Windows 可能弹出管理员权限提示。");
+            }
+            None => message.push_str("还没有读到当前权限，Windows 可能弹出管理员权限提示。"),
+            Some(true) => {}
+        }
+        let view = cx.entity().clone();
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let ok_view = view.clone();
+            let cancel_view = view.clone();
+            dialog
+                .confirm()
+                .title(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::NORMAL)
+                        .child("升级 WSL 平台"),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("升级")
+                        .cancel_text("取消"),
+                )
+                .description(div().text_sm().child(message.clone()))
+                .on_ok(move |_, _, cx| {
+                    ok_view.update(cx, |this, cx| {
+                        this.send(
+                            Kind::WslUpdate,
+                            json!({"command":"wsl_platform_update","confirm":true}),
+                            cx,
+                        );
+                    });
+                    true
+                })
+                .on_cancel(move |_, _, cx| {
+                    cancel_view.update(cx, |_this, cx| cx.notify());
+                    true
+                })
+        });
+    }
+
+    /// 检测住宅代理：用已保存的配置，从 Windows 直连和经宿主 SOCKS5 各登录一次。
+    /// 直连那一路会把账号密码不经前置代理发出去，先说明再发。
+    pub(crate) fn prompt_residential_probe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.locked() || self.residential_probe_checking {
+            return;
+        }
+        if !self.status_valid {
+            self.fail(
+                "后台状态未确认，暂时无法检测；请先点底部状态栏的后台图标重新连接。",
+                cx,
+            );
+            return;
+        }
+        // 检测只读配置库，输入框里没保存的值不会被用上。
+        if self.unsaved.contains(SaveScope::Settings) {
+            self.fail(
+                "设置有未保存的修改；检测只用已保存的配置，请先保存设置。",
+                cx,
+            );
+            return;
+        }
+        let saved = self.residential["ip"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty());
+        if !self.profile_exists || !saved {
+            self.fail("还没有保存住宅代理，请先填写服务器和账号并保存设置。", cx);
+            return;
+        }
+        let message = "将用已保存的住宅代理配置检测两条路：一条从 Windows 直接连住宅服务器，一条经宿主 SOCKS5 连过去。两条都会登录，并让住宅代理连一次 DNS 上游，各自最多 8 秒。直连那一条不经前置代理：SOCKS5 的用户名和密码是明文，会经本地网络直接发出，住宅服务商也会看到你的真实 IP。检测不改变接管状态和规则。";
+        let view = cx.entity().clone();
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let ok_view = view.clone();
+            let cancel_view = view.clone();
+            dialog
+                .confirm()
+                .title(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::NORMAL)
+                        .child("检测住宅代理"),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("检测")
+                        .cancel_text("取消"),
+                )
+                .description(div().text_sm().child(message))
+                .on_ok(move |_, _, cx| {
+                    ok_view.update(cx, |this, cx| {
+                        this.send(
+                            Kind::ResidentialProbe,
+                            json!({"command":"residential_probe"}),
+                            cx,
+                        );
+                    });
+                    true
+                })
+                .on_cancel(move |_, _, cx| {
+                    cancel_view.update(cx, |_this, cx| cx.notify());
+                    true
+                })
+        });
     }
 
     /// 托盘「退出」。空闲或状态未知时直接请求关闭后台，由后台自己核对是否空闲；
@@ -593,7 +723,7 @@ impl Desktop {
                 .confirm()
                 .title(
                     div()
-                        .text_base()
+                        .text_sm()
                         .font_weight(FontWeight::NORMAL)
                         .child("联系不上后台"),
                 )
@@ -602,7 +732,7 @@ impl Desktop {
                         .ok_text("仍然退出界面")
                         .cancel_text("取消"),
                 )
-                .description(div().text_base().child(
+                .description(div().text_sm().child(
                     "无法确认后台是否还在运行。仍然退出的话，只关闭界面：后台如果还在运行会保留，接管不会停止。之后可以重新打开程序再从托盘退出。",
                 ))
                 .on_ok(move |_, _, cx| {
@@ -631,27 +761,147 @@ impl Desktop {
         );
     }
 
-    pub(crate) fn save(&mut self, cx: &mut Context<Self>) {
-        if let Err(error) = self.limits_valid(cx) {
-            self.fail(error, cx);
+    /// 保存规则页或设置页：只发这一页的输入，其他页的字段用已保存的值。
+    pub(crate) fn save(&mut self, scope: SaveScope, cx: &mut Context<Self>) {
+        let page = match scope {
+            SaveScope::Environment => return,
+            SaveScope::Policy => PageDraft::Policy,
+            SaveScope::Settings => {
+                let checked = self.limits_valid(cx).and_then(|()| {
+                    Ok(PageDraft::Settings {
+                        port: self.port(cx)?,
+                        residential: self.residential_draft(cx)?,
+                    })
+                });
+                // 校验结果和保存结果一样，用保存结果通知弹出。
+                match checked {
+                    Ok(page) => page,
+                    Err(error) => {
+                        self.save_notice = Some(Err(super::backend::humanize_error(error)));
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+        };
+        self.send_save(page, cx);
+    }
+
+    /// 点「设为目标」：先确认，确认后立即只保存目标。
+    pub(crate) fn prompt_set_target(
+        &mut self,
+        target: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.locked() || self.profile_path.is_none() {
             return;
         }
-        let port = match self.port(cx) {
+        let name = self.environment_display_name(&target);
+        let message = match self.phase() {
+            "idle" => {
+                format!("将 {name} 设为接管目标并立即保存。之后点「启动接管」时接管这个发行版。")
+            }
+            "unknown" => format!(
+                "将 {name} 设为接管目标并立即保存。后台状态还没确认；保存只改目标，不会启动、停止或切换接管。"
+            ),
+            _ => format!(
+                "将 {name} 设为接管目标并立即保存。正在进行的接管不受影响，停止后再次启动时才接管 {name}。"
+            ),
+        };
+        let view = cx.entity().clone();
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let ok_view = view.clone();
+            let target = target.clone();
+            dialog
+                .confirm()
+                .title(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::NORMAL)
+                        .child("设为接管目标"),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("确认并保存")
+                        .cancel_text("取消"),
+                )
+                .description(div().text_sm().child(message.clone()))
+                .on_ok(move |_, _, cx| {
+                    let target = target.clone();
+                    ok_view.update(cx, |this, cx| this.save_target(target, cx));
+                    true
+                })
+                .on_cancel(|_, _, _| true)
+        });
+    }
+
+    /// 只保存接管目标；策略、入口端口和住宅代理都用已保存的值。
+    fn save_target(&mut self, target: String, cx: &mut Context<Self>) {
+        // 有别的操作在进行时 `send` 不会发出请求，要告诉用户目标没保存。
+        if !self.send_save(PageDraft::Environment(Some(target)), cx) {
+            self.fail("有操作正在进行，接管目标没有保存；请稍后再设一次。", cx);
+        }
+    }
+
+    /// 发出一页的保存。已保存的入口端口无效时提示并返回 `false`；有别的操作在进行、
+    /// 请求没有发出时也返回 `false`。
+    fn send_save(&mut self, page: PageDraft, cx: &mut Context<Self>) -> bool {
+        let port = match self.saved_port_number() {
             Ok(port) => port,
             Err(error) => {
                 self.fail(error, cx);
-                return;
+                return false;
             }
         };
-        let residential = match self.residential_draft(cx) {
-            Ok(value) => value,
-            Err(error) => {
-                self.fail(error, cx);
-                return;
-            }
+        let scope = page.scope();
+        let saved = Saved {
+            profile: &self.profile,
+            revision: &self.revision,
+            target: self.saved_selected.as_deref(),
+            port,
         };
-        self.send(Kind::Save, json!({"command":"profile_save","profile":self.draft(cx),"residential":residential,"expected_revision":self.revision,
-            "desktop":{"target":self.selected,"port":port}}), cx);
+        let request = save_request(&saved, page, |field| {
+            Self::field_value(self.profile_input(field), cx)
+        });
+        // 发出的修改类请求都会让 `epoch` 加一；没加说明请求被丢弃了，
+        // 这时可能还有一次保存在途，不能覆盖它记下的页面。
+        let epoch = self.epoch;
+        let previous = self.saving.replace(scope);
+        self.send(Kind::Save, request, cx);
+        let sent = self.epoch != epoch;
+        if !sent {
+            self.saving = previous;
+        }
+        sent
+    }
+
+    /// 已保存的目标发行版已不在 WSL 里（被删除、被注销或不再是 WSL 2）时，自动清掉库里的
+    /// 接管目标，免得重启后首页还显示它、启动接管时才在预检失败。只在拿到发行版列表后调用。
+    pub(crate) fn clear_missing_target(&mut self, cx: &mut Context<Self>) {
+        if self.profile_path.is_none()
+            || !target_missing(self.saved_selected.as_deref(), &self.distributions)
+        {
+            return;
+        }
+        // 自动保存不覆盖页面上原来的提示（例如「环境已删除。」），结果补在它后面。
+        let (notice, error) = (self.notice.clone(), self.error);
+        self.send_save(PageDraft::Environment(None), cx);
+        // 没发出去（有别的操作）就等下次拿到列表再清；后台通信失败时保留那条错误提示。
+        if self.busy == Some(Kind::Save) {
+            self.clearing_target = true;
+            self.notice = notice;
+            self.error = error;
+        }
+    }
+
+    /// 已保存的 Windows 入口端口；环境页、规则页保存时原样带上。
+    fn saved_port_number(&self) -> Result<u16, &'static str> {
+        self.saved_port
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port >= 1024)
+            .ok_or("已保存的 Windows 入口端口无效，请到设置页改正后保存。")
     }
 
     pub(crate) fn environment_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -744,24 +994,6 @@ impl Desktop {
             json!({"command":"environment_view","name":name}),
             cx,
         );
-    }
-
-    pub(crate) fn open_target_environment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.environment_editor.is_some() || self.locked() {
-            return;
-        }
-        let Some(target) = self.selected.clone() else {
-            return;
-        };
-        let detail_is_target = self
-            .environment_detail
-            .as_ref()
-            .and_then(|detail| detail["id"].as_str())
-            == Some(target.as_str());
-        if detail_is_target {
-            return;
-        }
-        self.environment_view(target, window, cx);
     }
 
     pub(crate) fn environment_submit(&mut self, cx: &mut Context<Self>) {
@@ -928,7 +1160,7 @@ impl Desktop {
                 .confirm()
                 .title(
                     div()
-                        .text_base()
+                        .text_sm()
                         .font_weight(FontWeight::NORMAL)
                         .child("删除环境"),
                 )
@@ -939,7 +1171,7 @@ impl Desktop {
                         .ok_variant(ButtonVariant::Danger)
                         .cancel_text("取消"),
                 )
-                .description(div().text_base().child(format!(
+                .description(div().text_sm().child(format!(
                     "将注销 WSL 环境 {name}，环境内的文件和配置都会被删除。"
                 )))
                 .on_ok({

@@ -7,18 +7,19 @@ use gpui_kit::base::Selectable as _;
 use gpui_kit::component::{
     Sizable as _,
     button::{Button, ButtonGroup},
-    tooltip::Tooltip,
 };
 use gpui_kit::{prelude::*, *};
 use serde_json::Value;
 
 use super::backend;
-use super::components::{badge, bytes, design_icon, fact, rate, status_dot};
+use super::components::{
+    StatusTone, Tip, badge, bytes, design_icon, fact, rate, status_icon, text_tip,
+};
 use super::model::{ConnectionFilter, ConnectionRow, UiAction};
 use super::state::Desktop;
 use super::theme::{
-    AMBER, BLUE, BLUE_SOFT, DANGER_BG, INK, MONO_FONT, MUTED, RULE, RUST, SUCCESS_BG, SURFACE,
-    SURFACE_SOFT, TEAL, WARNING_BG, app_rgb as rgb,
+    ACCENT, AMBER, DANGER_BG, INK, MONO_FONT, MUTED, ROUTE_DIRECT, ROUTE_DIRECT_BG, RULE, RUST,
+    SUCCESS_BG, SURFACE, SURFACE_SOFT, TEAL, WARNING_BG, app_rgb as rgb,
 };
 
 const ROW_HEIGHT: f32 = 48.;
@@ -30,7 +31,7 @@ const BYTES_WIDTH: f32 = 96.;
 const TIME_WIDTH: f32 = 112.;
 fn route_label(route: Option<&str>) -> (&'static str, u32, u32) {
     match route {
-        Some("direct") => ("直连", BLUE, BLUE_SOFT),
+        Some("direct") => ("直连", ROUTE_DIRECT, ROUTE_DIRECT_BG),
         Some("chain") => ("双跳", TEAL, SUCCESS_BG),
         Some("dns") => ("DNS", AMBER, WARNING_BG),
         Some("reject") => ("拒绝", RUST, DANGER_BG),
@@ -51,7 +52,7 @@ fn stage_label(stage: &str) -> &'static str {
 
 fn status_label(status: &str) -> (&'static str, u32) {
     match status {
-        "active" => ("活动", BLUE),
+        "active" => ("活动", ACCENT),
         "completed" => ("完成", INK),
         "failed" => ("失败", RUST),
         "stopped" => ("已停止", MUTED),
@@ -108,7 +109,6 @@ fn table_header() -> Div {
         .gap_3()
         .border_b_1()
         .border_color(rgb(RULE))
-        .text_sm()
         .text_color(rgb(MUTED))
         .child(cell(ENVIRONMENT_WIDTH).child("环境"))
         .child(cell(PROTOCOL_WIDTH).child("协议"))
@@ -142,7 +142,7 @@ fn connection_row(row: &ConnectionRow) -> Stateful<Div> {
     // 已落盘的记录显示结束时间；还在内存里的连接没有结束时间。
     let (when, when_color) = match &row.ended_at {
         Some(ended_at) => (ended_at.clone(), INK),
-        None if row.active() => ("进行中".to_owned(), BLUE),
+        None if row.active() => ("进行中".to_owned(), ACCENT),
         None => ("刚结束".to_owned(), MUTED),
     };
     let id = match row.record_id {
@@ -179,7 +179,6 @@ fn connection_row(row: &ConnectionRow) -> Stateful<Div> {
                 .child(destination.font_family(MONO_FONT).truncate())
                 .child(
                     div()
-                        .text_sm()
                         .text_color(rgb(MUTED))
                         .truncate()
                         .child(reason_label(row.reason.as_deref())),
@@ -191,7 +190,7 @@ fn connection_row(row: &ConnectionRow) -> Stateful<Div> {
                 .flex()
                 .flex_col()
                 .child(div().text_color(rgb(status_color)).child(status))
-                .child(div().text_sm().text_color(rgb(MUTED)).child(stage)),
+                .child(div().text_color(rgb(MUTED)).child(stage)),
         )
         .child(
             cell(BYTES_WIDTH)
@@ -199,7 +198,6 @@ fn connection_row(row: &ConnectionRow) -> Stateful<Div> {
                 .flex_col()
                 .items_end()
                 .font_family(MONO_FONT)
-                .text_sm()
                 .child(format!("↑ {}", bytes(row.tx_bytes)))
                 .child(format!("↓ {}", bytes(row.rx_bytes))),
         )
@@ -208,7 +206,6 @@ fn connection_row(row: &ConnectionRow) -> Stateful<Div> {
                 .flex()
                 .flex_col()
                 .items_end()
-                .text_sm()
                 .child(
                     div()
                         .font_family(MONO_FONT)
@@ -227,30 +224,24 @@ fn bar_separator() -> Div {
     div().w(px(1.)).h(px(14.)).flex_shrink_0().bg(rgb(RULE))
 }
 
-/// 底栏里的一项：内容尽量短，完整含义放在 tooltip。
-fn bar_item(id: &'static str, tooltip: impl Into<SharedString>, content: Div) -> Stateful<Div> {
-    let tooltip = tooltip.into();
+/// 底栏里的一项：内容尽量短，完整含义放在分行的悬停提示里。
+fn bar_item(id: &'static str, tip: Tip, content: Div) -> Stateful<Div> {
     content
         .id(id)
         .flex_shrink_0()
-        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+        .tooltip(move |window, cx| tip.build(window, cx))
 }
 
-/// 数值放进固定宽度、右对齐的槽位，每 2 秒刷新时不会左右跳。
-fn arrow_value(arrow: &'static str, value: String, width: f32) -> Div {
+/// 箭头紧跟数值，按实际长度排。数值会自动换算成 KiB、MiB、GiB，最长也只有十来个字符，
+/// 不预留固定宽度，免得短数值和前面的图标、箭头之间空出一大段。
+fn arrow_value(arrow: &'static str, value: String) -> Div {
     div()
         .flex()
+        .flex_shrink_0()
         .items_center()
         .gap_1()
         .child(div().text_color(rgb(MUTED)).child(arrow))
-        .child(
-            div()
-                .w(px(width))
-                .flex()
-                .justify_end()
-                .font_family(MONO_FONT)
-                .child(value),
-        )
+        .child(div().font_family(MONO_FONT).child(value))
 }
 
 impl Desktop {
@@ -260,43 +251,91 @@ impl Desktop {
         (self.status_valid && forwarding.is_object()).then_some(forwarding)
     }
 
-    pub(crate) fn status_observations(&self) -> Div {
-        let traffic = self
-            .forwarding()
-            .map(|forwarding| &forwarding["traffic"])
-            .unwrap_or(&Value::Null);
-        let total = |key: &str| {
-            traffic[key]
-                .as_u64()
-                .map(bytes)
-                .unwrap_or_else(|| "—".into())
-        };
-        // 底栏常驻：只有需要恢复才用红色；诊断转发等合法状态下 DNS 未接管用琥珀色提示。
-        let dns_color = if self.status_valid && self.status["dns_managed"] == true {
-            TEAL
+    /// 状态栏左侧图标组的后两个：DNS 和转发线程，只有图标，含义放在悬停提示里。
+    pub(crate) fn health_icons(&self) -> [Stateful<Div>; 2] {
+        const SNAPSHOT: &str = "来自后台最近一次状态快照";
+        // 只有需要恢复才用故障色；诊断转发等合法状态下 DNS 未接管用待处理色提示。
+        let (dns_tone, dns_tip) = if !self.status_valid {
+            (
+                StatusTone::Warn,
+                Tip::new("系统 DNS")
+                    .row("状态", "未知")
+                    .note("后台状态未确认，无法确认 DNS 保护"),
+            )
+        } else if self.status["dns_managed"] == true {
+            (
+                StatusTone::Ok,
+                Tip::new("系统 DNS").row("状态", "已接管").note(SNAPSHOT),
+            )
         } else if self.idle() {
-            MUTED
+            (
+                StatusTone::Off,
+                Tip::new("系统 DNS").row("状态", "未接管").note(SNAPSHOT),
+            )
         } else if self.phase() == "recovery_required" {
-            RUST
+            (
+                StatusTone::Error,
+                Tip::new("系统 DNS")
+                    .row("状态", "需要恢复")
+                    .note("请先停止接管并恢复直连")
+                    .note(SNAPSHOT),
+            )
         } else {
-            AMBER
+            (
+                StatusTone::Warn,
+                Tip::new("系统 DNS").row("状态", "未确认").note(SNAPSHOT),
+            )
         };
-        let (worker_label, worker_color, worker_tooltip) = match self
+        let (worker_tone, worker_tip) = match self
             .forwarding()
             .map(|forwarding| forwarding["healthy"].as_bool())
         {
-            Some(Some(true)) => ("转发正常", TEAL, "转发工作线程运行中。"),
+            Some(Some(true)) => (StatusTone::Ok, Tip::new("转发线程").row("状态", "运行中")),
             Some(Some(false)) => (
-                "转发故障",
-                RUST,
-                "转发工作线程故障；最后一次转发错误见连接页。",
+                StatusTone::Error,
+                Tip::new("转发线程")
+                    .row("状态", "故障")
+                    .note("最后一次转发错误见连接页"),
             ),
             _ => (
-                "转发 —",
-                MUTED,
-                "没有转发工作线程的观测：当前未接管，或后台状态未确认。",
+                StatusTone::Off,
+                Tip::new("转发线程")
+                    .row("状态", "无观测")
+                    .note("当前未接管或后台状态未确认"),
             ),
         };
+        [
+            status_icon("status-dns", "dns", dns_tip, dns_tone),
+            status_icon("status-worker", "forward", worker_tip, worker_tone),
+        ]
+    }
+
+    /// 状态栏的实时速率和累计流量。没有转发观测（未接管或状态未确认）时显示 0，
+    /// 悬停提示说明原因；实时和累计用图标区分，不写文字。
+    pub(crate) fn status_observations(&self) -> Div {
+        const NO_DATA: &str = "未接管或后台状态未确认，显示 0";
+        let forwarding = self.forwarding();
+        let traffic = forwarding
+            .map(|forwarding| &forwarding["traffic"])
+            .unwrap_or(&Value::Null);
+        let total = |key: &str| bytes(traffic[key].as_u64().unwrap_or_default());
+        let (tx_rate, rx_rate) = (
+            rate(&traffic["tx_bytes_per_sec"]),
+            rate(&traffic["rx_bytes_per_sec"]),
+        );
+        let (tx_total, rx_total) = (total("tx_bytes"), total("rx_bytes"));
+        let rate_tip = Tip::new("实时速率")
+            .row("↑ 上行", tx_rate.clone())
+            .row("↓ 下行", rx_rate.clone())
+            .note("目标发行版经 Windows 入口收发的应用层数据")
+            .note("按相邻两次状态快照计算")
+            .note_if(forwarding.is_none(), NO_DATA);
+        let total_tip = Tip::new("累计流量（本次接管以来）")
+            .row("↑ 上行", tx_total.clone())
+            .row("↓ 下行", rx_total.clone())
+            .note("应用层字节，不含代理握手和 IP 包头")
+            .note("重新启动接管后从零计")
+            .note_if(forwarding.is_none(), NO_DATA);
         div()
             .flex()
             .flex_shrink_0()
@@ -306,47 +345,27 @@ impl Desktop {
             .text_sm()
             .child(bar_separator())
             .child(bar_item(
-                "status-tx-rate",
-                "上行速率：目标发行版经 Windows 入口发出的应用层数据，按后台相邻两次状态快照计算。",
-                arrow_value("↑", rate(&traffic["tx_bytes_per_sec"]), 92.),
-            ))
-            .child(bar_item(
-                "status-rx-rate",
-                "下行速率：经 Windows 入口回到目标发行版的应用层数据，按后台相邻两次状态快照计算。",
-                arrow_value("↓", rate(&traffic["rx_bytes_per_sec"]), 92.),
+                "status-rates",
+                rate_tip,
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(design_icon("realtime", 15., MUTED))
+                    .child(arrow_value("↑", tx_rate))
+                    .child(arrow_value("↓", rx_rate)),
             ))
             .child(bar_separator())
             .child(bar_item(
                 "status-totals",
-                "本次接管以来累计的上行 / 下行应用层字节，不含代理握手和 IP 包头；重新启动接管后从零计。",
+                total_tip,
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(div().text_color(rgb(MUTED)).child("累计"))
-                    .child(arrow_value("↑", total("tx_bytes"), 76.))
-                    .child(arrow_value("↓", total("rx_bytes"), 76.)),
-            ))
-            .child(bar_separator())
-            .child(bar_item(
-                "status-dns",
-                format!("{}（来自后台最近一次状态快照）", self.dns_label()),
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(status_dot(dns_color))
-                    .child(format!("DNS {}", self.dns_state_label())),
-            ))
-            .child(bar_item(
-                "status-worker",
-                worker_tooltip,
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(status_dot(worker_color))
-                    .child(worker_label),
+                    .child(design_icon("total", 15., MUTED))
+                    .child(arrow_value("↑", tx_total))
+                    .child(arrow_value("↓", rx_total)),
             ))
     }
 
@@ -412,7 +431,7 @@ impl Desktop {
                     .truncate()
                     .child(value),
             )
-            .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
+            .tooltip(move |window, cx| text_tip(tooltip, window, cx))
     }
 
     /// 页面上显示的行：进行中的连接（状态有效时）在前，已落盘的记录在后。
@@ -703,7 +722,6 @@ impl Desktop {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_sm()
                             .text_color(rgb(MUTED))
                             .truncate()
                             .child(retention),
@@ -731,13 +749,7 @@ impl Desktop {
                     .items_center()
                     .gap_2()
                     .mb_2()
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_sm()
-                            .text_color(rgb(MUTED))
-                            .child("环境"),
-                    )
+                    .child(div().flex_shrink_0().text_color(rgb(MUTED)).child("环境"))
                     .child(
                         self.button(
                             "connection-filter-environment-all",
@@ -809,7 +821,7 @@ fn banner(id: &'static str, text: String, color: u32, background: u32) -> Statef
         .text_color(rgb(color))
         .child(design_icon("info", 16., color))
         .child(div().flex_1().min_w_0().truncate().child(text))
-        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+        .tooltip(move |window, cx| text_tip(tooltip.clone(), window, cx))
 }
 
 #[cfg(test)]
@@ -930,6 +942,7 @@ mod tests {
         assert_eq!(grouped(999), "999");
         assert_eq!(bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
         assert_eq!(rate(&json!(2048.0)), "2.0 KiB/s");
-        assert_eq!(rate(&serde_json::Value::Null), "—");
+        assert_eq!(rate(&serde_json::Value::Null), "0 B/s");
+        assert_eq!(rate(&json!(-5.0)), "0 B/s");
     }
 }

@@ -6,16 +6,46 @@ const UI_TICK_INTERVAL: Duration = Duration::from_millis(200);
 const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// 按 2 秒一次的状态轮询，约保留最近 2 分钟的速率样本。
 const TRAFFIC_SAMPLE_LIMIT: usize = 60;
+/// 首页事件时间线显示的运行日志条数。
+const EVENT_LIMIT: usize = 5;
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::select::{SelectEvent, SelectState};
 use gpui_kit::{prelude::*, *};
 use serde_json::{Value, json};
 
 use super::backend::{Job, Kind, worker};
+use super::components::design_icon;
+use super::drafts::{
+    FailedSaves, SaveScope, Unsaved, names_target, profile_fields, saved_residential_text,
+    saved_text, target_missing,
+};
 use super::model::{EnvironmentResult, Field, Fields, LogFilter, Page, RuntimeLog};
 use super::state::Desktop;
+use super::theme::{RUST, TEAL};
+
+/// 保存结果通知的编号：同一时间只留一条，新的结果顶替旧的。
+struct SaveNotice;
+
+/// 弹出保存结果通知（gpui-kit Notification，悬浮在窗口右上角）。成功 5 秒后自动消失；
+/// 失败要用户自己关掉，免得原因还没看完就没了。不设通知类型：设了类型组件就用类型自带的
+/// 图标，颜色取 `theme.success`，而这个应用把它设成了浅底色，图标会看不清。
+fn push_save_notice(result: Result<String, String>, window: &mut Window, cx: &mut App) {
+    let notification = match result {
+        Ok(message) => Notification::new()
+            .message(message)
+            .icon(design_icon("check", 16., TEAL)),
+        Err(message) => Notification::new()
+            .message(message)
+            .icon(design_icon("info", 16., RUST))
+            .autohide(false),
+    }
+    .id::<SaveNotice>();
+    window.remove_notification::<SaveNotice>(cx);
+    window.push_notification(notification, cx);
+}
 
 fn input(window: &mut Window, cx: &mut App, hint: &'static str, multiline: bool) -> Field {
     if multiline {
@@ -64,37 +94,33 @@ impl Desktop {
             environment_timezone: input(window, cx, "例如 Asia/Shanghai 或 Etc/UTC", false),
         };
         let mut subscriptions = Vec::new();
-        for field in [
-            &fields.first_hop,
-            &fields.residential_ip,
-            &fields.residential_port,
-            &fields.residential_username,
-            &fields.residential_password,
-            &fields.dns_upstream,
-            &fields.dns_tls_name,
-            &fields.health_domain,
-            &fields.direct_ips,
-            &fields.direct_domains,
-            &fields.direct_suffixes,
-            &fields.max_tcp_connections,
-            &fields.tcp_idle_timeout,
-            &fields.tcp_half_close_timeout,
-            &fields.port,
-            &fields.environment_name,
-            &fields.environment_distribution,
-            &fields.environment_install,
-            &fields.environment_backup,
-            &fields.environment_username,
-            &fields.environment_password,
-            &fields.environment_timezone,
+        // 每个输入框属于哪一页的保存；环境表单的输入框不属于任何一页的保存。
+        let settings = Some(SaveScope::Settings);
+        for (field, scope) in [
+            (&fields.first_hop, settings),
+            (&fields.residential_ip, settings),
+            (&fields.residential_port, settings),
+            (&fields.residential_username, settings),
+            (&fields.residential_password, settings),
+            (&fields.dns_upstream, settings),
+            (&fields.dns_tls_name, settings),
+            (&fields.health_domain, settings),
+            (&fields.max_tcp_connections, settings),
+            (&fields.tcp_idle_timeout, settings),
+            (&fields.tcp_half_close_timeout, settings),
+            (&fields.port, settings),
+            (&fields.environment_name, None),
+            (&fields.environment_distribution, None),
+            (&fields.environment_install, None),
+            (&fields.environment_backup, None),
+            (&fields.environment_username, None),
+            (&fields.environment_password, None),
+            (&fields.environment_timezone, None),
         ] {
             if let Field::Single(field) = field {
-                subscriptions.push(cx.subscribe(field, |this, _, event, cx| {
+                subscriptions.push(cx.subscribe(field, move |this, _, event, cx| {
                     if matches!(event, InputEvent::Change) && !this.loading_fields {
-                        this.preflight = None;
-                        this.pending_prepare = None;
-                        this.dirty = this.draft_is_dirty(cx);
-                        this.save_error = false;
+                        this.input_edited(scope, cx);
                         cx.notify();
                     }
                 }));
@@ -115,10 +141,7 @@ impl Desktop {
             if let Field::Multi(field) = field {
                 subscriptions.push(cx.subscribe(field, |this, _, event, cx| {
                     if matches!(event, InputEvent::Change) && !this.loading_fields {
-                        this.preflight = None;
-                        this.pending_prepare = None;
-                        this.dirty = this.draft_is_dirty(cx);
-                        this.save_error = false;
+                        this.input_edited(Some(SaveScope::Policy), cx);
                         cx.notify();
                     }
                 }));
@@ -172,6 +195,10 @@ impl Desktop {
             logs_loading_more: false,
             logs_in_flight: false,
             logs_error: None,
+            events: Vec::new(),
+            events_loaded: false,
+            events_in_flight: false,
+            events_error: None,
             logs_scroll: gpui_kit::base::VirtualListScrollHandle::new(),
             live_connections: Vec::new(),
             connection_history: Default::default(),
@@ -206,17 +233,20 @@ impl Desktop {
             profile_path: None,
             revision: Value::Null,
             profile_exists: false,
-            dirty: false,
+            unsaved: Unsaved::default(),
+            saving: None,
+            clearing_target: false,
             loading_fields: false,
             preflight: None,
             pending_prepare: None,
             notice: "正在连接后台；关闭窗口只会收进托盘，从托盘退出才会停止接管并关闭后台。".into(),
             error: false,
-            save_error: false,
+            failed_saves: FailedSaves::default(),
             dialog_error: None,
             autostart_enabled: super::autostart::enabled().unwrap_or(false),
             confirmation: None,
             confirmation_pending: false,
+            kernel_prepare_offered: false,
             exiting: false,
             exit_anyway_pending: false,
             export_path: None,
@@ -238,6 +268,16 @@ impl Desktop {
             environment_zsh: true,
             environment_chrome: true,
             environment_chinese: true,
+            wsl_platform: None,
+            wsl_platform_error: None,
+            wsl_platform_at: None,
+            wsl_platform_checking: false,
+            wsl_update_result: None,
+            residential_probe: None,
+            residential_probe_error: None,
+            residential_probe_at: None,
+            residential_probe_checking: false,
+            save_notice: None,
         };
         this.send(Kind::Bootstrap, Value::Null, cx);
         cx.spawn_in(window, async move |view, cx| {
@@ -280,6 +320,14 @@ impl Desktop {
         } else if matches!(kind, Kind::Connections | Kind::Logs) {
             // 后台静默读取：不置 reading，不弹加载框，也不改页面提示。
             // 在途请求各自用 `connection_history.requested` 和 `logs_in_flight` 标记。
+        } else if kind == Kind::WslPlatform {
+            // 平台检查同样是后台静默读取；卡片自己显示「检查中」，结果只写进卡片。
+            self.wsl_platform_checking = true;
+            self.wsl_platform_error = None;
+        } else if kind == Kind::ResidentialProbe {
+            // 住宅代理检测同样静默：不锁界面，卡片自己显示「检测中」，结果只写进卡片。
+            self.residential_probe_checking = true;
+            self.residential_probe_error = None;
         } else {
             if self.reading || self.busy.is_some() {
                 return;
@@ -287,8 +335,11 @@ impl Desktop {
             self.reading = true;
             self.reading_kind = Some(kind);
         }
-        if kind == Kind::Save {
-            self.save_error = false;
+        // 重新保存这一页时先去掉它的「保存失败」；别的页保持原样。
+        if kind == Kind::Save
+            && let Some(scope) = self.saving
+        {
+            self.failed_saves.remove(scope);
         }
         if self
             .sender
@@ -308,12 +359,21 @@ impl Desktop {
                 self.environment_timezone_only = false;
             }
             self.status_valid = false;
-            if kind == Kind::Save {
-                self.save_error = true;
+            if kind == Kind::Save
+                && let Some(scope) = self.saving.take()
+            {
+                self.failed_saves.insert(scope);
             }
             if kind == Kind::Logs {
                 self.logs_loading_more = false;
                 self.logs_in_flight = false;
+            }
+            // 否则 WSL 平台卡片会一直停在「检查中」，「检查」按钮也一直禁用。
+            if kind == Kind::WslPlatform {
+                self.wsl_platform_checking = false;
+            }
+            if kind == Kind::ResidentialProbe {
+                self.residential_probe_checking = false;
             }
             self.fail("后台通信线程已退出，请重新打开窗口。", cx);
         } else {
@@ -321,7 +381,12 @@ impl Desktop {
             // 自动发出的，不能覆盖它，否则「预检未通过」这类原因会被冲掉。
             if !matches!(
                 kind,
-                Kind::Status | Kind::Connections | Kind::Logs | Kind::EnvironmentView
+                Kind::Status
+                    | Kind::Connections
+                    | Kind::Logs
+                    | Kind::EnvironmentView
+                    | Kind::WslPlatform
+                    | Kind::ResidentialProbe
             ) {
                 self.notice = match kind {
                     Kind::EnvironmentCreate => "正在创建环境并安装组件…".into(),
@@ -329,6 +394,10 @@ impl Desktop {
                         "正在更新时区并刷新环境详情…".into()
                     }
                     Kind::EnvironmentEdit => "正在安装组件并刷新环境能力…".into(),
+                    Kind::WslUpdate => {
+                        "正在运行 wsl --update 升级 WSL；期间 WSL 会重启，所有发行版中的程序都会停止。"
+                            .into()
+                    }
                     _ => format!("{}中…", kind.label()),
                 };
                 self.error = false;
@@ -387,6 +456,48 @@ impl Desktop {
             }),
             cx,
         );
+    }
+
+    /// 读取首页时间线用的最新几条运行日志。直接交给后台线程而不经过 `send`：这是静默
+    /// 读取，不置 `reading`、不改页面提示，发送失败也不改「状态是否有效」。
+    /// 同一时间只有一个在途请求。
+    pub(crate) fn refresh_events(&mut self, cx: &mut Context<Self>) {
+        if self.events_in_flight {
+            return;
+        }
+        let job = Job {
+            kind: Kind::Events,
+            epoch: self.epoch,
+            request: json!({"command": "runtime_logs", "limit": EVENT_LIMIT}),
+        };
+        if self.sender.send(job).is_err() {
+            self.events_error = Some("后台通信线程已退出，请重新打开窗口。".into());
+            cx.notify();
+            return;
+        }
+        self.events_in_flight = true;
+    }
+
+    /// 后台按新到旧返回日志，取最前面几条。
+    fn accept_events(&mut self, value: &Value) {
+        self.events = value["logs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(RuntimeLog::from_value)
+            .take(EVENT_LIMIT)
+            .collect();
+        self.events_loaded = true;
+        self.events_error = None;
+    }
+
+    /// 读取失败只写在时间线卡片里，保留上次读到的事件。
+    fn accept_events_reply(&mut self, result: Result<Value, String>) {
+        self.events_in_flight = false;
+        match result {
+            Ok(value) => self.accept_events(&value),
+            Err(error) => self.events_error = Some(super::backend::humanize_error(&error)),
+        }
     }
 
     /// 读取已落盘的连接记录第一页；同一时间只有一个在途请求。「进行中」筛选不显示
@@ -490,6 +601,36 @@ impl Desktop {
         }
     }
 
+    /// 平台检查是静默读取：结果只写进设置页卡片，不动页面提示和全局错误条。
+    fn accept_wsl_platform(&mut self, result: Result<Value, String>) {
+        self.wsl_platform_checking = false;
+        match result {
+            Ok(value) => {
+                self.wsl_platform = Some(value);
+                self.wsl_platform_at = Some(Instant::now());
+                self.wsl_platform_error = None;
+            }
+            Err(error) => {
+                self.wsl_platform_error = Some(super::backend::humanize_error(&error));
+            }
+        }
+    }
+
+    /// 住宅代理检测同样是静默的：结果只写进设置页住宅代理卡片，不动页面提示和全局错误条。
+    fn accept_residential_probe(&mut self, result: Result<Value, String>) {
+        self.residential_probe_checking = false;
+        match result {
+            Ok(value) => {
+                self.residential_probe = Some(value["residential_probe"].clone());
+                self.residential_probe_at = Some(Instant::now());
+                self.residential_probe_error = None;
+            }
+            Err(error) => {
+                self.residential_probe_error = Some(super::backend::humanize_error(&error));
+            }
+        }
+    }
+
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         while let Ok(reply) = self.replies.try_recv() {
             if reply.kind == Kind::Connections {
@@ -497,8 +638,23 @@ impl Desktop {
                 cx.notify();
                 continue;
             }
+            if reply.kind == Kind::Events {
+                self.accept_events_reply(reply.result);
+                cx.notify();
+                continue;
+            }
             if reply.kind == Kind::Logs {
                 self.accept_logs_reply(reply.result, cx);
+                cx.notify();
+                continue;
+            }
+            if reply.kind == Kind::WslPlatform {
+                self.accept_wsl_platform(reply.result);
+                cx.notify();
+                continue;
+            }
+            if reply.kind == Kind::ResidentialProbe {
+                self.accept_residential_probe(reply.result);
                 cx.notify();
                 continue;
             }
@@ -536,9 +692,20 @@ impl Desktop {
             }
             let environment_operation = matches!(
                 reply.kind,
-                Kind::EnvironmentCreate | Kind::EnvironmentEdit | Kind::EnvironmentDelete
+                Kind::EnvironmentCreate
+                    | Kind::EnvironmentEdit
+                    | Kind::EnvironmentDelete
+                    | Kind::WslUpdate
             );
             let result_succeeded = reply.result.is_ok();
+            // 这次回复让发行版列表变成了后台的最新结果。删除环境后列表读取失败时，
+            // 本地列表只去掉被删的那一个，同样可以用来判断目标还在不在。
+            let distributions_known = match (&reply.result, reply.kind) {
+                (Ok(value), Kind::Bootstrap) => value["distributions"].is_array(),
+                (Ok(value), Kind::List) => value.is_array(),
+                (Ok(_), Kind::EnvironmentDelete) => true,
+                _ => false,
+            };
             match reply.result {
                 Err(error) => {
                     if matches!(reply.kind, Kind::Status | Kind::Bootstrap) {
@@ -547,10 +714,17 @@ impl Desktop {
                     if reply.kind == Kind::Preflight {
                         self.pending_prepare = None;
                     }
-                    if reply.kind == Kind::Save {
-                        self.save_error = true;
+                    let failed_save = if reply.kind == Kind::Save {
+                        self.saving.take()
+                    } else {
+                        None
+                    };
+                    if let Some(scope) = failed_save {
+                        self.failed_saves.insert(scope);
                     }
                     let readable_error = super::backend::humanize_error(&error);
+                    let clearing_target =
+                        reply.kind == Kind::Save && std::mem::take(&mut self.clearing_target);
                     let message = match reply.kind {
                         Kind::EnvironmentCreate => {
                             format!("环境创建失败，组件安装未完成：{readable_error}")
@@ -562,21 +736,51 @@ impl Desktop {
                             format!("组件安装失败，环境设置未更新：{readable_error}")
                         }
                         Kind::EnvironmentDelete => format!("环境删除失败：{readable_error}"),
+                        Kind::WslUpdate => readable_error,
+                        Kind::Save if clearing_target => format!(
+                            "原接管目标已不在 WSL 里，但自动清除保存的目标失败：{readable_error}"
+                        ),
+                        Kind::Save => format!(
+                            "{}失败：{readable_error}",
+                            failed_save.map_or("保存修改", SaveScope::action)
+                        ),
                         _ => format!("{}失败：{readable_error}", reply.kind.label()),
                     };
-                    self.fail(message, cx);
+                    // 用户发起的保存用保存结果通知提示，不再弹全局错误条。
+                    // 自动清除失效目标不是用户发起的，失败仍走全局错误条。
+                    if failed_save.is_some() && !clearing_target {
+                        self.save_notice = Some(Err(message.clone()));
+                        self.notice = message;
+                        self.error = false;
+                        cx.notify();
+                    } else {
+                        self.fail(message, cx);
+                    }
                 }
                 Ok(value) => match reply.kind {
                     Kind::Bootstrap => {
                         if let Some(distributions) = value["distributions"].as_array() {
                             self.distributions = distributions.clone();
+                            self.forget_missing_environment();
                         }
-                        // A reconnect keeps edits the user has not saved yet.
-                        if !(self.dirty && self.profile_path.is_some()) {
-                            self.accept_profile(&value["profile"], window, cx);
-                        }
+                        // 重连时保留没保存的输入：有改动的页不动输入框，其余页和版本号都换成
+                        // 后台最新的，之后的保存不会因为版本号过期被拒。
+                        self.accept_profile_keeping_edits(&value["profile"], window, cx);
                         self.accept_status(value["status"].clone());
                         self.accept_logs(&value["logs"], false);
+                        // 连接时读到的就是未筛选的最新日志，首页时间线直接用它。
+                        // 读日志失败时两处都显示读取失败，不能当成「暂无记录」。
+                        match value["logs"]["error"].as_str() {
+                            Some(error) => {
+                                let error = super::backend::humanize_error(error);
+                                self.logs_error = Some(error.clone());
+                                self.events_error = Some(error);
+                            }
+                            None => {
+                                self.logs_error = None;
+                                self.accept_events(&value["logs"]);
+                            }
+                        }
                         self.notice = "后台已连接。请选择目标，然后启动接管。".into();
                         self.error = false;
                         // 关窗期间开始的环境操作仍在后台执行。
@@ -587,12 +791,19 @@ impl Desktop {
                                 Some("environment_edit") => "编辑环境",
                                 Some("environment_backup") => "备份环境",
                                 Some("environment_delete") => "删除环境",
+                                Some("wsl_platform_update") => "升级 WSL 平台",
                                 _ => "环境操作",
                             };
-                            self.notice = format!(
-                                "后台正在{operation}（{}），完成前不能启动接管或管理环境；结果见运行日志。",
-                                job["target"].as_str().unwrap_or("未知环境")
-                            );
+                            self.notice = if job["command"] == "wsl_platform_update" {
+                                format!(
+                                    "后台正在{operation}，完成前不能启动接管或管理环境；结果见运行日志。"
+                                )
+                            } else {
+                                format!(
+                                    "后台正在{operation}（{}），完成前不能启动接管或管理环境；结果见运行日志。",
+                                    job["target"].as_str().unwrap_or("未知环境")
+                                )
+                            };
                         }
                         // 连接记录独立于当前接管状态，后台空闲时也要预先读取，
                         // 这样打开连接页可以直接看到历史记录。
@@ -603,38 +814,69 @@ impl Desktop {
                         if self.page == Page::Connection {
                             self.refresh_connection_history(cx);
                         }
+                        // 首页打开时跟着状态轮询刷新时间线，状态切换和操作结果几秒内出现。
+                        if self.page == Page::Overview {
+                            self.refresh_events(cx);
+                        }
                     }
                     // 已在循环开头单独处理，不会走到这里。
+                    Kind::Events => {}
+                    // 已在循环开头单独处理，不会走到这里。
                     Kind::Connections => {}
+                    // 已在循环开头单独处理，不会走到这里。
+                    Kind::WslPlatform => {}
+                    // 已在循环开头单独处理，不会走到这里。
+                    Kind::ResidentialProbe => {}
                     Kind::List => {
                         self.distributions = value.as_array().cloned().unwrap_or_default();
-                        let valid = |id: &Option<String>| {
-                            id.as_ref().is_some_and(|id| {
-                                self.distributions.iter().any(|distro| {
-                                    distro["id"].as_str() == Some(id) && distro["version"] == 2
-                                })
-                            })
-                        };
-                        if !valid(&self.selected) {
+                        // 和自动清除用同一条规则判断目标还在不在，界面和库里才不会不一致。
+                        if target_missing(self.selected.as_deref(), &self.distributions) {
                             self.selected = None;
                         }
+                        self.forget_missing_environment();
                         self.preflight = None;
                         self.pending_prepare = None;
-                        self.dirty = self.draft_is_dirty(cx);
+                        self.unsaved = self.draft_unsaved(cx);
                         self.notice = "列表已刷新；未启动 WSL。".into();
                     }
                     // 已在循环开头单独处理，不会走到这里。
                     Kind::Logs => {}
-                    Kind::Save => {
-                        self.accept_profile(&value, window, cx);
-                        self.save_error = false;
-                        self.notice = if self.page == Page::Environment {
-                            "环境选择已保存；不会立即改变当前接管。"
-                        } else {
-                            "策略已保存；不会立即改变当前接管。"
+                    // 只重置这次保存的那一页；其他页没保存的输入原样保留。
+                    Kind::Save => match self.saving.take() {
+                        Some(scope) => {
+                            self.accept_record(&value);
+                            self.load_saved_fields(scope, window, cx);
+                            self.unsaved = self.draft_unsaved(cx);
+                            self.failed_saves.remove(scope);
+                            if scope == SaveScope::Environment {
+                                self.preflight = None;
+                                self.pending_prepare = None;
+                            }
+                            let clearing_target = std::mem::take(&mut self.clearing_target);
+                            self.notice = if clearing_target {
+                                format!(
+                                    "{}原接管目标已不在 WSL 里，已自动清除；请到「环境」页重新设定目标。",
+                                    self.notice
+                                )
+                            } else {
+                                match self.unsaved.pages() {
+                                    Some(pages) => {
+                                        format!("{}{pages}还有未保存的修改。", scope.saved_notice())
+                                    }
+                                    None => scope.saved_notice().into(),
+                                }
+                            };
+                            // 用户发起的保存（含环境页「设为目标」）用保存结果通知提示。
+                            if !clearing_target {
+                                self.save_notice = Some(Ok(self.notice.clone()));
+                            }
                         }
-                        .into();
-                    }
+                        // 不知道保存的是哪一页时按已保存的配置全部重置。
+                        None => {
+                            self.accept_profile(&value, window, cx);
+                            self.notice = "配置已保存；不会立即改变当前接管。".into();
+                        }
+                    },
                     Kind::Preflight => {
                         let passed = value["passed"] == true;
                         let blockers = value["blockers"]
@@ -648,10 +890,10 @@ impl Desktop {
                             })
                             .unwrap_or_default();
                         self.preflight = Some(value);
-                        let pending = self.pending_prepare.take();
                         if passed {
+                            self.kernel_prepare_offered = false;
                             self.error = false;
-                            if let Some(pending) = pending {
+                            if let Some(pending) = self.pending_prepare.take() {
                                 let selection_matches = matches!(
                                     self.selection(cx),
                                     Ok((target, port))
@@ -670,31 +912,70 @@ impl Desktop {
                             }
                         } else {
                             self.error = true;
-                            let kernel_gap = blockers.iter().any(|blocker| {
-                                blocker.starts_with("capability.kernel.")
-                                    || blocker.starts_with("baseline.ip6tables")
-                                    || blocker.starts_with("baseline.iptables")
-                            });
-                            self.notice = if blockers.is_empty() {
-                                "预检未通过，请检查当前环境。".into()
+                            let kernel_gap = super::backend::kernel_gap(&blockers);
+                            let pending_kind =
+                                self.pending_prepare.as_ref().map(|pending| pending.kind);
+                            // 切换时旧目标还在接管中，不能加载模块；只有从空闲启动才询问。
+                            if super::backend::offer_kernel_prepare(
+                                pending_kind,
+                                self.kernel_prepare_offered,
+                                &blockers,
+                            ) {
+                                self.kernel_prepare_offered = true;
+                                let pending = self
+                                    .pending_prepare
+                                    .take()
+                                    .expect("pending was checked above");
+                                self.prompt_kernel_prepare(pending, cx);
                             } else {
-                                let mut notice = format!("预检未通过：{}", blockers.join("；"));
-                                if kernel_gap {
+                                let switch_blocked =
+                                    kernel_gap && pending_kind == Some(Kind::Switch);
+                                self.pending_prepare = None;
+                                let mut notice = if blockers.is_empty() {
+                                    "预检未通过，请检查当前环境。".into()
+                                } else {
+                                    format!("预检未通过：{}", blockers.join("；"))
+                                };
+                                if switch_blocked {
                                     notice.push_str(
-                                        "。缺少的内核能力可由「准备内核环境」从目标已有的模块补齐。",
+                                        "。目标内核能力未就绪；需要先停止当前接管，再重新开始。",
                                     );
                                 }
-                                notice
-                            };
+                                self.notice = notice;
+                            }
                         }
                     }
                     Kind::PrepareKernel => {
                         self.preflight = None;
-                        self.pending_prepare = None;
                         let (notice, needs_attention) =
                             super::backend::kernel_prepare_notice(&value);
                         self.notice = notice;
                         self.error = needs_attention;
+                        let ready = value["preparation"]["ok"] == true
+                            && value["preparation"]["modules_failed"]
+                                .as_array()
+                                .is_none_or(|items| items.is_empty())
+                            && value["inspection_error"].is_null();
+                        if ready {
+                            // 预检因为缺少内核能力而停在这里：加载成功后自动重跑，
+                            // 通过就接着弹启动确认，不要求用户再点一次启动。
+                            if let Some((target, port)) = self
+                                .pending_prepare
+                                .as_ref()
+                                .map(|pending| (pending.target.clone(), pending.port))
+                            {
+                                self.send(
+                                    Kind::Preflight,
+                                    json!({"command":"preflight","target":target,"port":port}),
+                                    cx,
+                                );
+                                if self.reading {
+                                    self.notice = "内核能力已就绪，正在重新预检…".into();
+                                }
+                            }
+                        } else {
+                            self.pending_prepare = None;
+                        }
                     }
                     Kind::Export => {
                         self.export_path = value["path"].as_str().map(str::to_owned);
@@ -782,11 +1063,15 @@ impl Desktop {
                             self.distributions
                                 .retain(|distro| distro["id"].as_str() != deleted_id);
                         }
-                        if deleted_id.is_some_and(|id| self.selected.as_deref() == Some(id)) {
+                        if self
+                            .selected
+                            .as_deref()
+                            .is_some_and(|target| names_target(&value["environment"], target))
+                        {
                             self.selected = None;
                             self.preflight = None;
                             self.pending_prepare = None;
-                            self.dirty = self.draft_is_dirty(cx);
+                            self.unsaved = self.draft_unsaved(cx);
                         }
                         self.environment_selected = None;
                         self.environment_detail = None;
@@ -796,6 +1081,17 @@ impl Desktop {
                         self.backup_result_path = None;
                         self.notice = "环境已删除。".into();
                         self.error = false;
+                    }
+                    Kind::WslUpdate => {
+                        // 升级结果按版本前后变化说明；随后重新检查，卡片显示升级后的版本。
+                        let update = value["update"].clone();
+                        self.notice = super::backend::wsl_update_notice(&update);
+                        self.error = false;
+                        self.wsl_update_result = Some(update);
+                        self.wsl_platform = None;
+                        self.wsl_platform_at = None;
+                        self.wsl_platform_error = None;
+                        self.check_wsl_platform(cx);
                     }
                     Kind::Start | Kind::Switch | Kind::Stop => {
                         if value["passed"] == false {
@@ -834,6 +1130,10 @@ impl Desktop {
                     self.environment_timezone_only = false;
                 }
             }
+            // 放在环境结果框记下提示之后，免得结果框里显示成「保存修改中…」。
+            if distributions_known {
+                self.clear_missing_target(cx);
+            }
             if self.page == Page::Logs
                 && matches!(
                     reply.kind,
@@ -856,11 +1156,6 @@ impl Desktop {
             }
             if self.logs_refresh_pending && self.busy.is_none() && !self.logs_in_flight {
                 self.refresh_logs(cx);
-            }
-            if matches!(reply.kind, Kind::Bootstrap | Kind::List | Kind::Save)
-                && self.page == Page::Environment
-            {
-                self.open_target_environment(window, cx);
             }
             cx.notify();
         }
@@ -925,6 +1220,9 @@ impl Desktop {
             && !self.environment_result_dialog_open
         {
             self.open_environment_result_dialog(window, cx);
+        }
+        if let Some(result) = self.save_notice.take() {
+            push_save_notice(result, window, cx);
         }
         if matches!(
             self.busy,
@@ -999,6 +1297,25 @@ impl Desktop {
         }
     }
 
+    /// 列表里已经没有正在查看的环境（比如在别处删掉了）：右侧详情一起清掉，
+    /// 免得对着不存在的环境点编辑、备份、删除。
+    fn forget_missing_environment(&mut self) {
+        let gone = self
+            .environment_selected
+            .as_deref()
+            .is_some_and(|selected| {
+                !self
+                    .distributions
+                    .iter()
+                    .any(|distro| names_target(distro, selected))
+            });
+        if gone {
+            self.environment_selected = None;
+            self.environment_detail = None;
+            self.environment_backup_target = None;
+        }
+    }
+
     fn accept_environment_detail(
         &mut self,
         value: Value,
@@ -1019,78 +1336,74 @@ impl Desktop {
         }
     }
 
+    /// 后台返回的已保存配置；全部输入框都按它重置。
     fn accept_profile(&mut self, result: &Value, window: &mut Window, cx: &mut Context<Self>) {
+        self.accept_record(result);
+        for scope in [
+            SaveScope::Environment,
+            SaveScope::Policy,
+            SaveScope::Settings,
+        ] {
+            self.load_saved_fields(scope, window, cx);
+        }
+        self.unsaved = Unsaved::default();
+        self.failed_saves = FailedSaves::default();
+    }
+
+    /// 后台返回的已保存配置；有未保存输入的页面保留输入框，其余页面按它重置。
+    fn accept_profile_keeping_edits(
+        &mut self,
+        result: &Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let unsaved = self.unsaved;
+        self.accept_record(result);
+        for scope in unsaved.clean_pages() {
+            self.load_saved_fields(scope, window, cx);
+            self.failed_saves.remove(scope);
+        }
+        self.unsaved = self.draft_unsaved(cx);
+    }
+
+    /// 记下后台返回的已保存配置，不动输入框。
+    fn accept_record(&mut self, result: &Value) {
         self.profile = result["profile"].clone();
         self.revision = result["revision"].clone();
         self.profile_exists = result["exists"].as_bool().unwrap_or(false);
-        self.save_error = false;
         // The daemon validates and owns this stable AppData location; never synthesize a CWD path.
         self.profile_path = result["path"].as_str().map(str::to_owned);
         self.residential = result["residential"].clone();
+        let desktop = result.get("desktop");
+        self.saved_selected = desktop
+            .and_then(|desktop| desktop["target"].as_str())
+            .map(str::to_owned);
+        if let Some(port) = desktop.and_then(|desktop| desktop["port"].as_u64()) {
+            self.saved_port = port.to_string();
+        }
+    }
+
+    /// 把一页的输入框重置成已保存的值。
+    fn load_saved_fields(&mut self, scope: SaveScope, window: &mut Window, cx: &mut Context<Self>) {
         self.loading_fields = true;
-        for (field, key, array) in [
-            (&self.fields.first_hop, "first_hop", false),
-            (&self.fields.dns_upstream, "dns_upstream", false),
-            (&self.fields.dns_tls_name, "dns_tls_name", false),
-            (&self.fields.health_domain, "health_domain", false),
-            (&self.fields.direct_ips, "direct_ips", true),
-            (&self.fields.direct_domains, "direct_domains", true),
-            (&self.fields.direct_suffixes, "direct_suffixes", true),
-        ] {
-            let value = if array {
-                self.profile[key]
-                    .as_array()
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .unwrap_or_default()
-            } else {
-                self.profile[key].as_str().unwrap_or_default().to_owned()
-            };
-            field.set_value(value, window, cx);
-        }
         // 留空表示用默认值；后台不保存默认值，所以默认时这里是空的。
-        for (field, key) in [
-            (&self.fields.max_tcp_connections, "max_tcp_connections"),
-            (&self.fields.tcp_idle_timeout, "tcp_idle_timeout_seconds"),
-            (
-                &self.fields.tcp_half_close_timeout,
-                "tcp_half_close_timeout_seconds",
-            ),
-        ] {
-            let value = self.profile[key]
-                .as_u64()
-                .map(|value| value.to_string())
-                .unwrap_or_default();
-            field.set_value(value, window, cx);
+        for field in profile_fields(scope) {
+            let value = saved_text(&self.profile, field);
+            self.profile_input(field).set_value(value, window, cx);
         }
-        for (field, key) in [
-            (&self.fields.residential_ip, "ip"),
-            (&self.fields.residential_port, "port"),
-            (&self.fields.residential_username, "username"),
-            (&self.fields.residential_password, "password"),
-        ] {
-            let value = self.residential[key]
-                .as_str()
-                .map(str::to_owned)
-                .or_else(|| self.residential[key].as_u64().map(|v| v.to_string()))
-                .unwrap_or_default();
-            field.set_value(value, window, cx);
-        }
-        self.selected = None;
-        if let Some(desktop) = result.get("desktop") {
-            self.selected = desktop["target"].as_str().map(str::to_owned);
-            if let Some(port) = desktop["port"].as_u64() {
-                self.fields.port.set_value(port.to_string(), window, cx);
+        match scope {
+            SaveScope::Environment => self.selected = self.saved_selected.clone(),
+            SaveScope::Policy => {}
+            SaveScope::Settings => {
+                self.fields
+                    .port
+                    .set_value(self.saved_port.clone(), window, cx);
+                for (field, key) in self.residential_inputs() {
+                    let value = saved_residential_text(&self.residential, key);
+                    field.set_value(value, window, cx);
+                }
             }
         }
-        self.saved_selected = self.selected.clone();
-        self.saved_port = Self::field_value(&self.fields.port, cx);
         self.loading_fields = false;
-        self.dirty = false;
     }
 }

@@ -11,6 +11,8 @@ pub(crate) enum Kind {
     Connections,
     List,
     Logs,
+    /// 首页事件时间线：读取最新几条运行日志。静默读取，不受日志页筛选影响。
+    Events,
     Preflight,
     PrepareKernel,
     Save,
@@ -24,6 +26,12 @@ pub(crate) enum Kind {
     EnvironmentEdit,
     EnvironmentBackup,
     EnvironmentDelete,
+    /// 只读检查 WSL 平台（wsl.exe、内核与默认版本）：和读日志一样静默，不占用界面。
+    WslPlatform,
+    /// 升级 WSL 平台：后台执行 `wsl --update`，请求立刻返回，结果要轮询。
+    WslUpdate,
+    /// 用已保存的配置检测住宅代理能否直连、能否经宿主 SOCKS5：静默，结果只写进设置页卡片。
+    ResidentialProbe,
     ResetDnsAliases,
     Abandon,
     /// 托盘「退出」的最后一步：关闭空闲的后台。不算变更，回复后不再查询状态。
@@ -44,6 +52,7 @@ impl Kind {
                 | Self::EnvironmentEdit
                 | Self::EnvironmentBackup
                 | Self::EnvironmentDelete
+                | Self::WslUpdate
                 | Self::ResetDnsAliases
                 | Self::Abandon
         )
@@ -56,6 +65,7 @@ impl Kind {
                 | Self::EnvironmentEdit
                 | Self::EnvironmentBackup
                 | Self::EnvironmentDelete
+                | Self::WslUpdate
         )
     }
 
@@ -66,9 +76,10 @@ impl Kind {
             Self::List => "刷新列表",
             Self::Connections => "读取连接记录",
             Self::Logs => "刷新日志",
+            Self::Events => "读取运行事件",
             Self::Preflight => "启动前检查",
             Self::PrepareKernel => "准备内核环境",
-            Self::Save => "保存策略",
+            Self::Save => "保存修改",
             Self::Start => "启动接管",
             Self::Switch => "切换目标",
             Self::Stop => "停止并恢复",
@@ -79,6 +90,9 @@ impl Kind {
             Self::EnvironmentEdit => "编辑环境",
             Self::EnvironmentBackup => "备份环境",
             Self::EnvironmentDelete => "删除环境",
+            Self::WslPlatform => "检查 WSL 平台",
+            Self::WslUpdate => "升级 WSL 平台",
+            Self::ResidentialProbe => "检测住宅代理",
             Self::ResetDnsAliases => "重置 DNS 别名",
             Self::Abandon => "放弃本次记录",
             Self::Shutdown => "退出程序",
@@ -131,7 +145,22 @@ fn humanize_code(code: &str, message: &str) -> String {
         "kernel_prepare_failed" => {
             "内核环境准备失败，请确认目标发行版能启动，并且带有内核模块。".into()
         }
+        "residential_credential_incomplete" => {
+            "住宅服务器信息不完整，请在设置页的住宅代理里填写完整的服务器地址、端口、用户名和密码并保存。".into()
+        }
         "environment_requires_idle" => "请先停止接管并恢复直连，再管理 WSL 环境。".into(),
+        "wsl_platform_failed" => "检查 WSL 平台失败，请确认 WSL 可以正常运行后重试。".into(),
+        "wsl_not_installed" => "没有找到 wsl.exe，请先安装 Windows Subsystem for Linux。".into(),
+        "wsl_update_requires_idle" => "请先停止接管并恢复直连，再升级 WSL。".into(),
+        "wsl_update_failed" => {
+            "升级 WSL 失败，请检查网络和 Windows 更新；也可以在以管理员身份打开的终端里运行 wsl --update，或用 wsl --update --web-download 从 GitHub 下载更新。"
+                .into()
+        }
+        // 后台环境任务会把失败原因包成 desktop_request_failed，只有这里保留命令本身的输出。
+        "wsl_update_command_failed" => format!(
+            "升级 WSL 失败：{} 请检查网络、Windows 更新和权限；也可以在以管理员身份打开的终端里运行 wsl --update，或用 wsl --update --web-download 从 GitHub 下载更新。",
+            message.trim()
+        ),
         "same_target" => "当前目标没有变化。".into(),
         "environment_name_invalid" => "环境名称只能使用字母、数字、点、下划线和短横线。".into(),
         "environment_name_exists" => "环境名称已经存在，请换一个名称。".into(),
@@ -186,6 +215,7 @@ fn humanize_code(code: &str, message: &str) -> String {
             "开机自启设置失败，请检查系统权限。".into()
         }
         "stale_profile_revision" => "配置已被其他操作更新，请刷新后重试。".into(),
+        "desktop_store_not_saved" => "设置还没有保存过，请先保存设置。".into(),
         "udp_chain_unavailable" => UDP_CHAIN_UNAVAILABLE.into(),
         "tcp_capacity_reached" => tcp_capacity_reached(message),
         "dns_alias_space_exhausted" => {
@@ -264,6 +294,10 @@ fn humanize_detail(detail: &str) -> String {
     if lower.contains("udp_chain_unavailable") {
         return UDP_CHAIN_UNAVAILABLE.into();
     }
+    // The digit in "ipv6" keeps this code out of the code table above.
+    if lower.contains("ipv6_domain_allowlist_unsupported") {
+        return "目标启用了 IPv6，而域名直连规则只支持 IPv4，所以不能启动接管。请到规则页清空「精确域名」和「域名后缀」两列并保存，再启动；IP / CIDR 规则不受影响。".into();
+    }
     if lower.contains("already exists") {
         return "目标环境或目录已经存在，请换一个名称或路径。".into();
     }
@@ -277,6 +311,24 @@ fn humanize_detail(detail: &str) -> String {
         return "WSL 命令执行失败，请检查 WSL 状态和网络后重试。".into();
     }
     "操作失败，请检查当前状态后重试。".into()
+}
+
+/// Blockers that only loading the target's own modules and empty tables can
+/// clear. Used to decide whether a failed preflight should ask the user to
+/// prepare the kernel instead of just listing the codes.
+pub(crate) fn kernel_gap(blockers: &[String]) -> bool {
+    blockers.iter().any(|blocker| {
+        blocker.starts_with("capability.kernel.")
+            || blocker.starts_with("baseline.ip6tables")
+            || blocker.starts_with("baseline.iptables")
+    })
+}
+
+/// Whether a failed preflight should ask about preparing the kernel. Only a
+/// start from idle can do it, and only once per attempt: a switch keeps the old
+/// target running, and repeating the question after a failed attempt is noise.
+pub(crate) fn offer_kernel_prepare(kind: Option<Kind>, offered: bool, blockers: &[String]) -> bool {
+    kind == Some(Kind::Start) && !offered && kernel_gap(blockers)
 }
 
 /// The overview notice for one explicit kernel preparation. `true` means the
@@ -306,6 +358,16 @@ pub(crate) fn kernel_prepare_notice(value: &Value) -> (String, bool) {
     if failed > 0 {
         message.push_str(&format!("{failed} 个模块不可用，请检查目标内核模块。"));
     }
+    let autoload_error = preparation["autoload"]["error"].as_str().is_some()
+        || preparation["boot_unit"]["error"].as_str().is_some();
+    let autoload_ready = preparation["autoload"]["written"] == true
+        && preparation["boot_unit"]["written"] == true
+        && preparation["boot_unit"]["enabled"] == true;
+    if autoload_ready {
+        message.push_str("已设置开机自动加载。");
+    } else if autoload_error {
+        message.push_str("开机自动加载配置写入失败。");
+    }
     let record_error = value["record_error"].as_str().is_some();
     if record_error {
         message.push_str("准备记录写入失败，请检查本机配置目录。");
@@ -318,7 +380,139 @@ pub(crate) fn kernel_prepare_notice(value: &Value) -> (String, bool) {
         0 => message.push_str("可以在总览重新预检并启动接管。"),
         blockers => message.push_str(&format!("仍有 {blockers} 个阻断项，请查看预检结果。")),
     }
-    (message, failed > 0 || blockers > 0 || record_error)
+    (
+        message,
+        failed > 0 || blockers > 0 || record_error || autoload_error,
+    )
+}
+
+/// 设置页 WSL 平台卡片的状态标签：`(文字, 色调)`。色调由视图映射成主题色。
+pub(crate) fn wsl_platform_badge(
+    report: Option<&Value>,
+    checking: bool,
+    error: Option<&str>,
+) -> (&'static str, &'static str) {
+    if checking {
+        return ("检查中", "checking");
+    }
+    if error.is_some() {
+        return ("检查失败", "failed");
+    }
+    let Some(report) = report else {
+        return ("尚未检查", "untested");
+    };
+    let count = |key: &str| report[key].as_array().map_or(0, Vec::len);
+    if count("blockers") > 0 {
+        ("需要处理", "blocked")
+    } else if count("warnings") > 0 {
+        ("有提醒", "warning")
+    } else {
+        ("正常", "ok")
+    }
+}
+
+/// 设置页住宅代理检测的状态标签：`(文字, 色调)`。`stale` 表示检测之后设置又保存过，
+/// 旧结果不再对应当前配置。
+pub(crate) fn residential_probe_badge(
+    report: Option<&Value>,
+    checking: bool,
+    error: Option<&str>,
+    stale: bool,
+) -> (&'static str, &'static str) {
+    if checking {
+        return ("检测中", "checking");
+    }
+    if error.is_some() {
+        return ("检测失败", "failed");
+    }
+    let Some(report) = report else {
+        return ("尚未检测", "untested");
+    };
+    if stale {
+        return ("设置已改，需重新检测", "untested");
+    }
+    match report["verdict"].as_str() {
+        Some("both") => ("可直连，也可经宿主 SOCKS5", "ok"),
+        Some("needs_first_hop") => ("需要宿主 SOCKS5", "ok"),
+        Some("direct_only") => ("只能直连", "warning"),
+        Some("credential_rejected") => ("登录被拒绝", "failed"),
+        _ => ("两条路都不通", "failed"),
+    }
+}
+
+/// 检测结论的解释。接管始终经宿主 SOCKS5，所以「只能直连」意味着现在启动接管会失败。
+pub(crate) fn residential_probe_summary(verdict: &str) -> &'static str {
+    match verdict {
+        "both" => "住宅代理从 Windows 直接能连上，经宿主 SOCKS5 也能连上。接管照常经宿主 SOCKS5。",
+        "needs_first_hop" => {
+            "住宅代理从 Windows 直接连不上，经宿主 SOCKS5 能连上，需要宿主 SOCKS5 作为前置代理。"
+        }
+        "direct_only" => {
+            "住宅代理从 Windows 直接能连上，但经宿主 SOCKS5 连不上。接管始终经宿主 SOCKS5，现在启动接管会失败；请检查宿主 SOCKS5 是否在运行、是否放行到住宅服务器的连接。"
+        }
+        "credential_rejected" => {
+            "住宅服务器拒绝了用户名或密码。也可能是服务商只允许白名单里的来源 IP 登录。"
+        }
+        _ => "直接连接和经宿主 SOCKS5 都没有连上住宅代理，下面是各自停下的位置。",
+    }
+}
+
+/// 一条路径停在哪一步。阶段码来自后台，措辞留在这里。
+pub(crate) fn residential_stage_text(path: &Value) -> String {
+    if path["ok"] == true {
+        return "能连上，登录和转发都成功".into();
+    }
+    match path["stage"].as_str() {
+        Some("first_hop_unreachable") => "连不上宿主 SOCKS5".into(),
+        Some("first_hop_rejected") => "宿主 SOCKS5 拒绝了握手（它需要免认证的 SOCKS5）".into(),
+        Some("first_hop_connect_rejected") => "宿主 SOCKS5 没能连到住宅服务器".into(),
+        Some("residential_unreachable") => "连不上住宅服务器".into(),
+        Some("residential_method_rejected") => "住宅服务器没有按 SOCKS5 用户名密码方式应答".into(),
+        Some("residential_auth_rejected") => "住宅服务器拒绝了登录".into(),
+        Some("residential_connect_rejected") => "登录成功，但住宅服务器没能连到外部地址".into(),
+        Some(other) => format!("检测出错（{other}）"),
+        None => "没有结果".into(),
+    }
+}
+
+/// 一项检查的说明。目标状态由后台的检查代码决定，措辞留在这里。
+pub(crate) fn wsl_check_text(code: &str, level: &str, detail: Option<&str>) -> String {
+    let failed = level != "ok";
+    match (code, failed) {
+        ("wsl.executable", true) => {
+            "没有找到 wsl.exe；请先安装 Windows Subsystem for Linux。".into()
+        }
+        ("wsl.executable", false) => "找到 wsl.exe。".into(),
+        ("wsl.version_supported", true) => {
+            "wsl --version 不可用，可能是旧版 WSL；升级后再检查。".into()
+        }
+        ("wsl.version_supported", false) => "wsl --version 可用。".into(),
+        ("wsl.default_version_2", true) => match detail {
+            Some("1") => "默认版本是 WSL 1；新建的发行版不能作为接管目标。".into(),
+            _ => "没有读到默认版本；可以先升级 WSL 再检查。".into(),
+        },
+        ("wsl.default_version_2", false) => "新发行版默认使用 WSL 2。".into(),
+        ("wsl.no_wsl1_distribution", true) => match detail {
+            Some(names) => format!("{names} 是 WSL 1，不能作为接管目标。"),
+            None => "有发行版是 WSL 1，不能作为接管目标。".into(),
+        },
+        ("wsl.no_wsl1_distribution", false) => "所有发行版都是 WSL 2。".into(),
+        (_, true) => "这项检查没有通过。".into(),
+        (_, false) => "这项检查已通过。".into(),
+    }
+}
+
+/// 一次 WSL 升级结果的说明。是否升级按版本前后变化判断，不解析本地化输出。
+pub(crate) fn wsl_update_notice(update: &Value) -> String {
+    let before = update["before"]["version"].as_str();
+    let after = update["after"]["version"].as_str();
+    match (before, after) {
+        (Some(before), Some(after)) if update["updated"] == true => {
+            format!("WSL 已升级：{before} → {after}。")
+        }
+        (Some(_), Some(after)) => format!("WSL 已是最新（{after}），升级命令执行成功。"),
+        _ => "升级命令执行成功，但没有读到版本变化，无法确认是否已升级。".to_owned(),
+    }
 }
 
 /// 打开命名管道时报「文件不存在」（Windows 错误 2）：当前用户没有后台在运行。
@@ -383,8 +577,12 @@ pub(crate) fn worker() -> (Sender<Job>, Receiver<Reply>) {
         for job in jobs {
             let result = if job.kind == Kind::Bootstrap {
                 wsl_proxyctl::ipc::ensure_daemon().and_then(|()| {
+                    // 读日志失败不影响连接后台，但要把原因带回去，日志页和首页时间线显示读取失败，
+                    // 而不是「暂无记录」。
                     let logs = request(&json!({"command":"runtime_logs","limit":500}))
-                        .unwrap_or_else(|_| json!({"logs":[],"total":0,"has_more":false}));
+                        .unwrap_or_else(
+                            |error| json!({"logs":[],"total":0,"has_more":false,"error":error}),
+                        );
                     Ok(json!({
                         "distributions": request(&json!({"command":"list"}))?,
                         "profile": request(&json!({"command":"profile_get"}))?,
@@ -437,8 +635,55 @@ pub(crate) fn worker() -> (Sender<Job>, Receiver<Reply>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{humanize_error, kernel_prepare_notice};
+    use super::Kind;
+    use super::{
+        humanize_error, kernel_gap, kernel_prepare_notice, offer_kernel_prepare,
+        residential_probe_badge, residential_stage_text, wsl_check_text, wsl_platform_badge,
+        wsl_update_notice,
+    };
     use serde_json::json;
+
+    #[test]
+    fn offers_kernel_preparation_only_once_for_a_start() {
+        // The blockers an actual cold Target produced on 2026-11-24.
+        let gap: Vec<String> = [
+            "capability.kernel.module.xt_cgroup.unverified",
+            "capability.kernel.module.ip6table_nat.unverified",
+            "capability.kernel.matches_v4.cgroup.unverified",
+            "capability.kernel.matches_v6.cgroup.unverified",
+            "capability.kernel.targets_v6.DNAT.unverified",
+            "capability.kernel.tables_v6.nat.unverified",
+            "baseline.ip6tables_legacy.unavailable",
+        ]
+        .iter()
+        .map(|code| (*code).to_owned())
+        .collect();
+        assert!(offer_kernel_prepare(Some(Kind::Start), false, &gap));
+        assert!(!offer_kernel_prepare(Some(Kind::Start), true, &gap));
+        assert!(!offer_kernel_prepare(Some(Kind::Switch), false, &gap));
+        assert!(!offer_kernel_prepare(None, false, &gap));
+        assert!(!offer_kernel_prepare(
+            Some(Kind::Start),
+            false,
+            &["host_port_unavailable".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn recognizes_kernel_capability_blockers() {
+        assert!(kernel_gap(&[
+            "capability.kernel.module.xt_cgroup.unverified".into()
+        ]));
+        assert!(kernel_gap(
+            &["baseline.ip6tables_legacy.unavailable".into()]
+        ));
+        assert!(kernel_gap(&["baseline.iptables_legacy.unavailable".into()]));
+        assert!(!kernel_gap(&[
+            "identity.pid_namespace_unverified".into(),
+            "host_port_unavailable".into()
+        ]));
+        assert!(!kernel_gap(&[]));
+    }
 
     #[test]
     fn summarizes_kernel_preparation_and_keeps_failures_visible() {
@@ -447,15 +692,33 @@ mod tests {
                 "ok": true,
                 "modules_added": ["xt_cgroup"],
                 "modules_failed": [],
-                "tables": {"added": {"v4": ["filter"], "v6": ["filter", "nat"]}}
+                "tables": {"added": {"v4": ["filter"], "v6": ["filter", "nat"]}},
+                "autoload": {"written": true, "error": null},
+                "boot_unit": {"written": true, "enabled": true, "error": null}
             },
             "blockers": [],
             "inspection_error": null
         });
         let (message, error) = kernel_prepare_notice(&ready);
         assert!(message.contains("新增 1 个模块、3 个空表"), "{message}");
+        assert!(message.contains("已设置开机自动加载"), "{message}");
         assert!(message.contains("可以"), "{message}");
         assert!(!error);
+
+        let autoload_failed = json!({
+            "preparation": {
+                "ok": true,
+                "modules_added": ["xt_cgroup"],
+                "modules_failed": [],
+                "tables": {"added": {"v4": [], "v6": []}},
+                "autoload": {"written": false, "error": "PermissionError: denied"}
+            },
+            "blockers": [],
+            "inspection_error": null
+        });
+        let (message, error) = kernel_prepare_notice(&autoload_failed);
+        assert!(message.contains("开机自动加载配置写入失败"), "{message}");
+        assert!(error);
 
         let incomplete = json!({
             "preparation": {
@@ -564,6 +827,14 @@ mod tests {
     }
 
     #[test]
+    fn an_ipv6_target_with_domain_rules_points_to_the_rules_page() {
+        assert!(
+            humanize_error("controller_error · ipv6_domain_allowlist_unsupported")
+                .contains("规则页清空")
+        );
+    }
+
+    #[test]
     fn dns_alias_ledger_states_point_to_the_fix() {
         assert!(
             humanize_error("dns_alias_space_exhausted: the durable DNS alias range is used up")
@@ -603,5 +874,103 @@ mod tests {
             ),
             "目标 HTTPS 健康探测失败，当前状态需要恢复；请先停止并恢复直连后重试。"
         );
+    }
+
+    #[test]
+    fn residential_probe_badge_follows_the_latest_result_and_saved_settings() {
+        assert_eq!(
+            residential_probe_badge(None, false, None, false).0,
+            "尚未检测"
+        );
+        assert_eq!(residential_probe_badge(None, true, None, false).0, "检测中");
+        assert_eq!(
+            residential_probe_badge(None, false, Some("后台离线"), false).0,
+            "检测失败"
+        );
+        let report = |verdict: &str| json!({"verdict": verdict});
+        assert_eq!(
+            residential_probe_badge(Some(&report("needs_first_hop")), false, None, false),
+            ("需要宿主 SOCKS5", "ok")
+        );
+        assert_eq!(
+            residential_probe_badge(Some(&report("direct_only")), false, None, false).1,
+            "warning"
+        );
+        assert_eq!(
+            residential_probe_badge(Some(&report("credential_rejected")), false, None, false).1,
+            "failed"
+        );
+        // 检测之后又保存过设置，旧结论不能再当成当前配置的结果。
+        assert_eq!(
+            residential_probe_badge(Some(&report("both")), false, None, true).0,
+            "设置已改，需重新检测"
+        );
+        assert_eq!(
+            residential_stage_text(&json!({"ok": false, "stage": "first_hop_unreachable"})),
+            "连不上宿主 SOCKS5"
+        );
+        assert_eq!(
+            residential_stage_text(&json!({"ok": true})),
+            "能连上，登录和转发都成功"
+        );
+    }
+
+    #[test]
+    fn wsl_platform_badge_follows_the_latest_check() {
+        assert_eq!(wsl_platform_badge(None, false, None).0, "尚未检查");
+        assert_eq!(wsl_platform_badge(None, true, None).0, "检查中");
+        assert_eq!(
+            wsl_platform_badge(None, false, Some("后台离线")).0,
+            "检查失败"
+        );
+        let blocked = json!({"blockers": ["wsl.executable"], "warnings": []});
+        assert_eq!(
+            wsl_platform_badge(Some(&blocked), false, None).0,
+            "需要处理"
+        );
+        let warned = json!({"blockers": [], "warnings": ["wsl.default_version_2"]});
+        assert_eq!(wsl_platform_badge(Some(&warned), false, None).0, "有提醒");
+        let ready = json!({"blockers": [], "warnings": []});
+        assert_eq!(wsl_platform_badge(Some(&ready), false, None).0, "正常");
+    }
+
+    #[test]
+    fn wsl_check_text_matches_each_reported_state() {
+        assert!(wsl_check_text("wsl.version_supported", "blocker", None).contains("旧版 WSL"));
+        assert!(wsl_check_text("wsl.version_supported", "ok", None).contains("可用"));
+        assert!(wsl_check_text("wsl.default_version_2", "warning", Some("1")).contains("WSL 1"));
+        assert!(wsl_check_text("wsl.default_version_2", "warning", None).contains("没有读到"));
+        assert!(
+            wsl_check_text("wsl.no_wsl1_distribution", "warning", Some("Legacy"))
+                .contains("Legacy")
+        );
+        assert!(wsl_check_text("wsl.no_wsl1_distribution", "ok", None).contains("都是 WSL 2"));
+        assert_eq!(
+            wsl_check_text("wsl.unknown", "blocker", None),
+            "这项检查没有通过。"
+        );
+    }
+
+    #[test]
+    fn wsl_update_notice_reports_only_measured_changes() {
+        let upgraded =
+            json!({"before":{"version":"3.0.5.0"},"after":{"version":"3.0.6.0"},"updated":true});
+        assert!(wsl_update_notice(&upgraded).contains("3.0.5.0 → 3.0.6.0"));
+        let current =
+            json!({"before":{"version":"3.0.5.0"},"after":{"version":"3.0.5.0"},"updated":false});
+        assert!(wsl_update_notice(&current).contains("已是最新"));
+        let unread = json!({"before":{"version":null},"after":{"version":null},"updated":false});
+        assert!(wsl_update_notice(&unread).contains("无法确认"));
+    }
+
+    #[test]
+    fn keeps_the_wsl_update_command_output_and_adds_the_fix() {
+        let message = humanize_error(
+            "desktop_request_failed · wsl_update_command_failed: wsl_exit_failed: exit code: 0xffffffff: 正在检查更新。已禁止(403)。",
+        );
+        assert!(message.starts_with("升级 WSL 失败："), "{message}");
+        assert!(message.contains("已禁止(403)"), "{message}");
+        assert!(message.contains("管理员"), "{message}");
+        assert!(message.contains("--web-download"), "{message}");
     }
 }

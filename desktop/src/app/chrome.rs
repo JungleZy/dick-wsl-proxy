@@ -4,17 +4,30 @@ use gpui_kit::component::{
     Disableable, Sizable as _,
     button::Button,
     input::{Input, InputContentType, Textarea},
-    tooltip::Tooltip,
 };
 use gpui_kit::{prelude::*, *};
 use serde_json::json;
 
 use super::backend::Kind;
-use super::components::design_icon;
+use super::components::{badge, design_icon, text_tip};
+use super::drafts::SaveScope;
 use super::model::{Field, UiAction};
 use super::state::Desktop;
-use super::theme::{INK, MUTED, app_rgb as rgb};
+use super::theme::{AMBER, DANGER_BG, INK, MUTED, RUST, WARNING_BG, app_rgb as rgb};
+
 impl Desktop {
+    /// 这一页的未保存和保存失败标签，各页用同一种样式；已保存时各页显示自己的状态，
+    /// 返回 `None`。
+    pub(crate) fn unsaved_badge(&self, scope: SaveScope) -> Option<Div> {
+        if self.failed_saves.contains(scope) {
+            Some(badge("保存失败", RUST, DANGER_BG))
+        } else if self.unsaved.contains(scope) {
+            Some(badge("有未保存修改", AMBER, WARNING_BG))
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn field_label(
         &self,
         label: &'static str,
@@ -27,7 +40,7 @@ impl Desktop {
             .gap_1()
             .child(
                 div()
-                    .text_base()
+                    .text_sm()
                     .font_weight(FontWeight::NORMAL)
                     .text_color(rgb(INK))
                     .child(label),
@@ -36,7 +49,7 @@ impl Desktop {
                 div()
                     .id(tooltip_id)
                     .child(design_icon("info", 14., MUTED))
-                    .tooltip(move |window, cx| Tooltip::new(tooltip_text).build(window, cx)),
+                    .tooltip(move |window, cx| text_tip(tooltip_text, window, cx)),
             )
     }
 
@@ -75,10 +88,9 @@ impl Desktop {
             .on_click(
                 cx.listener(move |this, _, window, cx| match action.clone() {
                     UiAction::List => this.send(Kind::List, json!({"command":"list"}), cx),
-                    UiAction::Save => this.save(cx),
+                    UiAction::Save(scope) => this.save(scope, cx),
                     UiAction::Probe => this.probe(cx),
                     UiAction::Prepare(kind) => this.prepare(kind, window, cx),
-                    UiAction::KernelPrepare => this.prepare_kernel(window, cx),
                     UiAction::Reveal => {
                         if let Some(path) = &this.export_path {
                             cx.reveal_path(std::path::Path::new(path));
@@ -98,6 +110,9 @@ impl Desktop {
                         this.send(Kind::Export, json!({"command":"export_diagnostics"}), cx)
                     }
                     UiAction::ResetDnsAliases => this.prepare_reset_dns_aliases(window, cx),
+                    UiAction::WslPlatformCheck => this.check_wsl_platform(cx),
+                    UiAction::WslUpdate => this.prompt_wsl_update(window, cx),
+                    UiAction::ResidentialProbe => this.prompt_residential_probe(window, cx),
                     UiAction::ConnectionFilter(filter) => {
                         if this.connection_filter != filter {
                             this.connection_filter = filter;
@@ -125,8 +140,14 @@ impl Desktop {
     ) -> Div {
         let input = match state {
             Field::Single(state) => Input::new(state).disabled(self.locked()).into_any_element(),
+            // 多行输入框撑满所在栏剩下的高度（规则页三列随窗口拉高），最矮 112px。
+            Field::Multi(state) if multiline => Textarea::new(state)
+                .flex_1()
+                .min_h(px(112.))
+                .disabled(self.locked())
+                .into_any_element(),
             Field::Multi(state) => Textarea::new(state)
-                .h(px(if multiline { 112. } else { 32. }))
+                .h(px(32.))
                 .disabled(self.locked())
                 .into_any_element(),
         };
@@ -138,13 +159,13 @@ impl Desktop {
             .min_w_0()
             .child(
                 div()
-                    .text_base()
+                    .text_sm()
                     .font_weight(FontWeight::NORMAL)
                     .text_color(rgb(INK))
                     .child(label),
             )
             .child(input)
-            .child(div().text_base().text_color(rgb(MUTED)).child(hint))
+            .child(div().text_sm().text_color(rgb(MUTED)).child(hint))
     }
 
     pub(crate) fn compact_secret_field(
@@ -193,7 +214,7 @@ impl Desktop {
             .gap_2()
             .child(
                 div()
-                    .text_base()
+                    .text_sm()
                     .font_weight(FontWeight::NORMAL)
                     .text_color(rgb(INK))
                     .child(label),
@@ -211,6 +232,6 @@ impl Desktop {
                             .flex_shrink_0(),
                     ),
             )
-            .child(div().text_base().text_color(rgb(MUTED)).child(hint))
+            .child(div().text_sm().text_color(rgb(MUTED)).child(hint))
     }
 }
