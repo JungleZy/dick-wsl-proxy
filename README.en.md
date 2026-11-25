@@ -255,9 +255,9 @@ The "Updates" group under Settings › About:
 
 - **Check**: 15 seconds after the app opens it asks GitHub for a newer release, then once a day; "Check for updates" asks right away. It goes through the host SOCKS5 when one is saved, direct if that fails, never through the residential proxy. Every check shows GitHub your exit IP; turn off "Check for updates automatically" if the app should not go online by itself.
 - **Notice**: a newer release is announced once, and the status bar shows it next to the version.
-- **Upgrade**: after you click "Upgrade to vX" and confirm, the app downloads the package (about 41 MB), checks it against the SHA-256 published with the release, closes its window, runs the new package's `install.ps1`, reopens itself and shows the result.
+- **Upgrade**: after you click "Upgrade to vX" and confirm, the app downloads the package (about 41 MB), checks it against the SHA-256 published with the release, closes its window, runs the new package's `install.ps1`, reopens itself and shows the result. The window usually takes a minute or two to come back, with no progress shown meanwhile; do not open the app yourself, or the installer refuses the upgrade (the open window then shows why).
 
-One-click upgrade needs all of these; otherwise the app only tells you, and says why:
+One-click upgrade needs all of these. When either of the first two is missing, the Upgrade button is greyed out with the reason beside it; the execution policy is checked only after you click Upgrade, and if it does not allow scripts the app says so and downloads nothing:
 
 - no takeover is running or waiting for recovery (stop it on the home page first);
 - this copy was installed with `install.ps1` (not unpacked and run in place, not self-built);
