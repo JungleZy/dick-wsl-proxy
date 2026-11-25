@@ -11,7 +11,7 @@ use gpui_kit::component::{
     progress::Progress,
     resizable::{h_resizable, resizable_panel},
     select::Select,
-    setting::{SettingField, SettingGroup, SettingItem, SettingPage, Settings},
+    setting::{SettingGroup, SettingItem, SettingPage, Settings},
 };
 use gpui_kit::{prelude::*, *};
 use serde_json::Value;
@@ -2308,21 +2308,18 @@ impl Desktop {
                 )
         })
         .keywords(["关于", "版本", super::theme::TITLE]);
-        let path_item = SettingItem::new(
-            "配置库",
-            SettingField::render(move |_, _, _| {
-                let tip = profile_path.clone();
-                div()
-                    .id("about-profile-path")
-                    .max_w(px(360.))
-                    .truncate()
-                    .font_family(MONO_FONT)
-                    .text_sm()
-                    .text_color(rgb(MUTED))
-                    .child(profile_path.clone())
-                    .tooltip(move |window, cx| text_tip(tip.clone(), window, cx))
-            }),
-        );
+        let path_item = setting_row("配置库", move |_| {
+            let tip = profile_path.clone();
+            div()
+                .id("about-profile-path")
+                .max_w(px(360.))
+                .truncate()
+                .font_family(MONO_FONT)
+                .text_sm()
+                .text_color(rgb(MUTED))
+                .child(profile_path.clone())
+                .tooltip(move |window, cx| text_tip(tip.clone(), window, cx))
+        });
         SettingPage::new("关于").resettable(false).group(
             SettingGroup::new()
                 .item(header)
@@ -2355,7 +2352,10 @@ impl Desktop {
         let view = cx.entity().clone();
         let locked = self.locked();
         let input = |label: &'static str, field: &Field| {
-            SettingItem::new(label, setting_input(field, locked))
+            let field = field.clone();
+            setting_row(label, move |horizontal| {
+                setting_input(&field, locked, horizontal)
+            })
         };
         let residential = SettingPage::new("住宅代理")
             .resettable(false)
@@ -2402,24 +2402,21 @@ impl Desktop {
                     .description(
                         "白名单以外的域名先回一个占位地址，连接时把域名交给住宅代理解析，省掉一次经代理链的 DNS 往返。住宅代理不支持按域名连接时自动不启用。下次启动或切换接管时生效。",
                     )
-                    .item(SettingItem::new(
-                        "白名单以外的域名由住宅代理解析",
-                        SettingField::render({
+                    .item(setting_row("白名单以外的域名由住宅代理解析", {
+                        let view = view.clone();
+                        let checked = self.fake_ip_draft;
+                        move |_| {
                             let view = view.clone();
-                            let checked = self.fake_ip_draft;
-                            move |_, _, _| {
-                                let view = view.clone();
-                                Checkbox::new("settings-fake-ip")
-                                    .checked(checked)
-                                    .disabled(locked)
-                                    .on_click(move |checked: &bool, _, cx: &mut App| {
-                                        view.update(cx, |this, cx| {
-                                            this.set_fake_ip_draft(*checked, cx)
-                                        });
-                                    })
-                            }
-                        }),
-                    )),
+                            Checkbox::new("settings-fake-ip")
+                                .checked(checked)
+                                .disabled(locked)
+                                .on_click(move |checked: &bool, _, cx: &mut App| {
+                                    view.update(cx, |this, cx| {
+                                        this.set_fake_ip_draft(*checked, cx)
+                                    });
+                                })
+                        }
+                    })),
             );
         let limits = SettingPage::new("转发限制").resettable(false).group(
             SettingGroup::new()
@@ -2439,18 +2436,15 @@ impl Desktop {
         let autostart_view = view.clone();
         let runtime = SettingPage::new("桌面运行").resettable(false).group(
             SettingGroup::new()
-                .item(SettingItem::new(
-                    "开机自动启动",
-                    SettingField::render(move |_, _, _| {
-                        let view = autostart_view.clone();
-                        Checkbox::new("settings-autostart")
-                            .checked(autostart)
-                            .disabled(locked)
-                            .on_click(move |checked: &bool, _, cx: &mut App| {
-                                view.update(cx, |this, cx| this.set_autostart(*checked, cx));
-                            })
-                    }),
-                ))
+                .item(setting_row("开机自动启动", move |_| {
+                    let view = autostart_view.clone();
+                    Checkbox::new("settings-autostart")
+                        .checked(autostart)
+                        .disabled(locked)
+                        .on_click(move |checked: &bool, _, cx: &mut App| {
+                            view.update(cx, |this, cx| this.set_autostart(*checked, cx));
+                        })
+                }))
                 .item(value_item("关闭窗口", "隐藏到托盘"))
                 .item(value_item("托盘退出", "停止接管并关闭后台"))
                 .item(value_item("配置库", "SQLite"))
@@ -2495,48 +2489,89 @@ impl Desktop {
     }
 }
 
-/// 设置项里的输入框，沿用页面自己的输入状态。横排时定宽、竖排时占满，和 gpui-kit 自带的
-/// 文本设置项一样。`locked` 直接传给输入框，不用 `SettingItem::disabled`：那会让整项变暗，
-/// 每次保存整个分区都会闪一下。
-fn setting_input(field: &Field, locked: bool) -> SettingField<SharedString> {
-    let field = field.clone();
-    SettingField::render(move |options, _, _| {
+/// 设置项名称一栏的最小宽度，放得下最长的输入项名称「国内 DoH 上游 IPv4:端口」，
+/// 同一分区里的输入框因此左边对齐。更长的名称只撑宽自己那一行，不换行。
+const SETTING_LABEL_WIDTH: f32 = 160.;
+
+/// 设置页的一项：左边是名称，输入框或值紧跟在名称栏后面。gpui-kit 自带的设置项横排时
+/// 把名称和输入框推到两端，窗口一宽中间就空出一大块，所以设置页的项都用这个自己排。
+/// 分区窄到上下排时名称在上、内容占满一行，`field` 收到的参数表示当前是否横排。
+/// 自定义项默认只在搜索框为空时显示，名称同时设为搜索关键字，照样能按名称过滤。
+fn setting_row<E: IntoElement>(
+    label: &'static str,
+    field: impl Fn(bool) -> E + 'static,
+) -> SettingItem {
+    SettingItem::render(move |options, _, _| {
         let horizontal = options.layout() == Axis::Horizontal;
-        match &field {
-            Field::Single(state) => Input::new(state)
-                .disabled(locked)
-                .map(|input| {
-                    if horizontal {
-                        input.w_64()
-                    } else {
-                        input.w_full()
-                    }
-                })
-                .into_any_element(),
-            Field::Multi(state) => Textarea::new(state)
-                .h(px(96.))
-                .disabled(locked)
-                .map(|input| {
-                    if horizontal {
-                        input.w_64()
-                    } else {
-                        input.w_full()
-                    }
-                })
-                .into_any_element(),
-        }
+        div()
+            .w_full()
+            .flex()
+            .gap_3()
+            .map(|row| {
+                if horizontal {
+                    row.flex_row().items_center()
+                } else {
+                    row.flex_col()
+                }
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .when(horizontal, |name| name.min_w(px(SETTING_LABEL_WIDTH)))
+                    .text_sm()
+                    .text_color(rgb(INK))
+                    .child(label),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .map(|value| {
+                        if horizontal {
+                            value.flex_1()
+                        } else {
+                            value.w_full()
+                        }
+                    })
+                    .child(field(horizontal)),
+            )
     })
+    .keywords([label])
 }
 
-/// 只读的一项：右边是一段说明文字。
+/// 设置项里的输入框，沿用页面自己的输入状态。横排时定宽、竖排时占满。`locked` 直接传给
+/// 输入框，不用 `SettingItem::disabled`：那会让整项变暗，每次保存整个分区都会闪一下。
+fn setting_input(field: &Field, locked: bool, horizontal: bool) -> AnyElement {
+    match field {
+        Field::Single(state) => Input::new(state)
+            .disabled(locked)
+            .map(|input| {
+                if horizontal {
+                    input.w_64()
+                } else {
+                    input.w_full()
+                }
+            })
+            .into_any_element(),
+        Field::Multi(state) => Textarea::new(state)
+            .h(px(96.))
+            .disabled(locked)
+            .map(|input| {
+                if horizontal {
+                    input.w_64()
+                } else {
+                    input.w_full()
+                }
+            })
+            .into_any_element(),
+    }
+}
+
+/// 只读的一项：名称后面是一段说明文字。
 fn value_item(label: &'static str, value: impl Into<SharedString>) -> SettingItem {
     let value = value.into();
-    SettingItem::new(
-        label,
-        SettingField::render(move |_, _, _| {
-            div().text_sm().text_color(rgb(MUTED)).child(value.clone())
-        }),
-    )
+    setting_row(label, move |_| {
+        div().text_sm().text_color(rgb(MUTED)).child(value.clone())
+    })
 }
 
 /// 一整块自定义内容的一项，用桌面端自己的绘制方法。Settings 在桌面视图的 `render` 返回之后
