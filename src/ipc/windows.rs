@@ -1114,8 +1114,16 @@ mod inner {
             let server = std::thread::spawn(move || {
                 let mut pipe = Pipe::server(&thread_name, &thread_sid).unwrap();
                 ready_tx.send(()).unwrap();
-                pipe.connect().unwrap();
+                match pipe.connect() {
+                    Ok(()) => {}
+                    // The client may have checked the server image and left
+                    // before this accept ran (seen on a slow CI runner);
+                    // `serve_pipe` treats this the same way.
+                    Err(error) if error.raw_os_error() == Some(ERROR_NO_DATA as i32) => {}
+                    Err(error) => panic!("accept failed: {error}"),
+                }
                 pipe.reset(FRAME_TIMEOUT);
+                // Either way no request byte may have reached the server.
                 assert!(framing::read_frame(&mut pipe).is_err());
             });
             ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
