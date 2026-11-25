@@ -481,7 +481,7 @@ pub(crate) fn dispatch_result(
             controller
                 .switch(expected_generation, new, runtime)
                 .map_err(error)?;
-            controller.status().map_err(error)?
+            with_unproven_left(controller, controller.status().map_err(error)?)
         }
         Command::Start {
             target,
@@ -518,7 +518,7 @@ pub(crate) fn dispatch_result(
         } => {
             controller::lifecycle::checked(expected_generation).map_err(error)?;
             controller.stop().map_err(error)?;
-            controller.status().map_err(error)?
+            with_unproven_left(controller, controller.status().map_err(error)?)
         }
         Command::Abandon {
             confirm,
@@ -685,4 +685,18 @@ fn chain_probe(names: &[String], port: u16, rounds: u32) -> Result<serde_json::V
         }));
     }
     Ok(serde_json::json!({ "chain_probe": results }))
+}
+
+/// Adds, once, how many entries carrying the old takeover's mark the stop or
+/// switch left in the target because they could not be proven its own
+/// (decision 20); omitted when there were none.
+fn with_unproven_left(
+    controller: &mut controller::Controller,
+    mut status: serde_json::Value,
+) -> serde_json::Value {
+    let left = controller.take_unproven_left();
+    if left > 0 {
+        status["unproven_mappings_left"] = left.into();
+    }
+    status
 }

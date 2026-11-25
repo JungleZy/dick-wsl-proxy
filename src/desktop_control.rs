@@ -384,6 +384,19 @@ fn command_log(command: &str, response: &Value) -> (&'static str, String, String
             )
         }
         "start" => ("info", "lifecycle".into(), "已开始接管".into()),
+        "switch" | "stop" if response["unproven_mappings_left"].as_u64().unwrap_or(0) > 0 => (
+            "warning",
+            "lifecycle".into(),
+            format!(
+                "{}；旧目标里还留着 {} 条带本次接管标记、但无法证明归属的连接跟踪记录，按设计没有删除。它们只会让各自原有的连接失败，不影响新连接，连接跟踪超时后自行消失。",
+                if command == "stop" {
+                    "已停止接管并恢复直连"
+                } else {
+                    "已切换接管目标"
+                },
+                response["unproven_mappings_left"]
+            ),
+        ),
         "switch" => ("info", "lifecycle".into(), "已切换接管目标".into()),
         "stop" => ("info", "lifecycle".into(), "已停止接管并恢复直连".into()),
         "probe_exit" => ("info", "diagnostics".into(), "出口检测完成".into()),
@@ -743,6 +756,22 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stop_that_left_unprovable_mappings_is_logged_as_a_warning() {
+        let (level, source, message) =
+            command_log("stop", &json!({"phase":"idle","unproven_mappings_left":2}));
+        assert_eq!((level, source.as_str()), ("warning", "lifecycle"));
+        assert!(
+            message.starts_with("已停止接管并恢复直连；旧目标里还留着 2 条"),
+            "{message}"
+        );
+        let (level, _, message) = command_log("stop", &json!({"phase":"idle"}));
+        assert_eq!((level, message.as_str()), ("info", "已停止接管并恢复直连"));
+        let (level, _, message) = command_log("switch", &json!({"unproven_mappings_left":1}));
+        assert_eq!(level, "warning");
+        assert!(message.starts_with("已切换接管目标；"), "{message}");
+    }
 
     #[test]
     fn an_environment_job_runs_once_reports_once_and_blocks_conflicting_requests() {

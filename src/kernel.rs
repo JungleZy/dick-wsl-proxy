@@ -39,8 +39,10 @@ pub fn arm(p: &Plan, window: GrantWindow) -> Result<(), String> {
 
 /// Removes interception before deleting precisely identified owned mappings.
 /// The Windows ingress must remain alive until this succeeds; TCP must reconnect.
-pub fn remove(p: &Plan) -> Result<(), String> {
-    invoke(p, "remove", None).map(|_| ())
+/// Returns how many entries carrying this instance's mark could not be proven
+/// ours and were left in place (decision 20).
+pub fn remove(p: &Plan) -> Result<u32, String> {
+    invoke(p, "remove", None).map(|response| response.unproven_mappings.unwrap_or(0))
 }
 
 /// A read-only observation of this generation, not permission to delete it.
@@ -51,11 +53,16 @@ pub struct Ownership {
     pub rules_present: bool,
     pub mappings_present: bool,
     pub rules_complete: bool,
+    /// Entries carrying this instance's mark that cannot be proven its
+    /// mappings. Never deleted; the periodic check counts any as a loss.
+    #[serde(default)]
+    pub unproven_mappings: u32,
 }
 
 impl Ownership {
     /// True only after inspection independently verifies this generation absent.
     /// A changed identity may be clean, but can never authorize deletion.
+    /// Unprovable marked entries are not this generation's to clean.
     pub fn clean(&self) -> bool {
         !self.rules_present && !self.rules_complete && !self.mappings_present
     }
@@ -96,6 +103,8 @@ struct Response {
     grant_deadline: Option<u64>,
     #[serde(default)]
     identity_error: Option<String>,
+    #[serde(default)]
+    unproven_mappings: Option<u32>,
 }
 
 fn invoke(p: &Plan, operation: &str, deadline: Option<u64>) -> Result<Response, String> {
@@ -141,6 +150,9 @@ fn parse_response(output: &str, operation: &str) -> Result<Response, String> {
     }
     if response.identity_error.is_some() && !matches!(operation, "inspect" | "remove") {
         return Err("kernel_unexpected_identity_error".into());
+    }
+    if response.unproven_mappings.is_some() != (operation == "remove") {
+        return Err("kernel_unexpected_or_missing_unproven_count".into());
     }
     if let Some(ownership) = &response.ownership
         && ((ownership.rules_complete && !ownership.rules_present)
@@ -397,6 +409,7 @@ mod tests {
                         rules_present,
                         mappings_present,
                         rules_complete: false,
+                        unproven_mappings: 1,
                     };
                     assert_eq!(ownership.clean(), !rules_present && !mappings_present);
                     assert!(serde_json::to_string(&ownership).is_ok());
@@ -415,9 +428,23 @@ mod tests {
                 .as_deref(),
             Some("boot_changed")
         );
-        let remove =
-            r#"{"ok":true,"operation":"remove","identity_error":"workload_outside_distro_cgroup"}"#;
+        let remove = r#"{"ok":true,"operation":"remove","identity_error":"workload_outside_distro_cgroup","unproven_mappings":0}"#;
         assert!(parse_response(remove, "remove").is_ok());
+        // Remove always reports how many unprovable marked entries it left,
+        // and nothing else does.
+        let counted = r#"{"ok":true,"operation":"remove","unproven_mappings":3}"#;
+        assert_eq!(
+            parse_response(counted, "remove").unwrap().unproven_mappings,
+            Some(3)
+        );
+        assert!(parse_response(r#"{"ok":true,"operation":"remove"}"#, "remove").is_err());
+        assert!(
+            parse_response(
+                r#"{"ok":true,"operation":"install","unproven_mappings":0}"#,
+                "install"
+            )
+            .is_err()
+        );
         for operation in ["install", "arm"] {
             let response = format!(
                 r#"{{"ok":true,"operation":"{operation}","identity_error":"boot_changed"}}"#

@@ -414,6 +414,13 @@ def m2_artifacts(p):
         body.append(["-A", chain, "-d", ingress + "/32", "-p", protocol, "-m", protocol, "--dport", str(ingress_port), *comment, "-j", "RETURN"])
     for network in ("0.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4"):
         body.append(["-A", chain, "-d", network, *comment, "-j", "RETURN"])
+    # Non-local traffic (container bridges) for a resolver other than the
+    # system one is not redirected (decision 20). `Ownership.owned` could never
+    # prove such a mapping, so one marked would turn the whole takeover into a
+    # protection loss although the ingress refuses it anyway. Left unmarked,
+    # it meets the FORWARD guard's final DROP and never leaves directly.
+    for protocol in ("tcp", "udp"):
+        body.append(["-A", chain, "!", "-s", p["guest"] + "/32", "!", "-d", p["system_dns"] + "/32", "-p", protocol, "-m", protocol, "--dport", "53", *comment, "-j", "RETURN"])
     body.extend([
         ["-A", chain, "-m", "connmark", "--mark", "0x0", *comment, "-j", "CONNMARK", "--set-xmark", mark + "/0xffffffff"],
         ["-A", chain, "-p", "tcp", "-m", "connmark", "--mark", mark, *comment, "-j", "DNAT", "--to-destination", p["ingress"]],
@@ -1183,6 +1190,41 @@ def inspect_ipv6_mappings(p, ct):
     return Ownership6(p).entries(ct.dump(ipv6=True))
 
 
+def partition_marked(cookie, entries, owned):
+    """The entries carrying this instance's mark, split into provable mappings
+    and a count of the rest. Unlike `Ownership.entries` it never fails: an
+    entry that cannot be proven, or that shares a tuple with another marked
+    entry, is only counted and never offered for deletion (decision 20)."""
+    marked = [entry for entry in entries if entry["mark"] == cookie]
+    originals, replies = {}, {}
+    for entry in marked:
+        originals[entry["original"]] = originals.get(entry["original"], 0) + 1
+        replies[entry["reply"]] = replies.get(entry["reply"], 0) + 1
+    proven = [
+        entry
+        for entry in marked
+        if originals[entry["original"]] == 1 and replies[entry["reply"]] == 1 and owned(entry)
+    ]
+    return proven, len(marked) - len(proven)
+
+
+def mapping_partition(p, ct):
+    """For stop and inspection: (provable IPv4 mappings, provable IPv6
+    mappings, count of marked entries that cannot be proven). Stopping
+    deletes only the first two and still removes every exact-tagged rule."""
+    ownership, authorized = Ownership(p), {}
+    entries, unproven = partition_marked(p["cookie"], ct.dump(), lambda entry: ownership.owned(entry, authorized))
+    ipv6_entries = []
+    if p.get("ipv6") is not None:
+        ipv6_entries, more = partition_marked(p["cookie"], ct.dump(ipv6=True), Ownership6(p).owned)
+        unproven += more
+    elif p.get("system_dns") is not None:
+        # M2 without managed IPv6 never creates IPv6 NAT: a matching IPv6
+        # connmark is not ours to delete.
+        unproven += sum(1 for entry in ct.dump(ipv6=True) if entry["mark"] == p["cookie"])
+    return entries, ipv6_entries, unproven
+
+
 class MappingIndex:
     def __init__(self, prepared, entries):
         prepared.entries(entries)
@@ -1233,6 +1275,7 @@ def execute(request):
     with guest_lock():
         identity_matches = True
         drift = None
+        unproven_left = None
         try:
             guard(p, check_resolver=operation not in ("remove", "inspect"), write_tools=operation != "inspect")
         except Failure as error:
@@ -1275,14 +1318,17 @@ def execute(request):
                 if p.get("system_dns") is not None or p.get("ipv6") is not None:
                     _, ipv6_rules = inspect_firewall(p, firewall(ipv6=True), True, ipv6=True)
                 # Complete both families and every owned tuple before any delete.
-                entries = inspect_mappings(p, ct)
-                ipv6_entries = inspect_ipv6_mappings(p, ct)
+                # Marked entries that cannot be proven are counted, never deleted,
+                # and do not stop the exact-tagged rules from going (decision 20);
+                # the periodic check still treats any of them as a protection loss.
+                entries, ipv6_entries, unproven = mapping_partition(p, ct)
                 if operation == "inspect":
                     ownership = {
                         "identity_matches": identity_matches,
                         "rules_present": present or any(rules.values()) or bool(ipv6_rules and any(ipv6_rules.values())),
                         "rules_complete": rules_complete(p, present, rules, ipv6_rules),
                         "mappings_present": bool(entries or ipv6_entries),
+                        "unproven_mappings": unproven,
                     }
                     require(identity_matches or not (ownership["rules_present"] or ownership["mappings_present"]), "stale_identity_has_owned_artifacts: " + str(drift))
                     if not ownership["rules_present"] and not ownership["mappings_present"]:
@@ -1325,8 +1371,7 @@ def execute(request):
                         )
                 # Table commits synchronize old readers before exact tuple cleanup.
                 for _ in range(4):
-                    entries = inspect_mappings(p, ct)
-                    ipv6_entries = inspect_ipv6_mappings(p, ct)
+                    entries, ipv6_entries, unproven = mapping_partition(p, ct)
                     if not entries and not ipv6_entries:
                         break
                     for entry in entries:
@@ -1338,19 +1383,21 @@ def execute(request):
                 inspect_firewall(p, firewall(), False)
                 if p.get("system_dns") is not None or p.get("ipv6") is not None:
                     inspect_firewall(p, firewall(ipv6=True), False, ipv6=True)
-                require(
-                    not inspect_mappings(p, ct) and not inspect_ipv6_mappings(p, ct),
-                    "owned_conntrack_residual",
-                )
+                entries, ipv6_entries, unproven = mapping_partition(p, ct)
+                require(not entries and not ipv6_entries, "owned_conntrack_residual")
+                unproven_left = unproven
             else:
                 if isinstance(request["peer"], str) and request["peer"].startswith("["):
                     origin = resolve6(p, ct.dump(ipv6=True), request["protocol"], request["peer"])
                 else:
                     origin = resolve(p, ct.dump(), request["protocol"], request["peer"])
                 return {"ok": True, "operation": operation, "origin": origin}
+            result = {"ok": True, "operation": operation}
             if drift is not None:
-                return {"ok": True, "operation": operation, "identity_error": drift}
-            return {"ok": True, "operation": operation}
+                result["identity_error"] = drift
+            if unproven_left is not None:
+                result["unproven_mappings"] = unproven_left
+            return result
         except (OSError, Failure) as error:
             if cached_conntrack and (
                 isinstance(error, OSError) or "conntrack_" in str(error)

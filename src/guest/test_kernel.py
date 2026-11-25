@@ -911,7 +911,7 @@ class FirewallTests(unittest.TestCase):
                 ):
                     conntrack.return_value.dump.return_value = []
                     result = kernel.execute(operation)
-                self.assertEqual(result, {"ok": True, "operation": "remove", "identity_error": reason})
+                self.assertEqual(result, {"ok": True, "operation": "remove", "identity_error": reason, "unproven_mappings": 0})
                 guard.assert_called_once_with(p, check_resolver=False, write_tools=True)
                 grant.assert_called_once_with(p, "revoke")
                 self.assertTrue(transact.call_args_list)
@@ -947,7 +947,9 @@ class FirewallTests(unittest.TestCase):
                 transact.assert_not_called()
                 conntrack.return_value.delete.assert_not_called()
 
-    def test_stale_remove_rejects_foreign_same_cookie_conntrack(self):
+    def test_stale_remove_leaves_and_counts_an_unprovable_same_cookie_mapping(self):
+        # Decision 20: an entry with this mark that cannot be proven ours is
+        # never deleted, and no longer makes the stop fail.
         for reason in ("cgroup_namespace_changed", "workload_outside_distro_cgroup"):
             with self.subTest(reason=reason):
                 p = plan()
@@ -964,8 +966,8 @@ class FirewallTests(unittest.TestCase):
                     patch.object(kernel, "transaction") as transact,
                 ):
                     conntrack.return_value.dump.return_value = [foreign]
-                    with self.assertRaisesRegex(kernel.Failure, "instance_mark_has_unproven_mapping"):
-                        kernel.execute(operation)
+                    result = kernel.execute(operation)
+                self.assertEqual(result, {"ok": True, "operation": "remove", "identity_error": reason, "unproven_mappings": 1})
                 guard.assert_called_once_with(p, check_resolver=False, write_tools=True)
                 grant.assert_called_once_with(p, "revoke")
                 transact.assert_not_called()
@@ -1019,7 +1021,7 @@ class InspectionTests(unittest.TestCase):
             if p.get("system_dns") is not None:
                 tables.append(ipv6_snapshot(p))
             value = self.observe(p, tables)
-            self.assertEqual(value, {"identity_matches": True, "rules_present": True, "rules_complete": True, "mappings_present": False})
+            self.assertEqual(value, {"identity_matches": True, "rules_present": True, "rules_complete": True, "mappings_present": False, "unproven_mappings": 0})
             partial = snapshot(p)
             del partial["nat"]
             tables = [partial] + ([ipv6_snapshot(p)] if p.get("system_dns") is not None else [])
@@ -1049,6 +1051,32 @@ class InspectionTests(unittest.TestCase):
             absent = self.observe(p, tables)
             self.assertFalse(absent["rules_present"] or absent["mappings_present"] or absent["rules_complete"])
 
+    def test_inspect_counts_unprovable_marked_mappings_without_failing(self):
+        p = comprehensive_plan()
+        corrupt = comprehensive_entry()
+        corrupt["reply"] = (17, "172.28.80.1", 9999, p["guest"], 45000)
+        value = self.observe(p, [snapshot(p), ipv6_snapshot(p)], entries=[corrupt, comprehensive_entry(port=80)])
+        self.assertEqual(value["unproven_mappings"], 1)
+        self.assertTrue(value["mappings_present"])
+        self.assertTrue(value["rules_complete"])
+
+    def test_bridge_dns_for_other_resolvers_is_left_to_the_forward_drop(self):
+        p = comprehensive_plan()
+        chain, _, _, body, guards = kernel.artifacts(p)
+        skip = [rule for rule in body if "--dport" in rule and rule[rule.index("--dport") + 1] == "53"]
+        self.assertEqual([rule[rule.index("-p") + 1] for rule in skip], ["tcp", "udp"])
+        for rule in skip:
+            self.assertEqual(rule[rule.index("-s") - 1 : rule.index("-s") + 2], ["!", "-s", p["guest"] + "/32"])
+            self.assertEqual(rule[rule.index("-d") - 1 : rule.index("-d") + 2], ["!", "-d", p["system_dns"] + "/32"])
+            self.assertEqual(rule[-1], "RETURN")
+            # Before marking, so such packets are never marked or redirected.
+            self.assertLess(body.index(rule), next(i for i, r in enumerate(body) if "CONNMARK" in r))
+        # Left unmarked, they meet the final FORWARD drop.
+        forward = [rule for rule in guards if rule[1] == "FORWARD"]
+        self.assertEqual(forward[-1][-1], "DROP")
+        # The installed shape is still recognized as this instance's own.
+        kernel.inspect_firewall(p, snapshot(p), True)
+
     def test_changed_identity_can_only_attest_independently_proved_absence(self):
         for reason in ("boot_changed", "cgroup_namespace_changed", "cgroup_root_changed", "guest_address_changed"):
             p = comprehensive_plan()
@@ -1057,12 +1085,12 @@ class InspectionTests(unittest.TestCase):
             foreign = snapshot(other)
             foreign["filter"]["rules"][0].extend(["--unrelated-shape", "unreachable"])
             value = self.observe(p, [foreign, ipv6_snapshot(other)], identity_error=reason)
-            self.assertEqual(value, {"identity_matches": False, "rules_present": False, "rules_complete": False, "mappings_present": False})
+            self.assertEqual(value, {"identity_matches": False, "rules_present": False, "rules_complete": False, "mappings_present": False, "unproven_mappings": 0})
             with self.subTest(reason=reason), self.assertRaises(kernel.Failure):
                 self.observe(p, [snapshot(p), ipv6_snapshot(p)], identity_error=reason)
         # Any other drift is handled the same way: it can attest absence only.
         value = self.observe(plan(), [{}], identity_error="workload_outside_distro_cgroup")
-        self.assertEqual(value, {"identity_matches": False, "rules_present": False, "rules_complete": False, "mappings_present": False})
+        self.assertEqual(value, {"identity_matches": False, "rules_present": False, "rules_complete": False, "mappings_present": False, "unproven_mappings": 0})
         with self.assertRaisesRegex(kernel.Failure, "stale_identity_has_owned_artifacts: workload_outside_distro_cgroup"):
             self.observe(plan(), [snapshot(plan())], identity_error="workload_outside_distro_cgroup")
 
@@ -1085,20 +1113,33 @@ class InspectionTests(unittest.TestCase):
         corrupt_v6["filter"]["rules"][0].remove("!")
         corrupt_mapping = comprehensive_entry()
         corrupt_mapping["reply"] = (17, "172.28.80.1", 9999, p["guest"], 45000)
-        cases = [
-            (corrupt_v6, [], []),
-            (ipv6_snapshot(p), [corrupt_mapping], []),
-            (ipv6_snapshot(p), [], [{"mark": p["cookie"]}]),
-        ]
         operation = request(p)
         operation["operation"] = "remove"
-        for v6, mappings, v6_mappings in cases:
-            with self.subTest(v6=v6, mappings=mappings), patch.object(kernel, "guest_lock"), patch.object(kernel, "guard"), patch.object(kernel, "grant") as grant, patch.object(kernel, "Conntrack") as conntrack, patch.object(kernel, "firewall", side_effect=[snapshot(p), v6]), patch.object(kernel, "transaction") as transact:
+        # A corrupt owned rule shape still blocks every delete: the rules
+        # themselves could not be told apart from another instance's.
+        with patch.object(kernel, "guest_lock"), patch.object(kernel, "guard"), patch.object(kernel, "grant") as grant, patch.object(kernel, "Conntrack") as conntrack, patch.object(kernel, "firewall", side_effect=[snapshot(p), corrupt_v6]), patch.object(kernel, "transaction") as transact:
+            conntrack.return_value.dump.return_value = []
+            with self.assertRaises(kernel.Failure):
+                kernel.execute(operation)
+            grant.assert_called_once_with(p, "revoke")
+            transact.assert_not_called()
+            conntrack.return_value.delete.assert_not_called()
+
+    def test_unprovable_marked_mappings_do_not_block_removing_the_rules(self):
+        # Decision 20: an unprovable or foreign-family entry with this mark is
+        # counted and left alone; the exact-tagged rules are still removed.
+        p = comprehensive_plan()
+        corrupt_mapping = comprehensive_entry()
+        corrupt_mapping["reply"] = (17, "172.28.80.1", 9999, p["guest"], 45000)
+        operation = request(p)
+        operation["operation"] = "remove"
+        for mappings, v6_mappings in (([corrupt_mapping], []), ([], [{"mark": p["cookie"]}])):
+            with self.subTest(mappings=mappings, v6_mappings=v6_mappings), patch.object(kernel, "guest_lock"), patch.object(kernel, "guard"), patch.object(kernel, "grant"), patch.object(kernel, "Conntrack") as conntrack, patch.object(kernel, "firewall", side_effect=[snapshot(p), ipv6_snapshot(p), {}, {}]), patch.object(kernel, "transaction") as transact:
                 conntrack.return_value.dump.side_effect = lambda ipv6=False: v6_mappings if ipv6 else mappings
-                with self.assertRaises(kernel.Failure):
-                    kernel.execute(operation)
-                grant.assert_called_once_with(p, "revoke")
-                transact.assert_not_called()
+                result = kernel.execute(operation)
+                self.assertEqual(result, {"ok": True, "operation": "remove", "unproven_mappings": 1})
+                self.assertTrue(transact.call_args_list)
+                self.assertTrue(all(rule[0] in ("-D", "-X") for call in transact.call_args_list for rule in call.args[1]))
                 conntrack.return_value.delete.assert_not_called()
 
     def test_ambiguous_original_or_reply_mapping_is_never_owned(self):
@@ -1112,8 +1153,10 @@ class InspectionTests(unittest.TestCase):
         with patch.object(ct, "request", return_value=[]) as send:
             self.assertEqual(ct.dump(ipv6=True), [])
         send.assert_called_once_with(kernel.CT_GET, kernel.ROOT | kernel.MATCH, ipv6=True)
-        with self.assertRaises(kernel.Failure):
-            self.observe(comprehensive_plan(), [{}, {}], ipv6_entries=[{"mark": plan()["cookie"]}])
+        # Counted as unprovable, never deleted (`observe` asserts no delete).
+        value = self.observe(comprehensive_plan(), [{}, {}], ipv6_entries=[{"mark": plan()["cookie"]}])
+        self.assertEqual(value["unproven_mappings"], 1)
+        self.assertFalse(value["mappings_present"])
 
 
 class GrantTests(unittest.TestCase):

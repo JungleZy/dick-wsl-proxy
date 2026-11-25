@@ -16,6 +16,9 @@ pub struct Controller {
     pub(crate) runtime: Option<Arc<Runtime>>,
     recent_exit: Option<serde_json::Value>,
     watch: Watch,
+    /// Marked entries the last stop or switch left because they could not
+    /// be proven this takeover's (decision 20); reported once, then cleared.
+    unproven_left: u32,
 }
 
 /// Periodic, read-only evidence that the live target still carries this
@@ -79,6 +82,15 @@ fn changed(reason: &str) -> String {
 
 fn classify(result: Result<(kernel::Ownership, Option<String>), String>) -> Observed {
     match result {
+        // Per-connection lookups read only the one entry they authorize, so
+        // this check is where a marked entry that is not a provable mapping of
+        // this takeover, or two entries sharing a tuple, is caught.
+        Ok((own, _)) if own.identity_matches && own.rules_complete && own.unproven_mappings > 0 => {
+            Observed::Lost(format!(
+                "protection_lost: mapping_integrity: {} connection-tracking entries carry this takeover's mark without a provable mapping",
+                own.unproven_mappings
+            ))
+        }
         Ok((own, _)) if own.identity_matches && own.rules_complete => Observed::Protected,
         Ok((own, _)) if own.identity_matches => Observed::Lost(
             "protection_lost: rules_incomplete: this takeover's rules are missing or incomplete in the target".into(),
@@ -90,13 +102,6 @@ fn classify(result: Result<(kernel::Ownership, Option<String>), String>) -> Obse
             Some((Drift::Changed, reason)) => changed(reason),
             _ => "protection_lost: rules_missing: this takeover's rules are gone from the target".into(),
         }),
-        // Per-connection lookups read only the one entry they authorize, so
-        // this check is where a marked entry that is not a provable mapping of
-        // this takeover, or two entries sharing a tuple, is caught.
-        Err(error) if mapping_integrity(&error).is_some() => Observed::Lost(format!(
-            "protection_lost: mapping_integrity: {}: a connection-tracking entry carries this takeover's mark without a provable mapping",
-            mapping_integrity(&error).unwrap_or_default()
-        )),
         // Rules survive, but the guest could not confirm the identity they were
         // installed for. Only a restart or a real change counts as a loss.
         Err(error) => match error
@@ -111,18 +116,6 @@ fn classify(result: Result<(kernel::Ownership, Option<String>), String>) -> Obse
             None => Observed::Unverified(error),
         },
     }
-}
-
-/// The guest's reason when an inspect failed on a mapping-integrity check.
-fn mapping_integrity(error: &str) -> Option<&'static str> {
-    const REASONS: [&str; 4] = [
-        "instance_mark_has_unproven_mapping",
-        "duplicate_conntrack_mapping",
-        "instance_ipv6_mark_has_unproven_mapping",
-        "duplicate_ipv6_conntrack_mapping",
-    ];
-    let (_, reason) = error.split_once("kernel_operation_failed: ")?;
-    REASONS.into_iter().find(|known| reason.trim() == *known)
 }
 
 fn unix_seconds() -> Option<u64> {
@@ -475,12 +468,13 @@ impl Controller {
         // Revoke even an armed install that has not committed a rule yet. A stale
         // identity is never permission to mutate; retire it only on a separate
         // read-only proof that the old generation is already completely absent.
-        if let Err(error) = kernel::remove(&p) {
-            match kernel::inspect(&p) {
-                Ok(owned) if !owned.identity_matches && owned.clean() => (),
+        let unproven = match kernel::remove(&p) {
+            Ok(unproven) => unproven,
+            Err(error) => match kernel::inspect(&p) {
+                Ok(owned) if !owned.identity_matches && owned.clean() => owned.unproven_mappings,
                 _ => return Err(error),
-            }
-        }
+            },
+        };
         if let Some((_, i)) = &mut self.live {
             // Like `abandon`: an earlier forwarding failure, which `stop` reports
             // once after joining every worker, is no reason to keep the ports or
@@ -495,7 +489,14 @@ impl Controller {
         self.runtime = None;
         self.recent_exit = None;
         self.watch = Watch::default();
+        self.unproven_left = unproven;
         Ok(())
+    }
+
+    /// How many unprovable marked entries the last stop or switch left in
+    /// the old target, once; zero afterwards.
+    pub(crate) fn take_unproven_left(&mut self) -> u32 {
+        std::mem::take(&mut self.unproven_left)
     }
 }
 
@@ -509,6 +510,7 @@ mod tests {
             rules_present: rules_complete,
             mappings_present: false,
             rules_complete,
+            unproven_mappings: 0,
         }
     }
 
@@ -558,26 +560,15 @@ mod tests {
             "protection_lost: environment_changed: guest_ipv6_address_changed",
         );
         // A marked entry that is not a provable mapping is caught here, not
-        // per connection: the lookups read only the entry they authorize.
-        for reason in [
-            "instance_mark_has_unproven_mapping",
-            "duplicate_conntrack_mapping",
-            "instance_ipv6_mark_has_unproven_mapping",
-            "duplicate_ipv6_conntrack_mapping",
-        ] {
-            lost(
-                classify(Err(format!(
-                    "inspect:wsl_exit_failed: exit code: 1: kernel_operation_failed: {reason}\n"
-                ))),
-                &format!("protection_lost: mapping_integrity: {reason}"),
-            );
-        }
-        assert!(matches!(
-            classify(Err(
-                "inspect:wsl_exit_failed: exit code: 1: kernel_operation_failed: duplicate_conntrack_mapping_extra".into()
-            )),
-            Observed::Unverified(_)
-        ));
+        // per connection: the lookups read only the entry they authorize. The
+        // guest counts such entries instead of failing, so a stop can still
+        // remove the rules (decision 20).
+        let mut unprovable = ownership(true, true);
+        unprovable.unproven_mappings = 2;
+        lost(
+            classify(Ok((unprovable, None))),
+            "protection_lost: mapping_integrity: 2 connection-tracking entries",
+        );
         // A passing race or a missing tool is not evidence of loss.
         for reason in [
             "unverifiable_workload",
