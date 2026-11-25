@@ -72,12 +72,18 @@ const MIN_POOL_IDLE: Duration = Duration::from_secs(2);
 pub(super) enum Setup {
     Failed(String),
     Incompatible(String),
+    /// Pipelined: authentication was accepted, but not one byte came back
+    /// for the CONNECT sent behind it. Either the target cannot be reached,
+    /// or the proxy dropped the CONNECT it read together with the credentials.
+    Unanswered(String),
 }
 
 impl Setup {
     fn into_message(self) -> String {
         match self {
-            Self::Failed(message) | Self::Incompatible(message) => message,
+            Self::Failed(message) | Self::Incompatible(message) | Self::Unanswered(message) => {
+                message
+            }
         }
     }
 }
@@ -95,6 +101,9 @@ pub(super) struct Dialer {
     /// in one write. Cleared for the rest of this takeover the first time the
     /// proxy cannot follow that.
     pub(super) pipeline: AtomicBool,
+    /// Set once a pipelined CONNECT has been answered on this takeover. From
+    /// then on an unanswered one is the target's failure, not the proxy's.
+    pipeline_proven: AtomicBool,
     /// Upper bound on the pool; 0 disables it.
     max: usize,
     adaptive_max: bool,
@@ -150,6 +159,7 @@ impl Dialer {
             first_hop,
             residential,
             pipeline: AtomicBool::new(true),
+            pipeline_proven: AtomicBool::new(false),
             max: settings.max.unwrap_or(AUTO_MAX),
             adaptive_max: settings.max.is_none(),
             fixed_demand: settings.demand_window,
@@ -225,7 +235,7 @@ impl Dialer {
                     self.stats.hits.fetch_add(1, Ordering::Relaxed);
                     return finish(stream);
                 }
-                Err(Setup::Failed(message)) => return Err(message),
+                Err(Setup::Failed(message) | Setup::Unanswered(message)) => return Err(message),
                 // The tunnel went stale while pooled: build a fresh chain.
                 Err(Setup::Incompatible(_)) => {
                     self.stats.stale_on_connect.fetch_add(1, Ordering::Relaxed);
@@ -241,12 +251,36 @@ impl Dialer {
         let pipelined = self.pipeline.load(Ordering::Relaxed);
         let mut stream = self.open_residential(deadline)?;
         match self.residential_connect(&mut stream, target, deadline, pipelined) {
-            Ok(()) => Ok(stream),
+            Ok(()) => {
+                if pipelined {
+                    self.pipeline_proven.store(true, Ordering::Relaxed);
+                }
+                Ok(stream)
+            }
             Err(Setup::Incompatible(_)) if pipelined => {
                 self.pipeline.store(false, Ordering::Relaxed);
                 let mut stream = self.open_residential(deadline)?;
                 self.residential_connect(&mut stream, target, deadline, false)
                     .map_err(Setup::into_message)?;
+                Ok(stream)
+            }
+            // Until a pipelined CONNECT has worked, an unanswered one may be
+            // a proxy that drops what follows the credentials; then every
+            // pipelined chain would hang until its deadline. Ask once more
+            // step by step, with a deadline of its own since the first one
+            // may be spent, and stop pipelining only if that is answered: a
+            // target that cannot be reached fails both ways and changes
+            // nothing.
+            Err(Setup::Unanswered(message))
+                if pipelined && !self.pipeline_proven.load(Ordering::Relaxed) =>
+            {
+                let deadline = Instant::now() + SETUP_TIMEOUT;
+                let mut stream = self
+                    .open_residential(deadline)
+                    .map_err(|_| message.clone())?;
+                self.residential_connect(&mut stream, target, deadline, false)
+                    .map_err(|_| message)?;
+                self.pipeline.store(false, Ordering::Relaxed);
                 Ok(stream)
             }
             Err(error) => Err(error.into_message()),
@@ -520,7 +554,12 @@ impl Dialer {
                 "residential SOCKS5 authentication rejected".into(),
             ));
         }
-        connect_reply(stream, deadline).map_err(Setup::Failed)
+        let mut first = [0; 1];
+        receive(stream, &mut first, deadline).map_err(Setup::Unanswered)?;
+        if first[0] != 5 {
+            return Err(Setup::Failed("SOCKS5 CONNECT rejected or malformed".into()));
+        }
+        connect_reply_rest(stream, deadline).map_err(Setup::Failed)
     }
 }
 

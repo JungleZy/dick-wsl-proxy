@@ -1699,6 +1699,70 @@ mod tests {
     }
 
     #[test]
+    fn a_proxy_that_drops_the_connect_behind_accepted_credentials_stops_pipelining() {
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let residential = TcpListener::bind("127.0.0.1:0").unwrap();
+        let residential_endpoint = endpoint(&residential);
+        let origin: SocketAddrV4 = "192.0.2.1:443".parse().unwrap();
+        let policy = policy(endpoint(&first), residential_endpoint);
+        let outer = first_hop_tunnels(first, residential_endpoint, 2);
+        let inner = thread::spawn(move || {
+            // Accepts the credentials, never answers the CONNECT read with them.
+            let mut stream = accept(&residential);
+            assert_eq!(read::<3>(&mut stream), [5, 1, 2]);
+            stream.write_all(&[5, 2]).unwrap();
+            read_credentials(&mut stream);
+            request(&mut stream, origin);
+            stream.write_all(&[1, 0]).unwrap();
+            drop(stream);
+            // Step by step, the same proxy answers.
+            let mut stream = accept(&residential);
+            assert_eq!(read::<3>(&mut stream), [5, 1, 2]);
+            stream.write_all(&[5, 2]).unwrap();
+            read_credentials(&mut stream);
+            stream.write_all(&[1, 0]).unwrap();
+            request(&mut stream, origin);
+            success(&mut stream);
+        });
+        drop(policy.chain(origin).unwrap());
+        inner.join().unwrap();
+        outer.join().unwrap();
+        assert!(!policy.dialer.pipeline.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn once_pipelining_has_worked_an_unanswered_connect_fails_without_a_retry() {
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let residential = TcpListener::bind("127.0.0.1:0").unwrap();
+        let residential_endpoint = endpoint(&residential);
+        let origin: SocketAddrV4 = "192.0.2.1:443".parse().unwrap();
+        let policy = policy(endpoint(&first), residential_endpoint);
+        let outer = first_hop_tunnels(first, residential_endpoint, 2);
+        let inner = thread::spawn(move || {
+            for answered in [true, false] {
+                let mut stream = accept(&residential);
+                assert_eq!(read::<3>(&mut stream), [5, 1, 2]);
+                stream.write_all(&[5, 2]).unwrap();
+                read_credentials(&mut stream);
+                request(&mut stream, origin);
+                stream.write_all(&[1, 0]).unwrap();
+                if answered {
+                    success(&mut stream);
+                }
+            }
+        });
+        drop(policy.chain(origin).unwrap());
+        // A retry would need a third first-hop tunnel and fail differently.
+        assert_eq!(
+            policy.chain(origin).unwrap_err(),
+            "SOCKS5 chain reply closed"
+        );
+        inner.join().unwrap();
+        outer.join().unwrap();
+        assert!(policy.dialer.pipeline.load(Ordering::Relaxed));
+    }
+
+    #[test]
     fn rejected_outer_connect_sends_no_residential_authentication_or_fallback() {
         let first = TcpListener::bind("127.0.0.1:0").unwrap();
         let residential = TcpListener::bind("127.0.0.1:0").unwrap();
