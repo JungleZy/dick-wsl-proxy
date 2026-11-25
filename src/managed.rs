@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 // The leading code lets the desktop translate this when it surfaces as last_error.
-const UDP_CHAIN_UNSUPPORTED: &str = "udp_chain_unavailable: chained UDP failed its readiness probe; non-whitelisted UDP is refused until the next start or switch";
+const UDP_CHAIN_UNSUPPORTED: &str = "udp_chain_unavailable: chained UDP failed its readiness probe; application UDP, whitelisted or not, is refused until the next start or switch";
 const HTTPS_PROBE_ATTEMPTS: usize = 2;
 const HTTPS_PROBE_RETRY_DELAY: Duration = Duration::from_millis(250);
 
@@ -136,12 +136,18 @@ impl Runtime {
     /// A runtime over a fixture policy whose hops are never reached.
     #[cfg(test)]
     pub(crate) fn for_test(fake_ip: bool) -> Arc<Self> {
+        Self::for_test_with_direct_ips(fake_ip, &[])
+    }
+
+    /// Like `for_test`, with these IPs or CIDRs allowlisted.
+    #[cfg(test)]
+    pub(crate) fn for_test_with_direct_ips(fake_ip: bool, direct_ips: &[&str]) -> Arc<Self> {
         let config: crate::policy::Config = serde_json::from_value(serde_json::json!({
             "first_hop": "127.0.0.1:19",
             "credential": "fixture",
             "dns_upstream": "8.8.8.8:443",
             "dns_tls_name": "dns.google",
-            "direct_ips": [],
+            "direct_ips": direct_ips,
             "direct_domains": [],
             "direct_suffixes": [],
             "allow_loopback_residential": true,

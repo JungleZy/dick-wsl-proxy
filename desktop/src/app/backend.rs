@@ -202,6 +202,24 @@ fn policy_field_error(error: &str) -> Option<String> {
     Some(format!("{place}填写有误{rejected}。{hint}"))
 }
 
+/// 接管前改时区或重启目标失败：接管没有启动，说清卡在哪一步。
+fn timezone_sync_failure(message: &str) -> String {
+    let detail = if message.contains("timezone_lookup_domain_is_direct") {
+        "my.ippure.com 在直连例外里，经它查到的是本机出口而不是住宅出口；请把它移出直连例外。"
+    } else if message.contains("timezone_lookup_failed") {
+        "经代理链查询住宅出口的时区失败（查询服务 my.ippure.com），目标没有被改动。请确认住宅代理可用后重试。"
+    } else if message.contains("timezone_not_in_target") {
+        "目标里没有这个时区的数据（/usr/share/zoneinfo），目标没有被改动。请在目标里安装 tzdata 后重试。"
+    } else if message.contains("timezone_apply_failed") {
+        "在目标里写入时区失败，目标没有被重启。请确认目标能正常启动后重试。"
+    } else if message.contains("target_restart_failed") {
+        "时区已经改好，但重启目标失败。请确认目标能正常启动后重试。"
+    } else {
+        "请查看日志后重试。"
+    };
+    format!("没能把目标时区改成住宅出口所在时区，接管没有启动：{detail}")
+}
+
 fn humanize_code(code: &str, message: &str) -> String {
     match code {
         // 管道只对同一账户开放；这里还被拒绝，就是后台以管理员身份运行、
@@ -216,6 +234,7 @@ fn humanize_code(code: &str, message: &str) -> String {
         "enumeration_failed" => "读取 WSL 环境列表失败，请检查 WSL 服务状态。".into(),
         "probe_failed" => "检查目标 WSL 失败，请确认发行版可以正常启动。".into(),
         "target_already_owned" => "当前已有接管任务，请先停止接管并恢复直连。".into(),
+        "timezone_sync_failed" => timezone_sync_failure(message),
         "kernel_prepare_requires_idle" => "请先停止接管并恢复直连，再准备内核环境。".into(),
         "kernel_prepare_failed" => {
             "内核环境准备失败，请确认目标发行版能启动，并且带有内核模块。".into()
@@ -342,7 +361,7 @@ fn humanize_code(code: &str, message: &str) -> String {
     }
 }
 
-const UDP_CHAIN_UNAVAILABLE: &str = "住宅出口没有通过 UDP 探测，非白名单 UDP（含 QUIC）已阻断，不会直连；下次启动或切换目标时重新探测。";
+const UDP_CHAIN_UNAVAILABLE: &str = "住宅出口没有通过 UDP 探测，UDP（含 QUIC，直连例外也一样）已阻断，不会直连；下次启动或切换目标时重新探测。";
 /// 上限来自这次接管的策略，所以从后台的消息里取，不写死。
 fn tcp_capacity_reached(message: &str) -> String {
     let limit = message
@@ -921,7 +940,7 @@ mod tests {
         let expected = super::UDP_CHAIN_UNAVAILABLE;
         assert_eq!(
             humanize_error(
-                "udp_chain_unavailable: chained UDP failed its readiness probe; non-whitelisted UDP is refused until the next start or switch"
+                "udp_chain_unavailable: chained UDP failed its readiness probe; application UDP, whitelisted or not, is refused until the next start or switch"
             ),
             expected
         );

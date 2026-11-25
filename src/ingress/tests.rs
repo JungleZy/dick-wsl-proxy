@@ -931,6 +931,65 @@ fn fake_addresses_route_by_name_and_unknown_ones_are_refused() {
             "tcp",
             SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 443)
         ),
-        Ok((Route::Chain, "default_chain"))
+        Ok((
+            Route::Chain(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 443)),
+            "default_chain"
+        ))
+    );
+}
+
+#[test]
+fn allowlisted_destinations_are_direct_for_tcp_only() {
+    let plan = Plan {
+        target: crate::host::Distro {
+            id: "test-id".into(),
+            name: "test-distro".into(),
+            base_path: "test-path".into(),
+            version: 2,
+        },
+        cgroup_ns: "test-cgroup-ns".into(),
+        cgroup_root: "/test-cgroup".into(),
+        boot_id: "test-boot".into(),
+        guest: Ipv4Addr::new(172, 20, 0, 2),
+        ingress: SocketAddrV4::new(Ipv4Addr::new(172, 20, 0, 1), 18080),
+        origins: Vec::new(),
+        system_dns: Some(Ipv4Addr::new(10, 255, 255, 254)),
+        cookie: 1,
+        ipv6: None,
+    };
+    let runtime = crate::managed::Runtime::for_test_with_direct_ips(false, &["203.0.113.0/24"]);
+    let stun = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 3478);
+    assert_eq!(
+        route_details(&plan, Some(&runtime), "tcp", stun),
+        Ok((Route::Direct(stun), "ip_or_cidr"))
+    );
+    // A direct UDP flow would let an allowlisted STUN server report the real
+    // Windows address to a web page, so UDP is chained like any other.
+    assert_eq!(
+        route_details(&plan, Some(&runtime), "udp", stun),
+        Ok((Route::Chain(stun), "allowlist_udp"))
+    );
+    let other = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 7), 3478);
+    assert_eq!(
+        route_details(&plan, Some(&runtime), "udp", other),
+        Ok((Route::Chain(other), "default_chain"))
+    );
+    // A whitelisted domain's alias: TCP dials the real address directly, UDP
+    // asks the chain for that real address, never for the alias.
+    let real = Ipv4Addr::new(203, 0, 113, 50);
+    let alias = runtime
+        .dns
+        .assign_alias("stun.allowed.example", real)
+        .unwrap();
+    assert_ne!(alias, real);
+    let addressed = SocketAddrV4::new(alias, 3478);
+    let actual = SocketAddrV4::new(real, 3478);
+    assert_eq!(
+        route_details(&plan, Some(&runtime), "tcp", addressed),
+        Ok((Route::Direct(actual), "domain_alias"))
+    );
+    assert_eq!(
+        route_details(&plan, Some(&runtime), "udp", addressed),
+        Ok((Route::Chain(actual), "allowlist_udp"))
     );
 }

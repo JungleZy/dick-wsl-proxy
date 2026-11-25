@@ -140,7 +140,7 @@ impl UdpPump {
                 flow.stats.stage("policy");
                 match route(plan, runtime, "udp", original) {
                     Ok(Route::Direct(target)) if flow.target == Some(target) => Ok(()),
-                    Ok(Route::Chain | Route::ChainName) if flow.target.is_none() => Ok(()),
+                    Ok(Route::Chain(_) | Route::ChainName) if flow.target.is_none() => Ok(()),
                     _ => Err("UDP route expired before reply".into()),
                 }
             });

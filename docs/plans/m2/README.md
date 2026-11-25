@@ -38,7 +38,7 @@
 
    `profile` 可指向策略 JSON 或 EXE 同级的 `desktop.sqlite`。指向 JSON 时，住宅服务器设置仍从 `desktop.sqlite` 读取；两种方式都要先导入或在桌面策略页保存住宅字段。`credential` 字段只是标签，不参与凭据查找。
 
-   `startup_verified` 是**启动时**的探测结果，不是实时可用性保证。只有来自目标的两个独立未缓存 DNS 探测（UDP、强制 TCP）在 Windows 端经认证上游收到对应回答，以及目标的非白名单 HTTPS 探测经双跳完成，才返回 `forwarding_managed`；任一项失败进入恢复状态，查看状态后显式 `stop` 恢复，不通过删除日志或改成只代理网页来跳过失败。启动时另探测一次双跳 SOCKS5 UDP 关联，只建立并关闭关联、不发送业务数据：住宅端拒绝 UDP 时接管照常，结果记在 `startup_verified.udp_supported`，本次接管期间非白名单 UDP（含 QUIC）一律拒绝、不直连。策略开启 `fake_ip` 时，HTTPS 探测之前还探测一次住宅代理是否接受域名形式的 CONNECT：结果记在 `startup_verified.fake_ip`，不启用的原因记在 `startup_verified.fake_ip_reason`，不启用时接管照常、按原方式解析；启用时 HTTPS 探测本身就走假地址和按域名连接。正常结束拥有活动入口的会话会执行停止；若控制器崩溃，另行运行 `wsl-proxyctl.exe status`、`wsl-proxyctl.exe stop`。
+   `startup_verified` 是**启动时**的探测结果，不是实时可用性保证。只有来自目标的两个独立未缓存 DNS 探测（UDP、强制 TCP）在 Windows 端经认证上游收到对应回答，以及目标的非白名单 HTTPS 探测经双跳完成，才返回 `forwarding_managed`；任一项失败进入恢复状态，查看状态后显式 `stop` 恢复，不通过删除日志或改成只代理网页来跳过失败。启动时另探测一次双跳 SOCKS5 UDP 关联，只建立并关闭关联、不发送业务数据：住宅端拒绝 UDP 时接管照常，结果记在 `startup_verified.udp_supported`，本次接管期间应用 UDP（含 QUIC，白名单的也一样，决策 27）一律拒绝、不直连。策略开启 `fake_ip` 时，HTTPS 探测之前还探测一次住宅代理是否接受域名形式的 CONNECT：结果记在 `startup_verified.fake_ip`，不启用的原因记在 `startup_verified.fake_ip_reason`，不启用时接管照常、按原方式解析；启用时 HTTPS 探测本身就走假地址和按域名连接。正常结束拥有活动入口的会话会执行停止；若控制器崩溃，另行运行 `wsl-proxyctl.exe status`、`wsl-proxyctl.exe stop`。
 4. 停止不会删除配置。如不再使用，可运行 `wsl-proxyctl.exe forget-credential --name my-residence` 清空 `desktop.sqlite` 里的住宅字段。不得把密码放进命令行或策略文件。
 
 ## 分流与故障语义

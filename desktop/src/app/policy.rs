@@ -31,7 +31,7 @@ impl Desktop {
             .rounded_md()
             .child(card_header(
                 "直连规则",
-                "每行一个；命中任一条的连接直连，不走代理链。",
+                "每行一个；命中任一条的 TCP 连接直连，不走代理链；UDP（含 QUIC）一律走代理链。",
             ))
             .child(
                 div()

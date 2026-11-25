@@ -137,6 +137,16 @@ impl ManagedDns {
             .assign(name, Instant::now())
     }
 
+    /// Grants `name` an alias for `real`, as a whitelisted A answer would.
+    #[cfg(test)]
+    pub(crate) fn assign_alias(&self, name: &str, real: Ipv4Addr) -> Result<Ipv4Addr, String> {
+        lock(&self.resolver.aliases)
+            .assign(name, &[real], 60, Instant::now())?
+            .first()
+            .copied()
+            .ok_or_else(|| "no alias assigned".to_string())
+    }
+
     #[cfg(test)]
     pub(crate) fn fake_ip_active(&self) -> bool {
         self.resolver.fake_enabled.load(Ordering::Acquire)

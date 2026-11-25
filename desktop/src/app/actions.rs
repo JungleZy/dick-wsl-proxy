@@ -333,11 +333,13 @@ impl Desktop {
             let active_target = text(&self.status, "active_target", "当前目标");
             let active_target_name = self.environment_display_name(&active_target);
             format!(
-                "将从 {} 切换到 {target_name}。旧目标会先恢复直连；现有 TCP 连接需要重连。",
+                "将从 {} 切换到 {target_name}。切换前会把 {target_name} 的时区改成住宅出口所在时区并重启它，其中正在运行的程序都会被结束；旧目标会先恢复直连；现有 TCP 连接需要重连。",
                 active_target_name
             )
         } else {
-            format!("将接管 {target_name} 的 TCP 和系统 DNS。非直连例外流量经代理链。")
+            format!(
+                "将接管 {target_name} 的 TCP、UDP 和系统 DNS；只有直连例外的 TCP 连接直连，其余经代理链。接管前会把 {target_name} 的时区改成住宅出口所在时区并重启它，其中正在运行的程序都会被结束。"
+            )
         };
         self.confirmation = Some(Confirmation {
             kind,

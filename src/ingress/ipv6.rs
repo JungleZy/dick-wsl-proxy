@@ -265,7 +265,7 @@ fn forward_tcp(
     let origin = destination_v6(&plan, "tcp", peer, &shared)?;
     flow.destination(SocketAddr::V6(origin));
     let runtime = runtime.as_ref().ok_or("IPv6 managed runtime missing")?;
-    let chained = route_v6(runtime, origin)?;
+    let chained = route_v6(runtime, "tcp", origin)?;
     let upstream = if !chained {
         flow.selected("direct", "ip_or_cidr");
         TcpStream::connect_timeout(&SocketAddr::V6(origin), CONNECT_TIMEOUT)
@@ -361,7 +361,7 @@ fn handle_udp(
         shared.record_error("udp", "IPv6 UDP runtime missing".into());
         return;
     };
-    let chained = match route_v6(runtime, origin) {
+    let chained = match route_v6(runtime, "udp", origin) {
         Ok(chained) => chained,
         Err(error) => {
             shared.record_error("udp", error);
@@ -403,7 +403,7 @@ fn handle_udp(
         if chained {
             let stats = shared.flows.begin("udp");
             stats.destination(SocketAddr::V6(origin));
-            stats.selected("chain", "default_chain");
+            stats.selected("chain", chain_reason(runtime, origin));
             stats.stage("connect");
             if shared.is_stopping() {
                 stats.stopped();
@@ -412,6 +412,7 @@ fn handle_udp(
             super::start_chain_setup(
                 setups,
                 peer,
+                SocketAddr::V6(origin),
                 SocketAddr::V6(origin),
                 datagram,
                 stats,
@@ -575,7 +576,7 @@ fn collect_udp(
                     }
                 };
                 let route_valid = policy.is_some_and(|runtime| {
-                    route_v6(runtime, verified)
+                    route_v6(runtime, "udp", verified)
                         .map(|chained| chained == flow.chained)
                         .unwrap_or(false)
                 });
@@ -696,9 +697,24 @@ fn destination_v6(
     )
 }
 
-fn route_v6(runtime: &crate::managed::Runtime, origin: SocketAddrV6) -> Result<bool, String> {
-    let direct = runtime.policy.allows_ipv6(*origin.ip());
+/// Whether `origin` is chained. Only TCP is dialled directly: allowlisted UDP
+/// is chained like any other, so an allowlisted STUN server cannot hand a web
+/// page the real Windows address (WebRTC).
+fn route_v6(
+    runtime: &crate::managed::Runtime,
+    protocol: &str,
+    origin: SocketAddrV6,
+) -> Result<bool, String> {
+    let direct = protocol == "tcp" && runtime.policy.allows_ipv6(*origin.ip());
     route_v6_decision(origin, direct)
+}
+
+fn chain_reason(runtime: &crate::managed::Runtime, origin: SocketAddrV6) -> &'static str {
+    if runtime.policy.allows_ipv6(*origin.ip()) {
+        "allowlist_udp"
+    } else {
+        "default_chain"
+    }
 }
 
 fn route_v6_decision(origin: SocketAddrV6, direct: bool) -> Result<bool, String> {
@@ -936,5 +952,18 @@ mod tests {
             route_v6_decision(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 443, 0, 0), true),
             Ok(false)
         );
+    }
+
+    #[test]
+    fn allowlisted_ipv6_is_direct_for_tcp_only() {
+        let runtime =
+            crate::managed::Runtime::for_test_with_direct_ips(false, &["2001:db8:1234::/48"]);
+        let stun: SocketAddrV6 = "[2001:db8:1234::9]:3478".parse().unwrap();
+        assert_eq!(route_v6(&runtime, "tcp", stun), Ok(false));
+        assert_eq!(route_v6(&runtime, "udp", stun), Ok(true));
+        assert_eq!(chain_reason(&runtime, stun), "allowlist_udp");
+        let other: SocketAddrV6 = "[2001:db8:5678::9]:3478".parse().unwrap();
+        assert_eq!(route_v6(&runtime, "udp", other), Ok(true));
+        assert_eq!(chain_reason(&runtime, other), "default_chain");
     }
 }

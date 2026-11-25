@@ -44,10 +44,10 @@ pub(super) fn forward_tcp(
             TcpStream::connect_timeout(&SocketAddr::V4(target), CONNECT_TIMEOUT)
                 .map_err(|e| format!("connect to authorized direct endpoint: {e}"))?
         }
-        Route::Chain => runtime
+        Route::Chain(target) => runtime
             .expect("chain route requires M2 runtime")
             .policy
-            .chain(origin)
+            .chain(target)
             .map_err(|_| "two-hop TCP chain connect failed".to_string())?,
         Route::ChainName => {
             let runtime = runtime.expect("fake-ip route requires M2 runtime");

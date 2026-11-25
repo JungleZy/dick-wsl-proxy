@@ -841,7 +841,9 @@ fn finish_observation_v6(
 enum Route {
     Dns,
     Direct(SocketAddrV4),
-    Chain,
+    /// Chained to this address: the original one, or the real address behind
+    /// a domain alias for UDP.
+    Chain(SocketAddrV4),
     /// A fake-ip address: chained by the name it stands for.
     ChainName,
 }
@@ -851,7 +853,7 @@ enum Route {
 fn route_details(
     plan: &Plan,
     runtime: Option<&crate::managed::Runtime>,
-    _protocol: &str,
+    protocol: &str,
     original: SocketAddrV4,
 ) -> Result<(Route, &'static str), String> {
     let Some(runtime) = runtime else {
@@ -883,12 +885,19 @@ fn route_details(
     if actual == plan.ingress || runtime.policy.is_reserved_endpoint(actual) {
         return Err("reserved resolved business endpoint rejected".into());
     }
-    if alias.is_some() {
-        Ok((Route::Direct(actual), "domain_alias"))
+    let allowlisted = if alias.is_some() {
+        Some("domain_alias")
     } else if runtime.policy.allows_ip(*actual.ip()) {
-        Ok((Route::Direct(actual), "ip_or_cidr"))
+        Some("ip_or_cidr")
     } else {
-        Ok((Route::Chain, "default_chain"))
+        None
+    };
+    match allowlisted {
+        Some(reason) if protocol == "tcp" => Ok((Route::Direct(actual), reason)),
+        // Allowlisted UDP is never dialled directly: an allowlisted STUN
+        // server would hand any web page the real Windows address (WebRTC).
+        Some(_) => Ok((Route::Chain(actual), "allowlist_udp")),
+        None => Ok((Route::Chain(actual), "default_chain")),
     }
 }
 
@@ -914,7 +923,7 @@ fn select_route(
             match route {
                 Route::Dns => "dns",
                 Route::Direct(_) => "direct",
-                Route::Chain | Route::ChainName => "chain",
+                Route::Chain(_) | Route::ChainName => "chain",
             },
             reason,
         );
@@ -929,8 +938,8 @@ fn select_route(
         (Ok(Route::Dns), _) => &mut counters.dns_udp,
         (Ok(Route::Direct(_)), "tcp") => &mut counters.direct_tcp,
         (Ok(Route::Direct(_)), _) => &mut counters.direct_udp,
-        (Ok(Route::Chain | Route::ChainName), "tcp") => &mut counters.chain_tcp,
-        (Ok(Route::Chain | Route::ChainName), _) => &mut counters.chain_udp,
+        (Ok(Route::Chain(_) | Route::ChainName), "tcp") => &mut counters.chain_tcp,
+        (Ok(Route::Chain(_) | Route::ChainName), _) => &mut counters.chain_udp,
         (Err(_), "tcp") => &mut counters.rejected_tcp,
         (Err(_), _) => &mut counters.rejected_udp,
     };
@@ -1188,7 +1197,7 @@ fn run(
             stats.stage("policy");
             let (target, chained) =
                 match select_route(&plan, runtime.as_deref(), "udp", origin, stats, &shared) {
-                    Ok(Route::Direct(target)) => (Some(target), false),
+                    Ok(Route::Direct(target)) => (Some(target), None),
                     Ok(Route::Dns) => {
                         stats.stage("dns");
                         let runtime = runtime.as_ref().expect("DNS route requires M2 runtime");
@@ -1214,7 +1223,8 @@ fn run(
                         }
                         continue;
                     }
-                    Ok(Route::Chain | Route::ChainName) => (None, true),
+                    Ok(Route::Chain(destination)) => (None, Some(SocketAddr::V4(destination))),
+                    Ok(Route::ChainName) => (None, Some(SocketAddr::V4(origin))),
                     Err(error) => {
                         flows.remove(&peer);
                         shared.record_error("udp", error);
@@ -1228,7 +1238,9 @@ fn run(
             {
                 new_stats = Some(previous.stats);
             }
-            if !flows.contains_key(&peer) && chained {
+            if !flows.contains_key(&peer)
+                && let Some(destination) = chained
+            {
                 let stats = new_stats.expect("new UDP mapping has an accounting record");
                 if shared.is_stopping() {
                     stats.stopped();
@@ -1246,6 +1258,7 @@ fn run(
                     &mut chain_setups,
                     peer,
                     SocketAddr::V4(origin),
+                    destination,
                     &datagram[..size],
                     stats,
                     runtime,
@@ -1653,10 +1666,14 @@ impl UdpFlow {
 
 /// Starts building a chained UDP association off the ingress thread. Once the
 /// readiness probe has refused chained UDP, refuse here without a worker.
+/// `origin` is what the guest addressed and keys the mapping; `destination` is
+/// what the chain is asked to reach (a domain alias's real address).
+#[allow(clippy::too_many_arguments)]
 fn start_chain_setup<K: Ord + Copy + Send + 'static>(
     setups: &mut ChainSetups<K, UdpChain>,
     peer: K,
     origin: SocketAddr,
+    destination: SocketAddr,
     datagram: &[u8],
     stats: Flow,
     runtime: &Arc<crate::managed::Runtime>,
@@ -1669,7 +1686,7 @@ fn start_chain_setup<K: Ord + Copy + Send + 'static>(
     }
     let chain_runtime = Arc::clone(runtime);
     if let Err((stats, refused)) = setups.start(peer, origin, datagram, stats, move || {
-        chain_runtime.chain_udp(origin)
+        chain_runtime.chain_udp(destination)
     }) {
         stats.failed();
         if refused == Refused::Full {

@@ -4,6 +4,8 @@
 //! are kept here so the desktop IPC layer can validate one request and delegate
 //! all process execution to the host adapter without constructing shell commands.
 
+pub(crate) mod timezone;
+
 use crate::host::{self, Distro};
 use serde_json::{Value, json};
 use std::fs;

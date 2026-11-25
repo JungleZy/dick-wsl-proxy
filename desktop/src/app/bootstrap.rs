@@ -1316,22 +1316,33 @@ impl Desktop {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    // 改时区并重启之后的那次预检没过：时区已经改了，接管没有启动。
+                    let restarted = value["timezone_synced"]
+                        .as_str()
+                        .map(|timezone| format!("目标时区已改为 {timezone} 并已重启目标，但重启后的预检没有通过，接管没有启动。"))
+                        .unwrap_or_default();
                     self.preflight = Some(value);
                     match super::backend::kernel_release_notice(&blockers) {
-                        Some(notice) => self.fail(notice, cx),
-                        None => self.fail("操作前预检未通过；请查看阻断项。", cx),
+                        Some(notice) => self.fail(format!("{restarted}{notice}"), cx),
+                        None => {
+                            self.fail(format!("{restarted}操作前预检未通过；请查看阻断项。"), cx)
+                        }
                     }
                 } else {
                     let udp_blocked =
                         kind != Kind::Stop && value["startup_verified"]["udp_supported"] == false;
                     self.notice = if udp_blocked {
                         format!(
-                            "{}已完成，但住宅出口没有通过 UDP 探测：非白名单 UDP（含 QUIC）已阻断，不会直连；TCP 和系统 DNS 照常经代理链。",
+                            "{}已完成，但住宅出口没有通过 UDP 探测：UDP（含 QUIC，直连例外也一样）已阻断，不会直连；TCP 和系统 DNS 照常经代理链。",
                             kind.label()
                         )
                     } else {
                         format!("{}已完成；请以后台状态为准。", kind.label())
                     };
+                    if let Some(timezone) = value["timezone_synced"].as_str() {
+                        self.notice =
+                            format!("目标时区已改为 {timezone} 并已重启目标。{}", self.notice);
+                    }
                     if udp_blocked {
                         self.reminder = Some(Reminder {
                             message: self.notice.clone(),

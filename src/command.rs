@@ -1,6 +1,6 @@
 use crate::{
-    controller, credential, desktop_store, host, kernel_env, managed, managed_dns, plan, ports,
-    probe, transition, wsl_platform,
+    controller, credential, desktop_store, environment, host, kernel_env, managed, managed_dns,
+    plan, ports, probe, transition, wsl_platform,
 };
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
@@ -53,7 +53,9 @@ pub(crate) enum Command {
         #[serde(default = "default_probe_rounds")]
         rounds: u32,
     },
-    /// Enable the single-target policy including protected system DNS.
+    /// Enable the single-target policy including protected system DNS. First
+    /// sets the target's timezone to the residential exit's and restarts the
+    /// target, ending every process in it.
     Start {
         target: String,
         #[arg(long, default_value = "43531")]
@@ -76,6 +78,8 @@ pub(crate) enum Command {
         expected_generation: Option<u64>,
     },
     /// Switch the live managed owner; obtain expected-generation from its last status.
+    /// First sets the new target's timezone to the residential exit's and
+    /// restarts the new target, ending every process in it.
     Switch {
         target: String,
         #[arg(long)]
@@ -442,8 +446,9 @@ pub(crate) fn dispatch_result(
             let (source, old_runtime) = controller
                 .switch_source(expected_generation)
                 .map_err(error)?;
+            let source_ingress = source.ingress;
             let port = port
-                .unwrap_or_else(|| NonZeroU16::new(source.ingress.port()).expect("validated port"));
+                .unwrap_or_else(|| NonZeroU16::new(source_ingress.port()).expect("validated port"));
             let all = registry()?;
             if find(&all, &target)?
                 .id
@@ -456,7 +461,7 @@ pub(crate) fn dispatch_result(
                 &target,
                 port,
                 controller.status().map_err(error)?,
-                Some(source.ingress),
+                Some(source_ingress),
             )?;
             if !result.passed {
                 return Ok((2, serde_json::json!(result)));
@@ -466,6 +471,25 @@ pub(crate) fn dispatch_result(
                 None => old_runtime.for_next_target(),
             }
             .map_err(error)?;
+            // Only the new target is touched, before the old one is released:
+            // a failure here leaves the old takeover exactly as it was.
+            let timezone =
+                environment::timezone::sync_and_restart(&runtime, result.target.distribution)
+                    .map_err(|e| Failure::new("timezone_sync_failed", e))?;
+            // The restart made the snapshot stale: everything below uses a fresh one.
+            let restarted = registry()?;
+            let result = preflight(
+                &restarted,
+                &target,
+                port,
+                controller.status().map_err(error)?,
+                Some(source_ingress),
+            )?;
+            if !result.passed {
+                let mut refused = serde_json::json!(result);
+                refused["timezone_synced"] = serde_json::json!(timezone);
+                return Ok((2, refused));
+            }
             let resolver = managed::resolver(&result.target.snapshot).map_err(error)?;
             runtime
                 .dns
@@ -481,7 +505,8 @@ pub(crate) fn dispatch_result(
             controller
                 .switch(expected_generation, new, runtime)
                 .map_err(error)?;
-            with_unproven_left(controller, controller.status().map_err(error)?)
+            let status = controller.status().map_err(error)?;
+            with_timezone(with_unproven_left(controller, status), Some(timezone))
         }
         Command::Start {
             target,
@@ -572,21 +597,47 @@ fn start(
         ));
     }
     let all = host::distributions().map_err(|e| Failure::new("enumeration_failed", e))?;
-    let result = preflight(
+    let first = preflight(
         &all,
         target,
         port,
         controller.status().map_err(error)?,
         None,
     )?;
-    if !result.passed {
-        return Ok((2, serde_json::json!(result)));
+    if !first.passed {
+        return Ok((2, serde_json::json!(first)));
     }
     let runtime = profile
         .as_deref()
         .map(managed::Runtime::from_file)
         .transpose()
         .map_err(error)?;
+    let restarted;
+    let mut synced_timezone = None;
+    let result = match &runtime {
+        Some(runtime) => {
+            let timezone =
+                environment::timezone::sync_and_restart(runtime, first.target.distribution)
+                    .map_err(|e| Failure::new("timezone_sync_failed", e))?;
+            // The restart made the snapshot stale: everything below uses a fresh one.
+            restarted = host::distributions().map_err(|e| Failure::new("enumeration_failed", e))?;
+            let result = preflight(
+                &restarted,
+                target,
+                port,
+                controller.status().map_err(error)?,
+                None,
+            )?;
+            if !result.passed {
+                let mut refused = serde_json::json!(result);
+                refused["timezone_synced"] = serde_json::json!(timezone);
+                return Ok((2, refused));
+            }
+            synced_timezone = Some(timezone);
+            result
+        }
+        None => first,
+    };
     let resolver = match &runtime {
         Some(runtime) => {
             runtime
@@ -607,7 +658,18 @@ fn start(
     controller
         .start(plan, runtime, expected_generation)
         .map_err(error)?;
-    Ok((0, controller.status().map_err(error)?))
+    Ok((
+        0,
+        with_timezone(controller.status().map_err(error)?, synced_timezone),
+    ))
+}
+
+/// Tells the caller which timezone the target was set to before its restart.
+fn with_timezone(mut response: serde_json::Value, timezone: Option<String>) -> serde_json::Value {
+    if let (Some(timezone), Some(object)) = (timezone, response.as_object_mut()) {
+        object.insert("timezone_synced".into(), serde_json::json!(timezone));
+    }
+    response
 }
 
 pub(crate) fn dispatch(
