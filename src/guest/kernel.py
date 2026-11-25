@@ -605,22 +605,32 @@ def legacy_rules(p, ipv6=False):
 
 DOCKER_SOCKETS = ("/var/run/docker.sock", "/run/docker.sock")
 BRIDGE_NAME = re.compile(r"[A-Za-z0-9_.-]{1,15}")
-# Destinations a container reaches only on its own host: never redirected by
-# the main chain, so the per-network gate must not drop them either.
-LOCAL_SCOPES = {"v4": ("224.0.0.0/4", "255.255.255.255/32", "169.254.0.0/16"), "v6": ("fe80::/10", "ff00::/8")}
+# Destinations that cannot be routed off the host (multicast, limited
+# broadcast, IPv6 link-local): the gate lets them through. Link-local IPv4
+# (169.254.0.0/16, e.g. 169.254.169.254) is routable and stays dropped, as
+# for the target's own processes.
+LOCAL_SCOPES = {"v4": ("224.0.0.0/4", "255.255.255.255/32"), "v6": ("fe80::/10", "ff00::/8")}
 
 
-def dockerd_running(proc="/proc"):
-    """Whether a dockerd process runs in the target (its own PID namespace).
-    Only then is docker.sock asked: connecting to an idle socket-activated
-    one would start Docker, and a socket without a daemon here may lead to
-    another distribution's (decision 24)."""
+def dockerd_running(proc="/proc", netns=None):
+    """Whether a dockerd process runs in the target (its own PID namespace)
+    and in this network stack. Only then is docker.sock asked: connecting to
+    an idle socket-activated one would start Docker, and a socket without a
+    daemon here may lead to another distribution's. A dockerd in a network
+    namespace of its own (rootless Docker, Docker in a container) has no
+    bridges here; its containers leave through processes in the target's
+    cgroup and count as the target's own traffic (decision 24)."""
+    netns = netns or (lambda pid: os.readlink(os.path.join(proc, pid, "ns", "net")))
+    try:
+        own = netns("self")
+    except OSError:
+        return False
     for entry in os.listdir(proc):
         if not entry.isdigit():
             continue
         try:
             with open(os.path.join(proc, entry, "comm"), "rb") as handle:
-                if handle.read(64).strip() == b"dockerd":
+                if handle.read(64).strip() == b"dockerd" and netns(entry) == own:
                     return True
         except OSError:
             continue
@@ -680,10 +690,10 @@ def parse_docker_networks(networks, exists):
 
 
 def docker_networks():
-    """The target's own Docker bridge networks (decision 24); empty when no
-    dockerd runs in the target."""
+    """The target's own Docker bridge networks (decision 24); None when no
+    dockerd runs in the target, so they are not known right now."""
     if not dockerd_running():
-        return {}
+        return None
     path = next((path for path in DOCKER_SOCKETS if os.path.exists(path)), None)
     require(path is not None, "docker_socket_missing")
     try:
@@ -763,6 +773,40 @@ def installed_networks(p, found, ipv6=False):
     return result
 
 
+def installed_network_map(p, found, ipv6=False):
+    """The networks this instance's per-network rules in `found` cover, in
+    the shape `docker_networks` returns."""
+    family = "v6" if ipv6 else "v4"
+    result = {}
+    for name, rules in installed_networks(p, found, ipv6).items():
+        subnets = set()
+        for _, rule in rules:
+            if "-d" in rule:
+                subnet = str(ipaddress.ip_network(rule[rule.index("-d") + 1], strict=False))
+                if subnet not in LOCAL_SCOPES[family]:
+                    subnets.add(subnet)
+        result[name] = {"v4": [], "v6": [], family: sorted(subnets)}
+    return result
+
+
+def wanted_networks(p, rules, ipv6_rules, exists=lambda name: os.path.isdir("/sys/class/net/" + name)):
+    """The networks the per-network rules should cover now. While no dockerd
+    runs here (stopped, restarting, possibly with live-restore keeping its
+    containers up), the networks already covered stay covered as long as
+    their bridge exists; only a bridge that is gone loses its rules. Never
+    lets a still-attached container fall back to a direct path."""
+    networks = docker_networks()
+    if networks is not None:
+        return networks
+    kept = {}
+    for found, ipv6 in ((rules, False), (ipv6_rules or {}, True)):
+        for name, families in installed_network_map(p, found, ipv6).items():
+            if exists(name):
+                entry = kept.setdefault(name, {"v4": [], "v6": []})
+                entry["v6" if ipv6 else "v4"] = families["v6" if ipv6 else "v4"]
+    return kept
+
+
 def network_changes(p, found, wanted, ipv6=False):
     """Bridges whose per-network rules differ from what `wanted` asks for, as
     (removals, additions): lists of (table, rule)."""
@@ -783,7 +827,7 @@ def network_report(p, rules, ipv6_rules):
     match the target's Docker networks, without changing anything."""
     installed = sorted(set(installed_networks(p, rules)) | set(installed_networks(p, ipv6_rules or {}, ipv6=True)))
     try:
-        wanted = docker_networks()
+        wanted = wanted_networks(p, rules, ipv6_rules)
     except Failure as error:
         return {"installed": installed, "wanted": None, "in_sync": None, "error": str(error)}
     in_sync = not any(network_changes(p, rules, wanted)) and not any(network_changes(p, ipv6_rules or {}, wanted, ipv6=True))
@@ -1648,7 +1692,7 @@ def execute(request):
                 present, rules = inspect_firewall(p, tables, True)
                 _, ipv6_rules = inspect_firewall(p, ipv6_tables, True, ipv6=True)
                 require(rules_complete(p, present, rules, ipv6_rules), "network_sync_without_complete_rules")
-                wanted = docker_networks()
+                wanted = wanted_networks(p, rules, ipv6_rules)
                 changes = [(False, *network_changes(p, rules, wanted)), (True, *network_changes(p, ipv6_rules, wanted, ipv6=True))]
                 # Redirection goes before the drops it relies on when removing,
                 # and after them when adding, as for the base rules.

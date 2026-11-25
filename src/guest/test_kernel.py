@@ -1,6 +1,7 @@
 """Pure guest-kernel boundary tests; no guest or network operation is performed."""
 
 import copy
+import ipaddress
 import json
 import os
 import struct
@@ -114,22 +115,30 @@ def ipv6_full_snapshot(p):
     return declare_chains(tables, p, ipv6=True)
 
 
-def legacy_snapshot(p, ipv6=False):
-    """What an older version installed: PREROUTING ! -i eth0 straight into the
-    redirect chain, and accepts plus a global drop on FORWARD."""
-    if ipv6:
-        tables = ipv6_full_snapshot(p) if p.get("ipv6") is not None else ipv6_snapshot(p)
-    else:
-        tables = snapshot(p)
-    cookie = f"{p['cookie']:08x}"
-    newer = {prefix + cookie for prefix in ("WPM2B_", "WPM2F_", "WPM2FB_", "WPM2VB_", "WPM2VF_", "WPM2VFB_")}
-    legacy = kernel.legacy_rules(p, ipv6)
-    for name, table in tables.items():
-        table["rules"] = [rule for rule in table["rules"] if rule[1] not in newer and rule[1] not in ("PREROUTING", "FORWARD")]
-        table["rules"] += [rule for rule in legacy if ("nat" if rule[1] == "PREROUTING" else "filter") == name]
-        for chain_name in newer:
-            table["chains"].pop(chain_name, None)
-    return tables
+LEGACY_RULES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "legacy_rules.json")
+
+
+def legacy_plan(name):
+    p = comprehensive_plan()
+    if name.endswith("managed"):
+        p["ipv6"] = {"guest": "2001:db8:1::2", "ingress": "[fe80::1%2]:43771"}
+    return p
+
+
+def apply_removal(state, table, lines, test=False, ipv6=False):
+    """A removal as iptables would apply it to a parsed dump: -D must hit an
+    existing rule, -X an empty chain nothing jumps to; nothing else allowed."""
+    if test:
+        return
+    current = state["v6" if ipv6 else "v4"][table]
+    for line in lines:
+        if line[0] == "-D":
+            current["rules"].remove(["-A", *line[1:]])
+        elif line[0] == "-X":
+            assert not any(rule[1] == line[1] or rule[-1] == line[1] for rule in current["rules"]), line
+            del current["chains"][line[1]]
+        else:
+            raise AssertionError(line)
 
 
 class ValidationTests(unittest.TestCase):
@@ -692,30 +701,31 @@ class FirewallTests(unittest.TestCase):
         self.assertEqual(gate[0][-1], "RETURN")
 
     def test_an_older_versions_rules_are_removed_but_never_complete(self):
-        for p in (comprehensive_plan(), dict(comprehensive_plan(), ipv6={"guest": "2001:db8:1::2", "ingress": "[fe80::1%2]:43771"})):
-            with self.subTest(ipv6=p.get("ipv6") is not None):
-                old, old6 = legacy_snapshot(p), legacy_snapshot(p, ipv6=True)
+        # The rules come from the older scripts themselves (legacy_rules.json),
+        # not from kernel.legacy_rules, so this is not checked against itself.
+        with open(LEGACY_RULES, encoding="utf-8") as handle:
+            fixture = json.load(handle)
+        foreign = fixture["foreign"]
+        for name, installed in fixture["installed"].items():
+            p = legacy_plan(name)
+            with self.subTest(name=name):
+                old, old6 = copy.deepcopy(installed["v4"]), copy.deepcopy(installed["v6"])
                 present, rules = kernel.inspect_firewall(p, old, True)
                 _, ipv6_rules = kernel.inspect_firewall(p, old6, True, ipv6=True)
                 self.assertTrue(present)
+                instance = sum(len(table["rules"]) for family in ("v4", "v6") for table in installed[family].values()) - sum(len(table["rules"]) for family in ("v4", "v6") for table in foreign[family].values())
+                self.assertEqual(sum(len(found) for both in (rules, ipv6_rules) for found in both.values()), instance)
                 self.assertFalse(kernel.rules_complete(p, present, rules, ipv6_rules))
                 # Not an install target either: nothing of this instance may exist.
                 with self.assertRaises(kernel.Failure):
                     kernel.inspect_firewall(p, old, False)
+                state = copy.deepcopy(installed)
                 operation = request(p)
                 operation["operation"] = "remove"
-                with patch.object(kernel, "guest_lock"), patch.object(kernel, "grant"), patch.object(kernel, "guard"), patch.object(kernel, "Conntrack") as conntrack, patch.object(kernel, "firewall", side_effect=[old, old6, {}, {}]), patch.object(kernel, "transaction") as transact:
+                with patch.object(kernel, "guest_lock"), patch.object(kernel, "grant"), patch.object(kernel, "guard"), patch.object(kernel, "Conntrack") as conntrack, patch.object(kernel, "firewall", side_effect=lambda ipv6=False: copy.deepcopy(state["v6" if ipv6 else "v4"])), patch.object(kernel, "transaction", side_effect=lambda table, lines, test=False, ipv6=False: apply_removal(state, table, lines, test, ipv6)):
                     conntrack.return_value.dump.return_value = []
-                    kernel.execute(operation)
-                lines = [line for call in transact.call_args_list for line in call.args[1]]
-                self.assertTrue(all(line[0] in ("-D", "-X") for line in lines))
-                removed = {line[1] for line in lines if line[0] == "-X"}
-                expected = {"WPM2_12345678", "WPM2G_12345678"}
-                if p.get("ipv6") is not None:
-                    expected |= {"WPM2V_12345678", "WPM2VG_12345678"}
-                self.assertEqual(removed, expected)
-                deleted = sum(1 for line in lines if line[0] == "-D")
-                self.assertEqual(deleted, sum(len(table["rules"]) for tables in (old, old6) for table in tables.values()))
+                    self.assertTrue(kernel.execute(operation)["ok"])
+                self.assertEqual(state, foreign)
 
     def test_ipv6_artifacts_include_nat_and_forward_gate(self):
         p = comprehensive_plan()
@@ -1273,7 +1283,7 @@ def with_networks(tables, p, networks, ipv6=False):
 class ContainerNetworkTests(unittest.TestCase):
     def test_docker_networks_are_asked_only_while_dockerd_runs(self):
         with patch.object(kernel, "dockerd_running", return_value=False), patch.object(kernel, "docker_request") as ask:
-            self.assertEqual(kernel.docker_networks(), {})
+            self.assertIsNone(kernel.docker_networks())
         ask.assert_not_called()
         with patch.object(kernel, "dockerd_running", return_value=True), patch.object(kernel.os.path, "exists", return_value=True), patch.object(kernel, "docker_request", return_value=DOCKER_NETWORKS), patch.object(kernel.os.path, "isdir", side_effect=lambda path: path.rsplit("/", 1)[-1] in PRESENT):
             self.assertEqual(kernel.docker_networks(), WANTED)
@@ -1284,17 +1294,46 @@ class ContainerNetworkTests(unittest.TestCase):
             with self.assertRaisesRegex(kernel.Failure, "docker_socket_missing"):
                 kernel.docker_networks()
 
-    def test_dockerd_is_found_by_process_name_in_the_targets_proc(self):
+    def test_dockerd_counts_only_by_name_in_this_network_stack(self):
+        here, elsewhere = "net:[4026531833]", "net:[4026532201]"
+        stacks = {"self": here}
+
+        def process(proc, pid, name, netns):
+            os.mkdir(os.path.join(proc, pid))
+            with open(os.path.join(proc, pid, "comm"), "w") as handle:
+                handle.write(name + "\n")
+            stacks[pid] = netns
+
+        def netns(pid):
+            if pid not in stacks:
+                raise FileNotFoundError(pid)
+            return stacks[pid]
+
         with tempfile.TemporaryDirectory() as proc:
-            for pid, name in (("1", "systemd"), ("42", "containerd"), ("self", "dockerd")):
-                os.mkdir(os.path.join(proc, pid))
-                with open(os.path.join(proc, pid, "comm"), "w") as handle:
-                    handle.write(name + "\n")
-            self.assertFalse(kernel.dockerd_running(proc))
-            os.mkdir(os.path.join(proc, "77"))
-            with open(os.path.join(proc, "77", "comm"), "w") as handle:
+            for pid, name in (("1", "systemd"), ("42", "containerd")):
+                process(proc, pid, name, here)
+            os.mkdir(os.path.join(proc, "self"))
+            with open(os.path.join(proc, "self", "comm"), "w") as handle:
                 handle.write("dockerd\n")
-            self.assertTrue(kernel.dockerd_running(proc))
+            self.assertFalse(kernel.dockerd_running(proc, netns))
+            # Rootless Docker or Docker in a container: its own network stack,
+            # no bridges here, its containers leave as the target's processes.
+            process(proc, "66", "dockerd", elsewhere)
+            self.assertFalse(kernel.dockerd_running(proc, netns))
+            process(proc, "77", "dockerd", here)
+            self.assertTrue(kernel.dockerd_running(proc, netns))
+            # A process gone between listing and reading is skipped.
+            os.mkdir(os.path.join(proc, "88"))
+            with open(os.path.join(proc, "88", "comm"), "w") as handle:
+                handle.write("dockerd\n")
+            del stacks["77"]
+            self.assertFalse(kernel.dockerd_running(proc, netns))
+            # The default reads /proc/<pid>/ns/net.
+            same = {os.path.join(proc, pid, "ns", "net") for pid in ("self", "77")}
+            with patch.object(kernel.os, "readlink", side_effect=lambda path: here if path in same else elsewhere) as readlink:
+                stacks["77"] = here
+                self.assertTrue(kernel.dockerd_running(proc))
+            self.assertIn(os.path.join(proc, "self", "ns", "net"), [call.args[0] for call in readlink.call_args_list])
 
     def test_only_bridge_networks_with_an_interface_here_count(self):
         self.assertEqual(kernel.parse_docker_networks(DOCKER_NETWORKS, lambda name: name in PRESENT), WANTED)
@@ -1306,8 +1345,11 @@ class ContainerNetworkTests(unittest.TestCase):
         nat, filtered = kernel.network_rules(p, {"docker0": WANTED["docker0"]})
         self.assertEqual([(rule[1], rule[rule.index("-i") + 1], rule[-1]) for rule in nat], [("WPM2B_12345678", "docker0", "RETURN"), ("WPM2B_12345678", "docker0", "WPM2_12345678")])
         self.assertEqual(nat[0][nat[0].index("-d") + 1], "172.17.0.0/16")
-        self.assertEqual([rule[-1] for rule in filtered], ["RETURN"] * 4 + ["DROP"])
-        self.assertEqual([rule[rule.index("-d") + 1] for rule in filtered[:-1]], ["172.17.0.0/16", *kernel.LOCAL_SCOPES["v4"]])
+        self.assertEqual([rule[-1] for rule in filtered], ["RETURN"] * 3 + ["DROP"])
+        self.assertEqual([rule[rule.index("-d") + 1] for rule in filtered[:-1]], ["172.17.0.0/16", "224.0.0.0/4", "255.255.255.255/32"])
+        # Link-local IPv4 (169.254.169.254 and the like) is routable: dropped
+        # as for the target's own processes, never let through.
+        self.assertFalse(any(ipaddress.ip_address("169.254.169.254") in ipaddress.ip_network(scope) for scope in kernel.LOCAL_SCOPES["v4"]))
         self.assertTrue(all(rule[1] == "WPM2FB_12345678" for rule in filtered))
         # IPv6 block mode: no redirection, only the drop of what is not local.
         nat6, filtered6 = kernel.network_rules(p, WANTED, ipv6=True)
@@ -1316,6 +1358,20 @@ class ContainerNetworkTests(unittest.TestCase):
         self.assertIn("fd00:db8:18::/64", [token for rule in filtered6 for token in rule])
         for rule in nat + filtered + filtered6:
             self.assertEqual(kernel.network_rule_owner(p, rule, rule in filtered6), rule[rule.index("-i") + 1])
+
+    def test_while_no_dockerd_runs_covered_networks_stay_while_their_bridge_exists(self):
+        # A stopped or restarting dockerd (live-restore keeps containers up)
+        # must not turn a covered bridge into a direct path.
+        p = comprehensive_plan()
+        _, rules = kernel.inspect_firewall(p, with_networks(snapshot(p), p, WANTED), True)
+        _, rules6 = kernel.inspect_firewall(p, with_networks(ipv6_snapshot(p), p, WANTED, ipv6=True), True, ipv6=True)
+        with patch.object(kernel, "docker_networks", return_value=None):
+            self.assertEqual(kernel.wanted_networks(p, rules, rules6, exists=lambda name: True), WANTED)
+            kept = kernel.wanted_networks(p, rules, rules6, exists=lambda name: name == "docker0")
+        self.assertEqual(kept, {"docker0": WANTED["docker0"]})
+        self.assertEqual(kernel.network_changes(p, rules, WANTED), ([], []))
+        with patch.object(kernel, "docker_networks", return_value={}):
+            self.assertEqual(kernel.wanted_networks(p, rules, rules6, exists=lambda name: True), {})
 
     def test_installed_network_rules_are_owned_but_not_part_of_completeness(self):
         p = comprehensive_plan()

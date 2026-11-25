@@ -1,0 +1,515 @@
+{
+ "about": "iptables-legacy-save snapshots, parsed as firewall() returns them, of what older guest scripts installed: cfbde9f is the last script before decision 24, 891fc47 the one on main; 'ipv6 block' is test_kernel.comprehensive_plan(), 'ipv6 managed' that plan with ipv6 guest 2001:db8:1::2 and ingress [fe80::1%2]:43771. Generated once by running each script's own install_rules against a simulated iptables that already held the 'foreign' rules, so the instance rules come from those scripts and not from kernel.legacy_rules.",
+ "foreign": {
+  "v4": {
+   "nat": {
+    "chains": {
+     "PREROUTING": "ACCEPT",
+     "INPUT": "ACCEPT",
+     "OUTPUT": "ACCEPT",
+     "POSTROUTING": "ACCEPT",
+     "DOCKER": "-"
+    },
+    "rules": [
+     ["-A", "PREROUTING", "-m", "addrtype", "--dst-type", "LOCAL", "-j", "DOCKER"],
+     ["-A", "POSTROUTING", "-s", "172.17.0.0/16", "!", "-o", "docker0", "-j", "MASQUERADE"],
+     ["-A", "DOCKER", "-i", "docker0", "-j", "RETURN"]
+    ]
+   },
+   "filter": {
+    "chains": {
+     "INPUT": "ACCEPT",
+     "FORWARD": "ACCEPT",
+     "OUTPUT": "ACCEPT",
+     "DOCKER-USER": "-"
+    },
+    "rules": [
+     ["-A", "FORWARD", "-j", "DOCKER-USER"],
+     ["-A", "DOCKER-USER", "-j", "RETURN"]
+    ]
+   }
+  },
+  "v6": {
+   "nat": {
+    "chains": {
+     "PREROUTING": "ACCEPT",
+     "INPUT": "ACCEPT",
+     "OUTPUT": "ACCEPT",
+     "POSTROUTING": "ACCEPT",
+     "DOCKER": "-"
+    },
+    "rules": [
+     ["-A", "PREROUTING", "-m", "addrtype", "--dst-type", "LOCAL", "-j", "DOCKER"],
+     ["-A", "POSTROUTING", "-s", "172.17.0.0/16", "!", "-o", "docker0", "-j", "MASQUERADE"],
+     ["-A", "DOCKER", "-i", "docker0", "-j", "RETURN"]
+    ]
+   },
+   "filter": {
+    "chains": {
+     "INPUT": "ACCEPT",
+     "FORWARD": "ACCEPT",
+     "OUTPUT": "ACCEPT",
+     "DOCKER-USER": "-"
+    },
+    "rules": [
+     ["-A", "FORWARD", "-j", "DOCKER-USER"],
+     ["-A", "DOCKER-USER", "-j", "RETURN"]
+    ]
+   }
+  }
+ },
+ "installed": {
+  "cfbde9f ipv6 block": {
+   "v4": {
+    "nat": {
+     "chains": {
+      "PREROUTING": "ACCEPT",
+      "INPUT": "ACCEPT",
+      "OUTPUT": "ACCEPT",
+      "POSTROUTING": "ACCEPT",
+      "DOCKER": "-",
+      "WPM2_12345678": "-"
+     },
+     "rules": [
+      ["-A", "PREROUTING", "!", "-i", "eth0", "-p", "udp", "-m", "udp", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "WPM2_12345678"],
+      ["-A", "PREROUTING", "!", "-i", "eth0", "-p", "tcp", "-m", "tcp", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "WPM2_12345678"],
+      ["-A", "PREROUTING", "-m", "addrtype", "--dst-type", "LOCAL", "-j", "DOCKER"],
+      ["-A", "OUTPUT", "-d", "10.255.255.254/32", "-p", "udp", "-m", "udp", "--dport", "53", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "WPM2_12345678"],
+      ["-A", "OUTPUT", "-s", "172.28.83.138/32", "!", "-d", "127.0.0.0/8", "-p", "udp", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "WPM2_12345678"],
+      ["-A", "OUTPUT", "-d", "10.255.255.254/32", "-p", "tcp", "-m", "tcp", "--dport", "53", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "WPM2_12345678"],
+      ["-A", "OUTPUT", "-s", "172.28.83.138/32", "!", "-d", "127.0.0.0/8", "-p", "tcp", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "WPM2_12345678"],
+      ["-A", "POSTROUTING", "-d", "172.28.80.1/32", "-p", "udp", "-m", "udp", "--dport", "43771", "-m", "conntrack", "--ctdir", "ORIGINAL", "--ctstate", "DNAT", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "SNAT", "--to-source", "172.28.83.138"],
+      ["-A", "POSTROUTING", "-d", "172.28.80.1/32", "-p", "tcp", "-m", "tcp", "--dport", "43771", "-m", "conntrack", "--ctdir", "ORIGINAL", "--ctstate", "DNAT", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "SNAT", "--to-source", "172.28.83.138"],
+      ["-A", "POSTROUTING", "-s", "172.17.0.0/16", "!", "-o", "docker0", "-j", "MASQUERADE"],
+      ["-A", "DOCKER", "-i", "docker0", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "172.28.80.1/32", "-p", "tcp", "-m", "tcp", "--dport", "43771", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "172.28.80.1/32", "-p", "udp", "-m", "udp", "--dport", "43771", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "0.0.0.0/8", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "127.0.0.0/8", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "169.254.0.0/16", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "224.0.0.0/4", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "240.0.0.0/4", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "!", "-s", "172.28.83.138/32", "!", "-d", "10.255.255.254/32", "-p", "tcp", "-m", "tcp", "--dport", "53", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "!", "-s", "172.28.83.138/32", "!", "-d", "10.255.255.254/32", "-p", "udp", "-m", "udp", "--dport", "53", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-m", "connmark", "--mark", "0x0", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "CONNMARK", "--set-xmark", "0x12345678/0xffffffff"],
+      ["-A", "WPM2_12345678", "-p", "tcp", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "DNAT", "--to-destination", "172.28.80.1:43771"],
+      ["-A", "WPM2_12345678", "-p", "udp", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "DNAT", "--to-destination", "172.28.80.1:43771"]
+     ]
+    },
+    "filter": {
+     "chains": {
+      "INPUT": "ACCEPT",
+      "FORWARD": "ACCEPT",
+      "OUTPUT": "ACCEPT",
+      "DOCKER-USER": "-",
+      "WPM2G_12345678": "-"
+     },
+     "rules": [
+      ["-A", "FORWARD", "-p", "tcp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "FORWARD", "-d", "172.28.80.1/32", "-p", "tcp", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "FORWARD", "-p", "udp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "FORWARD", "-d", "172.28.80.1/32", "-p", "udp", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "FORWARD", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "DROP"],
+      ["-A", "FORWARD", "-j", "DOCKER-USER"],
+      ["-A", "OUTPUT", "!", "-d", "127.0.0.0/8", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "INVALID,UNTRACKED", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "WPM2G_12345678"],
+      ["-A", "OUTPUT", "-m", "cgroup", "--path", "/", "-m", "conntrack", "!", "--ctorigdst", "127.0.0.0/8", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "WPM2G_12345678"],
+      ["-A", "DOCKER-USER", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-m", "conntrack", "--ctdir", "REPLY", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-s", "172.28.83.138/32", "-p", "tcp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL", "--ctorigsrc", "172.28.83.138", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-s", "172.28.83.138/32", "-d", "172.28.80.1/32", "-p", "tcp", "-m", "tcp", "--dport", "43771", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "--ctorigsrc", "172.28.83.138", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-s", "172.28.83.138/32", "-p", "udp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL", "--ctorigsrc", "172.28.83.138", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-s", "172.28.83.138/32", "-d", "172.28.80.1/32", "-p", "udp", "-m", "udp", "--dport", "43771", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "--ctorigsrc", "172.28.83.138", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-p", "tcp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL", "--ctorigdst", "10.255.255.254", "--ctorigdstport", "53", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-d", "172.28.80.1/32", "-p", "tcp", "-m", "tcp", "--dport", "43771", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "--ctorigdst", "10.255.255.254", "--ctorigdstport", "53", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-p", "udp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL", "--ctorigdst", "10.255.255.254", "--ctorigdstport", "53", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-d", "172.28.80.1/32", "-p", "udp", "-m", "udp", "--dport", "43771", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "--ctorigdst", "10.255.255.254", "--ctorigdstport", "53", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "DROP"]
+     ]
+    }
+   },
+   "v6": {
+    "nat": {
+     "chains": {
+      "PREROUTING": "ACCEPT",
+      "INPUT": "ACCEPT",
+      "OUTPUT": "ACCEPT",
+      "POSTROUTING": "ACCEPT",
+      "DOCKER": "-"
+     },
+     "rules": [
+      ["-A", "PREROUTING", "-m", "addrtype", "--dst-type", "LOCAL", "-j", "DOCKER"],
+      ["-A", "POSTROUTING", "-s", "172.17.0.0/16", "!", "-o", "docker0", "-j", "MASQUERADE"],
+      ["-A", "DOCKER", "-i", "docker0", "-j", "RETURN"]
+     ]
+    },
+    "filter": {
+     "chains": {
+      "INPUT": "ACCEPT",
+      "FORWARD": "ACCEPT",
+      "OUTPUT": "ACCEPT",
+      "DOCKER-USER": "-"
+     },
+     "rules": [
+      ["-A", "FORWARD", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "DROP"],
+      ["-A", "FORWARD", "-j", "DOCKER-USER"],
+      ["-A", "OUTPUT", "-m", "cgroup", "--path", "/", "!", "-d", "::1/128", "-m", "conntrack", "--ctstate", "INVALID,UNTRACKED", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "DROP"],
+      ["-A", "OUTPUT", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctdir", "ORIGINAL", "!", "--ctorigdst", "::1/128", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "DROP"],
+      ["-A", "DOCKER-USER", "-j", "RETURN"]
+     ]
+    }
+   }
+  },
+  "cfbde9f ipv6 managed": {
+   "v4": {
+    "nat": {
+     "chains": {
+      "PREROUTING": "ACCEPT",
+      "INPUT": "ACCEPT",
+      "OUTPUT": "ACCEPT",
+      "POSTROUTING": "ACCEPT",
+      "DOCKER": "-",
+      "WPM2_12345678": "-"
+     },
+     "rules": [
+      ["-A", "PREROUTING", "!", "-i", "eth0", "-p", "udp", "-m", "udp", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "WPM2_12345678"],
+      ["-A", "PREROUTING", "!", "-i", "eth0", "-p", "tcp", "-m", "tcp", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "WPM2_12345678"],
+      ["-A", "PREROUTING", "-m", "addrtype", "--dst-type", "LOCAL", "-j", "DOCKER"],
+      ["-A", "OUTPUT", "-d", "10.255.255.254/32", "-p", "udp", "-m", "udp", "--dport", "53", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "WPM2_12345678"],
+      ["-A", "OUTPUT", "-s", "172.28.83.138/32", "!", "-d", "127.0.0.0/8", "-p", "udp", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "WPM2_12345678"],
+      ["-A", "OUTPUT", "-d", "10.255.255.254/32", "-p", "tcp", "-m", "tcp", "--dport", "53", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "WPM2_12345678"],
+      ["-A", "OUTPUT", "-s", "172.28.83.138/32", "!", "-d", "127.0.0.0/8", "-p", "tcp", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "WPM2_12345678"],
+      ["-A", "POSTROUTING", "-d", "172.28.80.1/32", "-p", "udp", "-m", "udp", "--dport", "43771", "-m", "conntrack", "--ctdir", "ORIGINAL", "--ctstate", "DNAT", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "SNAT", "--to-source", "172.28.83.138"],
+      ["-A", "POSTROUTING", "-d", "172.28.80.1/32", "-p", "tcp", "-m", "tcp", "--dport", "43771", "-m", "conntrack", "--ctdir", "ORIGINAL", "--ctstate", "DNAT", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "SNAT", "--to-source", "172.28.83.138"],
+      ["-A", "POSTROUTING", "-s", "172.17.0.0/16", "!", "-o", "docker0", "-j", "MASQUERADE"],
+      ["-A", "DOCKER", "-i", "docker0", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "172.28.80.1/32", "-p", "tcp", "-m", "tcp", "--dport", "43771", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "172.28.80.1/32", "-p", "udp", "-m", "udp", "--dport", "43771", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "0.0.0.0/8", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "127.0.0.0/8", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "169.254.0.0/16", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "224.0.0.0/4", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "240.0.0.0/4", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "!", "-s", "172.28.83.138/32", "!", "-d", "10.255.255.254/32", "-p", "tcp", "-m", "tcp", "--dport", "53", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "!", "-s", "172.28.83.138/32", "!", "-d", "10.255.255.254/32", "-p", "udp", "-m", "udp", "--dport", "53", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-m", "connmark", "--mark", "0x0", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "CONNMARK", "--set-xmark", "0x12345678/0xffffffff"],
+      ["-A", "WPM2_12345678", "-p", "tcp", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "DNAT", "--to-destination", "172.28.80.1:43771"],
+      ["-A", "WPM2_12345678", "-p", "udp", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "DNAT", "--to-destination", "172.28.80.1:43771"]
+     ]
+    },
+    "filter": {
+     "chains": {
+      "INPUT": "ACCEPT",
+      "FORWARD": "ACCEPT",
+      "OUTPUT": "ACCEPT",
+      "DOCKER-USER": "-",
+      "WPM2G_12345678": "-"
+     },
+     "rules": [
+      ["-A", "FORWARD", "-p", "tcp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "FORWARD", "-d", "172.28.80.1/32", "-p", "tcp", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "FORWARD", "-p", "udp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "FORWARD", "-d", "172.28.80.1/32", "-p", "udp", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "FORWARD", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "DROP"],
+      ["-A", "FORWARD", "-j", "DOCKER-USER"],
+      ["-A", "OUTPUT", "!", "-d", "127.0.0.0/8", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "INVALID,UNTRACKED", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "WPM2G_12345678"],
+      ["-A", "OUTPUT", "-m", "cgroup", "--path", "/", "-m", "conntrack", "!", "--ctorigdst", "127.0.0.0/8", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "WPM2G_12345678"],
+      ["-A", "DOCKER-USER", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-m", "conntrack", "--ctdir", "REPLY", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-s", "172.28.83.138/32", "-p", "tcp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL", "--ctorigsrc", "172.28.83.138", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-s", "172.28.83.138/32", "-d", "172.28.80.1/32", "-p", "tcp", "-m", "tcp", "--dport", "43771", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "--ctorigsrc", "172.28.83.138", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-s", "172.28.83.138/32", "-p", "udp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL", "--ctorigsrc", "172.28.83.138", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-s", "172.28.83.138/32", "-d", "172.28.80.1/32", "-p", "udp", "-m", "udp", "--dport", "43771", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "--ctorigsrc", "172.28.83.138", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-p", "tcp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL", "--ctorigdst", "10.255.255.254", "--ctorigdstport", "53", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-d", "172.28.80.1/32", "-p", "tcp", "-m", "tcp", "--dport", "43771", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "--ctorigdst", "10.255.255.254", "--ctorigdstport", "53", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-p", "udp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL", "--ctorigdst", "10.255.255.254", "--ctorigdstport", "53", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-d", "172.28.80.1/32", "-p", "udp", "-m", "udp", "--dport", "43771", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "--ctorigdst", "10.255.255.254", "--ctorigdstport", "53", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "DROP"]
+     ]
+    }
+   },
+   "v6": {
+    "nat": {
+     "chains": {
+      "PREROUTING": "ACCEPT",
+      "INPUT": "ACCEPT",
+      "OUTPUT": "ACCEPT",
+      "POSTROUTING": "ACCEPT",
+      "DOCKER": "-",
+      "WPM2V_12345678": "-"
+     },
+     "rules": [
+      ["-A", "PREROUTING", "-m", "addrtype", "--dst-type", "LOCAL", "-j", "DOCKER"],
+      ["-A", "PREROUTING", "!", "-i", "eth0", "-p", "tcp", "-m", "tcp", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "WPM2V_12345678"],
+      ["-A", "PREROUTING", "!", "-i", "eth0", "-p", "udp", "-m", "udp", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "WPM2V_12345678"],
+      ["-A", "OUTPUT", "-s", "2001:db8:1::2/128", "!", "-d", "::1/128", "-p", "udp", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "WPM2V_12345678"],
+      ["-A", "OUTPUT", "-s", "2001:db8:1::2/128", "!", "-d", "::1/128", "-p", "tcp", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "WPM2V_12345678"],
+      ["-A", "POSTROUTING", "-s", "172.17.0.0/16", "!", "-o", "docker0", "-j", "MASQUERADE"],
+      ["-A", "POSTROUTING", "-d", "fe80::1/128", "-p", "tcp", "-m", "tcp", "--dport", "43771", "-m", "conntrack", "--ctdir", "ORIGINAL", "--ctstate", "DNAT", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "SNAT", "--to-source", "2001:db8:1::2"],
+      ["-A", "POSTROUTING", "-d", "fe80::1/128", "-p", "udp", "-m", "udp", "--dport", "43771", "-m", "conntrack", "--ctdir", "ORIGINAL", "--ctstate", "DNAT", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "SNAT", "--to-source", "2001:db8:1::2"],
+      ["-A", "DOCKER", "-i", "docker0", "-j", "RETURN"],
+      ["-A", "WPM2V_12345678", "-d", "fe80::1/128", "-p", "tcp", "-m", "tcp", "--dport", "43771", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2V_12345678", "-d", "fe80::1/128", "-p", "udp", "-m", "udp", "--dport", "43771", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2V_12345678", "-d", "::/128", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2V_12345678", "-d", "::1/128", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2V_12345678", "-d", "::ffff:0:0/96", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2V_12345678", "-d", "fe80::/10", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2V_12345678", "-d", "ff00::/8", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2V_12345678", "-m", "connmark", "--mark", "0x0", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "CONNMARK", "--set-xmark", "0x12345678/0xffffffff"],
+      ["-A", "WPM2V_12345678", "-p", "tcp", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "DNAT", "--to-destination", "[fe80::1]:43771"],
+      ["-A", "WPM2V_12345678", "-p", "udp", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "DNAT", "--to-destination", "[fe80::1]:43771"]
+     ]
+    },
+    "filter": {
+     "chains": {
+      "INPUT": "ACCEPT",
+      "FORWARD": "ACCEPT",
+      "OUTPUT": "ACCEPT",
+      "DOCKER-USER": "-",
+      "WPM2VG_12345678": "-"
+     },
+     "rules": [
+      ["-A", "FORWARD", "-p", "tcp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "FORWARD", "-d", "fe80::1/128", "-p", "tcp", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "FORWARD", "-p", "udp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "FORWARD", "-d", "fe80::1/128", "-p", "udp", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "FORWARD", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "DROP"],
+      ["-A", "FORWARD", "-j", "DOCKER-USER"],
+      ["-A", "OUTPUT", "!", "-d", "::1/128", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "INVALID,UNTRACKED", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "WPM2VG_12345678"],
+      ["-A", "OUTPUT", "-m", "cgroup", "--path", "/", "-m", "conntrack", "!", "--ctorigdst", "::1/128", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "WPM2VG_12345678"],
+      ["-A", "DOCKER-USER", "-j", "RETURN"],
+      ["-A", "WPM2VG_12345678", "-m", "conntrack", "--ctdir", "REPLY", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2VG_12345678", "-s", "2001:db8:1::2/128", "-p", "tcp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL", "--ctorigsrc", "2001:db8:1::2", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2VG_12345678", "-s", "2001:db8:1::2/128", "-d", "fe80::1/128", "-p", "tcp", "-m", "tcp", "--dport", "43771", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "--ctorigsrc", "2001:db8:1::2", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2VG_12345678", "-s", "2001:db8:1::2/128", "-p", "udp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL", "--ctorigsrc", "2001:db8:1::2", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2VG_12345678", "-s", "2001:db8:1::2/128", "-d", "fe80::1/128", "-p", "udp", "-m", "udp", "--dport", "43771", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "--ctorigsrc", "2001:db8:1::2", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2VG_12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "DROP"]
+     ]
+    }
+   }
+  },
+  "891fc47 ipv6 block": {
+   "v4": {
+    "nat": {
+     "chains": {
+      "PREROUTING": "ACCEPT",
+      "INPUT": "ACCEPT",
+      "OUTPUT": "ACCEPT",
+      "POSTROUTING": "ACCEPT",
+      "DOCKER": "-",
+      "WPM2_12345678": "-"
+     },
+     "rules": [
+      ["-A", "PREROUTING", "!", "-i", "eth0", "-p", "udp", "-m", "udp", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "WPM2_12345678"],
+      ["-A", "PREROUTING", "!", "-i", "eth0", "-p", "tcp", "-m", "tcp", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "WPM2_12345678"],
+      ["-A", "PREROUTING", "-m", "addrtype", "--dst-type", "LOCAL", "-j", "DOCKER"],
+      ["-A", "OUTPUT", "-d", "10.255.255.254/32", "-p", "udp", "-m", "udp", "--dport", "53", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "WPM2_12345678"],
+      ["-A", "OUTPUT", "-s", "172.28.83.138/32", "!", "-d", "127.0.0.0/8", "-p", "udp", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "WPM2_12345678"],
+      ["-A", "OUTPUT", "-d", "10.255.255.254/32", "-p", "tcp", "-m", "tcp", "--dport", "53", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "WPM2_12345678"],
+      ["-A", "OUTPUT", "-s", "172.28.83.138/32", "!", "-d", "127.0.0.0/8", "-p", "tcp", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "WPM2_12345678"],
+      ["-A", "POSTROUTING", "-d", "172.28.80.1/32", "-p", "udp", "-m", "udp", "--dport", "43771", "-m", "conntrack", "--ctdir", "ORIGINAL", "--ctstate", "DNAT", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "SNAT", "--to-source", "172.28.83.138"],
+      ["-A", "POSTROUTING", "-d", "172.28.80.1/32", "-p", "tcp", "-m", "tcp", "--dport", "43771", "-m", "conntrack", "--ctdir", "ORIGINAL", "--ctstate", "DNAT", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "SNAT", "--to-source", "172.28.83.138"],
+      ["-A", "POSTROUTING", "-s", "172.17.0.0/16", "!", "-o", "docker0", "-j", "MASQUERADE"],
+      ["-A", "DOCKER", "-i", "docker0", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "172.28.80.1/32", "-p", "tcp", "-m", "tcp", "--dport", "43771", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "172.28.80.1/32", "-p", "udp", "-m", "udp", "--dport", "43771", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "0.0.0.0/8", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "127.0.0.0/8", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "169.254.0.0/16", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "224.0.0.0/4", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "240.0.0.0/4", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-m", "connmark", "--mark", "0x0", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "CONNMARK", "--set-xmark", "0x12345678/0xffffffff"],
+      ["-A", "WPM2_12345678", "-p", "tcp", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "DNAT", "--to-destination", "172.28.80.1:43771"],
+      ["-A", "WPM2_12345678", "-p", "udp", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "DNAT", "--to-destination", "172.28.80.1:43771"]
+     ]
+    },
+    "filter": {
+     "chains": {
+      "INPUT": "ACCEPT",
+      "FORWARD": "ACCEPT",
+      "OUTPUT": "ACCEPT",
+      "DOCKER-USER": "-",
+      "WPM2G_12345678": "-"
+     },
+     "rules": [
+      ["-A", "FORWARD", "-p", "tcp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "FORWARD", "-d", "172.28.80.1/32", "-p", "tcp", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "FORWARD", "-p", "udp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "FORWARD", "-d", "172.28.80.1/32", "-p", "udp", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "FORWARD", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "DROP"],
+      ["-A", "FORWARD", "-j", "DOCKER-USER"],
+      ["-A", "OUTPUT", "!", "-d", "127.0.0.0/8", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "INVALID,UNTRACKED", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "WPM2G_12345678"],
+      ["-A", "OUTPUT", "-m", "cgroup", "--path", "/", "-m", "conntrack", "!", "--ctorigdst", "127.0.0.0/8", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "WPM2G_12345678"],
+      ["-A", "DOCKER-USER", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-m", "conntrack", "--ctdir", "REPLY", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-s", "172.28.83.138/32", "-p", "tcp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL", "--ctorigsrc", "172.28.83.138", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-s", "172.28.83.138/32", "-d", "172.28.80.1/32", "-p", "tcp", "-m", "tcp", "--dport", "43771", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "--ctorigsrc", "172.28.83.138", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-s", "172.28.83.138/32", "-p", "udp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL", "--ctorigsrc", "172.28.83.138", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-s", "172.28.83.138/32", "-d", "172.28.80.1/32", "-p", "udp", "-m", "udp", "--dport", "43771", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "--ctorigsrc", "172.28.83.138", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-p", "tcp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL", "--ctorigdst", "10.255.255.254", "--ctorigdstport", "53", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-d", "172.28.80.1/32", "-p", "tcp", "-m", "tcp", "--dport", "43771", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "--ctorigdst", "10.255.255.254", "--ctorigdstport", "53", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-p", "udp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL", "--ctorigdst", "10.255.255.254", "--ctorigdstport", "53", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-d", "172.28.80.1/32", "-p", "udp", "-m", "udp", "--dport", "43771", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "--ctorigdst", "10.255.255.254", "--ctorigdstport", "53", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "DROP"]
+     ]
+    }
+   },
+   "v6": {
+    "nat": {
+     "chains": {
+      "PREROUTING": "ACCEPT",
+      "INPUT": "ACCEPT",
+      "OUTPUT": "ACCEPT",
+      "POSTROUTING": "ACCEPT",
+      "DOCKER": "-"
+     },
+     "rules": [
+      ["-A", "PREROUTING", "-m", "addrtype", "--dst-type", "LOCAL", "-j", "DOCKER"],
+      ["-A", "POSTROUTING", "-s", "172.17.0.0/16", "!", "-o", "docker0", "-j", "MASQUERADE"],
+      ["-A", "DOCKER", "-i", "docker0", "-j", "RETURN"]
+     ]
+    },
+    "filter": {
+     "chains": {
+      "INPUT": "ACCEPT",
+      "FORWARD": "ACCEPT",
+      "OUTPUT": "ACCEPT",
+      "DOCKER-USER": "-"
+     },
+     "rules": [
+      ["-A", "FORWARD", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "DROP"],
+      ["-A", "FORWARD", "-j", "DOCKER-USER"],
+      ["-A", "OUTPUT", "-m", "cgroup", "--path", "/", "!", "-d", "::1/128", "-m", "conntrack", "--ctstate", "INVALID,UNTRACKED", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "DROP"],
+      ["-A", "OUTPUT", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctdir", "ORIGINAL", "!", "--ctorigdst", "::1/128", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:ab8a1a6cd594680d", "-j", "DROP"],
+      ["-A", "DOCKER-USER", "-j", "RETURN"]
+     ]
+    }
+   }
+  },
+  "891fc47 ipv6 managed": {
+   "v4": {
+    "nat": {
+     "chains": {
+      "PREROUTING": "ACCEPT",
+      "INPUT": "ACCEPT",
+      "OUTPUT": "ACCEPT",
+      "POSTROUTING": "ACCEPT",
+      "DOCKER": "-",
+      "WPM2_12345678": "-"
+     },
+     "rules": [
+      ["-A", "PREROUTING", "!", "-i", "eth0", "-p", "udp", "-m", "udp", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "WPM2_12345678"],
+      ["-A", "PREROUTING", "!", "-i", "eth0", "-p", "tcp", "-m", "tcp", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "WPM2_12345678"],
+      ["-A", "PREROUTING", "-m", "addrtype", "--dst-type", "LOCAL", "-j", "DOCKER"],
+      ["-A", "OUTPUT", "-d", "10.255.255.254/32", "-p", "udp", "-m", "udp", "--dport", "53", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "WPM2_12345678"],
+      ["-A", "OUTPUT", "-s", "172.28.83.138/32", "!", "-d", "127.0.0.0/8", "-p", "udp", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "WPM2_12345678"],
+      ["-A", "OUTPUT", "-d", "10.255.255.254/32", "-p", "tcp", "-m", "tcp", "--dport", "53", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "WPM2_12345678"],
+      ["-A", "OUTPUT", "-s", "172.28.83.138/32", "!", "-d", "127.0.0.0/8", "-p", "tcp", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "WPM2_12345678"],
+      ["-A", "POSTROUTING", "-d", "172.28.80.1/32", "-p", "udp", "-m", "udp", "--dport", "43771", "-m", "conntrack", "--ctdir", "ORIGINAL", "--ctstate", "DNAT", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "SNAT", "--to-source", "172.28.83.138"],
+      ["-A", "POSTROUTING", "-d", "172.28.80.1/32", "-p", "tcp", "-m", "tcp", "--dport", "43771", "-m", "conntrack", "--ctdir", "ORIGINAL", "--ctstate", "DNAT", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "SNAT", "--to-source", "172.28.83.138"],
+      ["-A", "POSTROUTING", "-s", "172.17.0.0/16", "!", "-o", "docker0", "-j", "MASQUERADE"],
+      ["-A", "DOCKER", "-i", "docker0", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "172.28.80.1/32", "-p", "tcp", "-m", "tcp", "--dport", "43771", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "172.28.80.1/32", "-p", "udp", "-m", "udp", "--dport", "43771", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "0.0.0.0/8", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "127.0.0.0/8", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "169.254.0.0/16", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "224.0.0.0/4", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-d", "240.0.0.0/4", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2_12345678", "-m", "connmark", "--mark", "0x0", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "CONNMARK", "--set-xmark", "0x12345678/0xffffffff"],
+      ["-A", "WPM2_12345678", "-p", "tcp", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "DNAT", "--to-destination", "172.28.80.1:43771"],
+      ["-A", "WPM2_12345678", "-p", "udp", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "DNAT", "--to-destination", "172.28.80.1:43771"]
+     ]
+    },
+    "filter": {
+     "chains": {
+      "INPUT": "ACCEPT",
+      "FORWARD": "ACCEPT",
+      "OUTPUT": "ACCEPT",
+      "DOCKER-USER": "-",
+      "WPM2G_12345678": "-"
+     },
+     "rules": [
+      ["-A", "FORWARD", "-p", "tcp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "FORWARD", "-d", "172.28.80.1/32", "-p", "tcp", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "FORWARD", "-p", "udp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "FORWARD", "-d", "172.28.80.1/32", "-p", "udp", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "FORWARD", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "DROP"],
+      ["-A", "FORWARD", "-j", "DOCKER-USER"],
+      ["-A", "OUTPUT", "!", "-d", "127.0.0.0/8", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "INVALID,UNTRACKED", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "WPM2G_12345678"],
+      ["-A", "OUTPUT", "-m", "cgroup", "--path", "/", "-m", "conntrack", "!", "--ctorigdst", "127.0.0.0/8", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "WPM2G_12345678"],
+      ["-A", "DOCKER-USER", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-m", "conntrack", "--ctdir", "REPLY", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-s", "172.28.83.138/32", "-p", "tcp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL", "--ctorigsrc", "172.28.83.138", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-s", "172.28.83.138/32", "-d", "172.28.80.1/32", "-p", "tcp", "-m", "tcp", "--dport", "43771", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "--ctorigsrc", "172.28.83.138", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-s", "172.28.83.138/32", "-p", "udp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL", "--ctorigsrc", "172.28.83.138", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-s", "172.28.83.138/32", "-d", "172.28.80.1/32", "-p", "udp", "-m", "udp", "--dport", "43771", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "--ctorigsrc", "172.28.83.138", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-p", "tcp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL", "--ctorigdst", "10.255.255.254", "--ctorigdstport", "53", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-d", "172.28.80.1/32", "-p", "tcp", "-m", "tcp", "--dport", "43771", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "--ctorigdst", "10.255.255.254", "--ctorigdstport", "53", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-p", "udp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL", "--ctorigdst", "10.255.255.254", "--ctorigdstport", "53", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-d", "172.28.80.1/32", "-p", "udp", "-m", "udp", "--dport", "43771", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "--ctorigdst", "10.255.255.254", "--ctorigdstport", "53", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2G_12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2:12345678:2b048b8201e6f1b1", "-j", "DROP"]
+     ]
+    }
+   },
+   "v6": {
+    "nat": {
+     "chains": {
+      "PREROUTING": "ACCEPT",
+      "INPUT": "ACCEPT",
+      "OUTPUT": "ACCEPT",
+      "POSTROUTING": "ACCEPT",
+      "DOCKER": "-",
+      "WPM2V_12345678": "-"
+     },
+     "rules": [
+      ["-A", "PREROUTING", "-m", "addrtype", "--dst-type", "LOCAL", "-j", "DOCKER"],
+      ["-A", "PREROUTING", "!", "-i", "eth0", "-p", "tcp", "-m", "tcp", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "WPM2V_12345678"],
+      ["-A", "PREROUTING", "!", "-i", "eth0", "-p", "udp", "-m", "udp", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "WPM2V_12345678"],
+      ["-A", "OUTPUT", "-s", "2001:db8:1::2/128", "!", "-d", "::1/128", "-p", "udp", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "WPM2V_12345678"],
+      ["-A", "OUTPUT", "-s", "2001:db8:1::2/128", "!", "-d", "::1/128", "-p", "tcp", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "WPM2V_12345678"],
+      ["-A", "POSTROUTING", "-s", "172.17.0.0/16", "!", "-o", "docker0", "-j", "MASQUERADE"],
+      ["-A", "POSTROUTING", "-d", "fe80::1/128", "-p", "tcp", "-m", "tcp", "--dport", "43771", "-m", "conntrack", "--ctdir", "ORIGINAL", "--ctstate", "DNAT", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "SNAT", "--to-source", "2001:db8:1::2"],
+      ["-A", "POSTROUTING", "-d", "fe80::1/128", "-p", "udp", "-m", "udp", "--dport", "43771", "-m", "conntrack", "--ctdir", "ORIGINAL", "--ctstate", "DNAT", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "SNAT", "--to-source", "2001:db8:1::2"],
+      ["-A", "DOCKER", "-i", "docker0", "-j", "RETURN"],
+      ["-A", "WPM2V_12345678", "-d", "fe80::1/128", "-p", "tcp", "-m", "tcp", "--dport", "43771", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2V_12345678", "-d", "fe80::1/128", "-p", "udp", "-m", "udp", "--dport", "43771", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2V_12345678", "-d", "::/128", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2V_12345678", "-d", "::1/128", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2V_12345678", "-d", "::ffff:0:0/96", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2V_12345678", "-d", "fe80::/10", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2V_12345678", "-d", "ff00::/8", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2V_12345678", "-m", "connmark", "--mark", "0x0", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "CONNMARK", "--set-xmark", "0x12345678/0xffffffff"],
+      ["-A", "WPM2V_12345678", "-p", "tcp", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "DNAT", "--to-destination", "[fe80::1]:43771"],
+      ["-A", "WPM2V_12345678", "-p", "udp", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "DNAT", "--to-destination", "[fe80::1]:43771"]
+     ]
+    },
+    "filter": {
+     "chains": {
+      "INPUT": "ACCEPT",
+      "FORWARD": "ACCEPT",
+      "OUTPUT": "ACCEPT",
+      "DOCKER-USER": "-",
+      "WPM2VG_12345678": "-"
+     },
+     "rules": [
+      ["-A", "FORWARD", "-p", "tcp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "FORWARD", "-d", "fe80::1/128", "-p", "tcp", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "FORWARD", "-p", "udp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "FORWARD", "-d", "fe80::1/128", "-p", "udp", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "FORWARD", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "DROP"],
+      ["-A", "FORWARD", "-j", "DOCKER-USER"],
+      ["-A", "OUTPUT", "-m", "cgroup", "--path", "/", "-m", "conntrack", "!", "--ctorigdst", "::1/128", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "WPM2VG_12345678"],
+      ["-A", "OUTPUT", "!", "-d", "::1/128", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "INVALID,UNTRACKED", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "WPM2VG_12345678"],
+      ["-A", "DOCKER-USER", "-j", "RETURN"],
+      ["-A", "WPM2VG_12345678", "-m", "conntrack", "--ctdir", "REPLY", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2VG_12345678", "-s", "2001:db8:1::2/128", "-p", "tcp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL", "--ctorigsrc", "2001:db8:1::2", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2VG_12345678", "-s", "2001:db8:1::2/128", "-d", "fe80::1/128", "-p", "tcp", "-m", "tcp", "--dport", "43771", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "--ctorigsrc", "2001:db8:1::2", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2VG_12345678", "-s", "2001:db8:1::2/128", "-p", "udp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL", "--ctorigsrc", "2001:db8:1::2", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2VG_12345678", "-s", "2001:db8:1::2/128", "-d", "fe80::1/128", "-p", "udp", "-m", "udp", "--dport", "43771", "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "--ctorigsrc", "2001:db8:1::2", "-m", "connmark", "--mark", "0x12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "RETURN"],
+      ["-A", "WPM2VG_12345678", "-m", "comment", "--comment", "wsl-proxyctl-m2v6:12345678:2b048b8201e6f1b1", "-j", "DROP"]
+     ]
+    }
+   }
+  }
+ }
+}
