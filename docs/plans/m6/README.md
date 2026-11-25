@@ -10,7 +10,7 @@
 
 | 会做 | 不会做 |
 |---|---|
-| 按固定顺序加载 12 个模块：`ip_tables`、`iptable_filter`、`iptable_nat`、`ip6_tables`、`ip6table_filter`、`ip6table_nat`、`xt_cgroup`、`xt_connmark`、`xt_conntrack`、`xt_comment`、`xt_mark`、`xt_nat`。 | 不安装软件包，不下载或编译模块，不改 `.wslconfig`；除下面两个开机文件及其 enable 链接外，不改发行版持久配置。 |
+| 按固定顺序加载 14 个模块：`ip_tables`、`iptable_filter`、`iptable_nat`、`ip6_tables`、`ip6table_filter`、`ip6table_nat`、`xt_cgroup`、`xt_connmark`、`xt_conntrack`、`xt_comment`、`xt_mark`、`xt_nat`、`ipt_REJECT`、`ip6t_REJECT`（最后两个用来重置接管前建立的 TCP 连接，决策 29）。 | 不安装软件包，不下载或编译模块，不改 `.wslconfig`；除下面两个开机文件及其 enable 链接外，不改发行版持久配置。 |
 | 只看 `/lib/modules/<release>`：已加载或 `modules.builtin` 中内建的跳过；其余先用 `modprobe -n` 证明可加载，再 `modprobe`。 | 不使用 `--force`，不卸载任何模块，不重试失败项。 |
 | 对缺失的 IPv4/IPv6 `filter`、`nat` 各执行一次对应的 `iptables-legacy` / `ip6tables-legacy -t <table> -S`（只读转储），让内核注册空表。 | 不 flush、不增删规则、不碰已有表；转储内容不落日志。 |
 | 写入并启用开机配置：`/etc/modules-load.d/wsl-proxy.conf`（只列本次证明可用的模块，直接覆盖同名旧文件、不留备份；早期版本会留 `.bak-*` 备份，不会自动清理）和 `/etc/systemd/system/wsl-proxy-tables.service`（oneshot，开机执行同样四条 `-S` 查询、标准输出/错误丢弃）。 | 不写常驻服务、代理、凭据或计划任务；unit 失败不会让目标发行版进入 degraded，预检会重新报缺少能力。 |
