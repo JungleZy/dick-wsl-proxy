@@ -737,17 +737,22 @@ fn a_direct_answer_the_whitelist_would_refuse_is_asked_through_the_chain() {
         &message,
         &negative(&wire, 3, 300, 300)
     ));
-    // Whether SERVFAIL and REFUSED fall back is an open decision; for now
-    // they pass on as before.
-    assert!(direct_answer_usable(
-        &message,
-        &negative(&wire, 2, 300, 300)
-    ));
+    // SERVFAIL and REFUSED fall back too (decision 18), for any query type.
+    for rcode in [2, 5] {
+        assert!(!direct_answer_usable(
+            &message,
+            &negative(&wire, rcode, 300, 300)
+        ));
+    }
     let aaaa = typed("allowed.example", 28);
     let aaaa_message = Message::query(&aaaa).unwrap();
     assert!(direct_answer_usable(
         &aaaa_message,
         &negative(&aaaa, 0, 300, 300)
+    ));
+    assert!(!direct_answer_usable(
+        &aaaa_message,
+        &negative(&aaaa, 2, 300, 300)
     ));
 }
 

@@ -384,15 +384,18 @@ pub(super) fn finish_answer(
     Ok(wire)
 }
 
-/// Whether a direct (domestic) upstream's answer can be handed on as is. One
-/// that does not match the question, or a whitelisted A answer that
-/// `finish_answer` would refuse, is asked again through the chain instead of
-/// leaving the guest without a reply (decision 18). Error codes pass: whether
-/// SERVFAIL or REFUSED should fall back too is an open decision.
+/// Whether a direct (domestic) upstream's answer can be handed on as is
+/// (decision 18). One that does not match the question, SERVFAIL or REFUSED
+/// (the upstream failing or rate limiting, much like not answering), or a
+/// whitelisted A answer that `finish_answer` would refuse, is asked again
+/// through the chain instead. NXDOMAIN is an authoritative answer and passes.
 pub(super) fn direct_answer_usable(query: &Message, answer: &[u8]) -> bool {
     let Ok(response) = Message::response(answer, query) else {
         return false;
     };
+    if matches!(response.flags & 15, 2 | 5) {
+        return false;
+    }
     if query.question.kind != 1
         || query.dnssec
         || response.flags & 0x0200 != 0
