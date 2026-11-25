@@ -21,6 +21,7 @@ mod state;
 mod theme;
 mod timezones;
 mod tray;
+mod update;
 mod views;
 
 use state::Desktop;

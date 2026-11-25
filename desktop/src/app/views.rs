@@ -75,7 +75,7 @@ pub(crate) fn card(title: &'static str, caption: &'static str, body: impl IntoEl
 }
 
 /// 「刚刚检查」「3 分钟前检测」这类相对时间。
-fn elapsed_label(at: std::time::Instant, verb: &str) -> String {
+pub(crate) fn elapsed_label(at: std::time::Instant, verb: &str) -> String {
     let seconds = at.elapsed().as_secs();
     if seconds < 5 {
         format!("刚刚{verb}")
@@ -452,6 +452,7 @@ impl Desktop {
             .children(self.health_icons())
             .child(self.status_observations())
             .child(div().flex_1())
+            .children(self.update_chip(cx))
             .child(
                 div()
                     .font_family(MONO_FONT)
@@ -2472,7 +2473,26 @@ impl Desktop {
                 &["WSL", "wsl.exe", "内核", "升级", "版本"],
                 |this, cx| this.wsl_platform_body(cx),
             )));
-        let about = self.about_page();
+        let auto_update = self.updater.auto;
+        let auto_update_view = view.clone();
+        let about = self.about_page().group(
+            SettingGroup::new()
+                .title("更新")
+                .description("自动检查时，打开程序 15 秒后查一次 GitHub 上的新版本，之后每天一次；配置了宿主 SOCKS5 就经它查，连不上再直连。每次检查都会让 GitHub 看到出口 IP。")
+                .item(setting_row("自动检查更新", move |_| {
+                    let view = auto_update_view.clone();
+                    Checkbox::new("settings-auto-update")
+                        .checked(auto_update)
+                        .on_click(move |checked: &bool, _, cx: &mut App| {
+                            view.update(cx, |this, cx| this.set_auto_update(*checked, cx));
+                        })
+                }))
+                .item(view_item(
+                    &view,
+                    &["更新", "升级", "新版本", "检查更新"],
+                    |this, cx| this.update_panel(cx),
+                )),
+        );
         let settings = Settings::new("settings")
             .sidebar_width(px(180.))
             .sidebar_size_range(px(160.)..px(240.))

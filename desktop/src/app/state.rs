@@ -145,6 +145,8 @@ pub(crate) struct Desktop {
     /// 不是错误、但用户需要看到的结果（UDP 已阻断、目标已自动清除等），由 tick 弹成通知。
     /// 全局错误条只显示错误，没有它这些话只写进 `notice`，哪里都看不到。
     pub(crate) reminder: Option<Reminder>,
+    /// 检查更新与一键升级，见 [`super::update`]。
+    pub(crate) updater: super::update::Updater,
 }
 
 /// 一条待弹出的提醒。`warning` 的要用户自己关掉；其余几秒后自动消失。

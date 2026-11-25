@@ -311,6 +311,7 @@ impl Desktop {
             residential_probe_checking: false,
             save_notice: None,
             reminder: None,
+            updater: super::update::Updater::new(),
         };
         this.send(Kind::Bootstrap, Value::Null, cx);
         cx.spawn_in(window, async move |view, cx| {
@@ -722,6 +723,7 @@ impl Desktop {
 
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_environment_progress(cx);
+        self.update_tick(window, cx);
         while let Ok(reply) = self.replies.try_recv() {
             self.handle_reply(reply, window, cx);
         }
