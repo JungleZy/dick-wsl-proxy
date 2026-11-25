@@ -1580,6 +1580,9 @@ impl Desktop {
                     .id(("environment-row", index))
                     .role(Role::Button)
                     .aria_label("查看环境详情")
+                    // `tab_stop` 只是一个标记：元素可聚焦（有焦点句柄）才进 Tab 顺序。
+                    // 没有 `focusable()` 时键盘到不了这一行，也就打不开详情。
+                    .focusable()
                     .tab_stop(true)
                     .focus_visible(|style| style.border_1().border_color(rgb(ACCENT)))
                     .on_click(cx.listener(move |this, _, window, cx| {
