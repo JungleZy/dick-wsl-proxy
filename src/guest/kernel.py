@@ -400,6 +400,7 @@ def artifacts(p):
 def m2_artifacts(p):
     cookie = f"{p['cookie']:08x}"
     chain, guard_chain = "WPM2_" + cookie, "WPM2G_" + cookie
+    bridge_chain, forward_chain, forward_bridges = "WPM2B_" + cookie, "WPM2F_" + cookie, "WPM2FB_" + cookie
     digest = plan_digest(p)[:16]
     tag = "wsl-proxyctl-m2:" + cookie + ":" + digest
     comment = ["-m", "comment", "--comment", tag]
@@ -425,6 +426,10 @@ def m2_artifacts(p):
         ["-A", chain, "-m", "connmark", "--mark", "0x0", *comment, "-j", "CONNMARK", "--set-xmark", mark + "/0xffffffff"],
         ["-A", chain, "-p", "tcp", "-m", "connmark", "--mark", mark, *comment, "-j", "DNAT", "--to-destination", p["ingress"]],
         ["-A", chain, "-p", "udp", "-m", "connmark", "--mark", mark, *comment, "-j", "DNAT", "--to-destination", p["ingress"]],
+        # Per-network rules for the target's own container bridges go in
+        # front of this; anything else (other distributions' containers in
+        # the shared network stack) returns untouched (decision 24).
+        ["-A", bridge_chain, *comment, "-j", "RETURN"],
     ])
     for protocol in ("tcp", "udp"):
         hooks.append(["-A", "OUTPUT", "-s", p["guest"] + "/32", "!", "-d", "127.0.0.0/8", "-p", protocol, *local, *fresh, *comment, "-j", chain])
@@ -433,11 +438,13 @@ def m2_artifacts(p):
         # eligible, and its return address is always translated to this guest.
         dns = ["-p", protocol, "-m", protocol, "--dport", "53"]
         hooks.append(["-A", "OUTPUT", "-d", p["system_dns"] + "/32", *dns, *local, *fresh, *comment, "-j", chain])
-        # Forwarded bridge traffic has no local cgroup socket. Match only
-        # packets arriving from non-WSL-host interfaces, then SNAT them back
-        # to the guest address so the Windows ingress can use the same
-        # authenticated reply tuple as local workload traffic.
-        hooks.append(["-A", "PREROUTING", "!", "-i", "eth0", "-p", protocol, "-m", protocol, *fresh, *comment, "-j", chain])
+        # Forwarded container traffic has no local cgroup socket, and every
+        # standard distribution shares this network stack, so the rule alone
+        # cannot tell whose bridge a packet came from. It only enters the
+        # bridge chain; per-network rules there pick the target's own Docker
+        # networks (decision 24). Redirected packets are SNATed back to the
+        # guest address so the ingress can use the same reply tuple.
+        hooks.append(["-A", "PREROUTING", "!", "-i", "eth0", "-p", protocol, "-m", protocol, *fresh, *comment, "-j", bridge_chain])
         hooks.append(["-A", "POSTROUTING", "-d", ingress + "/32", "-p", protocol, "-m", protocol, "--dport", str(ingress_port), "-m", "conntrack", "--ctdir", "ORIGINAL", "--ctstate", "DNAT", "-m", "connmark", "--mark", mark, *comment, "-j", "SNAT", "--to-source", p["guest"]])
     guards = [
         ["-A", "OUTPUT", *local, "-m", "conntrack", "!", "--ctorigdst", "127.0.0.0/8", *comment, "-j", guard_chain],
@@ -447,10 +454,7 @@ def m2_artifacts(p):
         # falls through to the final DROP. A RETURN here would leave the guest
         # through Windows NAT and expose the host's own public address.
     ]
-    for protocol in ("tcp", "udp"):
-        guards.append(["-A", "FORWARD", "-p", protocol, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-m", "connmark", "--mark", mark, *comment, "-j", "RETURN"])
-        guards.append(["-A", "FORWARD", "-d", ingress + "/32", "-p", protocol, "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "-m", "connmark", "--mark", mark, *comment, "-j", "RETURN"])
-    guards.append(["-A", "FORWARD", *comment, "-j", "DROP"])
+    guards.extend(forward_gate(forward_chain, forward_bridges, comment, mark, ingress + "/32"))
     for dns_only in (False, True):
         for protocol in ("tcp", "udp"):
             # In xt_conntrack DNAT is a virtual state, not a --ctstatus value.
@@ -474,6 +478,7 @@ def ipv6_artifacts(p):
     ingress, ingress_port = endpoint6(p["ipv6"]["ingress"])
     cookie = f"{p['cookie']:08x}"
     chain, guard_chain = "WPM2V_" + cookie, "WPM2VG_" + cookie
+    bridge_chain, forward_chain, forward_bridges = "WPM2VB_" + cookie, "WPM2VF_" + cookie, "WPM2VFB_" + cookie
     digest = plan_digest(p)[:16]
     tag = "wsl-proxyctl-m2v6:" + cookie + ":" + digest
     comment = ["-m", "comment", "--comment", tag]
@@ -489,10 +494,11 @@ def ipv6_artifacts(p):
         ["-A", chain, "-m", "connmark", "--mark", "0x0", *comment, "-j", "CONNMARK", "--set-xmark", mark + "/0xffffffff"],
         ["-A", chain, "-p", "tcp", "-m", "connmark", "--mark", mark, *comment, "-j", "DNAT", "--to-destination", f"[{ingress}]:{ingress_port}"],
         ["-A", chain, "-p", "udp", "-m", "connmark", "--mark", mark, *comment, "-j", "DNAT", "--to-destination", f"[{ingress}]:{ingress_port}"],
+        ["-A", bridge_chain, *comment, "-j", "RETURN"],
     ])
     for protocol in ("tcp", "udp"):
         hooks.append(["-A", "OUTPUT", "-s", guest + "/128", "!", "-d", "::1/128", "-p", protocol, *local, *fresh, *comment, "-j", chain])
-        hooks.append(["-A", "PREROUTING", "!", "-i", "eth0", "-p", protocol, "-m", protocol, *fresh, *comment, "-j", chain])
+        hooks.append(["-A", "PREROUTING", "!", "-i", "eth0", "-p", protocol, "-m", protocol, *fresh, *comment, "-j", bridge_chain])
         hooks.append(["-A", "POSTROUTING", "-d", ingress + "/128", "-p", protocol, "-m", protocol, "--dport", str(ingress_port), "-m", "conntrack", "--ctdir", "ORIGINAL", "--ctstate", "DNAT", "-m", "connmark", "--mark", mark, *comment, "-j", "SNAT", "--to-source", guest])
     guards = [
         ["-A", "OUTPUT", *local, "-m", "conntrack", "!", "--ctorigdst", "::1/128", *comment, "-j", guard_chain],
@@ -502,9 +508,7 @@ def ipv6_artifacts(p):
     for protocol in ("tcp", "udp"):
         guards.append(["-A", guard_chain, "-s", guest + "/128", "-p", protocol, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL", "--ctorigsrc", guest, *comment, "-j", "RETURN"])
         guards.append(["-A", guard_chain, "-s", guest + "/128", "-d", ingress + "/128", "-p", protocol, "-m", protocol, "--dport", str(ingress_port), "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "--ctorigsrc", guest, "-m", "connmark", "--mark", mark, *comment, "-j", "RETURN"])
-        guards.append(["-A", "FORWARD", "-p", protocol, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-m", "connmark", "--mark", mark, *comment, "-j", "RETURN"])
-        guards.append(["-A", "FORWARD", "-d", ingress + "/128", "-p", protocol, "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "-m", "connmark", "--mark", mark, *comment, "-j", "RETURN"])
-    guards.append(["-A", "FORWARD", *comment, "-j", "DROP"])
+    guards.extend(forward_gate(forward_chain, forward_bridges, comment, mark, ingress + "/128"))
     guards.append(["-A", guard_chain, *comment, "-j", "DROP"])
     return chain, guard_chain, tag, hooks, body, guards
 
@@ -514,15 +518,88 @@ def ipv6_guards(p):
         return ipv6_artifacts(p)[5]
     if p.get("system_dns") is None:
         return []
+    cookie = f"{p['cookie']:08x}"
     comment = ["-m", "comment", "--comment", artifacts(p)[1]]
     base = ["-A", "OUTPUT", "-m", "cgroup", "--path", "/"]
-    # Without an IPv6 plan, drop forwarded namespaces and local external
-    # traffic so container IPv6 cannot silently bypass the managed policy.
+    # Without an IPv6 plan, drop local external traffic, and the forwarded
+    # IPv6 of the target's own container networks (decision 24), so neither
+    # can bypass the managed policy. Other bridges are left alone.
     return [
         [*base, "-m", "conntrack", "--ctdir", "ORIGINAL", "!", "--ctorigdst", "::1/128", *comment, "-j", "DROP"],
         [*base, "!", "-d", "::1/128", "-m", "conntrack", "--ctstate", "INVALID,UNTRACKED", *comment, "-j", "DROP"],
-        ["-A", "FORWARD", *comment, "-j", "DROP"],
+        *forward_gate("WPM2VF_" + cookie, "WPM2VFB_" + cookie, comment),
     ]
+
+
+def forward_gate(forward_chain, forward_bridges, comment, mark=None, ingress=None):
+    """The FORWARD hook and its chains. Replies to connections opened from
+    elsewhere pass; this instance's redirected flows are accepted; then the
+    per-network rules for the target's own container bridges (in
+    `forward_bridges`) drop what those containers send that was not
+    redirected. Everything else returns untouched (decision 24)."""
+    rules = [
+        ["-A", "FORWARD", *comment, "-j", forward_chain],
+        ["-A", forward_chain, "-m", "conntrack", "--ctdir", "REPLY", *comment, "-j", "RETURN"],
+    ]
+    if mark is not None:
+        for protocol in ("tcp", "udp"):
+            rules.append(["-A", forward_chain, "-p", protocol, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-m", "connmark", "--mark", mark, *comment, "-j", "ACCEPT"])
+            rules.append(["-A", forward_chain, "-d", ingress, "-p", protocol, "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "-m", "connmark", "--mark", mark, *comment, "-j", "ACCEPT"])
+    rules.extend([
+        ["-A", forward_chain, *comment, "-j", forward_bridges],
+        ["-A", forward_chain, *comment, "-j", "RETURN"],
+        ["-A", forward_bridges, *comment, "-j", "RETURN"],
+    ])
+    return rules
+
+
+def instance_chains(p, ipv6=False):
+    """Every chain this instance owns in one address family, with its table,
+    in creation order."""
+    cookie = f"{p['cookie']:08x}"
+    if p.get("system_dns") is None:
+        return {} if ipv6 else {"WPM1_" + cookie: "nat"}
+    if not ipv6:
+        names = (("WPM2_", "nat"), ("WPM2B_", "nat"), ("WPM2G_", "filter"), ("WPM2F_", "filter"), ("WPM2FB_", "filter"))
+    elif p.get("ipv6") is not None:
+        names = (("WPM2V_", "nat"), ("WPM2VB_", "nat"), ("WPM2VG_", "filter"), ("WPM2VF_", "filter"), ("WPM2VFB_", "filter"))
+    else:
+        names = (("WPM2VF_", "filter"), ("WPM2VFB_", "filter"))
+    return {prefix + cookie: table for prefix, table in names}
+
+
+def all_instance_chains(cookie):
+    """Chain names any mode of this instance could own; finding one where it
+    does not belong is a collision."""
+    prefixes = ("WPM1_", "WPM2_", "WPM2B_", "WPM2G_", "WPM2F_", "WPM2FB_", "WPM2V_", "WPM2VB_", "WPM2VG_", "WPM2VF_", "WPM2VFB_")
+    return {prefix + cookie for prefix in prefixes}
+
+
+def legacy_rules(p, ipv6=False):
+    """Rules an older version installed for this plan in place of today's
+    bridge and FORWARD hooks: PREROUTING ! -i eth0 straight into the redirect
+    chain, and accepts plus a global drop on FORWARD. Recognised only so that
+    a stop can remove them; they never count as complete (decision 24)."""
+    if p.get("system_dns") is None:
+        return []
+    mark = f"0x{p['cookie']:x}"
+    fresh = ["-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL"]
+    if not ipv6:
+        chain, tag = artifacts(p)[0], artifacts(p)[1]
+        ingress = endpoint(p["ingress"])[0] + "/32"
+    elif p.get("ipv6") is not None:
+        chain, _, tag, _, _, _ = ipv6_artifacts(p)
+        ingress = endpoint6(p["ipv6"]["ingress"])[0] + "/128"
+    else:
+        return [["-A", "FORWARD", "-m", "comment", "--comment", artifacts(p)[1], "-j", "DROP"]]
+    comment = ["-m", "comment", "--comment", tag]
+    rules = []
+    for protocol in ("tcp", "udp"):
+        rules.append(["-A", "PREROUTING", "!", "-i", "eth0", "-p", protocol, "-m", protocol, *fresh, *comment, "-j", chain])
+        rules.append(["-A", "FORWARD", "-p", protocol, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-m", "connmark", "--mark", mark, *comment, "-j", "RETURN"])
+        rules.append(["-A", "FORWARD", "-d", ingress, "-p", protocol, "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "-m", "connmark", "--mark", mark, *comment, "-j", "RETURN"])
+    rules.append(["-A", "FORWARD", *comment, "-j", "DROP"])
+    return rules
 
 
 def firewall(ipv6=False):
@@ -616,18 +693,16 @@ def inspect_firewall(p, tables, existing, ipv6=False):
         v6_chain, v6_guard, tag, hooks, body, guards = ipv6_artifacts(p)
         chain = v6_chain
     cookie = f"{p['cookie']:08x}"
-    reserved = {"WPM1_" + cookie, "WPM2_" + cookie, "WPM2G_" + cookie}
-    if ipv6 and p.get("ipv6") is not None:
-        reserved.update({v6_chain, v6_guard})
-        chains = {v6_chain: "nat", v6_guard: "filter"}
-    else:
-        chains = {} if ipv6 else {chain: "nat"}
-    if not ipv6 and p.get("system_dns") is not None:
-        chains["WPM2G_" + cookie] = "filter"
+    reserved = all_instance_chains(cookie)
+    chains = instance_chains(p, ipv6)
     expected = {
         "nat": [rule_key(rule) for rule in hooks + body] if (not ipv6 or p.get("ipv6") is not None) else [],
         "filter": [rule_key(rule) for rule in (ipv6_guards(p) if ipv6 else guards)],
     }
+    # An older version's hooks are this instance's too, for removal only;
+    # `rules_complete` still compares against today's exact set.
+    for rule in legacy_rules(p, ipv6):
+        expected["nat" if rule[1] == "PREROUTING" else "filter"].append(rule_key(rule))
     found = {"nat": [], "filter": []}
     seen = {"nat": set(), "filter": set()}
     observed_chains = set()
@@ -691,39 +766,36 @@ def transaction(table, lines, test=False, ipv6=False):
 def install_rules(p, test=False):
     chain, _, hooks, body, guards = artifacts(p)
     insert = lambda rule: ["-I", rule[1], "1", *rule[2:]]
+    builtin = ("PREROUTING", "INPUT", "FORWARD", "OUTPUT", "POSTROUTING")
+
+    def lines(owned, table, rules):
+        # Own chains first, then their contents in order, then the built-in
+        # hooks in front of pre-existing rules. Each -I ... 1 reverses
+        # insertion order, so the hooks go in backwards to keep their order.
+        names = [name for name, kind in owned.items() if kind == table]
+        return [
+            *(["-N", name] for name in names),
+            *(rule for rule in rules if rule[1] not in builtin),
+            *(insert(rule) for rule in reversed([rule for rule in rules if rule[1] in builtin])),
+        ]
+
     # Guards commit before redirection. An interrupted installation denies only
     # target workload traffic; the journal can recover either partial phase.
     if p.get("system_dns") is not None:
-        guard_chain = "WPM2G_" + f"{p['cookie']:08x}"
-        forward = [rule for rule in guards if rule[1] == "FORWARD"]
-        other = [rule for rule in guards if rule[1] != "FORWARD"]
-        lines = [["-N", guard_chain], *(insert(rule) if rule[1] == "OUTPUT" else rule for rule in other)]
-        # Each -I ... 1 reverses insertion order. Add the desired forward
-        # order backwards so owned replies pass before the final drop, and
-        # place the whole gate ahead of pre-existing FORWARD accepts.
-        lines.extend(["-I", "FORWARD", "1", *rule[2:]] for rule in reversed(forward))
-        transaction("filter", lines, test)
+        transaction("filter", lines(instance_chains(p), "filter", guards), test)
+        v6_owned = instance_chains(p, ipv6=True)
         if p.get("ipv6") is not None:
-            v6_chain, v6_guard, _, v6_hooks, v6_body, v6_guards = ipv6_artifacts(p)
-            v6_forward = [rule for rule in v6_guards if rule[1] == "FORWARD"]
-            v6_other = [rule for rule in v6_guards if rule[1] != "FORWARD"]
+            _, _, _, v6_hooks, v6_body, v6_guards = ipv6_artifacts(p)
             # Like IPv4: the OUTPUT jumps go ahead of pre-existing accepts, or
             # ICMPv6 and other non-TCP/UDP packets could leave before the drop.
-            v6_lines = [["-N", v6_guard], *(insert(rule) if rule[1] == "OUTPUT" else rule for rule in v6_other)]
-            v6_lines.extend(["-I", "FORWARD", "1", *rule[2:]] for rule in reversed(v6_forward))
-            transaction("filter", v6_lines, test, ipv6=True)
-            transaction(
-                "nat",
-                [["-N", v6_chain], *v6_body, *(insert(rule) if rule[1] == "OUTPUT" else rule for rule in v6_hooks)],
-                test,
-                ipv6=True,
-            )
+            transaction("filter", lines(v6_owned, "filter", v6_guards), test, ipv6=True)
+            transaction("nat", lines(v6_owned, "nat", v6_body + v6_hooks), test, ipv6=True)
         else:
-            transaction("filter", [insert(rule) for rule in ipv6_guards(p)], test, ipv6=True)
+            transaction("filter", lines(v6_owned, "filter", ipv6_guards(p)), test, ipv6=True)
     else:
         transaction("filter", [insert(rule) for rule in guards], test)
     # -N fails on a concurrent name collision; never flush an existing chain.
-    transaction("nat", [["-N", chain], *body, *(insert(rule) for rule in hooks)], test)
+    transaction("nat", lines(instance_chains(p), "nat", body + hooks), test)
 
 
 # nfnetlink_conntrack UAPI. All CTA scalar payloads below are network-order;
@@ -1313,10 +1385,12 @@ def execute(request):
                     # Issue and validate in the guest; RPC transit can only shorten the window.
                     return {"ok": True, "operation": operation, "grant_deadline": int(time.time()) + 30}
             elif operation in ("remove", "inspect"):
-                present, rules = inspect_firewall(p, firewall(), True)
-                ipv6_rules = None
+                tables = firewall()
+                present, rules = inspect_firewall(p, tables, True)
+                ipv6_tables, ipv6_rules = None, None
                 if p.get("system_dns") is not None or p.get("ipv6") is not None:
-                    _, ipv6_rules = inspect_firewall(p, firewall(ipv6=True), True, ipv6=True)
+                    ipv6_tables = firewall(ipv6=True)
+                    _, ipv6_rules = inspect_firewall(p, ipv6_tables, True, ipv6=True)
                 # Complete both families and every owned tuple before any delete.
                 # Marked entries that cannot be proven are counted, never deleted,
                 # and do not stop the exact-tagged rules from going (decision 20);
@@ -1337,38 +1411,19 @@ def execute(request):
                     if drift is not None:
                         result["identity_error"] = drift
                     return result
-                chain = artifacts(p)[0]
-                deletions = [["-D", *rule[1:]] for rule in rules["nat"]]
-                if present:
-                    transaction("nat", [*deletions, ["-X", chain]])
-                if rules["filter"]:
-                    deletions = [["-D", *rule[1:]] for rule in rules["filter"]]
-                    if p.get("system_dns") is not None:
-                        deletions.append(["-X", "WPM2G_" + f"{p['cookie']:08x}"])
-                    transaction("filter", deletions)
-                if ipv6_rules:
-                    if p.get("ipv6") is not None:
-                        v6_chain, v6_guard, _, _, _, _ = ipv6_artifacts(p)
-                        if ipv6_rules["nat"]:
-                            transaction(
-                                "nat",
-                                [["-D", *rule[1:]] for rule in ipv6_rules["nat"]]
-                                + [["-X", v6_chain]],
-                                ipv6=True,
-                            )
-                        if ipv6_rules["filter"]:
-                            transaction(
-                                "filter",
-                                [["-D", *rule[1:]] for rule in ipv6_rules["filter"]]
-                                + [["-X", v6_guard]],
-                                ipv6=True,
-                            )
-                    elif ipv6_rules["filter"]:
-                        transaction(
-                            "filter",
-                            [["-D", *rule[1:]] for rule in ipv6_rules["filter"]],
-                            ipv6=True,
-                        )
+                def withdraw(table, found, observed, ipv6=False):
+                    # Every owned rule, then every owned chain that exists
+                    # (an older version may have created fewer chains).
+                    names = [name for name, kind in instance_chains(p, ipv6).items() if kind == table and name in observed.get(table, {}).get("chains", {})]
+                    lines = [["-D", *rule[1:]] for rule in found] + [["-X", name] for name in names]
+                    if lines:
+                        transaction(table, lines, ipv6=ipv6)
+
+                withdraw("nat", rules["nat"], tables)
+                withdraw("filter", rules["filter"], tables)
+                if ipv6_rules is not None:
+                    withdraw("nat", ipv6_rules["nat"], ipv6_tables, ipv6=True)
+                    withdraw("filter", ipv6_rules["filter"], ipv6_tables, ipv6=True)
                 # Table commits synchronize old readers before exact tuple cleanup.
                 for _ in range(4):
                     entries, ipv6_entries, unproven = mapping_partition(p, ct)

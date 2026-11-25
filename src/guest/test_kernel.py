@@ -84,28 +84,52 @@ def encoded_entry(value, include_id=True):
     return result
 
 
+def declare_chains(tables, p, ipv6=False):
+    for name, table in kernel.instance_chains(p, ipv6).items():
+        tables.setdefault(table, {"chains": {"OUTPUT": "ACCEPT"}, "rules": []})["chains"][name] = "-"
+    return tables
+
+
 def snapshot(p=None):
     p = p or plan()
     chain, _, hooks, body, guards = kernel.artifacts(p)
     tables = {
-        "nat": {"chains": {"OUTPUT": "ACCEPT", chain: "-"}, "rules": copy.deepcopy(hooks + body)},
+        "nat": {"chains": {"OUTPUT": "ACCEPT"}, "rules": copy.deepcopy(hooks + body)},
         "filter": {"chains": {"OUTPUT": "ACCEPT"}, "rules": copy.deepcopy(guards)},
     }
-    if p.get("system_dns") is not None:
-        tables["filter"]["chains"]["WPM2G_" + f"{p['cookie']:08x}"] = "-"
-    return tables
+    return declare_chains(tables, p)
 
 
 def ipv6_snapshot(p):
-    return {"filter": {"chains": {"OUTPUT": "ACCEPT"}, "rules": copy.deepcopy(kernel.ipv6_guards(p))}}
+    tables = {"filter": {"chains": {"OUTPUT": "ACCEPT"}, "rules": copy.deepcopy(kernel.ipv6_guards(p))}}
+    return declare_chains(tables, p, ipv6=True)
 
 
 def ipv6_full_snapshot(p):
     chain, guard, _, hooks, body, guards = kernel.ipv6_artifacts(p)
-    return {
-        "nat": {"chains": {"OUTPUT": "ACCEPT", chain: "-"}, "rules": copy.deepcopy(hooks + body)},
-        "filter": {"chains": {"OUTPUT": "ACCEPT", guard: "-"}, "rules": copy.deepcopy(guards)},
+    tables = {
+        "nat": {"chains": {"OUTPUT": "ACCEPT"}, "rules": copy.deepcopy(hooks + body)},
+        "filter": {"chains": {"OUTPUT": "ACCEPT"}, "rules": copy.deepcopy(guards)},
     }
+    return declare_chains(tables, p, ipv6=True)
+
+
+def legacy_snapshot(p, ipv6=False):
+    """What an older version installed: PREROUTING ! -i eth0 straight into the
+    redirect chain, and accepts plus a global drop on FORWARD."""
+    if ipv6:
+        tables = ipv6_full_snapshot(p) if p.get("ipv6") is not None else ipv6_snapshot(p)
+    else:
+        tables = snapshot(p)
+    cookie = f"{p['cookie']:08x}"
+    newer = {prefix + cookie for prefix in ("WPM2B_", "WPM2F_", "WPM2FB_", "WPM2VB_", "WPM2VF_", "WPM2VFB_")}
+    legacy = kernel.legacy_rules(p, ipv6)
+    for name, table in tables.items():
+        table["rules"] = [rule for rule in table["rules"] if rule[1] not in newer and rule[1] not in ("PREROUTING", "FORWARD")]
+        table["rules"] += [rule for rule in legacy if ("nat" if rule[1] == "PREROUTING" else "filter") == name]
+        for chain_name in newer:
+            table["chains"].pop(chain_name, None)
+    return tables
 
 
 class ValidationTests(unittest.TestCase):
@@ -640,6 +664,59 @@ class FirewallTests(unittest.TestCase):
             kernel.transaction("filter", [["-I", "OUTPUT", "!", "-d", "127.0.0.0/8", "-j", "DROP"]], test=True)
         self.assertEqual(run.call_args.args[1], "*filter\n-I OUTPUT ! -d 127.0.0.0/8 -j DROP\nCOMMIT\n")
 
+    def test_other_bridges_pass_untouched_in_every_mode(self):
+        # Decision 24: until a per-network rule names one of the target's own
+        # Docker bridges, forwarded traffic is neither redirected nor dropped.
+        managed6 = comprehensive_plan()
+        managed6["ipv6"] = {"guest": "2001:db8:1::2", "ingress": "[fe80::1%2]:43771"}
+        cases = [
+            ("WPM2B_12345678", "WPM2FB_12345678", kernel.artifacts(comprehensive_plan())),
+            ("WPM2VB_12345678", "WPM2VFB_12345678", kernel.ipv6_artifacts(managed6)[2:]),
+        ]
+        for bridge_chain, bridge_gate, parts in cases:
+            hooks, body, guards = parts[-3], parts[-2], parts[-1]
+            with self.subTest(bridge_chain=bridge_chain):
+                prerouting = [rule for rule in hooks if rule[1] == "PREROUTING"]
+                self.assertEqual(len(prerouting), 2)
+                self.assertTrue(all(rule[-1] == bridge_chain for rule in prerouting))
+                self.assertEqual([rule[-1] for rule in body if rule[1] == bridge_chain], ["RETURN"])
+                self.assertEqual([rule[-1] for rule in guards if rule[1] == bridge_gate], ["RETURN"])
+                self.assertFalse([rule for rule in guards if rule[1] == "FORWARD" and rule[-1] == "DROP"])
+        blocked = kernel.ipv6_guards(comprehensive_plan())
+        self.assertFalse([rule for rule in blocked if rule[1] == "FORWARD" and rule[-1] == "DROP"])
+        self.assertEqual([rule[-1] for rule in blocked if rule[1] == "WPM2VFB_12345678"], ["RETURN"])
+        # Replies to connections opened from elsewhere, such as published
+        # ports, pass before anything else in the gate.
+        gate = [rule for rule in kernel.artifacts(comprehensive_plan())[4] if rule[1] == "WPM2F_12345678"]
+        self.assertIn("REPLY", gate[0])
+        self.assertEqual(gate[0][-1], "RETURN")
+
+    def test_an_older_versions_rules_are_removed_but_never_complete(self):
+        for p in (comprehensive_plan(), dict(comprehensive_plan(), ipv6={"guest": "2001:db8:1::2", "ingress": "[fe80::1%2]:43771"})):
+            with self.subTest(ipv6=p.get("ipv6") is not None):
+                old, old6 = legacy_snapshot(p), legacy_snapshot(p, ipv6=True)
+                present, rules = kernel.inspect_firewall(p, old, True)
+                _, ipv6_rules = kernel.inspect_firewall(p, old6, True, ipv6=True)
+                self.assertTrue(present)
+                self.assertFalse(kernel.rules_complete(p, present, rules, ipv6_rules))
+                # Not an install target either: nothing of this instance may exist.
+                with self.assertRaises(kernel.Failure):
+                    kernel.inspect_firewall(p, old, False)
+                operation = request(p)
+                operation["operation"] = "remove"
+                with patch.object(kernel, "guest_lock"), patch.object(kernel, "grant"), patch.object(kernel, "guard"), patch.object(kernel, "Conntrack") as conntrack, patch.object(kernel, "firewall", side_effect=[old, old6, {}, {}]), patch.object(kernel, "transaction") as transact:
+                    conntrack.return_value.dump.return_value = []
+                    kernel.execute(operation)
+                lines = [line for call in transact.call_args_list for line in call.args[1]]
+                self.assertTrue(all(line[0] in ("-D", "-X") for line in lines))
+                removed = {line[1] for line in lines if line[0] == "-X"}
+                expected = {"WPM2_12345678", "WPM2G_12345678"}
+                if p.get("ipv6") is not None:
+                    expected |= {"WPM2V_12345678", "WPM2VG_12345678"}
+                self.assertEqual(removed, expected)
+                deleted = sum(1 for line in lines if line[0] == "-D")
+                self.assertEqual(deleted, sum(len(table["rules"]) for tables in (old, old6) for table in tables.values()))
+
     def test_ipv6_artifacts_include_nat_and_forward_gate(self):
         p = comprehensive_plan()
         p["ipv6"] = {
@@ -651,7 +728,10 @@ class FirewallTests(unittest.TestCase):
         self.assertTrue(guard.startswith("WPM2VG_"))
         self.assertTrue(any(rule[1] == "PREROUTING" for rule in hooks))
         self.assertTrue(any("DNAT" in rule for rule in body))
-        self.assertTrue(any(rule[1] == "FORWARD" and rule[-1] == "DROP" for rule in guards))
+        # Forwarded traffic goes through the gate chain; nothing on the
+        # built-in FORWARD chain drops by itself (decision 24).
+        self.assertEqual([rule[-1] for rule in guards if rule[1] == "FORWARD"], ["WPM2VF_12345678"])
+        self.assertEqual([rule[-1] for rule in guards if rule[1] == "WPM2VFB_12345678"], ["RETURN"])
         for rule in hooks + body + guards:
             kernel.rule_key(rule)
 
@@ -807,10 +887,10 @@ class FirewallTests(unittest.TestCase):
             all(
                 "--ctorigsrc" in rule or ("--ctorigdst" in rule and "--ctorigdstport" in rule)
                 for rule in established
-                if rule[1] != "FORWARD"
+                if rule[1] != "WPM2F_12345678"
             )
         )
-        self.assertTrue(any(rule[1] == "FORWARD" and rule[-1] == "RETURN" for rule in established))
+        self.assertTrue(any(rule[1] == "WPM2F_12345678" and rule[-1] == "ACCEPT" for rule in established))
         snat = [rule for rule in hooks if "SNAT" in rule]
         self.assertEqual(len(snat), 2)
         for rule in snat:
@@ -864,7 +944,7 @@ class FirewallTests(unittest.TestCase):
         kernel.inspect_firewall(p, ipv6, True, ipv6=True)
         output_guards = [rule for rule in guards if rule[1] == "OUTPUT"]
         self.assertTrue(all("::1/128" in rule and "cgroup" in rule for rule in output_guards))
-        self.assertTrue(any(rule[1] == "FORWARD" and rule[-1] == "DROP" for rule in guards))
+        self.assertEqual([rule[-1] for rule in guards if rule[1] == "FORWARD"], ["WPM2VF_12345678"])
         ipv6["filter"]["rules"][0].remove("!")
         with self.assertRaises(kernel.Failure):
             kernel.inspect_firewall(p, ipv6, True, ipv6=True)
@@ -881,7 +961,7 @@ class FirewallTests(unittest.TestCase):
             kernel.execute(operation)
         guard.assert_called_once_with(p, check_resolver=False, write_tools=True)
         ipv4, ipv6 = transact.call_args_list
-        self.assertEqual(ipv4.args[1][-1], ["-X", "WPM2G_12345678"])
+        self.assertEqual({line[1] for line in ipv4.args[1] if line[0] == "-X"}, {"WPM2G_12345678", "WPM2F_12345678", "WPM2FB_12345678"})
         self.assertTrue(ipv6.kwargs["ipv6"])
         self.assertTrue(all(rule[0] in ("-D", "-X") for call in transact.call_args_list for rule in call.args[1]))
 
@@ -1038,7 +1118,7 @@ class InspectionTests(unittest.TestCase):
         value = self.observe(p, [snapshot(p), ipv6_full_snapshot(p)])
         self.assertTrue(value["rules_complete"])
         partial = ipv6_full_snapshot(p)
-        partial["nat"]["rules"].pop()
+        partial["nat"]["rules"].pop(0)  # one hook missing
         value = self.observe(p, [snapshot(p), partial])
         self.assertFalse(value["rules_complete"])
 
@@ -1071,9 +1151,10 @@ class InspectionTests(unittest.TestCase):
             self.assertEqual(rule[-1], "RETURN")
             # Before marking, so such packets are never marked or redirected.
             self.assertLess(body.index(rule), next(i for i, r in enumerate(body) if "CONNMARK" in r))
-        # Left unmarked, they meet the final FORWARD drop.
-        forward = [rule for rule in guards if rule[1] == "FORWARD"]
-        self.assertEqual(forward[-1][-1], "DROP")
+        # Left unmarked, the target's own containers meet the per-network
+        # drop in the bridge gate (decision 24); FORWARD only enters the gate.
+        self.assertEqual([rule[-1] for rule in guards if rule[1] == "FORWARD"], ["WPM2F_12345678"])
+        self.assertIn("WPM2FB_12345678", [rule[-1] for rule in guards if rule[1] == "WPM2F_12345678"])
         # The installed shape is still recognized as this instance's own.
         kernel.inspect_firewall(p, snapshot(p), True)
 
