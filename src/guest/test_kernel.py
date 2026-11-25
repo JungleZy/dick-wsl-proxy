@@ -824,6 +824,29 @@ class FirewallTests(unittest.TestCase):
         self.assertTrue(ipv6_guard.kwargs["ipv6"])
         self.assertEqual(nat.args[0], "nat")
 
+    def test_managed_ipv6_guards_go_ahead_of_existing_output_accepts(self):
+        # A pre-existing ACCEPT ahead of an appended jump would let ICMPv6 and
+        # other non-TCP/UDP packets leave before the guard's final DROP.
+        p = comprehensive_plan()
+        p["ipv6"] = {"guest": "2001:db8:1::2", "ingress": "[fe80::1%2]:43771"}
+        _, v6_guard, _, _, _, _ = kernel.ipv6_artifacts(p)
+        with patch.object(kernel, "transaction") as transact:
+            kernel.install_rules(p, test=True)
+        filters = [call.args[1] for call in transact.call_args_list if call.args[0] == "filter"]
+        self.assertEqual(len(filters), 2)
+        for lines in filters:
+            output = [line for line in lines if "OUTPUT" in line[:2]]
+            self.assertTrue(output)
+            self.assertTrue(all(line[:3] == ["-I", "OUTPUT", "1"] for line in output))
+        v6_filter = next(
+            call.args[1]
+            for call in transact.call_args_list
+            if call.args[0] == "filter" and call.kwargs.get("ipv6")
+        )
+        self.assertEqual(v6_filter[0], ["-N", v6_guard])
+        self.assertTrue(any(line[:2] == ["-A", v6_guard] for line in v6_filter))
+        self.assertTrue(all(line[:3] == ["-I", "FORWARD", "1"] for line in v6_filter if "FORWARD" in line[:2]))
+
     def test_comprehensive_partial_recovery_requires_exact_ipv4_and_ipv6_shapes(self):
         p = comprehensive_plan()
         tables = self.snapshot(p)

@@ -700,7 +700,9 @@ def install_rules(p, test=False):
             v6_chain, v6_guard, _, v6_hooks, v6_body, v6_guards = ipv6_artifacts(p)
             v6_forward = [rule for rule in v6_guards if rule[1] == "FORWARD"]
             v6_other = [rule for rule in v6_guards if rule[1] != "FORWARD"]
-            v6_lines = [["-N", v6_guard], *v6_other]
+            # Like IPv4: the OUTPUT jumps go ahead of pre-existing accepts, or
+            # ICMPv6 and other non-TCP/UDP packets could leave before the drop.
+            v6_lines = [["-N", v6_guard], *(insert(rule) if rule[1] == "OUTPUT" else rule for rule in v6_other)]
             v6_lines.extend(["-I", "FORWARD", "1", *rule[2:]] for rule in reversed(v6_forward))
             transaction("filter", v6_lines, test, ipv6=True)
             transaction(
