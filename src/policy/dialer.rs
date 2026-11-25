@@ -63,9 +63,15 @@ const BURST_WINDOW: Duration = Duration::from_secs(3);
 /// A pooled tunnel is closed after at most this long unused. Proxies drop
 /// sessions that stay quiet after authentication on their own schedule, so
 /// the limit shrinks to 80% of the shortest idle time at which the chain
-/// was seen to close one, but never below `MIN_POOL_IDLE`.
+/// was seen to close one, but never below `MIN_POOL_IDLE`. Only a tunnel
+/// found closed while it sat in the pool counts (decision 30).
 const POOL_IDLE: Duration = Duration::from_secs(20);
 const MIN_POOL_IDLE: Duration = Duration::from_secs(2);
+/// A learned idle limit returns to `POOL_IDLE` once this long has passed
+/// without another tunnel closing while pooled: a one-off batch close (the
+/// first hop restarting) must not shorten every later tunnel's life for the
+/// rest of the takeover (decision 30).
+const IDLE_RECOVERY: Duration = Duration::from_secs(600);
 /// How long a pipelined CONNECT waits for its first reply byte while
 /// pipelining has not yet worked on this takeover (decision 22). A proxy
 /// that drops the CONNECT read with the credentials and hangs would
@@ -95,10 +101,42 @@ impl Setup {
     }
 }
 
+/// How a CONNECT on a pooled tunnel failed.
+enum PooledFailure {
+    /// The tunnel could not even take the request: it closed while pooled.
+    Closed,
+    /// Sent, then no reply byte before the deadline, or the tunnel closed
+    /// first. A slow or unreachable target, or a proxy that closes on a
+    /// CONNECT it cannot complete, looks the same as a tunnel the chain had
+    /// closed, so this teaches the idle limit nothing (decision 30).
+    Unanswered,
+    /// The proxy answered: refused, or with a malformed reply.
+    Failed(String),
+}
+
 struct Pooled {
     id: u64,
     stream: TcpStream,
     since: Instant,
+}
+
+/// The idle limit and when a tunnel last closed while pooled.
+struct IdleLimit {
+    limit: Duration,
+    last_close: Option<Instant>,
+}
+
+impl IdleLimit {
+    /// Back to `POOL_IDLE` once `IDLE_RECOVERY` passed without a close.
+    fn recover(&mut self, now: Instant) {
+        if self
+            .last_close
+            .is_some_and(|at| now.saturating_duration_since(at) >= IDLE_RECOVERY)
+        {
+            self.limit = POOL_IDLE;
+            self.last_close = None;
+        }
+    }
 }
 
 pub(super) struct Dialer {
@@ -124,8 +162,8 @@ pub(super) struct Dialer {
     /// When chains were asked for recently, oldest first.
     demand: Mutex<VecDeque<Instant>>,
     closed: AtomicBool,
-    /// The current idle limit in milliseconds; see `POOL_IDLE`.
-    idle_limit_ms: AtomicU64,
+    /// The current idle limit; see `POOL_IDLE`.
+    idle_limit: Mutex<IdleLimit>,
     stats: Stats,
 }
 
@@ -138,8 +176,10 @@ struct Stats {
     by_name: AtomicU64,
     /// Pooled tunnels found closed, talking or too old when taken.
     discarded: AtomicU64,
-    /// Pooled tunnels that broke on their CONNECT.
+    /// Pooled tunnels found closed when their CONNECT was sent.
     stale_on_connect: AtomicU64,
+    /// Pooled tunnels whose CONNECT went unanswered; a fresh chain followed.
+    unanswered_on_connect: AtomicU64,
     /// Fresh chains asked again step by step because a pipelined CONNECT
     /// went unanswered before pipelining had ever worked.
     unanswered_retries: AtomicU64,
@@ -179,7 +219,10 @@ impl Dialer {
             in_flight: AtomicUsize::new(0),
             demand: Mutex::new(VecDeque::new()),
             closed: AtomicBool::new(false),
-            idle_limit_ms: AtomicU64::new(POOL_IDLE.as_millis() as u64),
+            idle_limit: Mutex::new(IdleLimit {
+                limit: POOL_IDLE,
+                last_close: None,
+            }),
             stats: Stats::default(),
         }
     }
@@ -208,12 +251,13 @@ impl Dialer {
                 .map(|gap| gap.as_secs())
                 .collect::<Vec<_>>(),
             "pipelined": self.pipeline.load(Ordering::Relaxed),
-            "idle_limit_ms": self.idle_limit_ms.load(Ordering::Relaxed),
+            "idle_limit_ms": u64::try_from(self.idle_limit().as_millis()).unwrap_or(u64::MAX),
             "hits": count(&self.stats.hits),
             "fresh": count(&self.stats.fresh),
             "by_name": count(&self.stats.by_name),
             "discarded": count(&self.stats.discarded),
             "stale_on_connect": count(&self.stats.stale_on_connect),
+            "unanswered_on_connect": count(&self.stats.unanswered_on_connect),
             "unanswered_retries": count(&self.stats.unanswered_retries),
             "prepared": count(&self.stats.prepared),
             "prepare_failures": count(&self.stats.prepare_failures),
@@ -246,11 +290,18 @@ impl Dialer {
                     self.stats.hits.fetch_add(1, Ordering::Relaxed);
                     return finish(stream);
                 }
-                Err(Setup::Failed(message) | Setup::Unanswered(message)) => return Err(message),
+                Err(PooledFailure::Failed(message)) => return Err(message),
                 // The tunnel went stale while pooled: build a fresh chain.
-                Err(Setup::Incompatible(_)) => {
+                Err(PooledFailure::Closed) => {
                     self.stats.stale_on_connect.fetch_add(1, Ordering::Relaxed);
                     self.closed_after(idle);
+                }
+                // Maybe the target, maybe the tunnel: try a fresh chain, but
+                // learn nothing from it.
+                Err(PooledFailure::Unanswered) => {
+                    self.stats
+                        .unanswered_on_connect
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -324,17 +375,26 @@ impl Dialer {
     }
 
     fn idle_limit(&self) -> Duration {
-        Duration::from_millis(self.idle_limit_ms.load(Ordering::Relaxed))
+        self.idle_limit_at(Instant::now())
     }
 
-    /// The chain closed a tunnel that had been idle for `idle`: keep later
-    /// tunnels well inside that.
+    fn idle_limit_at(&self, now: Instant) -> Duration {
+        let mut idle = self.idle_limit.lock().unwrap_or_else(|e| e.into_inner());
+        idle.recover(now);
+        idle.limit
+    }
+
+    /// The chain closed a tunnel that had been idle for `idle` while it sat
+    /// in the pool: keep later tunnels well inside that.
     fn closed_after(&self, idle: Duration) {
-        let limit = (idle.mul_f64(0.8)).max(MIN_POOL_IDLE);
-        self.idle_limit_ms.fetch_min(
-            u64::try_from(limit.as_millis()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
+        self.closed_after_at(idle, Instant::now());
+    }
+
+    fn closed_after_at(&self, idle: Duration, now: Instant) {
+        let mut learned = self.idle_limit.lock().unwrap_or_else(|e| e.into_inner());
+        learned.recover(now);
+        learned.limit = learned.limit.min(idle.mul_f64(0.8).max(MIN_POOL_IDLE));
+        learned.last_close = Some(now);
     }
 
     /// Starts background dials until pooled plus in-flight tunnels reach the
@@ -664,23 +724,26 @@ fn authenticate(
     .map_err(Setup::Failed)
 }
 
-/// CONNECT on a pooled, already authenticated tunnel. A tunnel that closes
-/// before any reply went stale while pooled; a reply that refuses is final.
+/// CONNECT on a pooled, already authenticated tunnel. A tunnel that cannot
+/// take the request closed while pooled; one that takes it and then gives
+/// no reply is unanswered; a reply that refuses is final.
 fn pooled_connect(
     stream: &mut TcpStream,
     target: &ChainTarget,
     deadline: Instant,
-) -> Result<(), Setup> {
-    let request = target_request(target).map_err(Setup::Failed)?;
+) -> Result<(), PooledFailure> {
+    let request = target_request(target).map_err(PooledFailure::Failed)?;
     if send(stream, &request, deadline).is_err() {
-        return Err(Setup::Incompatible("pooled tunnel closed".into()));
+        return Err(PooledFailure::Closed);
     }
     let mut first = [0; 1];
-    receive(stream, &mut first, deadline).map_err(Setup::Incompatible)?;
+    receive(stream, &mut first, deadline).map_err(|_| PooledFailure::Unanswered)?;
     if first[0] != 5 {
-        return Err(Setup::Failed("SOCKS5 CONNECT rejected or malformed".into()));
+        return Err(PooledFailure::Failed(
+            "SOCKS5 CONNECT rejected or malformed".into(),
+        ));
     }
-    connect_reply_rest(stream, deadline).map_err(Setup::Failed)
+    connect_reply_rest(stream, deadline).map_err(PooledFailure::Failed)
 }
 
 /// The rest of a CONNECT reply whose version byte was already read.
@@ -1004,6 +1067,89 @@ mod tests {
         });
         assert!(dialer.take().is_none());
         assert_eq!(dialer.report()["discarded"], 1);
+    }
+
+    #[test]
+    fn a_learned_idle_limit_recovers_after_ten_quiet_minutes() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let dialer = dialer_with_target(local(&listener), 8);
+        let start = Instant::now();
+        dialer.closed_after_at(Duration::from_millis(9_500), start);
+        assert_eq!(
+            dialer.idle_limit_at(start + Duration::from_secs(540)),
+            Duration::from_millis(7_600)
+        );
+        // Another close while pooled restarts the ten minutes.
+        dialer.closed_after_at(Duration::from_secs(9), start + Duration::from_secs(300));
+        assert_eq!(
+            dialer.idle_limit_at(start + IDLE_RECOVERY),
+            Duration::from_millis(7_200)
+        );
+        assert_eq!(
+            dialer.idle_limit_at(start + Duration::from_secs(300) + IDLE_RECOVERY),
+            POOL_IDLE
+        );
+        // Learning starts over from the initial limit.
+        dialer.closed_after_at(Duration::from_secs(15), start + Duration::from_secs(1_000));
+        assert_eq!(
+            dialer.idle_limit_at(start + Duration::from_secs(1_000)),
+            Duration::from_secs(12)
+        );
+    }
+
+    #[test]
+    fn only_a_tunnel_closed_while_pooled_teaches_the_idle_limit() {
+        // No pool refills, and no first hop: a fresh chain fails at once.
+        let unused = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let first_hop = local(&unused);
+        drop(unused);
+        let residential = crate::credential::fixture(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1));
+        let dialer = Arc::new(Dialer::new(
+            first_hop,
+            residential,
+            PoolSettings {
+                max: Some(0),
+                demand_window: Some(Duration::from_secs(60)),
+            },
+        ));
+        let pair = || {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            (client, listener.accept().unwrap().0)
+        };
+        let target = ChainTarget::Address(SocketAddr::from(([192, 0, 2, 1], 443)));
+
+        // The proxy reads the CONNECT and closes without a reply, as some do
+        // when the target cannot be reached: a fresh chain is tried, and the
+        // idle limit stays where it was.
+        let (client, mut server) = pair();
+        let reader = thread::spawn(move || {
+            let mut request = [0; 10];
+            server.read_exact(&mut request).unwrap();
+        });
+        dialer.pool.lock().unwrap().push(Pooled {
+            id: 1,
+            stream: client,
+            since: Instant::now() - Duration::from_secs(1),
+        });
+        assert!(dialer.chain(&target).is_err());
+        reader.join().unwrap();
+        assert_eq!(dialer.idle_limit(), POOL_IDLE);
+        assert_eq!(dialer.report()["unanswered_on_connect"], 1);
+        assert_eq!(dialer.report()["stale_on_connect"], 0);
+
+        // A tunnel found closed while it sat in the pool does teach it.
+        let (client, server) = pair();
+        drop(server);
+        thread::sleep(Duration::from_millis(100));
+        dialer.pool.lock().unwrap().push(Pooled {
+            id: 2,
+            stream: client,
+            since: Instant::now() - Duration::from_secs(5),
+        });
+        assert!(dialer.take().is_none());
+        assert!(dialer.idle_limit() <= Duration::from_secs(4) + Duration::from_millis(100));
+        assert!(dialer.idle_limit() >= Duration::from_secs(4));
     }
 
     #[test]
