@@ -47,14 +47,37 @@ function Assert-NoReparse([string] $Path) {
     }
 }
 
+# Owners and writers trusted besides the current user: SYSTEM and Administrators.
+# An elevated process (an elevated backend needs an elevated installer, decision 21)
+# creates files owned by Administrators by default, and both may already modify
+# everything here; any other account is refused.
+$script:TrustedOwners = @($script:Sid, 'S-1-5-18', 'S-1-5-32-544')
+
 function Assert-Owned([string] $Path) {
     Assert-NoReparse $Path
     $acl = Get-Acl -LiteralPath $Path
-    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $script:Sid) { throw "Path must be owned by the current Windows user: $Path" }
+    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $script:TrustedOwners) { throw "Path must be owned by the current Windows user, SYSTEM or Administrators: $Path" }
     foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
         if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
         if (($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
-        if (($rule.FileSystemRights.value__ -band 0xD0156) -ne 0 -and $rule.IdentityReference.Value -notin @($script:Sid, 'S-1-5-18', 'S-1-5-32-544')) { throw "Path permits another identity to modify it: $Path" }
+        if (($rule.FileSystemRights.value__ -band 0xD0156) -ne 0 -and $rule.IdentityReference.Value -notin $script:TrustedOwners) { throw "Path permits another identity to modify it: $Path" }
+    }
+}
+
+# What the installer writes stays owned by the current user, as New-PrivateDirectory
+# does for its own directories, even when it runs elevated.
+function Set-UserOwner([string] $Path) {
+    Assert-NoReparse $Path
+    $sid = New-Object Security.Principal.SecurityIdentifier($script:Sid)
+    if ((Get-Acl -LiteralPath $Path).GetOwner([Security.Principal.SecurityIdentifier]).Value -ceq $script:Sid) { return }
+    if (Test-Path -LiteralPath $Path -PathType Container) {
+        $security = New-Object Security.AccessControl.DirectorySecurity
+        $security.SetOwner($sid)
+        [IO.Directory]::SetAccessControl($Path, $security)
+    } else {
+        $security = New-Object Security.AccessControl.FileSecurity
+        $security.SetOwner($sid)
+        [IO.File]::SetAccessControl($Path, $security)
     }
 }
 
@@ -95,6 +118,7 @@ function Write-NewJson([string] $Path, $Value) {
     $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes(($Value | ConvertTo-Json -Depth 20 -Compress))
     $stream = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
     try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+    Set-UserOwner $Path
 }
 
 function Assert-Fields($Object, [string[]] $Fields) {
@@ -217,8 +241,16 @@ function Get-Install([string] $Path, [string] $LogicalPath = $Path) {
 
 function Copy-Package($Package, [string] $Destination, [string] $LogicalPath, [string] $InstallationId) {
     New-PrivateDirectory $Destination
-    foreach ($dir in @($Package.Directories.Keys | Sort-Object { $_.Length })) { [IO.Directory]::CreateDirectory((Join-Path $Destination $dir)) | Out-Null }
-    foreach ($name in @($Package.Files.Keys) + @('release.json')) { [IO.File]::Copy((Join-Path $Package.Root $name), (Join-Path $Destination $name), $false) }
+    foreach ($dir in @($Package.Directories.Keys | Sort-Object { $_.Length })) {
+        $path = Join-Path $Destination $dir
+        [IO.Directory]::CreateDirectory($path) | Out-Null
+        Set-UserOwner $path
+    }
+    foreach ($name in @($Package.Files.Keys) + @('release.json')) {
+        $path = Join-Path $Destination $name
+        [IO.File]::Copy((Join-Path $Package.Root $name), $path, $false)
+        Set-UserOwner $path
+    }
     Write-NewJson (Join-Path $Destination $script:MarkerName) @{ schema_version = 1; product = $script:Product; install_dir = $LogicalPath; owner_sid = $script:Sid; installation_id = $InstallationId; manifest_sha256 = $Package.Digest }
     $copy = Get-Install $Destination $LogicalPath
     if ($copy.Package.Digest -cne $Package.Digest) { throw 'Staged release differs from verified source.' }
