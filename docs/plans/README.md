@@ -2,7 +2,7 @@
 
 **状态：M5 已构建 Windows x64 未签名候选包，M6 增加冷启动内核环境的显式准备，M7 增加 WSL 平台的只读检查与显式升级。** 安装、升级、卸载、恢复方法及验收边界见 [M5 发布记录](m5/README.md)。桌面与 CLI 共用单目标控制逻辑；M3 切换、M4 桌面操作、M5 发布流程、M6 内核准备和 M7 平台检查的实机证据分开记录。
 
-本计划安排交付顺序，不把实验脚本算作产品实现。设计边界见[接管架构](../arch/README.md)、[决策登记](../decisions.md)和 [Rust + GPUI 实现方案](../discussions/rust-gpui-implementation.md)。
+本计划安排交付顺序，不把实验脚本算作产品实现。设计边界见[接管架构](../arch/README.md)、[决策登记](../decisions.md)和 [Rust + GPUI 实现方案](../discussions/2026-11-19-实现方案-Rust与GPUI接管指定WSL2发行版.md)。
 
 ## 第一项可演示的交付
 
@@ -10,7 +10,7 @@
 
 ## 里程碑与完成条件
 
-按 M0 至 M5 顺序验收。每阶段的右栏是进入下一阶段的条件，不以“进程启动了”或“界面按钮可点”代替。已有的[网络验证](../discussions/wsl-proxy-validation.md)和[公网对照](../discussions/netcoffee-paired-results.md)提供基线，不替代 Rust 产品路径的回归。
+按 M0 至 M5 顺序验收。每阶段的右栏是进入下一阶段的条件，不以“进程启动了”或“界面按钮可点”代替。已有的[网络验证](../discussions/2026-11-19-验证记录-指定WSL2发行版接管.md)和[公网对照](../discussions/2026-11-19-公网诊断-Net.Coffee双发行版对照.md)提供基线，不替代 Rust 产品路径的回归。
 
 | 阶段 | 开发任务与交付物 | 如何判定完成 |
 |---|---|---|

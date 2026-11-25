@@ -1,7 +1,7 @@
 //! fake-ip: non-allowlisted A queries are answered at once with an address
 //! from the top of the reserved range, and the residential proxy resolves the
 //! name when a connection to that address is chained. See
-//! docs/discussions/fake-ip-remote-resolution.md.
+//! docs/discussions/2026-11-24-fake-ip-非白名单域名交给住宅代理解析.md.
 use super::cache::question_length;
 use super::wire::Message;
 use super::{ALIAS_SPACE, ALIAS_START};

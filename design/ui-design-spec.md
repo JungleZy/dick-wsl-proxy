@@ -10,7 +10,7 @@
 
 - [HTML 设计原型](./ui-redesign-html.html)
 - [首页预览图](./ui-redesign-html.png)：上面那份原型的截图
-- [审核结论](./ui-review-conclusion.md)：早期的一次审核记录
+- [审核结论](./2026-11-21-桌面端UI审核-早期审核结论.md)：早期的一次审核记录
 
 ## 设计原则
 
