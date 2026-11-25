@@ -280,6 +280,21 @@ fn profile_path() -> Result<PathBuf, String> {
 
 /// 用已保存的配置检测住宅代理：直连和经宿主 SOCKS5 各走一遍。只读配置库，不碰接管状态。
 /// 结果带上检测时的配置版本，桌面端据此判断结果是否已经过时。
+/// Decision 25: the direct path of the residential check sends the
+/// residential credentials in clear text without the first hop, so the
+/// request must say the user confirmed it, as `wsl_platform_update` does. A
+/// caller of the same account can still pass it; this records intent, it is
+/// not an access control.
+fn residential_probe_confirmed(request: &Value) -> Result<(), crate::command::Failure> {
+    if request["confirm"].as_bool() == Some(true) {
+        return Ok(());
+    }
+    Err(crate::command::Failure::new(
+        "confirmation_required",
+        "Pass confirm: the direct path sends the residential credentials in clear text without the first hop",
+    ))
+}
+
 fn residential_probe() -> Result<Value, String> {
     let path = profile_path()?;
     let revision = desktop_store::revision(&path)?;
@@ -693,7 +708,10 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                 })?
             }
             "export_diagnostics" => export(controller).map_err(bad)?,
-            "residential_probe" => residential_probe().map_err(bad)?,
+            "residential_probe" => {
+                residential_probe_confirmed(&request)?;
+                residential_probe().map_err(bad)?
+            }
             "probe_exit" => {
                 let generation = request["expected_generation"]
                     .as_u64()
@@ -756,6 +774,25 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_residential_check_needs_an_explicit_confirm() {
+        for request in [
+            json!({"command":"residential_probe"}),
+            json!({"command":"residential_probe","confirm":false}),
+            json!({"command":"residential_probe","confirm":"true"}),
+        ] {
+            assert_eq!(
+                residential_probe_confirmed(&request).map_err(|e| e.code),
+                Err("confirmation_required"),
+                "{request}"
+            );
+        }
+        assert!(
+            residential_probe_confirmed(&json!({"command":"residential_probe","confirm":true}))
+                .is_ok()
+        );
+    }
 
     #[test]
     fn a_stop_that_left_unprovable_mappings_is_logged_as_a_warning() {

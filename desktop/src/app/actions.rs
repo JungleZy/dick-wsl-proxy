@@ -536,7 +536,7 @@ impl Desktop {
             .as_ref()
             .and_then(|report| report["elevated"].as_bool());
         let mut message = format!(
-            "将运行 wsl --update 升级 WSL 平台（当前 WSL {version}）。它会替换 WSL 包，并可能重启 WSL：所有发行版里的程序和后台服务都会停止。不修改发行版里的文件和配置，也不启动接管。"
+            "将运行 wsl --update 升级 WSL 平台（当前 WSL {version}）。它会替换 WSL 包，并可能重启 WSL：所有发行版里的程序和后台服务都会停止。不修改发行版里的文件和配置，也不启动接管。\n\n升级可能要很久，最多等 30 分钟；超过 30 分钟会结束 wsl --update，WSL 可能停在升级到一半。等待期间请不要关闭本程序、不要退出后台，也不要做别的环境操作，否则结果可能看不到或被误报为失败。如果升级失败、超时或没看到结果，请在 PowerShell 里运行 wsl --version 核对版本，必要时自己再运行一次 wsl --update。"
         );
         match elevated {
             Some(false) => {
@@ -631,7 +631,7 @@ impl Desktop {
                     ok_view.update(cx, |this, cx| {
                         this.send(
                             Kind::ResidentialProbe,
-                            json!({"command":"residential_probe"}),
+                            json!({"command":"residential_probe","confirm":true}),
                             cx,
                         );
                     });
