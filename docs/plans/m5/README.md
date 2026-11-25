@@ -119,14 +119,41 @@ UDP 活跃表实际达到 128 条，发生 70 次安静映射回收，容量拒�
 
 ## 发布包改由 Windows 原生 MSVC 编译
 
-**状态：脚本已改，还没有在 Windows 上编译、打包、安装或升级验证。**
+**状态：0.1.10 已在 Windows 上原生编译和打包，并在本机完成安装、从 GNU 版 0.1.3 升级、降级拒绝和卸载的验收，见下文「0.1.10 候选包」。没装 VC++ 运行库的机器上能否运行，只有导入表证据，没有实机。**
 
 - **为什么改：**维护者约定最终的编译、测试、运行和打包都在 Windows 上完成（`AGENTS.md`「构建与验证规矩」）。Windows 上的 Rust 工具链是 `x86_64-pc-windows-msvc`，所以发布包目标从 `x86_64-pc-windows-gnu` 改为 `x86_64-pc-windows-msvc`。`scripts/build-desktop-windows.sh` 在 WSL 交叉编译出的 EXE 不再进发布包。
 - **C 运行库静态链接：**MSVC 默认动态依赖 VC++ 运行库。改动前在 Windows 上编出的 `wsl-proxyctl.exe` 和 `wsl-proxy-desktop.exe`，导入表里都有 `VCRUNTIME140.dll`，用户机器没装 VC++ 运行库就打不开。仓库的 `.cargo/config.toml` 为 MSVC 目标开启了 `+crt-static`。设置了 `RUSTFLAGS` 环境变量时这项配置不生效，打发布包前要确认没设。
 - **构建与打包：**在 Windows PowerShell 里执行 `cargo build --locked --release -p wsl-proxyctl -p wsl-proxy-desktop`，产物在 `target\release\`。构建记录的 `target` 写 `x86_64-pc-windows-msvc`。`scripts/package-windows.py` 在 Windows 上运行，需要 Python 3.11 或更高版本。
-- **升级（从代码推断，未实测）：**安装器只接受 MSVC 清单的新包。已安装的副本则 GNU 和 MSVC 清单都接受，所以已装 GNU 版的用户可以直接用新包覆盖升级，也能用新版卸载。
-- **降级（从代码推断，未实测）：**GNU 版旧包自带的安装脚本只认 GNU 清单。装了 MSVC 版之后，用旧包加 `-AllowDowngrade` 降级会被旧脚本拒绝。要回到旧版，先用已安装新版的 `uninstall.ps1` 卸载，再装旧包。
-- **待在 Windows 上验证：**原生 release 构建和 `cargo test --locked` 通过；两个 EXE 不再导入 `VCRUNTIME140.dll`；EXE 能在 Windows 上运行；打包脚本能在 Windows 上生成 ZIP；新包能覆盖升级已装的 GNU 版；新版 `uninstall.ps1` 能完整卸载。
+- **升级（0.1.10 实测通过）：**安装器只接受 MSVC 清单的新包。已安装的副本则 GNU 和 MSVC 清单都接受，所以已装 GNU 版的用户可以直接用新包覆盖升级，也能用新版卸载。0.1.10 在本机从 GNU 版 0.1.3 覆盖升级成功，用户数据原样搬到新目录。
+- **降级（0.1.10 实测，与推断一致）：**GNU 版旧包自带的安装脚本只认 GNU 清单。装了 MSVC 版之后，用旧包加 `-AllowDowngrade` 降级会被旧脚本拒绝。要回到旧版，先用已安装新版的 `uninstall.ps1` 卸载，再装旧包。实测时不加 `-AllowDowngrade` 也一样：旧脚本一读到 MSVC 清单就报「Unsupported release manifest identity/platform」，安装目录不变。
+- **在 Windows 上验证（0.1.10）：**原生 release 构建和 `cargo test --locked` 通过；两个 EXE 的导入表里没有任何 C 运行库 DLL；EXE 能在 Windows 上运行；打包脚本能在 Windows 上生成 ZIP；新包能覆盖升级已装的 GNU 版；新版 `uninstall.ps1` 能完整卸载。还没验证：在没装 VC++ 运行库的干净机器上运行。
+
+## 0.1.10 候选包（2026-11-25，Windows 原生 MSVC）
+
+**结论：候选包在本机通过了下面这些安装验收项。它仍不是可发布的版本：没有签名，第三方许可证清单待审（78 条缺许可文本），中断恢复（`-Recover`）、没装 VC++ 运行库的干净机器、后台以管理员身份运行时的安装都没测。**
+
+- **构建：**源码是已推送到 `main` 的 `416a5c3`，工作区干净。Windows 上 `rustc 1.100.0`，host 是 `x86_64-pc-windows-msvc`，`RUSTFLAGS` 未设置。在仓库根目录运行 `cargo build --locked --release -p wsl-proxyctl -p wsl-proxy-desktop`，后台报 `wsl-proxyctl 0.1.10`。桌面 EXE 这次被 cargo 判定为已是最新、没有重编：它出自同一工作区此前对相同源码的构建。桌面程序没有命令行版本号，所以它的版本只能说「与后台同一次构建记录」，没有单独核对。
+- **不依赖 VC++ 运行库：**只靠导入表证明（这台机器本来就装着运行库，能运行说明不了什么）。两个 EXE 的普通导入和延迟加载导入里都没有 `VCRUNTIME140`、`MSVCP140`、`api-ms-win-crt-*`、`ucrtbase`；导入的全是 Windows 系统 DLL。打包脚本本身只查 PE 格式和架构，这一步是唯一的把关。
+- **打包：**Windows 上导出 `cargo metadata`（带解析图）、写构建记录，用 `scripts/package-windows.py` 出包。ZIP 的 SHA-256 是 `8e8e6d806c0572888c958927dd9e65a636342fe719b201ec7469619d5075cf9c`；用同一组输入再打一次，两个 ZIP 逐字节一致。`scripts/test_package_windows.py` 3 项通过。清单 `kind` 是 `release-candidate`，目标 `x86_64-pc-windows-msvc`。
+- **安装验收**（安装目录都在当前用户私有的 QA 目录下，每次都显式传 `-InstallDir`；执行策略是 CurrentUser `RemoteSigned`，没有绕过）：
+
+| 项 | 结果 |
+|---|---|
+| 全新安装 | 成功，安装目录里的后台报 `0.1.10` |
+| 同一个包再装一次 | 不做任何改动，1311 个文件的哈希和修改时间都没变 |
+| 包被改过（改了 `USAGE.txt`） | 拒绝：「Package file is missing or modified」，安装目录不变 |
+| 安装目录里有来历不明的文件 | 安装和卸载都拒绝：「Unowned file」，安装目录不变 |
+| 同目录有空闲的后台 | 安装器正常请它退出，然后照常执行 |
+| 卸载 | 程序文件、`licenses` 和安装标记都删掉；后台自己建的 `desktop.sqlite` 保留；上级目录没有残留的事务、暂存或备份目录 |
+| 在只剩数据文件的目录上重装 | 成功，`desktop.sqlite` 原样保留 |
+| 接管进行中 | 用工作区的后台真实启动接管（它占着当前用户的控制器锁），这时安装和卸载都拒绝：「Another controller/session … holds the lock」，没有结束任何进程，接管和代次不变，安装目录不变 |
+| 安装目录的桌面窗口开着 | 卸载拒绝，提示给出窗口的进程号，没有结束任何进程 |
+| 从 GNU 版 0.1.3 升级 | 先用 0.1.3 自带的安装器装好（后台报 `0.1.3`），再用 0.1.10 的安装器覆盖：后台报 `0.1.10`，清单目标变为 MSVC，放进去的诊断数据文件原样搬到新目录 |
+| 用 0.1.3 的安装器降级 | 加不加 `-AllowDowngrade` 都拒绝：「Unsupported release manifest identity/platform」，安装目录不变 |
+| 共享状态目录 | 动 0.1.3 之前整份备份了 `%LOCALAPPDATA%\WSLProxyLab`；全部测完后，除锁文件外的 7 个文件与备份一致；后台空闲，代次 208，没有倒退 |
+
+- **没测到的：**由安装目录里的后台自己发起的接管（它只读自己目录旁的配置库，那是个空库，启动报 `saved_profile_revision_required`；为此不把含住宅凭据的真实配置库复制进 QA 目录），所以「接管进行中」这一项测的是控制器锁这道防线；`-Recover` 中断恢复；没装 VC++ 运行库的干净机器；后台以管理员身份运行时的安装；从 GNU 版以外的旧版升级。
+- **证据：**包在 `D:\WSL\ProxyLab\m5-lab\release-0.1.10\`（另一份逐字节相同的在 `release-0.1.10-repack\`）；安装验收的输出、快照、导入表和汇总在 `D:\WSL\ProxyLab\m5-lab\install-qa\v0110\evidence\`（`acceptance-summary.json`）。两个 QA 安装已卸载，`app-fresh`、`app-upgrade` 里只剩各自的测试数据文件。
 
 ## 0.1.8 开发中定下的行为
 
