@@ -156,6 +156,7 @@ def main():
         f"- 目标：`{manifest['target']}`，包类型 `{manifest['kind']}`，清单列出 {len(manifest['files'])} 个文件",
         "- 工具链：" + "；".join(line.strip() for line in toolchain.splitlines() if line.strip().startswith(("rustc ", "host: ", "cargo ", "Python "))),
         f"- 构建机：GitHub Actions `{os.environ.get('ImageOS', 'windows')}` 镜像 `{os.environ.get('ImageVersion', '未知')}`",
+        "- 许可证：本项目 MIT（包里的 `LICENSE`）；第三方依赖的许可证见包里的 `THIRD-PARTY-NOTICES.json` 和 `licenses/`",
         "- C 运行库：两个 EXE 的普通导入和延迟加载导入里都没有 C 运行库 DLL（`VCRUNTIME*`、`MSVCP*`、`UCRTBASE`、`api-ms-win-crt-*`），"
         "不需要另装 Visual C++ 运行库。",
     ]

@@ -135,6 +135,7 @@ class PackagingTests(unittest.TestCase):
             for name in pack.SCRIPTS:
                 (root / "packaging/windows" / name).write_text("# test fixture script\n")
             (root / ".env").write_text("MUST_NOT_BUNDLE=secret")
+            (root / "LICENSE").write_text("MIT License\n\nCopyright (c) test fixture\n", newline="\n")
             for name in pack.BINARIES:
                 (root / name).write_bytes(pe())
             packages = [{"id": name, "name": name, "version": "0.1.1", "manifest_path": str(root / "Cargo.toml")} for name in ("wsl-proxyctl", "wsl-proxy-desktop")]
@@ -161,6 +162,8 @@ class PackagingTests(unittest.TestCase):
                         self.assertEqual(item["sha256"], pack.digest(data))
                         self.assertEqual(item["size"], len(data))
                     self.assertEqual(archive.read("licenses/example-dep-1.0.0/LICENSE-MIT"), b"Actual test notice text\n")
+                    self.assertEqual(archive.read("LICENSE"), b"MIT License\n\nCopyright (c) test fixture\n")
+                    self.assertIn(b"Project license: MIT, see LICENSE.", archive.read("USAGE.txt"))
                 record["binaries"][pack.BINARIES[0]]["sha256"] = "0" * 64
                 (root / "record.json").write_text(json.dumps(record))
                 args.output_dir = root / "refused"

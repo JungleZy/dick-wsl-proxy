@@ -11,6 +11,7 @@ Windows desktop app `wsl-proxy-desktop` · controller and CLI `wsl-proxyctl`
 ![Source version](https://img.shields.io/badge/source%20version-0.1.11-informational)
 [![Latest release](https://img.shields.io/github/v/release/JungleZy/dick-wsl-proxy?include_prereleases&label=latest%20release)](https://github.com/JungleZy/dick-wsl-proxy/releases)
 ![Rust](https://img.shields.io/badge/Rust-2024%20edition-B7410E)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 [简体中文](README.md) · English
 
@@ -25,6 +26,7 @@ Windows desktop app `wsl-proxy-desktop` · controller and CLI `wsl-proxyctl`
 | [Features](#features) | [Installation](#installation) | [Stopping and recovery](#stopping-and-recovery) | [Repository layout](#repository-layout) |
 | [How it works](#how-it-works) | [Desktop quick start](#desktop-quick-start) | [FAQ](#faq) | [Documentation](#documentation) |
 | [Read this first](#read-this-first) | [Command line](#command-line) | [Security notes](#security-notes) | [Contributing](#contributing) |
+| | | | [License](#license) |
 
 ## What it does
 
@@ -520,7 +522,7 @@ The project documentation is written in Chinese.
 
 ## Contributing
 
-Issues and pull requests are welcome. Read [AGENTS.md](AGENTS.md) first; the main points:
+Issues and pull requests are welcome. Contributions of code and documentation are licensed under the project's [MIT License](LICENSE). Read [AGENTS.md](AGENTS.md) first; the main points:
 
 - **Verify on Windows.** Final builds, tests and runs use the Windows Rust toolchain on the same working tree. `cargo build`, `cargo test` and cross-compiles in WSL are only intermediate checks and cannot be reported as passing.
 - **Before submitting, run the checks the pipeline runs:**
@@ -552,3 +554,9 @@ Issues and pull requests are welcome. Read [AGENTS.md](AGENTS.md) first; the mai
 - "Export redacted diagnostics" keeps only states and numeric counters, with no destination addresses, domains or credentials; still treat the file as internal.
 - Release packages are unsigned and nobody has yet confirmed the third-party redistribution obligations, which is why they are published as pre-releases. Packages released after v0.1.11 carry a GitHub build provenance attestation; see [Installation](#installation).
 - This project does not defend against a local administrator or against root inside the target distribution.
+
+## License
+
+This project is released under the [MIT License](LICENSE), copyright JungleZy.
+
+Release packages also carry the licenses of third-party dependencies: `THIRD-PARTY-NOTICES.json` lists every package in the Windows dependency graph with its license, and `licenses/` holds the license texts. Where a package ships no license file, the standard text of the license it declares is included. The release pipeline checks dependency licenses with `cargo-deny` against [`deny.toml`](deny.toml).

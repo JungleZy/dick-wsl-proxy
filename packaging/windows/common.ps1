@@ -5,6 +5,9 @@ $script:Product = 'wsl-proxy'
 $script:MarkerName = '.wsl-proxy-install.json'
 $script:Sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $script:RootNames = @('wsl-proxyctl.exe', 'wsl-proxy-desktop.exe', 'install.ps1', 'uninstall.ps1', 'common.ps1', 'USAGE.txt', 'BUILD-RECORD.json', 'Cargo.lock', 'THIRD-PARTY-NOTICES.json')
+# Allowed at the package root but not required, so manifests of releases that
+# predate them (0.1.11 and earlier have no LICENSE) still upgrade and uninstall.
+$script:OptionalRootNames = @('LICENSE')
 # Runtime files the application writes beside its EXEs (desktop store, environment progress,
 # diagnostics exports, scratch). They belong to the user, not to a release: walks skip them,
 # upgrades carry them into the new directory, and uninstall leaves them in the install directory.
@@ -132,7 +135,7 @@ function Get-Version([string] $Version) {
 }
 
 function Assert-RelativeFile([string] $Name) {
-    if ($script:RootNames -ccontains $Name) { return }
+    if ($script:RootNames -ccontains $Name -or $script:OptionalRootNames -ccontains $Name) { return }
     if ($Name -cmatch '^licenses/[A-Za-z0-9][A-Za-z0-9_.+-]*-[0-9][A-Za-z0-9_.+-]*/[A-Za-z0-9_.-]+$' -and -not $Name.Contains('..')) { return }
     throw "Unexpected package filename: $Name"
 }

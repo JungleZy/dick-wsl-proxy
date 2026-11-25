@@ -11,6 +11,7 @@ Windows 桌面端 `wsl-proxy-desktop` · 控制器与命令行 `wsl-proxyctl`
 ![源码版本](https://img.shields.io/badge/源码版本-0.1.11-informational)
 [![最新发布](https://img.shields.io/github/v/release/JungleZy/dick-wsl-proxy?include_prereleases&label=最新发布)](https://github.com/JungleZy/dick-wsl-proxy/releases)
 ![Rust](https://img.shields.io/badge/Rust-2024%20edition-B7410E)
+[![许可证](https://img.shields.io/badge/许可证-MIT-blue)](LICENSE)
 
 简体中文 · [English](README.en.md)
 
@@ -25,6 +26,7 @@ Windows 桌面端 `wsl-proxy-desktop` · 控制器与命令行 `wsl-proxyctl`
 | [功能](#功能) | [安装](#安装) | [停止与故障恢复](#停止与故障恢复) | [项目结构](#项目结构) |
 | [工作原理](#工作原理) | [桌面端上手](#桌面端上手) | [常见问题](#常见问题) | [文档导航](#文档导航) |
 | [使用前必读](#使用前必读) | [命令行用法](#命令行用法) | [安全说明](#安全说明) | [参与开发](#参与开发) |
+| | | | [许可证](#许可证) |
 
 ## 它解决什么问题
 
@@ -516,7 +518,7 @@ design/               桌面端界面规范与早期原型
 
 ## 参与开发
 
-欢迎提 Issue 和 Pull Request。动手之前请先读 [AGENTS.md](AGENTS.md)，要点如下：
+欢迎提 Issue 和 Pull Request。提交的代码和文档按本项目的 [MIT 许可证](LICENSE)授权。动手之前请先读 [AGENTS.md](AGENTS.md)，要点如下：
 
 - **验证必须在 Windows 上做。** 最终的编译、测试、运行都要用 Windows 的 Rust 工具链，构建同一份工作区代码。WSL 里的 `cargo build`、`cargo test` 和交叉编译只算中途检查，不能写成「已通过」。
 - **提交前跑一遍流水线里的检查：**
@@ -548,3 +550,9 @@ design/               桌面端界面规范与早期原型
 - 「导出脱敏诊断」只保留状态和数值计数，不含目的地址、域名和凭据，但仍请按内部资料处理。
 - 发布包没有签名，第三方许可证的再分发义务还没人确认，所以发布为预发布版本。v0.1.11 之后的发布包带 GitHub 构建来源证明，见[安装](#安装)。
 - 本项目不防御本机管理员，也不防御目标发行版里的 root。
+
+## 许可证
+
+本项目以 [MIT 许可证](LICENSE)发布，版权归 JungleZy 所有。
+
+发布包里另附第三方依赖的许可证：`THIRD-PARTY-NOTICES.json` 列出 Windows 版依赖图里的每个包和它的许可证，`licenses/` 目录放对应的许可文本。包自己没带许可证文件的，附的是它声明的许可证的标准全文。依赖的许可证由发布流水线用 `cargo-deny` 按 [`deny.toml`](deny.toml) 检查。
