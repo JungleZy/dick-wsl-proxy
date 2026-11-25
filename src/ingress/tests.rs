@@ -831,6 +831,35 @@ fn a_guest_reset_ends_the_relay_without_a_failure() {
 }
 
 #[test]
+fn a_cut_upstream_reaches_the_guest_as_a_reset_not_a_clean_end() {
+    let (mut client, ingress) = tcp_pair();
+    let (upstream, mut origin) = tcp_pair();
+    let shared = Arc::new(Shared::new());
+    let flow = shared.flows.begin("tcp");
+    let relay_shared = Arc::clone(&shared);
+    let worker = thread::spawn(move || relay(ingress, upstream, &relay_shared, &flow));
+    origin.write_all(b"partial").unwrap();
+    let mut received = [0; 7];
+    client.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"partial");
+    // The origin side breaks mid-transfer.
+    socket2::SockRef::from(&origin)
+        .set_linger(Some(Duration::ZERO))
+        .unwrap();
+    drop(origin);
+    assert!(worker.join().unwrap().is_err());
+    // A clean end here would let the guest take the cut transfer as whole.
+    let error = client.read(&mut [0; 16]).unwrap_err();
+    assert!(
+        matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn an_upstream_reset_is_still_a_relay_error() {
     let (mut client, ingress) = tcp_pair();
     let (upstream, origin) = tcp_pair();

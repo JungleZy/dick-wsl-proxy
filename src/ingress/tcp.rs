@@ -228,6 +228,30 @@ pub(super) fn relay(
     shared: &Shared,
     flow: &Flow,
 ) -> io::Result<Ended> {
+    let ended = exchange(&mut client, &mut upstream, shared, flow);
+    // Pass a failure on as one. Closed gracefully, the other side would see
+    // a clean end and could take a cut transfer as complete (HTTP/1.0
+    // without a length, FTP data, raw TCP). Linger is per socket, so the
+    // last close of any handle, including the registration's, sends the RST.
+    match &ended {
+        Err(_) => abort_on_close(&client),
+        Ok(Ended::ClientReset) => abort_on_close(&upstream),
+        Ok(Ended::Closed) => {}
+    }
+    ended
+}
+
+/// Makes the final close of `stream` an abortive one (RST), not a FIN.
+fn abort_on_close(stream: &TcpStream) {
+    let _ = socket2::SockRef::from(stream).set_linger(Some(Duration::ZERO));
+}
+
+fn exchange(
+    client: &mut TcpStream,
+    upstream: &mut TcpStream,
+    shared: &Shared,
+    flow: &Flow,
+) -> io::Result<Ended> {
     client.set_nodelay(true)?;
     upstream.set_nodelay(true)?;
     client.set_nonblocking(true)?;
@@ -238,7 +262,7 @@ pub(super) fn relay(
     let mut half_closed = None;
     while !shared.is_stopping() {
         // The request pipe reads from the client; the response pipe writes to it.
-        let mut progressed = match request.pump(&mut client, &mut upstream, flow, true) {
+        let mut progressed = match request.pump(client, upstream, flow, true) {
             Ok(progressed) => progressed,
             Err((Side::Source, error)) => return client_ended(error),
             Err((Side::Target, error)) => return Err(error),
@@ -246,7 +270,7 @@ pub(super) fn relay(
         if shared.is_stopping() {
             break;
         }
-        progressed |= match response.pump(&mut upstream, &mut client, flow, false) {
+        progressed |= match response.pump(upstream, client, flow, false) {
             Ok(progressed) => progressed,
             Err((Side::Target, error)) => return client_ended(error),
             Err((Side::Source, error)) => return Err(error),
@@ -301,7 +325,7 @@ pub(super) fn relay(
                         .saturating_sub(now.duration_since(since)),
                 );
             }
-            wait_quiet(&client, &upstream, &request, &response, wait);
+            wait_quiet(client, upstream, &request, &response, wait);
         }
     }
     let _ = client.shutdown(Shutdown::Both);
