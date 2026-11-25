@@ -9,6 +9,7 @@ Windows 桌面端 `wsl-proxy-desktop` · 控制器与命令行 `wsl-proxyctl`
 ![平台](https://img.shields.io/badge/平台-Windows%20x64-0078D6)
 ![WSL](https://img.shields.io/badge/WSL2-NAT%20模式-4E9A06)
 ![源码版本](https://img.shields.io/badge/源码版本-0.1.11-informational)
+[![最新发布](https://img.shields.io/github/v/release/JungleZy/dick-wsl-proxy?include_prereleases&label=最新发布)](https://github.com/JungleZy/dick-wsl-proxy/releases)
 ![Rust](https://img.shields.io/badge/Rust-2024%20edition-B7410E)
 
 简体中文 · [English](README.en.md)
@@ -141,7 +142,7 @@ SHA-256 校验值只能证明文件完整，不能证明是谁发布的。
 ## 安装
 
 > [!NOTE]
-> **目前 GitHub Releases 上还没有任何发布包。** 发布流水线还没有被 tag 触发过，仓库里已有的 `v0.1.4`–`v0.1.7` tag 都早于这条流水线。第一个版本发布之前，请[从源码构建](#从源码构建)。下面是发布之后的安装方法。
+> 预编译包从 [v0.1.11](https://github.com/JungleZy/dick-wsl-proxy/releases/tag/v0.1.11) 起发布在 GitHub Releases，都标为预发布：没有签名，第三方许可证还没审完。更早的 `v0.1.4`–`v0.1.7` tag 没有发布包。
 
 ### 下载预编译包
 

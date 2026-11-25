@@ -9,6 +9,7 @@ Windows desktop app `wsl-proxy-desktop` · controller and CLI `wsl-proxyctl`
 ![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078D6)
 ![WSL](https://img.shields.io/badge/WSL2-NAT%20mode-4E9A06)
 ![Source version](https://img.shields.io/badge/source%20version-0.1.11-informational)
+[![Latest release](https://img.shields.io/github/v/release/JungleZy/dick-wsl-proxy?include_prereleases&label=latest%20release)](https://github.com/JungleZy/dick-wsl-proxy/releases)
 ![Rust](https://img.shields.io/badge/Rust-2024%20edition-B7410E)
 
 [简体中文](README.md) · English
@@ -141,7 +142,7 @@ The SHA-256 checksum shows the file is intact; it does not identify the publishe
 ## Installation
 
 > [!NOTE]
-> **There are no packages on GitHub Releases yet.** The release pipeline has not been triggered by a tag so far, and the existing `v0.1.4`–`v0.1.7` tags predate it. Until the first release, [build from source](#building-from-source). The steps below apply once packages are published.
+> Prebuilt packages are published on GitHub Releases from [v0.1.11](https://github.com/JungleZy/dick-wsl-proxy/releases/tag/v0.1.11) on, all marked as pre-releases: they are unsigned and the third-party license review is unfinished. The older `v0.1.4`–`v0.1.7` tags have no packages.
 
 ### Download a release package
 
