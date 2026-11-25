@@ -169,14 +169,14 @@ fn encoded_commands_are_base64_of_utf16_little_endian() {
 }
 
 fn handoff_script(install_dir: &Path) -> String {
-    let staging = Path::new(r"C:\Users\O'Brien\AppData\Local\WSLProxyLab\updates\0.1.12");
+    let staging = Path::new(r"C:\Users\Lab'User\AppData\Local\WSLProxyLab\updates\0.1.12");
     helper_script(&Handoff {
         zip: &staging.join("wsl-proxy-0.1.12-windows-x64.zip"),
         sha256: "2cd2342bd9524e2649b8fc48abaea4e1e3e389dacdf40f12fb5d66a5fe184eed",
         package: &staging.join("package"),
         staging,
         install_dir,
-        result: Path::new(r"C:\Users\O'Brien\AppData\Local\WSLProxyLab\updates\result.json"),
+        result: Path::new(r"C:\Users\Lab'User\AppData\Local\WSLProxyLab\updates\result.json"),
         powershell: Path::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
         desktop_pid: 4242,
         version: Version::parse("0.1.12").unwrap(),
@@ -187,10 +187,10 @@ fn handoff_script(install_dir: &Path) -> String {
 #[test]
 fn the_helper_quotes_paths_and_names_every_input() {
     let script = handoff_script(Path::new(
-        r"C:\Users\O'Brien\AppData\Local\Programs\WslProxy",
+        r"C:\Users\Lab'User\AppData\Local\Programs\WslProxy",
     ));
-    assert!(script.contains(r"$target = 'C:\Users\O''Brien\AppData\Local\Programs\WslProxy'"));
-    assert!(script.contains(r"$zip = 'C:\Users\O''Brien\AppData\Local\WSLProxyLab\updates\0.1.12\wsl-proxy-0.1.12-windows-x64.zip'"));
+    assert!(script.contains(r"$target = 'C:\Users\Lab''User\AppData\Local\Programs\WslProxy'"));
+    assert!(script.contains(r"$zip = 'C:\Users\Lab''User\AppData\Local\WSLProxyLab\updates\0.1.12\wsl-proxy-0.1.12-windows-x64.zip'"));
     assert!(
         script
             .contains("$sha = '2cd2342bd9524e2649b8fc48abaea4e1e3e389dacdf40f12fb5d66a5fe184eed'")
@@ -207,7 +207,7 @@ fn the_helper_quotes_paths_and_names_every_input() {
 #[test]
 fn windows_powershell_parses_the_helper_without_errors() {
     let script = handoff_script(Path::new(
-        r"C:\Users\O'Brien\AppData\Local\Programs\WslProxy",
+        r"C:\Users\Lab'User\AppData\Local\Programs\WslProxy",
     ));
     // Prints the decoded length (UTF-16 units), then the number of parse errors
     // and their messages.
@@ -232,7 +232,7 @@ fn windows_powershell_parses_the_helper_without_errors() {
 #[test]
 fn the_helper_fits_on_a_command_line() {
     let script = handoff_script(Path::new(
-        r"C:\Users\O'Brien\AppData\Local\Programs\WslProxy",
+        r"C:\Users\Lab'User\AppData\Local\Programs\WslProxy",
     ));
     // CreateProcess allows 32,767 characters for the whole command line.
     assert!(encode_command(&script).len() < 24_000);

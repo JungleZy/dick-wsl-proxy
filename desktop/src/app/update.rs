@@ -44,6 +44,7 @@ const FIRST_CHECK_DELAY: Duration = Duration::from_secs(15);
 const PROFILE_WAIT: Duration = Duration::from_secs(60);
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const POLICY_TIMEOUT: Duration = Duration::from_secs(30);
+const OUTCOME_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// 下载进度至少隔这么多字节才报一次，免得每 64 KB 刷新一次界面。
 const PROGRESS_STEP: u64 = 512 * 1024;
 /// 安装器写在安装目录里的安装记录（`packaging/windows/common.ps1`）。
@@ -73,6 +74,9 @@ pub(crate) struct Updater {
     installable: Result<PathBuf, String>,
     /// 上一次升级的结果，窗口打开后显示一次。
     outcome: Option<Outcome>,
+    /// 上次看结果文件的时刻。升级期间用户自己打开了程序时，安装器会拒绝，助手写下结果后
+    /// 只能唤醒这个已经打开的窗口，所以运行中也隔一会儿看一次，不只在启动时读。
+    outcome_polled: Instant,
     started: Instant,
     last_auto: Option<Instant>,
     /// 已经提醒过的新版本：同一个版本只自动提醒一次。
@@ -107,6 +111,7 @@ impl Updater {
             installing: None,
             installable: installed_dir(),
             outcome: take_outcome(),
+            outcome_polled: Instant::now(),
             started: Instant::now(),
             last_auto: None,
             notified: None,
@@ -164,6 +169,13 @@ impl Desktop {
         }
         if self.auto_check_due() {
             self.check_update(false, cx);
+        }
+        if self.updater.outcome.is_none()
+            && !self.exiting
+            && self.updater.outcome_polled.elapsed() >= OUTCOME_POLL_INTERVAL
+        {
+            self.updater.outcome_polled = Instant::now();
+            self.updater.outcome = take_outcome();
         }
         if changed {
             cx.notify();
@@ -352,7 +364,7 @@ impl Desktop {
             None => "直连 GitHub".to_owned(),
         };
         let message = format!(
-            "将下载安装包 {name}（{size}，{route}），核对发布页公布的 SHA-256 后关闭本窗口，运行新包里的 install.ps1 升级 {dir}，装好后自动重新打开。\n\n后台必须空闲：安装器会请它退出，接管中或需要恢复时会拒绝。升级只替换程序文件，配置库 desktop.sqlite、开机自启和恢复记录都保留。\n\n安装包没有签名：SHA-256 只能发现下载损坏，证明不了发布者是谁；这和手动从发布页下载是同一个信任前提。",
+            "将下载安装包 {name}（{size}，{route}），核对发布页公布的 SHA-256 后关闭本窗口，运行新包里的 install.ps1 升级 {dir}，装好后自动重新打开。窗口关闭后通常要一两分钟才会重新打开，期间看不到进度；请不要自己打开程序，否则安装器会拒绝这次升级。\n\n后台必须空闲：安装器会请它退出，接管中或需要恢复时会拒绝。升级只替换程序文件，配置库 desktop.sqlite、开机自启和恢复记录都保留。\n\n安装包没有签名：SHA-256 只能发现下载损坏，证明不了发布者是谁；这和手动从发布页下载是同一个信任前提。",
             name = release.package.name,
             size = megabytes(release.package.size),
             dir = install_dir.display(),
