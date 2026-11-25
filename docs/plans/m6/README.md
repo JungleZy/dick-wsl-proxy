@@ -13,7 +13,7 @@
 | 按固定顺序加载 12 个模块：`ip_tables`、`iptable_filter`、`iptable_nat`、`ip6_tables`、`ip6table_filter`、`ip6table_nat`、`xt_cgroup`、`xt_connmark`、`xt_conntrack`、`xt_comment`、`xt_mark`、`xt_nat`。 | 不安装软件包，不下载或编译模块，不改 `.wslconfig`；除下面两个开机文件及其 enable 链接外，不改发行版持久配置。 |
 | 只看 `/lib/modules/<release>`：已加载或 `modules.builtin` 中内建的跳过；其余先用 `modprobe -n` 证明可加载，再 `modprobe`。 | 不使用 `--force`，不卸载任何模块，不重试失败项。 |
 | 对缺失的 IPv4/IPv6 `filter`、`nat` 各执行一次对应的 `iptables-legacy` / `ip6tables-legacy -t <table> -S`（只读转储），让内核注册空表。 | 不 flush、不增删规则、不碰已有表；转储内容不落日志。 |
-| 写入并启用开机配置：`/etc/modules-load.d/wsl-proxy.conf`（只列本次证明可用的模块，同名旧文件内容不同则先备份）和 `/etc/systemd/system/wsl-proxy-tables.service`（oneshot，开机执行同样四条 `-S` 查询、标准输出/错误丢弃）。 | 不写常驻服务、代理、凭据或计划任务；unit 失败不会让目标发行版进入 degraded，预检会重新报缺少能力。 |
+| 写入并启用开机配置：`/etc/modules-load.d/wsl-proxy.conf`（只列本次证明可用的模块，直接覆盖同名旧文件、不留备份；早期版本会留 `.bak-*` 备份，不会自动清理）和 `/etc/systemd/system/wsl-proxy-tables.service`（oneshot，开机执行同样四条 `-S` 查询、标准输出/错误丢弃）。 | 不写常驻服务、代理、凭据或计划任务；unit 失败不会让目标发行版进入 degraded，预检会重新报缺少能力。 |
 | 只在控制器 `idle`、且没有安装 journal 或待完成切换时执行；桌面端先确认。 | 不在接管中执行，不在预检里隐式执行，不启动接管。 |
 
 影响的是同一 WSL 内核上的所有发行版；模块常驻、空表保留默认 ACCEPT 策略。开机配置保存在目标发行版里，WSL 重启后由 `systemd-modules-load` 和这个 oneshot 重新加载/注册，不需要再次确认。
@@ -35,7 +35,7 @@ wsl-proxyctl.exe prepare-kernel Target --confirm
 | `preparation.modules_required` / `modules_before` / `modules_added` / `modules_failed` | 固定模块集与前后状态；失败项带截断原因。 |
 | `preparation.tables` | `before`、`after`、`added`（按 v4/v6），并校验 `added = after − before`。 |
 | `preparation.table_failures` | 表注册失败的 family/table/原因。 |
-| `preparation.autoload` | `/etc/modules-load.d/wsl-proxy.conf` 的路径、模块列表、是否写入、备份路径与错误。 |
+| `preparation.autoload` | `/etc/modules-load.d/wsl-proxy.conf` 的路径、模块列表、是否写入与错误；`backup` 字段保留，恒为空。 |
 | `preparation.boot_unit` | `/etc/systemd/system/wsl-proxy-tables.service` 的路径、是否写入、是否已 `systemctl enable` 与错误。 |
 | `record_path` / `record_error` | 准备记录写入 `%LOCALAPPDATA%\WSLProxyLab\kernel-env.json` 的结果。 |
 | `blockers` / `inspection_error` | 准备后重新运行只读预检的阻断项（不含入口端口检查）。 |

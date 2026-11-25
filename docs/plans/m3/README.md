@@ -11,7 +11,7 @@
 ```
 
 - `switch` 的 `expected_generation` 必填；`start` / `start_scoped` / `stop` 也可指定。自动化应在读到状态后带上代次；过期命令拒绝，不撤旧规则或重复落新规则。`config_generation` 是网络规则的实例标记，**不能代替**操作代次。
-- 不需要额外填写 `witness`：切换时当前发行版就是新目标的隔离对照。不能用 `switch` 静默接管已失去会话的孤儿实例；先明确恢复再启动。
+- 切换不需要对照发行版：预检不再实测隔离，改由内核版本把关（[决策 01](../../decisions.md)，目标内核低于 6.18.58.1 时阻断）。不能用 `switch` 静默接管已失去会话的孤儿实例；先明确恢复再启动。
 - 正常停止在同一会话发送 `{"command":"stop"}`；意外退出后，用新的原生进程执行 `wsl-proxyctl.exe status`、`wsl-proxyctl.exe stop`。未带代次的 `stop` 是人工明确恢复命令。成功停止后的重复停止保持空闲，不消耗新代次。
 - 目标在接管中被注销后 `stop` 无法完成（报 `journal_distribution_no_longer_matches_registration`，状态里 `target_registered` 为 `false`）。此时运行 `wsl-proxyctl.exe abandon --confirm`，或在桌面端概览页点「放弃本次记录」：只释放 Windows 侧端口和恢复记录，不碰 WSL。之后先执行一次 `wsl --shutdown`（会关闭所有发行版），清掉 WSL 里可能残留的规则，再预检启动。不要手动删除恢复记录。
 

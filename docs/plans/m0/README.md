@@ -14,7 +14,7 @@ $ctl = 'D:\WSL\ProxyLab\m0-1pRyLo\wsl-proxyctl.exe'
 $LASTEXITCODE
 ```
 
-`list` 读当前 Windows 用户的发行版注册表，不启动发行版。`preflight` 接受注册名称或注册 GUID；通过 `wsl.exe --distribution-id` 在明确指定的目标、对照中以 Linux root 执行内置探测，可能唤醒这两个发行版。不会探测未选择的其他注册项，不读取住宅凭据，也不自动安装工具。`--port` 是待检查的 **Windows** 入口端口（默认 43531）；分别独占绑定 TCP 和 UDP 后释放，不监听、不转发。这是即时可用性检查，不是为下一阶段预留端口。
+`list` 读当前 Windows 用户的发行版注册表，不启动发行版。`preflight` 接受注册名称或注册 GUID；通过 `wsl.exe --distribution-id` 在明确指定的目标中以 Linux root 执行内置探测，可能唤醒它（M0 当时还包括对照发行版，见下面的现行设计说明）。不会探测未选择的其他注册项，不读取住宅凭据，也不自动安装工具。`--port` 是待检查的 **Windows** 入口端口（默认 43531）；分别独占绑定 TCP 和 UDP 后释放，不监听、不转发。这是即时可用性检查，不是为下一阶段预留端口。
 
 > **现行设计（2026-11-25 起，[决策 01](../../decisions.md)）：** 预检不再接受对照发行版（`--witness` 已移除，上面的命令按现行参数改过），也不再临时安装计数规则实测隔离；隔离改由内核版本把关：目标的 WSL 内核低于已实测按发行版隔离的 6.18.58.1，或读不出版本时，预检报 `kernel.release_unverified` 阻断。本段以下描述对照、`witness` 和 `isolation_witness_missing` 的内容，以及验收结果表，都是 M0 当时的记录。
 
