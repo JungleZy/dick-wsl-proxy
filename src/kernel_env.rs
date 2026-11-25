@@ -19,7 +19,7 @@ const TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Fixed set of modules the takeover rules need. Kept in the same order as
 /// `guest/kernel_env.py`; the guest response is rejected if it differs.
-pub const REQUIRED_MODULES: [&str; 12] = [
+pub const REQUIRED_MODULES: [&str; 14] = [
     "ip_tables",
     "iptable_filter",
     "iptable_nat",
@@ -32,6 +32,8 @@ pub const REQUIRED_MODULES: [&str; 12] = [
     "xt_comment",
     "xt_mark",
     "xt_nat",
+    "ipt_REJECT",
+    "ip6t_REJECT",
 ];
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -163,6 +165,7 @@ fn interpret(output: &str) -> Result<Preparation, String> {
 }
 
 fn module_name(value: &str) -> bool {
+    // Some netfilter modules name their target in capitals (`ipt_REJECT`).
     (2..=64).contains(&value.len())
         && value
             .bytes()
@@ -170,7 +173,7 @@ fn module_name(value: &str) -> bool {
             .is_some_and(|byte| byte.is_ascii_lowercase())
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 fn table_name(value: &str) -> bool {

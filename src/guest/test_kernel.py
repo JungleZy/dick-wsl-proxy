@@ -727,6 +727,62 @@ class FirewallTests(unittest.TestCase):
                     self.assertTrue(kernel.execute(operation)["ok"])
                 self.assertEqual(state, foreign)
 
+    def test_only_this_takeovers_flows_pass_and_older_tcp_is_reset(self):
+        # Decision 29: a flow the target opened before the takeover carries no
+        # mark, so it never passes; its TCP gets a reset, the rest is dropped.
+        p = comprehensive_plan()
+        p["ipv6"] = {"guest": "2001:db8:1::2", "ingress": "[fe80::1%2]:43771"}
+        mark = f"0x{p['cookie']:x}"
+        for guards, guard_chain in ((kernel.artifacts(p)[4], "WPM2G_12345678"), (kernel.ipv6_artifacts(p)[5], "WPM2VG_12345678")):
+            with self.subTest(guard_chain=guard_chain):
+                chain = [rule for rule in guards if rule[1] == guard_chain]
+                established = [rule for rule in chain if "ESTABLISHED,RELATED" in rule]
+                self.assertTrue(established)
+                for rule in established:
+                    at = rule.index("connmark")
+                    self.assertEqual(rule[at - 1:at + 3], ["-m", "connmark", "--mark", mark])
+                    self.assertEqual(rule[-1], "RETURN")
+                reset, drop = chain[-2], chain[-1]
+                self.assertEqual(reset[reset.index("-p") + 1], "tcp")
+                self.assertEqual(reset[reset.index("--ctstate") + 1], "ESTABLISHED")
+                self.assertEqual(reset[reset.index("--ctdir") + 1], "ORIGINAL")
+                self.assertEqual(reset[-4:], ["-j", "REJECT", "--reject-with", "tcp-reset"])
+                self.assertEqual(drop[-2:], ["-j", "DROP"])
+                self.assertNotIn("-p", drop)
+                for rule in chain:
+                    kernel.rule_key(rule)
+        # Without an IPv6 plan the target's IPv6 is dropped outright, old
+        # flows included: there is no established accept to narrow.
+        blocked = kernel.ipv6_guards(comprehensive_plan())
+        self.assertFalse([rule for rule in blocked if "ESTABLISHED,RELATED" in rule and rule[1] == "OUTPUT"])
+
+    def test_an_installation_without_the_marked_accepts_is_this_instances_but_incomplete(self):
+        p = comprehensive_plan()
+        p["ipv6"] = {"guest": "2001:db8:1::2", "ingress": "[fe80::1%2]:43771"}
+        tables, tables6 = snapshot(p), ipv6_full_snapshot(p)
+        old = kernel.legacy_guard_rules(p)
+        old6 = kernel.legacy_guard_rules(p, ipv6=True)
+        self.assertEqual(len(old), 4)
+        self.assertEqual(len(old6), 2)
+        for table, unmarked in ((tables, old), (tables6, old6)):
+            rules = table["filter"]["rules"]
+            marked = [rule for rule in rules if "ESTABLISHED,RELATED" in rule and rule[1].startswith(("WPM2G_", "WPM2VG_"))]
+            for before, after in zip(marked, unmarked):
+                rules[rules.index(before)] = after
+            rules[:] = [rule for rule in rules if "REJECT" not in rule]
+        present, found = kernel.inspect_firewall(p, tables, True)
+        _, found6 = kernel.inspect_firewall(p, tables6, True, ipv6=True)
+        self.assertTrue(present)
+        for rule in old:
+            self.assertIn(rule, found["filter"])
+        for rule in old6:
+            self.assertIn(rule, found6["filter"])
+        self.assertFalse(kernel.rules_complete(p, present, found, found6))
+        # Today's own installation is complete.
+        present, found = kernel.inspect_firewall(p, snapshot(p), True)
+        _, found6 = kernel.inspect_firewall(p, ipv6_full_snapshot(p), True, ipv6=True)
+        self.assertTrue(kernel.rules_complete(p, present, found, found6))
+
     def test_ipv6_artifacts_include_nat_and_forward_gate(self):
         p = comprehensive_plan()
         p["ipv6"] = {

@@ -123,6 +123,8 @@ class Contract(unittest.TestCase):
             "xt_comment",
             "xt_mark",
             "xt_nat",
+            "ipt_REJECT",
+            "ip6t_REJECT",
         ))
 
     def test_only_filter_and_nat_are_registered(self):

@@ -32,6 +32,8 @@ MODULES = (
     "xt_comment",
     "xt_mark",
     "xt_nat",
+    "ipt_REJECT",
+    "ip6t_REJECT",
 )
 
 # (family, procfs table list, legacy tool, tables to register)

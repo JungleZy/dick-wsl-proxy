@@ -466,10 +466,23 @@ def m2_artifacts(p):
                 proof += ["--ctorigsrc", p["guest"]]
             established = ["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL"]
             established += ["--ctorigdst", p["system_dns"], "--ctorigdstport", "53"] if dns_only else ["--ctorigsrc", p["guest"]]
-            guards.append(["-A", guard_chain, *source, "-p", protocol, *established, *comment, "-j", "RETURN"])
+            # Only this takeover's own flows carry its mark: one the target
+            # opened before the takeover never leaves directly (decision 29).
+            guards.append(["-A", guard_chain, *source, "-p", protocol, *established, "-m", "connmark", "--mark", mark, *comment, "-j", "RETURN"])
             guards.append(["-A", guard_chain, *source, "-d", ingress + "/32", "-p", protocol, "-m", protocol, "--dport", str(ingress_port), *proof, "-m", "connmark", "--mark", mark, *comment, "-j", "RETURN"])
-    guards.append(["-A", guard_chain, *comment, "-j", "DROP"])
+    guards.extend(stale_flow_guards(guard_chain, comment))
     return chain, tag, hooks, body, guards
+
+
+def stale_flow_guards(guard_chain, comment):
+    """The end of a local guard chain. A TCP connection the target opened
+    before this takeover gets a reset on its next packet, so the application
+    notices at once and reconnects through the redirect; everything else
+    left, old UDP flows included, is dropped (decision 29)."""
+    return [
+        ["-A", guard_chain, "-p", "tcp", "-m", "conntrack", "--ctstate", "ESTABLISHED", "--ctdir", "ORIGINAL", *comment, "-j", "REJECT", "--reject-with", "tcp-reset"],
+        ["-A", guard_chain, *comment, "-j", "DROP"],
+    ]
 
 
 def ipv6_artifacts(p):
@@ -506,10 +519,10 @@ def ipv6_artifacts(p):
         ["-A", guard_chain, "-m", "conntrack", "--ctdir", "REPLY", *comment, "-j", "RETURN"],
     ]
     for protocol in ("tcp", "udp"):
-        guards.append(["-A", guard_chain, "-s", guest + "/128", "-p", protocol, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL", "--ctorigsrc", guest, *comment, "-j", "RETURN"])
+        guards.append(["-A", guard_chain, "-s", guest + "/128", "-p", protocol, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "--ctdir", "ORIGINAL", "--ctorigsrc", guest, "-m", "connmark", "--mark", mark, *comment, "-j", "RETURN"])
         guards.append(["-A", guard_chain, "-s", guest + "/128", "-d", ingress + "/128", "-p", protocol, "-m", protocol, "--dport", str(ingress_port), "-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "ORIGINAL", "--ctorigsrc", guest, "-m", "connmark", "--mark", mark, *comment, "-j", "RETURN"])
     guards.extend(forward_gate(forward_chain, forward_bridges, comment, mark, ingress + "/128"))
-    guards.append(["-A", guard_chain, *comment, "-j", "DROP"])
+    guards.extend(stale_flow_guards(guard_chain, comment))
     return chain, guard_chain, tag, hooks, body, guards
 
 
@@ -576,12 +589,34 @@ def all_instance_chains(cookie):
 
 
 def legacy_rules(p, ipv6=False):
-    """Rules an older version installed for this plan in place of today's
-    bridge and FORWARD hooks: PREROUTING ! -i eth0 straight into the redirect
-    chain, and accepts plus a global drop on FORWARD. Recognised only so that
-    a stop can remove them; they never count as complete (decision 24)."""
+    """Rules an older version installed for this plan: in place of today's
+    bridge and FORWARD hooks, PREROUTING ! -i eth0 straight into the redirect
+    chain, and accepts plus a global drop on FORWARD (decision 24); in the
+    guard chain, accepts for established flows without this instance's mark
+    (decision 29). Recognised only so that a stop can remove them; they
+    never count as complete."""
     if p.get("system_dns") is None:
         return []
+    return [*legacy_bridge_rules(p, ipv6), *legacy_guard_rules(p, ipv6)]
+
+
+def legacy_guard_rules(p, ipv6=False):
+    """Today's established-flow accepts of the local guard chain without the
+    mark they now require."""
+    if ipv6 and p.get("ipv6") is None:
+        return []
+    guards = ipv6_artifacts(p)[5] if ipv6 else artifacts(p)[4]
+    mark = f"0x{p['cookie']:x}"
+    unmarked = []
+    for rule in guards:
+        if rule[1].startswith(("WPM2G_", "WPM2VG_")) and "ESTABLISHED,RELATED" in rule:
+            at = rule.index("connmark") - 1
+            require(rule[at:at + 4] == ["-m", "connmark", "--mark", mark], "unexpected_guard_shape")
+            unmarked.append(rule[:at] + rule[at + 4:])
+    return unmarked
+
+
+def legacy_bridge_rules(p, ipv6=False):
     mark = f"0x{p['cookie']:x}"
     fresh = ["-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL"]
     if not ipv6:
@@ -895,7 +930,7 @@ def rule_key(rule):
     # this closed vocabulary is accepted for an owned rule; unknown options,
     # duplicate constraints and negation cannot broaden a deletion predicate.
     require(len(rule) >= 2 and rule[0] == "-A", "invalid_owned_rule")
-    allowed = {"-s", "-d", "-i", "-o", "-p", "-m", "-j", "--dport", "--path", "--ctstate", "--ctdir", "--ctstatus", "--ctorigsrc", "--ctorigdst", "--ctorigdstport", "--mark", "--comment", "--set-xmark", "--to-destination", "--to-source"}
+    allowed = {"-s", "-d", "-i", "-o", "-p", "-m", "-j", "--dport", "--path", "--ctstate", "--ctdir", "--ctstatus", "--ctorigsrc", "--ctorigdst", "--ctorigdstport", "--mark", "--comment", "--set-xmark", "--to-destination", "--to-source", "--reject-with"}
     result, seen = [], set()
     index = 2
     while index < len(rule):

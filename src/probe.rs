@@ -323,6 +323,9 @@ fn snapshot(
         ("kernel.matches_v6", "cgroup"),
         ("kernel.targets_v4", "DNAT"),
         ("kernel.targets_v6", "DNAT"),
+        // Resets TCP connections opened before a takeover (decision 29).
+        ("kernel.targets_v4", "REJECT"),
+        ("kernel.targets_v6", "REJECT"),
         ("kernel.tables_v4", "nat"),
         ("kernel.tables_v6", "nat"),
     ] {
