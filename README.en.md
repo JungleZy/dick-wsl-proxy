@@ -177,7 +177,7 @@ cd .\wsl-proxy-<version>
 ### Upgrade and uninstall
 
 1. **Stop the takeover, then close the window.** The installer refuses while a takeover is active or needs recovery, or while the desktop window from the install directory is open, and it never kills a process.
-2. **Upgrade**: from the new package's extracted directory, run `.\install.ps1` against the same `-InstallDir`. Downgrades are refused unless you add `-AllowDowngrade`.
+2. **Upgrade**: versions after 0.1.11 can upgrade themselves from the desktop app; see [Update check and one-click upgrade](#update-check-and-one-click-upgrade). To upgrade by hand, run `.\install.ps1` from the new package's extracted directory against the same `-InstallDir`. Downgrades are refused unless you add `-AllowDowngrade`.
 3. **Uninstall**: run `.\uninstall.ps1` from the extracted directory. It removes only the program files; three things stay behind:
    - `desktop.sqlite` in the install directory, with the residential password in plain text;
    - `%LOCALAPPDATA%\WSLProxyLab`, holding the controller lock, recovery records and the DNS alias ledger;
@@ -219,7 +219,7 @@ The desktop UI is in Chinese; the labels above are translations.
 | Rules | Direct rules in three columns: IP / CIDR, exact domain, domain suffix |
 | Connections | Connection records (the newest 50,000 finished connections are kept), re-check public exit, export redacted diagnostics, reset DNS aliases |
 | Logs | Run log with search and All / Errors / Warnings filters |
-| Settings | Residential proxy, network and DNS, forwarding limits, desktop (start at login), WSL platform, about |
+| Settings | Residential proxy, network and DNS, forwarding limits, desktop (start at login), WSL platform, about (update check and upgrade) |
 
 ### Tray and closing the window
 
@@ -248,6 +248,22 @@ It installs no packages and does not touch `.wslconfig`. From 0.1.11 the REJECT 
 - after a failure, a timeout or no result, check with `wsl --version` in PowerShell and run `wsl --update` yourself if needed.
 
 See [M7](docs/plans/m7/README.md).
+
+### Update check and one-click upgrade
+
+The "Updates" group under Settings › About:
+
+- **Check**: 15 seconds after the app opens it asks GitHub for a newer release, then once a day; "Check for updates" asks right away. It goes through the host SOCKS5 when one is saved, direct if that fails, never through the residential proxy. Every check shows GitHub your exit IP; turn off "Check for updates automatically" if the app should not go online by itself.
+- **Notice**: a newer release is announced once, and the status bar shows it next to the version.
+- **Upgrade**: after you click "Upgrade to vX" and confirm, the app downloads the package (about 41 MB), checks it against the SHA-256 published with the release, closes its window, runs the new package's `install.ps1`, reopens itself and shows the result.
+
+One-click upgrade needs all of these; otherwise the app only tells you, and says why:
+
+- no takeover is running or waiting for recovery (stop it on the home page first);
+- this copy was installed with `install.ps1` (not unpacked and run in place, not self-built);
+- the effective PowerShell execution policy runs local scripts (RemoteSigned, Unrestricted or Bypass). The app never changes or bypasses the policy; under Restricted, upgrade by hand from the releases page.
+
+The package is unsigned: the SHA-256 check catches a broken download but does not prove who published it, the same trust as downloading by hand. Only program files are replaced; the settings database, start-at-login entry and recovery records stay. If the upgrade does not finish, the reopened window explains why and gives the command to run by hand; if replacing files was interrupted, the app does not reopen and a message box gives the `-Recover` command. See [M8](docs/plans/m8/README.md).
 
 ### Environment management
 
@@ -518,6 +534,7 @@ The project documentation is written in Chinese.
 | [M5: release and compatibility](docs/plans/m5/README.md) | Install, upgrade, uninstall, supported scope, performance measurements, release pipeline |
 | [M6: kernel preparation](docs/plans/m6/README.md) | Loading existing modules and registering empty tables after a cold start |
 | [M7: WSL platform check and update](docs/plans/m7/README.md) | Read-only check and explicit `wsl --update` |
+| [M8: update check and one-click upgrade](docs/plans/m8/README.md) | Find a newer GitHub release, download and check it, hand it to the installer |
 | [UI specification](design/ui-design-spec.md) | Current desktop UI; the code wins where they differ |
 
 ## Contributing
