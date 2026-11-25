@@ -1345,19 +1345,34 @@ class ContainerNetworkTests(unittest.TestCase):
         nat, filtered = kernel.network_rules(p, {"docker0": WANTED["docker0"]})
         self.assertEqual([(rule[1], rule[rule.index("-i") + 1], rule[-1]) for rule in nat], [("WPM2B_12345678", "docker0", "RETURN"), ("WPM2B_12345678", "docker0", "WPM2_12345678")])
         self.assertEqual(nat[0][nat[0].index("-d") + 1], "172.17.0.0/16")
-        self.assertEqual([rule[-1] for rule in filtered], ["RETURN"] * 3 + ["DROP"])
-        self.assertEqual([rule[rule.index("-d") + 1] for rule in filtered[:-1]], ["172.17.0.0/16", "224.0.0.0/4", "255.255.255.255/32"])
+        gate = [rule for rule in filtered if rule[1] == "WPM2FB_12345678"]
+        self.assertEqual([rule[-1] for rule in gate], ["RETURN"] * 3 + ["DROP"])
+        self.assertEqual([rule[rule.index("-d") + 1] for rule in gate[:-1]], ["172.17.0.0/16", "224.0.0.0/4", "255.255.255.255/32"])
         # Link-local IPv4 (169.254.169.254 and the like) is routable: dropped
         # as for the target's own processes, never let through.
         self.assertFalse(any(ipaddress.ip_address("169.254.169.254") in ipaddress.ip_network(scope) for scope in kernel.LOCAL_SCOPES["v4"]))
-        self.assertTrue(all(rule[1] == "WPM2FB_12345678" for rule in filtered))
-        # IPv6 block mode: no redirection, only the drop of what is not local.
+        # The target's own traffic to the network, through its bridge only,
+        # passes the local guard (M19): the host, docker-proxy behind a
+        # published port. Nothing else is added to the guard.
+        guard = [rule for rule in filtered if rule[1] == "WPM2G_12345678"]
+        self.assertEqual(guard, [["-A", "WPM2G_12345678", "-o", "docker0", "-d", "172.17.0.0/16", "-m", "comment", "--comment", kernel.network_tag(p), "-j", "RETURN"]])
+        self.assertEqual(len(filtered), len(gate) + len(guard))
+        # IPv6 block mode: no redirection, only the drop of what is not
+        # local; the target's own IPv6 stays dropped on OUTPUT itself.
         nat6, filtered6 = kernel.network_rules(p, WANTED, ipv6=True)
         self.assertEqual(nat6, [])
         self.assertEqual([rule[-1] for rule in filtered6].count("DROP"), 2)
         self.assertIn("fd00:db8:18::/64", [token for rule in filtered6 for token in rule])
+        self.assertFalse([rule for rule in filtered6 if "-o" in rule])
+        # Managed IPv6: the IPv6 guard gets the same rule for IPv6 subnets.
+        managed = dict(p, ipv6={"guest": "2001:db8:1::2", "ingress": "[fe80::1%2]:43771"})
+        _, filtered6m = kernel.network_rules(managed, WANTED, ipv6=True)
+        self.assertEqual([(rule[1], rule[3], rule[5]) for rule in filtered6m if "-o" in rule], [("WPM2VG_12345678", "br-acc14c99a879", "fd00:db8:18::/64")])
         for rule in nat + filtered + filtered6:
-            self.assertEqual(kernel.network_rule_owner(p, rule, rule in filtered6), rule[rule.index("-i") + 1])
+            name = rule[rule.index("-i" if "-i" in rule else "-o") + 1]
+            self.assertEqual(kernel.network_rule_owner(p, rule, rule in filtered6), name)
+        for rule in filtered6m:
+            self.assertIsNotNone(kernel.network_rule_owner(managed, rule, True))
 
     def test_while_no_dockerd_runs_covered_networks_stay_while_their_bridge_exists(self):
         # A stopped or restarting dockerd (live-restore keeps containers up)
@@ -1391,6 +1406,13 @@ class ContainerNetworkTests(unittest.TestCase):
             ["-A", "WPM2FB_12345678", "-i", "docker0", "-d", "fd00::/8", "-m", "comment", "--comment", tag, "-j", "RETURN"],
             ["-A", "WPM2B_12345678", "-i", "docker0", "-m", "comment", "--comment", tag, "-j", "ACCEPT"],
             ["-A", "WPM2B_12345678", "-i", "docker0", "-p", "tcp", "-m", "comment", "--comment", tag, "-j", "WPM2_12345678"],
+            # The guard rule only ever pairs this network's bridge with its subnet.
+            ["-A", "WPM2G_12345678", "-o", "docker0", "-m", "comment", "--comment", tag, "-j", "RETURN"],
+            ["-A", "WPM2G_12345678", "-o", "eth0", "-d", "172.17.0.0/16", "-m", "comment", "--comment", tag, "-j", "RETURN"],
+            ["-A", "WPM2G_12345678", "-o", "docker0", "-d", "224.0.0.0/4", "-m", "comment", "--comment", tag, "-j", "RETURN"],
+            ["-A", "WPM2G_12345678", "-o", "docker0", "-d", "172.17.0.0/16", "-m", "comment", "--comment", tag, "-j", "ACCEPT"],
+            ["-A", "WPM2G_12345678", "-i", "docker0", "-o", "docker0", "-d", "172.17.0.0/16", "-m", "comment", "--comment", tag, "-j", "RETURN"],
+            ["-A", "WPM2FB_12345678", "-o", "docker0", "-d", "172.17.0.0/16", "-m", "comment", "--comment", tag, "-j", "RETURN"],
         ]
         for stray in strays:
             with self.subTest(stray=stray):

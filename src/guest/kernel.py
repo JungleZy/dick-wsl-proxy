@@ -711,16 +711,21 @@ def network_rules(p, networks, ipv6=False):
     """Per-network rules for the target's own Docker bridges, as (nat, filter)
     in the order they must end up in their chains (decision 24): traffic
     within the network stays local, other traffic is redirected like the
-    target's own, and what was not redirected is dropped at forwarding."""
+    target's own, and what was not redirected is dropped at forwarding. The
+    target's own processes may reach the network's subnet through its bridge
+    (the host, `docker-proxy` behind a published port): such packets never
+    leave the host, and anything a container sends on is again subject to
+    the rules above. Not in IPv6 block mode, where the target's own IPv6 is
+    dropped on OUTPUT itself."""
     cookie = f"{p['cookie']:08x}"
     comment = ["-m", "comment", "--comment", network_tag(p, ipv6)]
     family = "v6" if ipv6 else "v4"
     if not ipv6:
-        redirect, bridge_chain, gate = "WPM2_" + cookie, "WPM2B_" + cookie, "WPM2FB_" + cookie
+        redirect, bridge_chain, gate, guard = "WPM2_" + cookie, "WPM2B_" + cookie, "WPM2FB_" + cookie, "WPM2G_" + cookie
     elif p.get("ipv6") is not None:
-        redirect, bridge_chain, gate = "WPM2V_" + cookie, "WPM2VB_" + cookie, "WPM2VFB_" + cookie
+        redirect, bridge_chain, gate, guard = "WPM2V_" + cookie, "WPM2VB_" + cookie, "WPM2VFB_" + cookie, "WPM2VG_" + cookie
     else:
-        redirect, bridge_chain, gate = None, None, "WPM2VFB_" + cookie
+        redirect, bridge_chain, gate, guard = None, None, "WPM2VFB_" + cookie, None
     nat, filtered = [], []
     for name in sorted(networks):
         subnets = networks[name][family]
@@ -729,6 +734,8 @@ def network_rules(p, networks, ipv6=False):
             nat.append(["-A", bridge_chain, "-i", name, *comment, "-j", redirect])
         filtered.extend(["-A", gate, "-i", name, "-d", subnet, *comment, "-j", "RETURN"] for subnet in [*subnets, *LOCAL_SCOPES[family]])
         filtered.append(["-A", gate, "-i", name, *comment, "-j", "DROP"])
+        if guard is not None:
+            filtered.extend(["-A", guard, "-o", name, "-d", subnet, *comment, "-j", "RETURN"] for subnet in subnets)
     return nat, filtered
 
 
@@ -737,10 +744,10 @@ def network_rule_owner(p, rule, ipv6=False):
     `rule` is not exactly one of them."""
     if network_tag(p, ipv6) not in rule:
         return None
-    try:
-        name = rule[rule.index("-i") + 1]
-    except (ValueError, IndexError):
+    names = [rule[index + 1] for index, token in enumerate(rule[:-1]) if token in ("-i", "-o")]
+    if len(names) != 1:
         return None
+    name = names[0]
     if not BRIDGE_NAME.fullmatch(name) or name in ("eth0", "lo"):
         return None
     family = "v6" if ipv6 else "v4"
@@ -888,7 +895,7 @@ def rule_key(rule):
     # this closed vocabulary is accepted for an owned rule; unknown options,
     # duplicate constraints and negation cannot broaden a deletion predicate.
     require(len(rule) >= 2 and rule[0] == "-A", "invalid_owned_rule")
-    allowed = {"-s", "-d", "-i", "-p", "-m", "-j", "--dport", "--path", "--ctstate", "--ctdir", "--ctstatus", "--ctorigsrc", "--ctorigdst", "--ctorigdstport", "--mark", "--comment", "--set-xmark", "--to-destination", "--to-source"}
+    allowed = {"-s", "-d", "-i", "-o", "-p", "-m", "-j", "--dport", "--path", "--ctstate", "--ctdir", "--ctstatus", "--ctorigsrc", "--ctorigdst", "--ctorigdstport", "--mark", "--comment", "--set-xmark", "--to-destination", "--to-source"}
     result, seen = [], set()
     index = 2
     while index < len(rule):
