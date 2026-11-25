@@ -1,0 +1,33 @@
+# Third-party license check: `cargo deny --workspace check licenses` (without
+# --workspace only the controller is checked, not the desktop), run by the release
+# workflow before anything is published. Only the Windows build ships, so only
+# its dependency graph counts; dev dependencies are left out.
+
+[graph]
+targets = [{ triple = "x86_64-pc-windows-msvc" }]
+exclude-dev = true
+
+[licenses]
+# Licenses a dependency of the Windows build may use. A new dependency under
+# anything else fails the release until someone has reviewed it and added the
+# license here, or an exception below.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.93
+# Weak copyleft, allowed per crate: MPL-2.0 covers only that crate's own files,
+# which ship unmodified and whose source stays available on crates.io.
+exceptions = [
+    { allow = ["MPL-2.0"], crate = "option-ext" },
+]
+
+[licenses.private]
+# The workspace crates are unpublished (publish = false).
+ignore = true

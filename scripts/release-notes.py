@@ -91,6 +91,18 @@ def size(n):
     return f"{n / 1024 / 1024:.1f} MiB"
 
 
+def license_limit(licenses):
+    """The known-limits line on third-party licenses, from release.json."""
+    missing = licenses["missing_notice_count"]
+    if missing:
+        return f"- 第三方许可证尚未完成再分发审查：`THIRD-PARTY-NOTICES.json` 里有 {missing} 条缺少许可文本。"
+    return (
+        f"- 第三方许可证尚未完成再分发审查：清单里 Windows 版依赖图的 {licenses.get('package_count', '全部')} 个第三方包都附了许可文本，"
+        f"其中 {licenses.get('standard_text_count', 0)} 个包自己没带，附的是它声明的许可证的标准全文；"
+        "是否满足再分发义务仍待负责人确认。"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     for name in ("version", "tag", "zip", "imports", "smoke", "logs", "toolchain", "output"):
@@ -130,6 +142,14 @@ def main():
         "",
         f"校验：`Get-FileHash -Algorithm SHA256 .\\{archive.name}`，结果应与上表一致。`.sha256` 文件和 ZIP 来自同一处，不能证明发布者。",
         "",
+    ]
+    if args.repository:
+        out += [
+            f"来源：发布流水线为这个 ZIP 生成了 GitHub 构建来源证明。装了 GitHub CLI 的话，运行 `gh attestation verify .\\{archive.name} -R {args.repository}`，"
+            "通过就说明它是本仓库的发布流水线从下面的提交构建出来的。这证明的是构建来源，不是代码签名。",
+            "",
+        ]
+    out += [
         "## 构建",
         "",
         f"- 源码：`{args.tag}` → 提交 `{commit}`" + (f"（[查看]({repo}/tree/{commit})）" if repo else ""),
@@ -189,8 +209,8 @@ def main():
         "",
         "## 已知限制",
         "",
-        "- 未签名：Windows 可能提示来源未知；SHA-256 只证明一致性。",
-        f"- 第三方许可证尚未完成再分发审查：`THIRD-PARTY-NOTICES.json` 里有 {manifest['licenses']['missing_notice_count']} 条缺少许可文本。",
+        "- 未签名：Windows 可能提示来源未知；SHA-256 只证明一致性，构建来源可以用上面的 `gh attestation verify` 核对。",
+        license_limit(manifest["licenses"]),
         "- 目标发行版的 WSL 内核低于 6.18.58.1 时预检会阻断（决策 01）；升级 WSL 后能否通过没有实测。",
         "- 其余已知问题和未验证范围见 M5 发布说明与 `docs/decisions.md`。",
         "",

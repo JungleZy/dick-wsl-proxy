@@ -25,6 +25,83 @@ def pe(machine=0x8664):
     return bytes(data)
 
 
+def edge(pkg, *kinds):
+    return {"pkg": pkg, "dep_kinds": [{"kind": kind, "target": None} for kind in kinds]}
+
+
+def normal(pkg):
+    return edge(pkg, None)
+
+
+class LicenseTests(unittest.TestCase):
+    """The third-party inventory covers what the executables link, and fills in
+    a standard text only where a package ships none and offers a license we carry."""
+
+    def inventory(self, crates, edges):
+        """crates: name -> (license, files); edges: member/crate -> [edge]."""
+        with tempfile.TemporaryDirectory(prefix="wsl-proxy-license-test-") as temporary:
+            root = Path(temporary)
+            packages = [{"id": "member", "name": "wsl-proxyctl", "version": "0.1.1", "manifest_path": str(root / "Cargo.toml")}]
+            lock = {"package": [{"name": "wsl-proxyctl", "version": "0.1.1"}]}
+            for name, (license, files) in crates.items():
+                (root / name).mkdir()
+                for file, text in files.items():
+                    (root / name / file).write_text(text, newline="\n")
+                packages.append({"id": name, "name": name, "version": "1.0.0", "manifest_path": str(root / name / "Cargo.toml"), "source": "registry+test", "license": license, "authors": ["Example Author <author@example.invalid>"]})
+                lock["package"].append({"name": name, "version": "1.0.0"})
+            metadata = {"packages": packages, "workspace_members": ["member"], "resolve": {"nodes": [{"id": p["id"], "deps": edges.get(p["id"], [])} for p in packages]}}
+            payload = {}
+            return pack.license_inventory(metadata, lock, payload), payload
+
+    def test_reads_plain_choices_and_leaves_compound_expressions_to_a_person(self):
+        self.assertEqual(pack.license_options("MIT OR Apache-2.0"), ["MIT", "Apache-2.0"])
+        self.assertEqual(pack.license_options("MIT/Apache-2.0"), ["MIT", "Apache-2.0"])
+        self.assertEqual(pack.license_options("Apache-2.0"), ["Apache-2.0"])
+        self.assertIsNone(pack.license_options("(MIT OR Apache-2.0) AND Unicode-3.0"))
+        self.assertIsNone(pack.license_options("Apache-2.0 WITH LLVM-exception OR MIT"))
+
+    def test_covers_only_what_the_executables_link(self):
+        crates = {name: ("MIT", {"LICENSE": name}) for name in ("linked", "build-only", "dev-only", "both", "below-build")}
+        edges = {
+            "member": [normal("linked"), edge("build-only", "build"), edge("dev-only", "dev"), edge("both", "build", None)],
+            "build-only": [normal("below-build")],
+        }
+        inventory, _ = self.inventory(crates, edges)
+        self.assertEqual([p["name"] for p in inventory["packages"]], ["both", "linked"])
+        self.assertEqual(inventory["issues"], [])
+
+    def test_fills_in_the_standard_text_only_for_a_license_we_carry(self):
+        crates = {
+            "ships-file": ("MIT", {"LICENSE-MIT": "Own text\n"}),
+            "mit-or-apache": ("MIT OR Apache-2.0", {}),
+            "apache-only": ("Apache-2.0", {}),
+            "bsd-only": ("BSD-3-Clause", {}),
+            "compound": ("(MIT OR Apache-2.0) AND Unicode-3.0", {}),
+        }
+        inventory, payload = self.inventory(crates, {"member": [normal(name) for name in crates]})
+        by_name = {p["name"]: p for p in inventory["packages"]}
+        self.assertEqual(by_name["ships-file"]["notice_kind"], "crate-file")
+        self.assertEqual(payload["licenses/ships-file-1.0.0/LICENSE-MIT"], b"Own text\n")
+        mit = payload["licenses/mit-or-apache-1.0.0/MIT.txt"].decode()
+        self.assertEqual((by_name["mit-or-apache"]["notice_kind"], by_name["mit-or-apache"]["redistributed_under"]), ("standard-text", "MIT"))
+        self.assertIn('declares the license\n"MIT OR Apache-2.0"', mit)
+        self.assertIn("Copyright (c) Example Author <author@example.invalid>", mit)
+        self.assertIn("Permission is hereby granted, free of charge", mit)
+        apache = payload["licenses/apache-only-1.0.0/Apache-2.0.txt"].decode()
+        self.assertIn("Apache License\n                        Version 2.0, January 2004", apache)
+        self.assertNotIn("Copyright (c) Example Author", apache)
+        self.assertEqual(inventory["standard_text_count"], 2)
+        self.assertEqual(inventory["issues"], [
+            "bsd-only 1.0.0: missing license expression or local notice text",
+            "compound 1.0.0: missing license expression or local notice text",
+        ])
+
+    def test_refuses_metadata_without_dependency_kinds(self):
+        metadata = {"packages": [{"id": "member", "name": "wsl-proxyctl", "version": "0.1.1", "manifest_path": "Cargo.toml"}], "workspace_members": ["member"], "resolve": {"nodes": [{"id": "member", "dependencies": []}]}}
+        with self.assertRaises(ValueError):
+            pack.license_inventory(metadata, {"package": [{"name": "wsl-proxyctl", "version": "0.1.1"}]}, {})
+
+
 class PackagingTests(unittest.TestCase):
     def test_reads_json_records_regardless_of_the_windows_code_page(self):
         value = {"schema_version": 1, "note": "中文"}
@@ -62,7 +139,7 @@ class PackagingTests(unittest.TestCase):
                 (root / name).write_bytes(pe())
             packages = [{"id": name, "name": name, "version": "0.1.1", "manifest_path": str(root / "Cargo.toml")} for name in ("wsl-proxyctl", "wsl-proxy-desktop")]
             packages.append({"id": "dep", "name": "example-dep", "version": "1.0.0", "manifest_path": str(crate / "Cargo.toml"), "source": "registry+test", "license": "MIT"})
-            metadata = {"packages": packages, "workspace_members": ["wsl-proxyctl", "wsl-proxy-desktop"], "resolve": {"nodes": [{"id": p["id"], "dependencies": ["dep"] if p["id"] != "dep" else []} for p in packages]}}
+            metadata = {"packages": packages, "workspace_members": ["wsl-proxyctl", "wsl-proxy-desktop"], "resolve": {"nodes": [{"id": p["id"], "deps": [normal("dep")] if p["id"] != "dep" else []} for p in packages]}}
             (root / "metadata.json").write_text(json.dumps(metadata))
             record = {"schema_version": 1, "version": "0.1.1", "target": pack.TARGET, "cargo_lock_sha256": pack.digest((root / "Cargo.lock").read_bytes()), "binaries": {name: {"version": "0.1.1", "sha256": pack.digest(pe())} for name in pack.BINARIES}}
             (root / "record.json").write_text(json.dumps(record))

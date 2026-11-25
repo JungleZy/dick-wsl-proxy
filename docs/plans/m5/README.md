@@ -172,10 +172,11 @@ UDP 活跃表实际达到 128 条，发生 70 次安静映射回收，容量拒�
 2. tag 必须与工作区版本一致（`v0.1.11` 对 `0.1.11`），并且没有设置 `RUSTFLAGS`（设了会顶掉静态 C 运行库的配置），否则停止。
 3. 装 stable Rust；跑 `cargo fmt --check`、`cargo clippy -D warnings`、`cargo test`（控制器和桌面），以及客机脚本和打包脚本的测试。
 4. 构建两个 EXE，后台的 `--version` 必须与版本一致；`scripts/check-windows-imports.py` 读两个 EXE 的导入表，发现任何 C 运行库 DLL 就停止。打包脚本自己不查这一项（旧 H3），这一步在流水线里补上了。
-5. 导出 `cargo metadata`，用 `scripts/build-record.py` 写构建记录，再用 `scripts/package-windows.py` 打包。
+5. 导出只含 Windows 平台依赖的 `cargo metadata`（`--filter-platform x86_64-pc-windows-msvc`），用 `scripts/build-record.py` 写构建记录，再用 `scripts/package-windows.py` 打包。包里的第三方许可证清单 `THIRD-PARTY-NOTICES.json` 只列 Windows 版依赖图里的包：从工作区成员出发，只沿普通依赖走，开发依赖和编译期依赖不算（它们只在编译时运行，不进程序）。`cargo metadata` 是把整个工作区的特性合并后算的图，宁多勿漏：0.1.11 的清单里有 rav1e、sysinfo 等 44 个包不在 cargo-deny 按实际特性算出的依赖图里，多附几份许可文本无害。包自己带了 LICENSE、COPYING 或 NOTICE 文件就原样收进 `licenses/<包名>-<版本>/`；没带的，如果它声明的许可证里可以选 MIT 或 Apache-2.0，就附上 `packaging/licenses/` 里的标准全文（MIT 文本前写上它 Cargo 清单里的作者），文件开头注明「这个包没带许可证文件、按哪个许可证再分发」。两者都不行的记为缺失，清单里 `notice_kind` 写明每个包的文本来源。
 6. `scripts/smoke-install-windows.ps1` 在构建机上做安装冒烟测试：装到临时私有目录，核对后台版本，同包重装不改任何文件，改过的包被拒，卸载后不留程序文件和事务目录。构建机没有 WSL，不测接管。
 7. `scripts/release-notes.py` 生成发布记录：tag 注释、下载文件及 SHA-256、源码提交、工具链和构建机镜像、导入表检查、各项测试的通过数、冒烟测试结果、自上一个 `v*` tag 以来按类型分组的全部提交、安装说明和已知限制。记录也写进本次运行的摘要页。
-8. 发布在单独的 job 里，只有它有写权限：用 `gh release create` 建 Release，附上 ZIP 和 `.sha256`，**标为预发布（pre-release）**，因为包没有签名、第三方许可证还没审完。要改成正式发布，删掉工作流里的 `--prerelease`。
+8. 另一个 job 在 Linux 构建机上用 `cargo-deny` 检查许可证（`cargo deny --workspace check licenses`，配置在仓库根目录的 `deny.toml`；不加 `--workspace` 只查默认成员，也就是只查控制器、漏掉桌面端）：只看 Windows 版的依赖图（含编译期依赖，不含开发依赖），每个依赖的许可证都要在允许清单里。清单只收依赖里实际用到的几种宽松许可证（MIT、Apache-2.0、BSD-2-Clause、BSD-3-Clause、Zlib、Unicode-3.0、CC0-1.0、0BSD），外加只对 `option-ext` 开的 MPL-2.0 例外；以后新依赖用了清单外的许可证，这一步失败，发布不会进行，要有人审过再改 `deny.toml`。
+9. 发布在单独的 job 里，只有它有写权限，要等打包和许可证检查都通过才运行。先用 `actions/attest-build-provenance` 给 ZIP 生成 GitHub 构建来源证明（Sigstore 用这次运行的身份签名），任何人都能用 `gh attestation verify <zip> -R JungleZy/dick-wsl-proxy` 核对它是本仓库的这条流水线从哪个提交构建的；这证明构建来源，不等于代码签名，Windows 照样会提示来源未知。然后用 `gh release create` 建 Release，附上 ZIP 和 `.sha256`，**标为预发布（pre-release）**，因为包没有签名、第三方许可证的再分发义务还没人确认。要改成正式发布，删掉工作流里的 `--prerelease`。
 
 任一步失败都不会发布。同一个 tag 已有 Release 时，发布步骤会失败，不会覆盖。
 

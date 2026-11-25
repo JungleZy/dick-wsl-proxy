@@ -118,7 +118,7 @@ UDP 不直连是有意为之：网页可以借白名单里的 STUN 服务器，�
 「其他发行版不受影响」只在 WSL 内核 6.18.58.1 上实测过。目标内核低于这个版本或读不出版本时，预检直接阻断，需要先升级 WSL。升级后能不能过这道门槛，没有实测过。
 
 **8. 发布包没有签名。**
-SHA-256 校验值只能证明文件完整，不能证明是谁发布的。
+SHA-256 校验值只能证明文件完整，不能证明是谁发布的。v0.1.11 之后的发布包另带 GitHub 构建来源证明，能核对它是本仓库的发布流水线构建的，但这也不等于代码签名，Windows 照样会提示来源未知。
 
 ## 系统要求
 
@@ -156,6 +156,9 @@ SHA-256 校验值只能证明文件完整，不能证明是谁发布的。
 ```powershell
 # 1. 核对校验值，和发布页上的值比较
 Get-FileHash -Algorithm SHA256 .\wsl-proxy-<版本>-windows-x64.zip
+
+# 可选：核对构建来源（v0.1.11 之后的版本，需要 GitHub CLI）
+gh attestation verify .\wsl-proxy-<版本>-windows-x64.zip -R JungleZy/dick-wsl-proxy
 
 # 2. 解压到一个新的目录（不要解压到安装目录里）
 Expand-Archive .\wsl-proxy-<版本>-windows-x64.zip -DestinationPath .\wsl-proxy-<版本>
@@ -467,7 +470,7 @@ cargo test --locked --workspace
 
 **打包**
 
-发布包的打包步骤以 [`.github/workflows/release.yml`](.github/workflows/release.yml) 为准：先检查导入表，再导出 `cargo metadata`、写构建记录，然后用 `scripts/package-windows.py` 打包，最后跑安装冒烟测试。各脚本的参数和本机验收记录见 [M5](docs/plans/m5/README.md)。脚本拒绝覆盖已有的输出文件；`work/`、`dist/` 不在 `.gitignore` 里，建议输出到仓库外的目录。
+发布包的打包步骤以 [`.github/workflows/release.yml`](.github/workflows/release.yml) 为准：先检查导入表，再导出只含 Windows 平台依赖的 `cargo metadata`（`--filter-platform x86_64-pc-windows-msvc`）、写构建记录，然后用 `scripts/package-windows.py` 打包，最后跑安装冒烟测试；另一个 job 用 `cargo-deny` 按仓库根目录的 `deny.toml` 检查第三方许可证。包里的 `THIRD-PARTY-NOTICES.json` 和 `licenses/` 只收 Windows 版依赖图里的包（宁多勿漏），包自己没带许可证文件的，附它声明的许可证的标准全文（`packaging/licenses/`）。各脚本的参数和本机验收记录见 [M5](docs/plans/m5/README.md)。脚本拒绝覆盖已有的输出文件；`work/`、`dist/` 不在 `.gitignore` 里，建议输出到仓库外的目录。
 
 在 WSL 里可以用 `scripts/build-desktop-windows.sh` 交叉编译出 Windows EXE，但这只算开发中途的检查，产物不能进发布包。
 
@@ -526,6 +529,7 @@ design/               桌面端界面规范与早期原型
   python src/guest/test_https_probe.py
   python src/guest/test_kernel_env.py
   python scripts/test_package_windows.py
+  cargo deny --workspace check licenses   # 先装一次：cargo install cargo-deny --locked
   ```
 
 - **文档规矩：**
@@ -542,5 +546,5 @@ design/               桌面端界面规范与早期原型
 - 桌面端和后台之间的命名管道只接受同一 Windows 账户、且完整性级别不低于后台自身的进程（[决策 21](docs/decisions.md)）。后台以管理员身份运行时，普通权限的进程连不上它。
 - 「检测住宅代理」里直接连接的那一路，会把 SOCKS5 用户名和密码不经第一跳、明文发出去，住宅服务商也会看到真实 IP。所以检测前会先弹确认框。
 - 「导出脱敏诊断」只保留状态和数值计数，不含目的地址、域名和凭据，但仍请按内部资料处理。
-- 发布包没有签名，第三方许可证还没审完，所以发布为预发布版本。
+- 发布包没有签名，第三方许可证的再分发义务还没人确认，所以发布为预发布版本。v0.1.11 之后的发布包带 GitHub 构建来源证明，见[安装](#安装)。
 - 本项目不防御本机管理员，也不防御目标发行版里的 root。

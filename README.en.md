@@ -118,7 +118,7 @@ Closing the window, killing a process or a controller crash does not restore dir
 "Other distributions are unaffected" was measured only on WSL kernel 6.18.58.1. A target whose kernel is older or cannot be read is refused by the preflight until WSL is updated. Whether an update gets past this floor has not been tested.
 
 **8. Release packages are unsigned.**
-The SHA-256 checksum shows the file is intact; it does not identify the publisher.
+The SHA-256 checksum shows the file is intact; it does not identify the publisher. Packages released after v0.1.11 also carry a GitHub build provenance attestation, which shows the release pipeline of this repository built them; that is not a code signature either, and Windows still warns about an unknown publisher.
 
 ## Requirements
 
@@ -156,6 +156,9 @@ In PowerShell:
 ```powershell
 # 1. Check the checksum against the one on the release page
 Get-FileHash -Algorithm SHA256 .\wsl-proxy-<version>-windows-x64.zip
+
+# Optional: check the build provenance (releases after v0.1.11, needs the GitHub CLI)
+gh attestation verify .\wsl-proxy-<version>-windows-x64.zip -R JungleZy/dick-wsl-proxy
 
 # 2. Extract to a new directory (not into the install directory)
 Expand-Archive .\wsl-proxy-<version>-windows-x64.zip -DestinationPath .\wsl-proxy-<version>
@@ -469,7 +472,7 @@ Output goes to `target\release\`. The default Cargo member is the controller alo
 
 **Packaging**
 
-The release packaging steps are defined by [`.github/workflows/release.yml`](.github/workflows/release.yml): check the import tables, export `cargo metadata`, write the build record, package with `scripts/package-windows.py`, then run the install smoke test. Script arguments and the local acceptance records are in [M5](docs/plans/m5/README.md). The scripts refuse to overwrite existing output files; `work/` and `dist/` are not in `.gitignore`, so write the output outside the repository.
+The release packaging steps are defined by [`.github/workflows/release.yml`](.github/workflows/release.yml): check the import tables, export `cargo metadata` for the Windows platform only (`--filter-platform x86_64-pc-windows-msvc`), write the build record, package with `scripts/package-windows.py`, then run the install smoke test; a separate job checks third-party licenses with `cargo-deny` against `deny.toml` at the repository root. The package's `THIRD-PARTY-NOTICES.json` and `licenses/` cover only the Windows dependency graph (erring on the side of too many); where a dependency ships no license file, the standard text of the license it declares is included (`packaging/licenses/`). Script arguments and the local acceptance records are in [M5](docs/plans/m5/README.md). The scripts refuse to overwrite existing output files; `work/` and `dist/` are not in `.gitignore`, so write the output outside the repository.
 
 `scripts/build-desktop-windows.sh` can cross-compile Windows EXEs from WSL, but that is only a development check; its output must not go into a release package.
 
@@ -530,6 +533,7 @@ Issues and pull requests are welcome. Read [AGENTS.md](AGENTS.md) first; the mai
   python src/guest/test_https_probe.py
   python src/guest/test_kernel_env.py
   python scripts/test_package_windows.py
+  cargo deny --workspace check licenses   # install once: cargo install cargo-deny --locked
   ```
 
 - **Documentation rules:**
@@ -546,5 +550,5 @@ Issues and pull requests are welcome. Read [AGENTS.md](AGENTS.md) first; the mai
 - The named pipe between the desktop app and the backend accepts only processes of the same Windows account whose integrity level is not lower than the backend's ([decision 21](docs/decisions.md)). When the backend runs as administrator, normal-privilege processes cannot reach it.
 - The direct path of the residential proxy test sends the SOCKS5 username and password in plain text without the first hop, and the residential provider sees your real IP. The app therefore asks for confirmation before testing.
 - "Export redacted diagnostics" keeps only states and numeric counters, with no destination addresses, domains or credentials; still treat the file as internal.
-- Release packages are unsigned and the third-party license review is unfinished, which is why they are published as pre-releases.
+- Release packages are unsigned and nobody has yet confirmed the third-party redistribution obligations, which is why they are published as pre-releases. Packages released after v0.1.11 carry a GitHub build provenance attestation; see [Installation](#installation).
 - This project does not defend against a local administrator or against root inside the target distribution.

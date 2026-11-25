@@ -120,7 +120,9 @@ jobs:
         shell: pwsh
         run: |
           $version = '${{ steps.version.outputs.version }}'
-          cargo metadata --locked --format-version 1 > work/cargo-metadata.json
+          # Only the Windows graph: the license inventory lists what the
+          # executables link, not the macOS or Linux backends of GPUI.
+          cargo metadata --locked --format-version 1 --filter-platform x86_64-pc-windows-msvc > work/cargo-metadata.json
           if ($LASTEXITCODE) { exit 1 }
           python scripts/build-record.py --version $version --backend target/release/wsl-proxyctl.exe --desktop target/release/wsl-proxy-desktop.exe --output work/build-record.json
           if ($LASTEXITCODE) { exit 1 }
@@ -158,13 +160,32 @@ jobs:
             ci-logs/*
           if-no-files-found: error
 
+  licenses:
+    name: Check third-party licenses
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fails when a dependency of the Windows build uses a license that
+      # deny.toml does not allow.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+          # Both executables: without it only the default member
+          # (the controller) would be checked, not the desktop app.
+          arguments: --workspace
+
   publish:
     name: Publish the GitHub release
-    needs: package
+    needs: [package, licenses]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Build provenance: Sigstore signs it with the workflow's OIDC identity.
+      id-token: write
+      attestations: write
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -175,6 +196,14 @@ jobs:
         with:
           name: wsl-proxy-${{ needs.package.outputs.version }}-windows-x64
           path: artifact
+
+      # Lets anyone check that the ZIP came from this workflow at this commit:
+      # gh attestation verify <zip> -R <owner/repo>. Proves the build, not the
+      # publisher's identity the way a code signature would.
+      - name: Attest the build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: artifact/dist/wsl-proxy-${{ needs.package.outputs.version }}-windows-x64.zip
 
       # Published as a pre-release: the package is unsigned and its
       # third-party licenses are still under review (docs/plans/m5/README.md).
