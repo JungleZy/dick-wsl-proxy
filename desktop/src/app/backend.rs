@@ -113,6 +113,9 @@ pub(crate) struct Reply {
 
 pub(crate) fn humanize_error(error: &str) -> String {
     let error = error.trim();
+    if let Some(text) = policy_field_error(error) {
+        return text;
+    }
     if let Some((code, message)) = error.split_once(" · ") {
         return humanize_code(code.trim(), message.trim());
     }
@@ -130,6 +133,73 @@ pub(crate) fn humanize_error(error: &str) -> String {
         return humanize_code(error, "");
     }
     humanize_detail(error)
+}
+
+/// 保存配置时后台的校验错误以字段名开头、原因是英文（`direct_ips: invalid direct IP CIDR
+/// prefix: "10.0.0.1/33"`）。换成页面上的位置和名称，并带上被拒的那一项，用户才知道改哪里。
+/// 策略里没有秘密，原值可以显示；住宅凭据的错误本身不带原值。
+fn policy_field_error(error: &str) -> Option<String> {
+    // (后台字段名, 页面上的位置, 补充说明)
+    const FIELDS: &[(&str, &str, &str)] = &[
+        ("direct_ips", "规则页「IPv4 / CIDR」", ""),
+        ("direct_domains", "规则页「精确域名」", ""),
+        ("direct_suffixes", "规则页「域名后缀」", ""),
+        (
+            "first_hop",
+            "设置页「宿主 SOCKS5」",
+            "需要是本机回环地址和端口，例如 127.0.0.1:7890。",
+        ),
+        ("dns_upstream", "设置页「DoH 上游 IPv4:端口」", ""),
+        ("dns_tls_name", "设置页受管 DNS 的「TLS 主机名」", ""),
+        (
+            "direct_dns_upstream",
+            "设置页「国内 DoH 上游 IPv4:端口」",
+            "需要是公网 IPv4 和端口；留空即关闭。",
+        ),
+        ("direct_dns_tls_name", "设置页「国内 DoH TLS 主机名」", ""),
+        ("health_domain", "设置页「健康检查域名」", ""),
+        (
+            "max_tcp_connections",
+            "设置页「并发 TCP 上限」",
+            "范围 16–1024。",
+        ),
+        (
+            "tcp_idle_timeout_seconds",
+            "设置页「TCP 空闲断开」",
+            "范围 30–86400 秒。",
+        ),
+        (
+            "tcp_half_close_timeout_seconds",
+            "设置页「半关闭等待」",
+            "范围 5–3600 秒。",
+        ),
+        ("credential ip", "设置页住宅代理的「服务器 IPv4」", ""),
+        (
+            "credential endpoint",
+            "设置页住宅代理的「服务器 IPv4」或「服务器端口」",
+            "",
+        ),
+        ("credential port", "设置页住宅代理的「服务器端口」", ""),
+    ];
+    // 后台另有 `controller_error · ` 之类的外层包装时，取里面的原文。
+    let detail = error.rsplit(" · ").next().unwrap_or(error).trim();
+    let detail = detail
+        .strip_prefix("desktop_request_failed:")
+        .unwrap_or(detail)
+        .trim();
+    let (_, place, hint) = FIELDS.iter().find(|(field, _, _)| {
+        detail
+            .strip_prefix(field)
+            .is_some_and(|rest| rest.starts_with(':') || rest.starts_with(' '))
+    })?;
+    // 被拒的那一项在末尾，带引号。
+    let rejected = detail
+        .rfind(": \"")
+        .map(|at| detail[at + 2..].trim())
+        .filter(|value| value.len() > 2 && value.ends_with('"'))
+        .map(|value| format!("：{value}"))
+        .unwrap_or_default();
+    Some(format!("{place}填写有误{rejected}。{hint}"))
 }
 
 fn humanize_code(code: &str, message: &str) -> String {
@@ -856,6 +926,38 @@ mod tests {
             humanize_error("environment_job_running · environment_create is still running for Dev"),
             "后台正在执行环境操作，请等它完成后再试。"
         );
+    }
+
+    #[test]
+    fn names_the_page_field_and_entry_a_saved_policy_was_refused_for() {
+        assert_eq!(
+            humanize_error(
+                "desktop_request_failed · direct_ips: invalid direct IP CIDR prefix: \"10.0.0.1/33\""
+            ),
+            "规则页「IPv4 / CIDR」填写有误：\"10.0.0.1/33\"。"
+        );
+        assert_eq!(
+            humanize_error(
+                "direct_suffixes: policy domain must be an ASCII DNS hostname: \"bad name\""
+            ),
+            "规则页「域名后缀」填写有误：\"bad name\"。"
+        );
+        assert_eq!(
+            humanize_error(
+                "desktop_request_failed · direct_dns_upstream must be a literal public IPv4:port or null"
+            ),
+            "设置页「国内 DoH 上游 IPv4:端口」填写有误。需要是公网 IPv4 和端口；留空即关闭。"
+        );
+        assert_eq!(
+            humanize_error("dns_upstream must be a literal unicast IPv4:port"),
+            "设置页「DoH 上游 IPv4:端口」填写有误。"
+        );
+        assert_eq!(
+            humanize_error("credential ip must be literal IPv4"),
+            "设置页住宅代理的「服务器 IPv4」填写有误。"
+        );
+        // A code that merely starts with a field name is not a field error.
+        assert!(!humanize_error("first_hop_unreachable").contains("填写有误"));
     }
 
     #[test]
