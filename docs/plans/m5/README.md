@@ -17,7 +17,7 @@
    ```
 
    若没有存活的后台、曾经崩溃或切换被打断，先执行 `& $ctl status`，在明确要恢复后执行 `& $ctl stop`，再查状态。期望 `phase=idle`、`active_target=null`；`controller_busy` 表示另有持锁者，不是已恢复。归属或 DNS 未核实就停止维护，不手动删除 `m1-active.json`/`m3-operation.json`、不清空共享防火墙或连接表。目标已被注销、`stop` 无法完成时，改用 `& $ctl abandon --confirm`，再执行一次 `wsl --shutdown`。详见 [M3 异常恢复](../m3/README.md)。
-4. 关闭窗口。升级时在新包解压目录对同一 `-InstallDir` 运行 ` .\install.ps1`；卸载用 ` .\uninstall.ps1`。安装器会先认证并请求同目录的**空闲**后台退出，再持同一用户控制器锁替换成对文件。默认拒绝降级、不同构建占用相同版本号、未知/修改过的文件及活动或待恢复的接管。
+4. 关闭窗口。升级时在新包解压目录对同一 `-InstallDir` 运行 ` .\install.ps1`；卸载用 ` .\uninstall.ps1`。安装器会先认证并请求同目录的**空闲**后台退出，再持同一用户控制器锁替换成对文件。默认拒绝降级、不同构建占用相同版本号、未知/修改过的文件及活动或待恢复的接管。后台以管理员身份运行时，普通权限的 PowerShell 连不上它（决策 21），安装器会报「Another controller/session … holds the lock」并且不改任何文件；这时在管理员 PowerShell 里运行安装或卸载脚本。
    程序运行时在安装目录里写的文件（`desktop.sqlite` 及其 `-wal`/`-shm`、`environment-progress-*`、`diagnostics-*.json`、`io-*.tmp`，见 [M4](../m4/README.md)）属于用户数据，不算未知文件。升级时安装器把它们搬进新目录；卸载只删除清单内的程序文件，这些数据留在原安装目录，之后在同一位置重新安装会继续使用。要彻底删除，卸载后手动删掉该目录。搬运时若新旧两处有同名文件，安装器停止并保留两边，不覆盖。
 5. 文件事务中断时保留事务记录、stage/backup 和原文件；先核对网络状态，不启动不完整的安装。从外部完整包运行原来的脚本，指定同一 `-InstallDir` 和 `-Recover`。这只处理文件交换，不重放接管、不恢复用户密码、不替不明文件认领所有权。正常卸载后仍可自行管理 Windows 凭据和用户配置。
 
