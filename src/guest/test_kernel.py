@@ -1083,7 +1083,8 @@ class InspectionTests(unittest.TestCase):
         operation = request(p)
         operation["operation"] = "inspect"
         failure = kernel.Failure(identity_error) if identity_error else None
-        with patch.object(kernel, "guest_lock") as lock, patch.object(kernel, "guard", side_effect=failure) as guard, patch.object(kernel, "Conntrack") as conntrack, patch.object(kernel, "firewall", side_effect=tables), patch.object(kernel, "transaction") as transact, patch.object(kernel, "install_rules") as install, patch.object(kernel, "grant") as grant, patch.object(kernel, "grant_pending", return_value=pending):
+        # No test may reach the host's real /proc or docker.sock.
+        with patch.object(kernel, "guest_lock") as lock, patch.object(kernel, "guard", side_effect=failure) as guard, patch.object(kernel, "Conntrack") as conntrack, patch.object(kernel, "firewall", side_effect=tables), patch.object(kernel, "transaction") as transact, patch.object(kernel, "install_rules") as install, patch.object(kernel, "grant") as grant, patch.object(kernel, "grant_pending", return_value=pending), patch.object(kernel, "docker_networks", return_value={}):
             conntrack.return_value.dump.side_effect = lambda ipv6=False: (ipv6_entries or []) if ipv6 else (entries or [])
             try:
                 return kernel.execute(operation)["ownership"]
@@ -1238,6 +1239,181 @@ class InspectionTests(unittest.TestCase):
         value = self.observe(comprehensive_plan(), [{}, {}], ipv6_entries=[{"mark": plan()["cookie"]}])
         self.assertEqual(value["unproven_mappings"], 1)
         self.assertFalse(value["mappings_present"])
+
+
+DOCKER_NETWORKS = [
+    # Shaped like a real `GET /networks` answer; names and ids are made up.
+    {"Name": "bridge", "Id": "09a063a82840" + "1" * 52, "Driver": "bridge", "Options": {"com.docker.network.bridge.name": "docker0"}, "IPAM": {"Driver": "default", "Config": [{"Subnet": "172.17.0.0/16", "Gateway": "172.17.0.1"}]}},
+    {"Name": "shop", "Id": "acc14c99a879" + "2" * 52, "Driver": "bridge", "Options": {}, "IPAM": {"Driver": "default", "Config": [{"Subnet": "172.18.0.0/16", "Gateway": "172.18.0.1"}, {"Subnet": "fd00:db8:18::/64"}]}},
+    {"Name": "host", "Id": "3161673e190f" + "3" * 52, "Driver": "host", "Options": {}, "IPAM": {"Driver": "default", "Config": None}},
+    {"Name": "none", "Id": "c335aa371a37" + "4" * 52, "Driver": "null", "Options": {}, "IPAM": {"Driver": "default", "Config": None}},
+    # A bridge network whose interface is not in this network stack.
+    {"Name": "elsewhere", "Id": "ffeeddccbbaa" + "5" * 52, "Driver": "bridge", "Options": {}, "IPAM": {"Config": [{"Subnet": "172.19.0.0/16"}]}},
+    {"Name": "odd", "Id": "not-an-id", "Driver": "bridge", "Options": {}, "IPAM": {"Config": [{"Subnet": "172.20.0.0/16"}]}},
+    {"Name": "evil", "Id": "aaaaaaaaaaaa" + "6" * 52, "Driver": "bridge", "Options": {"com.docker.network.bridge.name": "eth0"}, "IPAM": {"Config": [{"Subnet": "172.21.0.0/16"}]}},
+]
+PRESENT = {"docker0", "br-acc14c99a879", "eth0"}
+WANTED = {"docker0": {"v4": ["172.17.0.0/16"], "v6": []}, "br-acc14c99a879": {"v4": ["172.18.0.0/16"], "v6": ["fd00:db8:18::/64"]}}
+
+
+def with_networks(tables, p, networks, ipv6=False):
+    """`tables` with the per-network rules for `networks` in their chains,
+    ahead of each chain's final RETURN, as a sync would leave them."""
+    nat, filtered = kernel.network_rules(p, networks, ipv6)
+    for table, rules in (("nat", nat), ("filter", filtered)):
+        if not rules:
+            continue
+        existing = tables[table]["rules"]
+        for rule in rules:
+            last = max(index for index, current in enumerate(existing) if current[1] == rule[1])
+            existing.insert(last, copy.deepcopy(rule))
+    return tables
+
+
+class ContainerNetworkTests(unittest.TestCase):
+    def test_docker_networks_are_asked_only_while_dockerd_runs(self):
+        with patch.object(kernel, "dockerd_running", return_value=False), patch.object(kernel, "docker_request") as ask:
+            self.assertEqual(kernel.docker_networks(), {})
+        ask.assert_not_called()
+        with patch.object(kernel, "dockerd_running", return_value=True), patch.object(kernel.os.path, "exists", return_value=True), patch.object(kernel, "docker_request", return_value=DOCKER_NETWORKS), patch.object(kernel.os.path, "isdir", side_effect=lambda path: path.rsplit("/", 1)[-1] in PRESENT):
+            self.assertEqual(kernel.docker_networks(), WANTED)
+        with patch.object(kernel, "dockerd_running", return_value=True), patch.object(kernel.os.path, "exists", return_value=True), patch.object(kernel, "docker_request", side_effect=OSError("refused")):
+            with self.assertRaisesRegex(kernel.Failure, "docker_networks_unavailable"):
+                kernel.docker_networks()
+        with patch.object(kernel, "dockerd_running", return_value=True), patch.object(kernel.os.path, "exists", return_value=False):
+            with self.assertRaisesRegex(kernel.Failure, "docker_socket_missing"):
+                kernel.docker_networks()
+
+    def test_dockerd_is_found_by_process_name_in_the_targets_proc(self):
+        with tempfile.TemporaryDirectory() as proc:
+            for pid, name in (("1", "systemd"), ("42", "containerd"), ("self", "dockerd")):
+                os.mkdir(os.path.join(proc, pid))
+                with open(os.path.join(proc, pid, "comm"), "w") as handle:
+                    handle.write(name + "\n")
+            self.assertFalse(kernel.dockerd_running(proc))
+            os.mkdir(os.path.join(proc, "77"))
+            with open(os.path.join(proc, "77", "comm"), "w") as handle:
+                handle.write("dockerd\n")
+            self.assertTrue(kernel.dockerd_running(proc))
+
+    def test_only_bridge_networks_with_an_interface_here_count(self):
+        self.assertEqual(kernel.parse_docker_networks(DOCKER_NETWORKS, lambda name: name in PRESENT), WANTED)
+        with self.assertRaises(kernel.Failure):
+            kernel.parse_docker_networks({"not": "a list"}, lambda name: True)
+
+    def test_network_rules_keep_subnets_local_redirect_the_rest_and_drop_leftovers(self):
+        p = comprehensive_plan()
+        nat, filtered = kernel.network_rules(p, {"docker0": WANTED["docker0"]})
+        self.assertEqual([(rule[1], rule[rule.index("-i") + 1], rule[-1]) for rule in nat], [("WPM2B_12345678", "docker0", "RETURN"), ("WPM2B_12345678", "docker0", "WPM2_12345678")])
+        self.assertEqual(nat[0][nat[0].index("-d") + 1], "172.17.0.0/16")
+        self.assertEqual([rule[-1] for rule in filtered], ["RETURN"] * 4 + ["DROP"])
+        self.assertEqual([rule[rule.index("-d") + 1] for rule in filtered[:-1]], ["172.17.0.0/16", *kernel.LOCAL_SCOPES["v4"]])
+        self.assertTrue(all(rule[1] == "WPM2FB_12345678" for rule in filtered))
+        # IPv6 block mode: no redirection, only the drop of what is not local.
+        nat6, filtered6 = kernel.network_rules(p, WANTED, ipv6=True)
+        self.assertEqual(nat6, [])
+        self.assertEqual([rule[-1] for rule in filtered6].count("DROP"), 2)
+        self.assertIn("fd00:db8:18::/64", [token for rule in filtered6 for token in rule])
+        for rule in nat + filtered + filtered6:
+            self.assertEqual(kernel.network_rule_owner(p, rule, rule in filtered6), rule[rule.index("-i") + 1])
+
+    def test_installed_network_rules_are_owned_but_not_part_of_completeness(self):
+        p = comprehensive_plan()
+        tables = with_networks(snapshot(p), p, WANTED)
+        tables6 = with_networks(ipv6_snapshot(p), p, WANTED, ipv6=True)
+        present, rules = kernel.inspect_firewall(p, tables, True)
+        _, rules6 = kernel.inspect_firewall(p, tables6, True, ipv6=True)
+        self.assertTrue(kernel.rules_complete(p, present, rules, rules6))
+        self.assertEqual(sorted(kernel.installed_networks(p, rules)), sorted(WANTED))
+        self.assertEqual(kernel.network_changes(p, rules, WANTED), ([], []))
+        self.assertEqual(kernel.network_changes(p, rules6, WANTED, ipv6=True), ([], []))
+        # Anything else carrying the per-network tag is refused.
+        tag = kernel.network_tag(p)
+        strays = [
+            ["-A", "WPM2B_12345678", "-i", "eth0", "-m", "comment", "--comment", tag, "-j", "WPM2_12345678"],
+            ["-A", "WPM2F_12345678", "-i", "docker0", "-m", "comment", "--comment", tag, "-j", "DROP"],
+            ["-A", "WPM2FB_12345678", "-i", "docker0", "-d", "fd00::/8", "-m", "comment", "--comment", tag, "-j", "RETURN"],
+            ["-A", "WPM2B_12345678", "-i", "docker0", "-m", "comment", "--comment", tag, "-j", "ACCEPT"],
+            ["-A", "WPM2B_12345678", "-i", "docker0", "-p", "tcp", "-m", "comment", "--comment", tag, "-j", "WPM2_12345678"],
+        ]
+        for stray in strays:
+            with self.subTest(stray=stray):
+                broken = snapshot(p)
+                table = "nat" if stray[1].startswith("WPM2B") else "filter"
+                broken[table]["rules"].insert(0, stray)
+                with self.assertRaisesRegex(kernel.Failure, "foreign_instance_rule"):
+                    kernel.inspect_firewall(p, broken, True)
+
+    def test_a_stop_removes_the_network_rules_with_the_rest(self):
+        p = comprehensive_plan()
+        tables = with_networks(snapshot(p), p, WANTED)
+        tables6 = with_networks(ipv6_snapshot(p), p, WANTED, ipv6=True)
+        operation = request(p)
+        operation["operation"] = "remove"
+        with patch.object(kernel, "guest_lock"), patch.object(kernel, "grant"), patch.object(kernel, "guard"), patch.object(kernel, "Conntrack") as conntrack, patch.object(kernel, "firewall", side_effect=[tables, tables6, {}, {}]), patch.object(kernel, "transaction") as transact:
+            conntrack.return_value.dump.return_value = []
+            kernel.execute(operation)
+        lines = [line for call in transact.call_args_list for line in call.args[1]]
+        deleted = sum(1 for line in lines if line[0] == "-D")
+        self.assertEqual(deleted, sum(len(table["rules"]) for both in (tables, tables6) for table in both.values()))
+
+    def sync(self, p, tables, tables6, wanted, guard_error=None):
+        operation = request(p)
+        operation["operation"] = "sync_networks"
+        failure = kernel.Failure(guard_error) if guard_error else None
+        with patch.object(kernel, "guest_lock"), patch.object(kernel, "guard", side_effect=failure), patch.object(kernel, "Conntrack"), patch.object(kernel, "firewall", side_effect=[tables, tables6]), patch.object(kernel, "docker_networks", return_value=wanted), patch.object(kernel, "transaction") as transact:
+            result = kernel.execute(operation)
+        return result, [(call.args[0], call.kwargs.get("ipv6", False), call.args[1]) for call in transact.call_args_list]
+
+    def test_sync_adds_new_networks_and_removes_gone_ones_in_a_safe_order(self):
+        p = comprehensive_plan()
+        old = {"docker0": WANTED["docker0"]}
+        new = {"br-acc14c99a879": WANTED["br-acc14c99a879"]}
+        tables = with_networks(snapshot(p), p, old)
+        tables6 = with_networks(ipv6_snapshot(p), p, old, ipv6=True)
+        result, calls = self.sync(p, tables, tables6, new)
+        self.assertEqual(result["synced"], {"current": ["br-acc14c99a879"], "added": ["br-acc14c99a879"], "removed": ["docker0"]})
+        # Removals: redirection (nat) before the drops; additions: drops first.
+        self.assertEqual([(table, ipv6, lines[0][0]) for table, ipv6, lines in calls], [("nat", False, "-D"), ("filter", False, "-D"), ("filter", True, "-D"), ("filter", False, "-I"), ("filter", True, "-I"), ("nat", False, "-I")])
+        removed = [line for _, _, lines in calls for line in lines if line[0] == "-D"]
+        self.assertTrue(all("docker0" in line for line in removed))
+        for table, ipv6, lines in calls:
+            if lines[0][0] != "-I":
+                continue
+            # Inserted at the top in reverse, so they end up in rule order.
+            final = [["-A", line[1], *line[3:]] for line in reversed(lines)]
+            expected = kernel.network_rules(p, new, ipv6)[0 if table == "nat" else 1]
+            self.assertEqual(final, expected)
+        # Nothing to do when the rules already match.
+        result, calls = self.sync(p, tables, tables6, old)
+        self.assertEqual((result["synced"]["added"], result["synced"]["removed"], calls), ([], [], []))
+
+    def test_sync_extends_only_a_complete_takeover_of_this_identity(self):
+        p = comprehensive_plan()
+        partial = snapshot(p)
+        del partial["nat"]
+        with self.assertRaisesRegex(kernel.Failure, "network_sync_without_complete_rules"):
+            self.sync(p, partial, ipv6_snapshot(p), WANTED)
+        with self.assertRaisesRegex(kernel.Failure, "boot_changed"):
+            self.sync(p, snapshot(p), ipv6_snapshot(p), WANTED, guard_error="boot_changed")
+
+    def test_inspect_reports_network_drift_without_changing_anything(self):
+        p = comprehensive_plan()
+        operation = request(p)
+        operation["operation"] = "inspect"
+        tables = with_networks(snapshot(p), p, {"docker0": WANTED["docker0"]})
+        tables6 = with_networks(ipv6_snapshot(p), p, {"docker0": WANTED["docker0"]}, ipv6=True)
+        for wanted, expected in (({"docker0": WANTED["docker0"]}, True), (WANTED, False), ({}, False)):
+            with self.subTest(wanted=sorted(wanted)), patch.object(kernel, "guest_lock"), patch.object(kernel, "guard"), patch.object(kernel, "Conntrack") as conntrack, patch.object(kernel, "firewall", side_effect=[copy.deepcopy(tables), copy.deepcopy(tables6)]), patch.object(kernel, "docker_networks", return_value=wanted), patch.object(kernel, "transaction") as transact:
+                conntrack.return_value.dump.return_value = []
+                result = kernel.execute(operation)
+                transact.assert_not_called()
+            self.assertEqual(result["networks"], {"installed": ["docker0"], "wanted": sorted(wanted), "in_sync": expected, "error": None})
+        with patch.object(kernel, "guest_lock"), patch.object(kernel, "guard"), patch.object(kernel, "Conntrack") as conntrack, patch.object(kernel, "firewall", side_effect=[copy.deepcopy(tables), copy.deepcopy(tables6)]), patch.object(kernel, "docker_networks", side_effect=kernel.Failure("docker_networks_unavailable")):
+            conntrack.return_value.dump.return_value = []
+            result = kernel.execute(operation)
+        self.assertEqual(result["networks"]["error"], "docker_networks_unavailable")
+        self.assertIsNone(result["networks"]["in_sync"])
 
 
 class GrantTests(unittest.TestCase):

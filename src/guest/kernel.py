@@ -94,7 +94,7 @@ def validate(request):
     fields = {"operation", "plan", "protocol", "peer"}
     require(isinstance(request, dict) and set(request) in (fields, fields | {"deadline"}), "invalid_request")
     operation = request["operation"]
-    require(operation in ("precheck", "arm", "install", "remove", "inspect", "lookup"), "invalid_operation")
+    require(operation in ("precheck", "arm", "install", "remove", "inspect", "lookup", "sync_networks"), "invalid_operation")
     require((operation == "arm") == ("deadline" in request), "unexpected_or_missing_grant_deadline")
     if operation == "arm":
         require(integer(request["deadline"], 1, 0xffffffffffffffff), "invalid_grant_deadline")
@@ -602,6 +602,193 @@ def legacy_rules(p, ipv6=False):
     return rules
 
 
+
+DOCKER_SOCKETS = ("/var/run/docker.sock", "/run/docker.sock")
+BRIDGE_NAME = re.compile(r"[A-Za-z0-9_.-]{1,15}")
+# Destinations a container reaches only on its own host: never redirected by
+# the main chain, so the per-network gate must not drop them either.
+LOCAL_SCOPES = {"v4": ("224.0.0.0/4", "255.255.255.255/32", "169.254.0.0/16"), "v6": ("fe80::/10", "ff00::/8")}
+
+
+def dockerd_running(proc="/proc"):
+    """Whether a dockerd process runs in the target (its own PID namespace).
+    Only then is docker.sock asked: connecting to an idle socket-activated
+    one would start Docker, and a socket without a daemon here may lead to
+    another distribution's (decision 24)."""
+    for entry in os.listdir(proc):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(os.path.join(proc, entry, "comm"), "rb") as handle:
+                if handle.read(64).strip() == b"dockerd":
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def docker_request(path, socket_path, timeout=3, limit=4 << 20):
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.settimeout(timeout)
+    try:
+        connection.connect(socket_path)
+        connection.sendall(b"GET " + path.encode("ascii") + b" HTTP/1.0\r\nHost: docker\r\n\r\n")
+        data = b""
+        while True:
+            chunk = connection.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+            require(len(data) <= limit, "docker_response_too_large")
+    finally:
+        connection.close()
+    head, separator, body = data.partition(b"\r\n\r\n")
+    status = head.split(b"\r\n", 1)[0].split(b" ")
+    require(bool(separator) and len(status) >= 2 and status[1] == b"200", "docker_request_failed")
+    return json.loads(body)
+
+
+def parse_docker_networks(networks, exists):
+    """{bridge name: {"v4": [subnets], "v6": [subnets]}} for the bridge-driver
+    networks whose interface `exists` in this network stack."""
+    require(isinstance(networks, list), "docker_networks_invalid")
+    result = {}
+    for network in networks:
+        if not isinstance(network, dict) or network.get("Driver") != "bridge":
+            continue
+        options = network.get("Options")
+        name = options.get("com.docker.network.bridge.name") if isinstance(options, dict) else None
+        if not name:
+            ident = network.get("Id")
+            if not (isinstance(ident, str) and re.fullmatch(r"[0-9a-f]{12,64}", ident)):
+                continue
+            name = "br-" + ident[:12]
+        if not (isinstance(name, str) and BRIDGE_NAME.fullmatch(name)) or name in ("eth0", "lo") or not exists(name):
+            continue
+        families = {"v4": set(), "v6": set()}
+        ipam = network.get("IPAM")
+        configs = ipam.get("Config") if isinstance(ipam, dict) else None
+        for config in configs if isinstance(configs, list) else []:
+            subnet = config.get("Subnet") if isinstance(config, dict) else None
+            try:
+                value = ipaddress.ip_network(subnet, strict=False)
+            except (TypeError, ValueError):
+                continue
+            families["v6" if value.version == 6 else "v4"].add(str(value))
+        result[name] = {family: sorted(values) for family, values in families.items()}
+    return result
+
+
+def docker_networks():
+    """The target's own Docker bridge networks (decision 24); empty when no
+    dockerd runs in the target."""
+    if not dockerd_running():
+        return {}
+    path = next((path for path in DOCKER_SOCKETS if os.path.exists(path)), None)
+    require(path is not None, "docker_socket_missing")
+    try:
+        networks = docker_request("/networks", path)
+    except (OSError, ValueError) as error:
+        raise Failure("docker_networks_unavailable") from error
+    return parse_docker_networks(networks, lambda name: os.path.isdir("/sys/class/net/" + name))
+
+
+def network_tag(p, ipv6=False):
+    return ("wsl-proxyctl-m2v6n:" if ipv6 else "wsl-proxyctl-m2n:") + f"{p['cookie']:08x}:" + plan_digest(p)[:16]
+
+
+def network_rules(p, networks, ipv6=False):
+    """Per-network rules for the target's own Docker bridges, as (nat, filter)
+    in the order they must end up in their chains (decision 24): traffic
+    within the network stays local, other traffic is redirected like the
+    target's own, and what was not redirected is dropped at forwarding."""
+    cookie = f"{p['cookie']:08x}"
+    comment = ["-m", "comment", "--comment", network_tag(p, ipv6)]
+    family = "v6" if ipv6 else "v4"
+    if not ipv6:
+        redirect, bridge_chain, gate = "WPM2_" + cookie, "WPM2B_" + cookie, "WPM2FB_" + cookie
+    elif p.get("ipv6") is not None:
+        redirect, bridge_chain, gate = "WPM2V_" + cookie, "WPM2VB_" + cookie, "WPM2VFB_" + cookie
+    else:
+        redirect, bridge_chain, gate = None, None, "WPM2VFB_" + cookie
+    nat, filtered = [], []
+    for name in sorted(networks):
+        subnets = networks[name][family]
+        if redirect is not None:
+            nat.extend(["-A", bridge_chain, "-i", name, "-d", subnet, *comment, "-j", "RETURN"] for subnet in subnets)
+            nat.append(["-A", bridge_chain, "-i", name, *comment, "-j", redirect])
+        filtered.extend(["-A", gate, "-i", name, "-d", subnet, *comment, "-j", "RETURN"] for subnet in [*subnets, *LOCAL_SCOPES[family]])
+        filtered.append(["-A", gate, "-i", name, *comment, "-j", "DROP"])
+    return nat, filtered
+
+
+def network_rule_owner(p, rule, ipv6=False):
+    """The bridge a per-network rule of this instance belongs to, or None when
+    `rule` is not exactly one of them."""
+    if network_tag(p, ipv6) not in rule:
+        return None
+    try:
+        name = rule[rule.index("-i") + 1]
+    except (ValueError, IndexError):
+        return None
+    if not BRIDGE_NAME.fullmatch(name) or name in ("eth0", "lo"):
+        return None
+    family = "v6" if ipv6 else "v4"
+    subnets = []
+    if "-d" in rule:
+        try:
+            value = ipaddress.ip_network(rule[rule.index("-d") + 1], strict=False)
+        except (ValueError, IndexError):
+            return None
+        if value.version != (6 if ipv6 else 4):
+            return None
+        if str(value) not in LOCAL_SCOPES[family]:
+            subnets.append(str(value))
+    nat, filtered = network_rules(p, {name: {"v4": subnets, "v6": subnets}}, ipv6)
+    try:
+        key = rule_key(rule)
+    except Failure:
+        return None
+    return name if key in {rule_key(candidate) for candidate in nat + filtered} else None
+
+
+def installed_networks(p, found, ipv6=False):
+    """{bridge: [(table, rule)]} for this instance's per-network rules in `found`."""
+    result = {}
+    for table in ("nat", "filter"):
+        for rule in found.get(table, []):
+            name = network_rule_owner(p, rule, ipv6)
+            if name is not None:
+                result.setdefault(name, []).append((table, rule))
+    return result
+
+
+def network_changes(p, found, wanted, ipv6=False):
+    """Bridges whose per-network rules differ from what `wanted` asks for, as
+    (removals, additions): lists of (table, rule)."""
+    installed = installed_networks(p, found, ipv6)
+    removals, additions = [], []
+    for name in sorted(set(installed) | set(wanted)):
+        nat, filtered = network_rules(p, {name: wanted[name]} if name in wanted else {}, ipv6)
+        want = [("nat", rule) for rule in nat] + [("filter", rule) for rule in filtered]
+        have = installed.get(name, [])
+        if sorted((table, rule_key(rule)) for table, rule in want) != sorted((table, rule_key(rule)) for table, rule in have):
+            removals.extend(have)
+            additions.extend(want)
+    return removals, additions
+
+
+def network_report(p, rules, ipv6_rules):
+    """For the periodic check: the bridges with rules now, and whether they
+    match the target's Docker networks, without changing anything."""
+    installed = sorted(set(installed_networks(p, rules)) | set(installed_networks(p, ipv6_rules or {}, ipv6=True)))
+    try:
+        wanted = docker_networks()
+    except Failure as error:
+        return {"installed": installed, "wanted": None, "in_sync": None, "error": str(error)}
+    in_sync = not any(network_changes(p, rules, wanted)) and not any(network_changes(p, ipv6_rules or {}, wanted, ipv6=True))
+    return {"installed": installed, "wanted": sorted(wanted), "in_sync": in_sync, "error": None}
+
 def firewall(ipv6=False):
     output = run(["ip6tables-legacy-save" if ipv6 else "iptables-legacy-save"])
     tables, table = {}, None
@@ -707,7 +894,7 @@ def inspect_firewall(p, tables, existing, ipv6=False):
     seen = {"nat": set(), "filter": set()}
     observed_chains = set()
     present = False
-    prefixes = tuple("wsl-proxyctl-" + mode + ":" + cookie + ":" for mode in ("m1", "m2", "m2v6"))
+    prefixes = tuple("wsl-proxyctl-" + mode + ":" + cookie + ":" for mode in ("m1", "m2", "m2v6", "m2n", "m2v6n"))
     for name, table in tables.items():
         for owned_chain in reserved.intersection(table["chains"]):
             require(existing and chains.get(owned_chain) == name and table["chains"][owned_chain] == "-", "instance_chain_collision")
@@ -718,7 +905,13 @@ def inspect_firewall(p, tables, existing, ipv6=False):
             candidate = tag in rule or any(value in rule for value in reserved)
             if candidate:
                 key = rule_key(rule)
-                require(key in expected.get(name, []), "foreign_instance_rule")
+                # Per-network rules vary with the target's Docker networks;
+                # each must still be exactly one of their shapes, in its chain.
+                require(
+                    key in expected.get(name, [])
+                    or (network_rule_owner(p, rule, ipv6) is not None and chains.get(rule[1]) == name),
+                    "foreign_instance_rule",
+                )
                 require(existing, "instance_rule_collision")
                 require(key not in seen[name], "duplicate_instance_rule")
                 seen[name].add(key)
@@ -736,7 +929,10 @@ def inspect_firewall(p, tables, existing, ipv6=False):
 
 
 def rules_complete(p, present, rules, ipv6_rules):
-    same = lambda left, right: sorted(rule_key(rule) for rule in left) == sorted(rule_key(rule) for rule in right)
+    # Per-network rules come and go with the target's Docker networks and are
+    # compared separately (`network_changes`).
+    tags = (network_tag(p), network_tag(p, ipv6=True))
+    same = lambda left, right: sorted(rule_key(rule) for rule in left if not any(tag in rule for tag in tags)) == sorted(rule_key(rule) for rule in right)
     if p.get("ipv6") is not None:
         _, _, hooks, body, guards = artifacts(p)
         _, _, _, v6_hooks, v6_body, v6_guards = ipv6_artifacts(p)
@@ -1410,6 +1606,8 @@ def execute(request):
                     result = {"ok": True, "operation": operation, "ownership": ownership}
                     if drift is not None:
                         result["identity_error"] = drift
+                    if p.get("system_dns") is not None and identity_matches and ownership["rules_complete"]:
+                        result["networks"] = network_report(p, rules, ipv6_rules)
                     return result
                 def withdraw(table, found, observed, ipv6=False):
                     # Every owned rule, then every owned chain that exists
@@ -1441,6 +1639,38 @@ def execute(request):
                 entries, ipv6_entries, unproven = mapping_partition(p, ct)
                 require(not entries and not ipv6_entries, "owned_conntrack_residual")
                 unproven_left = unproven
+            elif operation == "sync_networks":
+                # Only an active, complete takeover of this exact identity is
+                # extended (the guard above refused any drift); after a stop
+                # the base rules are gone and nothing can be added.
+                require(p.get("system_dns") is not None, "networks_need_managed_mode")
+                tables, ipv6_tables = firewall(), firewall(ipv6=True)
+                present, rules = inspect_firewall(p, tables, True)
+                _, ipv6_rules = inspect_firewall(p, ipv6_tables, True, ipv6=True)
+                require(rules_complete(p, present, rules, ipv6_rules), "network_sync_without_complete_rules")
+                wanted = docker_networks()
+                changes = [(False, *network_changes(p, rules, wanted)), (True, *network_changes(p, ipv6_rules, wanted, ipv6=True))]
+                # Redirection goes before the drops it relies on when removing,
+                # and after them when adding, as for the base rules.
+                for table in ("nat", "filter"):
+                    for ipv6, removals, _ in changes:
+                        lines = [["-D", *rule[1:]] for kind, rule in removals if kind == table]
+                        if lines:
+                            transaction(table, lines, ipv6=ipv6)
+                for table in ("filter", "nat"):
+                    for ipv6, _, additions in changes:
+                        rules_here = [rule for kind, rule in additions if kind == table]
+                        # Each -I ... 1 lands on top, so insert backwards to
+                        # keep the subnet RETURNs ahead of their jump or drop.
+                        lines = [["-I", rule[1], "1", *rule[2:]] for rule in reversed(rules_here)]
+                        if lines:
+                            transaction(table, lines, ipv6=ipv6)
+                added, removed = set(), set()
+                for ipv6, removals, additions in changes:
+                    removed.update(network_rule_owner(p, rule, ipv6) for _, rule in removals)
+                    added.update(network_rule_owner(p, rule, ipv6) for _, rule in additions)
+                # A network whose subnets changed is re-added, not removed.
+                return {"ok": True, "operation": operation, "synced": {"current": sorted(wanted), "added": sorted(added), "removed": sorted(removed - set(wanted))}}
             else:
                 if isinstance(request["peer"], str) and request["peer"].startswith("["):
                     origin = resolve6(p, ct.dump(ipv6=True), request["protocol"], request["peer"])

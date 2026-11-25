@@ -78,9 +78,47 @@ pub fn inspect(p: &Plan) -> Result<Ownership, String> {
 /// As `inspect`, plus the guest's reason when it could not confirm this
 /// generation's identity (restart, rename, new address, foreign workload, ...).
 pub fn inspect_detail(p: &Plan) -> Result<(Ownership, Option<String>), String> {
+    inspect_networks(p).map(|(ownership, drift, _)| (ownership, drift))
+}
+
+/// As `inspect_detail`, plus how the target's Docker networks compare with
+/// this takeover's per-network rules; reported only for a complete managed
+/// takeover of the same identity (decision 24). Changes nothing.
+pub fn inspect_networks(p: &Plan) -> Result<(Ownership, Option<String>, Option<Networks>), String> {
     let response = invoke(p, "inspect", None)?;
     let ownership = response.ownership.ok_or("kernel_missing_ownership")?;
-    Ok((ownership, response.identity_error))
+    Ok((ownership, response.identity_error, response.networks))
+}
+
+/// Brings the per-network rules in line with the target's Docker bridge
+/// networks (decision 24). Only extends a complete managed takeover of the
+/// same identity; after a stop it fails without changing anything.
+pub fn sync_networks(p: &Plan) -> Result<Synced, String> {
+    invoke(p, "sync_networks", None)?
+        .synced
+        .ok_or_else(|| "kernel_missing_network_sync".into())
+}
+
+/// The target's Docker bridge networks next to the bridges this takeover has
+/// per-network rules for. `wanted` and `in_sync` are `None` when the networks
+/// could not be read, with the reason in `error`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Networks {
+    pub installed: Vec<String>,
+    pub wanted: Option<Vec<String>>,
+    pub in_sync: Option<bool>,
+    pub error: Option<String>,
+}
+
+/// What a network sync left: the target's networks now, and the bridges
+/// whose rules it added (or replaced) and removed.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Synced {
+    pub current: Vec<String>,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -105,6 +143,10 @@ struct Response {
     identity_error: Option<String>,
     #[serde(default)]
     unproven_mappings: Option<u32>,
+    #[serde(default)]
+    networks: Option<Networks>,
+    #[serde(default)]
+    synced: Option<Synced>,
 }
 
 fn invoke(p: &Plan, operation: &str, deadline: Option<u64>) -> Result<Response, String> {
@@ -153,6 +195,12 @@ fn parse_response(output: &str, operation: &str) -> Result<Response, String> {
     }
     if response.unproven_mappings.is_some() != (operation == "remove") {
         return Err("kernel_unexpected_or_missing_unproven_count".into());
+    }
+    if response.networks.is_some() && operation != "inspect" {
+        return Err("kernel_unexpected_network_report".into());
+    }
+    if response.synced.is_some() != (operation == "sync_networks") {
+        return Err("kernel_unexpected_or_missing_network_sync".into());
     }
     if let Some(ownership) = &response.ownership
         && ((ownership.rules_complete && !ownership.rules_present)
@@ -438,6 +486,35 @@ mod tests {
             Some(3)
         );
         assert!(parse_response(r#"{"ok":true,"operation":"remove"}"#, "remove").is_err());
+        // The network report belongs to inspect, the sync result to its own
+        // operation (decision 24).
+        let report = r#"{"ok":true,"operation":"inspect","ownership":{"identity_matches":true,"rules_present":true,"rules_complete":true,"mappings_present":false},"networks":{"installed":["docker0"],"wanted":["docker0","br-0123456789ab"],"in_sync":false,"error":null}}"#;
+        let networks = parse_response(report, "inspect").unwrap().networks.unwrap();
+        assert_eq!(networks.in_sync, Some(false));
+        assert_eq!(networks.wanted.unwrap().len(), 2);
+        let synced = r#"{"ok":true,"operation":"sync_networks","synced":{"current":["docker0"],"added":["docker0"],"removed":[]}}"#;
+        assert_eq!(
+            parse_response(synced, "sync_networks")
+                .unwrap()
+                .synced
+                .unwrap()
+                .added,
+            ["docker0"]
+        );
+        assert!(
+            parse_response(
+                r#"{"ok":true,"operation":"sync_networks"}"#,
+                "sync_networks"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_response(
+                r#"{"ok":true,"operation":"remove","unproven_mappings":0,"networks":{"installed":[],"wanted":null,"in_sync":null,"error":null}}"#,
+                "remove"
+            )
+            .is_err()
+        );
         assert!(
             parse_response(
                 r#"{"ok":true,"operation":"install","unproven_mappings":0}"#,

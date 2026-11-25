@@ -32,6 +32,10 @@ struct Watch {
     target_running: Option<bool>,
     consecutive_failures: u32,
     last_error: Option<String>,
+    /// The target's Docker bridge networks this takeover covers (decision 24).
+    networks: Vec<String>,
+    /// Why they could not be read or synced in the last round, if so.
+    network_error: Option<String>,
 }
 
 /// The outcome of one guest observation, judged only by its evidence.
@@ -140,12 +144,68 @@ enum Finding {
     Unregistered,
     RunningListFailed(String),
     NotRunning,
-    Inspected(Observed),
+    Inspected(Observed, Option<NetworkUpdate>),
+}
+
+/// The target's Docker networks after a round, and what changed (decision 24).
+struct NetworkUpdate {
+    current: Vec<String>,
+    added: Vec<String>,
+    removed: Vec<String>,
+    error: Option<String>,
+}
+
+/// What [`Controller::finish_watch`] reports back: a first protection loss,
+/// and a runtime log line about the target's container networks.
+pub(crate) struct WatchOutcome {
+    pub(crate) lost: Option<String>,
+    pub(crate) note: Option<(&'static str, String)>,
 }
 
 impl WatchRound {
     pub(crate) fn target(&self) -> &str {
         &self.plan.target.name
+    }
+
+    /// One guest inspect; when the rules are complete and the target's Docker
+    /// networks no longer match them, one sync to add or remove per-network
+    /// rules. This is the only change a round ever makes (decision 24).
+    fn inspect(&self) -> Finding {
+        match kernel::inspect_networks(&self.plan) {
+            Ok((ownership, drift, networks)) => {
+                let observed = classify(Ok((ownership, drift)));
+                let update = match (&observed, networks) {
+                    (Observed::Protected, Some(networks)) => Some(self.update_networks(networks)),
+                    _ => None,
+                };
+                Finding::Inspected(observed, update)
+            }
+            Err(error) => Finding::Inspected(classify(Err(error)), None),
+        }
+    }
+
+    fn update_networks(&self, networks: kernel::Networks) -> NetworkUpdate {
+        let unchanged = |error: Option<String>| NetworkUpdate {
+            current: networks.installed.clone(),
+            added: Vec::new(),
+            removed: Vec::new(),
+            error,
+        };
+        if let Some(error) = networks.error.clone() {
+            return unchanged(Some(error));
+        }
+        if networks.in_sync == Some(true) {
+            return unchanged(None);
+        }
+        match kernel::sync_networks(&self.plan) {
+            Ok(synced) => NetworkUpdate {
+                current: synced.current,
+                added: synced.added,
+                removed: synced.removed,
+                error: None,
+            },
+            Err(error) => unchanged(Some(error)),
+        }
     }
 
     /// The slow, read-only part of a check: the registry, `wsl --list
@@ -171,7 +231,7 @@ impl WatchRound {
                     .iter()
                     .any(|name| name.eq_ignore_ascii_case(&current.name)) =>
             {
-                Finding::Inspected(classify(kernel::inspect_detail(&self.plan)))
+                self.inspect()
             }
             Ok(_) => Finding::NotRunning,
             Err(error) => Finding::RunningListFailed(error),
@@ -218,6 +278,17 @@ impl Controller {
         &mut self,
         round: WatchRound,
         finding: WatchFinding,
+    ) -> WatchOutcome {
+        let mut note = None;
+        let lost = self.record_watch(round, finding, &mut note);
+        WatchOutcome { lost, note }
+    }
+
+    fn record_watch(
+        &mut self,
+        round: WatchRound,
+        finding: WatchFinding,
+        note: &mut Option<(&'static str, String)>,
     ) -> Option<String> {
         let unchanged = matches!(&self.live, Some((plan, _)) if *plan == round.plan)
             && self.readiness.as_ref().is_some_and(Result::is_ok)
@@ -250,8 +321,11 @@ impl Controller {
                 self.watch.last_error = None;
                 None
             }
-            Finding::Inspected(observed) => {
+            Finding::Inspected(observed, update) => {
                 self.watch.target_running = Some(true);
+                if let Some(update) = update {
+                    *note = self.record_networks(update);
+                }
                 match observed {
                     Observed::Protected => {
                         self.watch.consecutive_failures = 0;
@@ -263,6 +337,39 @@ impl Controller {
                 }
             }
         }
+    }
+
+    /// Keeps the round's view of the target's Docker networks and says what
+    /// is worth a log line: each change, and a read failure when it first
+    /// appears or changes, not again every round.
+    fn record_networks(&mut self, update: NetworkUpdate) -> Option<(&'static str, String)> {
+        self.watch.networks = update.current;
+        let note = if let Some(error) = &update.error {
+            (self.watch.network_error.as_ref() != Some(error)).then(|| {
+                (
+                    "warning",
+                    format!(
+                        "读不出目标的 Docker 网络（{error}）：已有的容器规则保持不变，新建的容器网络暂时不经代理。"
+                    ),
+                )
+            })
+        } else if !update.added.is_empty() || !update.removed.is_empty() {
+            let mut parts = Vec::new();
+            if !update.added.is_empty() {
+                parts.push(format!("已纳入 {}", update.added.join("、")));
+            }
+            if !update.removed.is_empty() {
+                parts.push(format!("已移除 {}", update.removed.join("、")));
+            }
+            Some((
+                "info",
+                format!("目标的 Docker 网络有变化：{}。", parts.join("；")),
+            ))
+        } else {
+            None
+        };
+        self.watch.network_error = update.error;
+        note
     }
 
     fn lose(&mut self, reason: String) -> Option<String> {
@@ -292,6 +399,8 @@ impl Controller {
             "consecutive_failures": self.watch.consecutive_failures,
             "last_error": self.watch.last_error,
             "lost": self.watch.lost,
+            "container_networks": self.watch.networks,
+            "container_network_error": self.watch.network_error,
         })
     }
 
@@ -393,27 +502,47 @@ impl Controller {
                 return Err(e);
             }
         };
-        if let Err(e) = kernel::arm(&p, window).and_then(|_| kernel::install(&p)) {
-            if runtime.is_some() {
-                // A partial filter/NAT transaction is not proof of either a healthy or an
-                // idle target. Keep ownership and stop all forwarding until explicit recovery.
-                let shutdown = sockets.stop().err();
-                self.live = Some((p, sockets));
-                let reason = format!("managed_install_unverified:{e}; ingress_stop:{shutdown:?}");
-                self.readiness = Some(Err(reason.clone()));
-                return Err(reason);
-            }
-            // A guest invocation can time out AFTER installing some rules. Keep journal and
-            // independent socket reservation if cleanup is incomplete; never infer rollback.
-            let rollback = kernel::remove(&p)
-                .and_then(|_| sockets.stop())
-                .and_then(|_| lease::release(&p))
-                .and_then(|_| journal::forget(&p));
-            return Err(match rollback {
-                Ok(()) => format!("start_rolled_back:{e}"),
-                Err(r) => format!("recovery_required:{e}; rollback:{r}"),
+        // The target's own Docker networks are covered from the start; a
+        // running dockerd whose networks cannot be read fails the start like
+        // an unverified install (decision 24).
+        let installed = kernel::arm(&p, window)
+            .and_then(|_| kernel::install(&p))
+            .and_then(|_| match runtime {
+                Some(_) => kernel::sync_networks(&p)
+                    .map(|synced| synced.current)
+                    .map_err(|e| format!("container_networks_unavailable:{e}")),
+                None => Ok(Vec::new()),
             });
-        }
+        let networks = match installed {
+            Ok(networks) => networks,
+            Err(e) => {
+                if runtime.is_some() {
+                    // A partial filter/NAT transaction is not proof of either a healthy or an
+                    // idle target. Keep ownership and stop all forwarding until explicit recovery.
+                    let shutdown = sockets.stop().err();
+                    self.live = Some((p, sockets));
+                    let reason =
+                        format!("managed_install_unverified:{e}; ingress_stop:{shutdown:?}");
+                    self.readiness = Some(Err(reason.clone()));
+                    return Err(reason);
+                }
+                // A guest invocation can time out AFTER installing some rules. Keep journal and
+                // independent socket reservation if cleanup is incomplete; never infer rollback.
+                let rollback = kernel::remove(&p)
+                    .and_then(|_| sockets.stop())
+                    .and_then(|_| lease::release(&p))
+                    .and_then(|_| journal::forget(&p));
+                return Err(match rollback {
+                    Ok(()) => format!("start_rolled_back:{e}"),
+                    Err(r) => format!("recovery_required:{e}; rollback:{r}"),
+                });
+            }
+        };
+        self.watch = Watch {
+            cookie: p.cookie,
+            networks,
+            ..Watch::default()
+        };
         if let Some(runtime) = &runtime {
             let chain_tcp_before = sockets.chain_tcp_attempts();
             match runtime.verify(&p) {
@@ -503,6 +632,42 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_changes_are_logged_and_a_read_failure_only_once() {
+        let update = |added: &[&str], removed: &[&str], error: Option<&str>| NetworkUpdate {
+            current: vec!["br-0123456789ab".into()],
+            added: added.iter().map(|name| (*name).to_owned()).collect(),
+            removed: removed.iter().map(|name| (*name).to_owned()).collect(),
+            error: error.map(str::to_owned),
+        };
+        let mut controller = Controller::default();
+        assert_eq!(controller.record_networks(update(&[], &[], None)), None);
+        let (level, message) = controller
+            .record_networks(update(&["br-0123456789ab"], &["docker0"], None))
+            .unwrap();
+        assert_eq!(level, "info");
+        assert_eq!(
+            message,
+            "目标的 Docker 网络有变化：已纳入 br-0123456789ab；已移除 docker0。"
+        );
+        let unreadable = Some("docker_networks_unavailable");
+        assert_eq!(
+            controller
+                .record_networks(update(&[], &[], unreadable))
+                .unwrap()
+                .0,
+            "warning"
+        );
+        // The same failure next round is not logged again.
+        assert_eq!(
+            controller.record_networks(update(&[], &[], unreadable)),
+            None
+        );
+        assert_eq!(controller.record_networks(update(&[], &[], None)), None);
+        assert_eq!(controller.watch.networks, ["br-0123456789ab"]);
+        assert_eq!(controller.watch.network_error, None);
+    }
 
     fn ownership(identity_matches: bool, rules_complete: bool) -> kernel::Ownership {
         kernel::Ownership {

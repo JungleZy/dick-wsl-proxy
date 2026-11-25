@@ -123,10 +123,21 @@ impl ProtectionWatch {
                         continue;
                     };
                     let target = round.target().to_owned();
-                    let lost = guard.finish_watch(round, finding);
+                    let outcome = guard.finish_watch(round, finding);
                     drop(guard);
                     next = Instant::now() + PROTECTION_CHECK_INTERVAL;
-                    if let (Some(reason), Some(path)) = (lost, &store) {
+                    if let (Some((level, message)), Some(path)) = (outcome.note, &store) {
+                        let _ = desktop_store::append_runtime_log(
+                            path,
+                            level,
+                            "protection",
+                            &message,
+                            None,
+                            Some(&target),
+                            None,
+                        );
+                    }
+                    if let (Some(reason), Some(path)) = (outcome.lost, &store) {
                         let _ = desktop_store::append_runtime_log(
                             path,
                             "error",
