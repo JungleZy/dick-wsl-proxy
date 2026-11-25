@@ -35,6 +35,10 @@ struct Entry {
     last_used: Instant,
     /// Relayed connections still using this address.
     leases: usize,
+    /// Whether any connection has used this address in this takeover. Such
+    /// an address is never given to another name: a program that kept it
+    /// would reach that other name instead (decision 19).
+    connected: bool,
 }
 
 /// Session-only name and fake-address mapping, allocated downwards between
@@ -129,19 +133,24 @@ impl FakePool {
                 name: name.to_owned(),
                 last_used: now,
                 leases: 0,
+                connected: false,
             },
         );
         Some(Ipv4Addr::from(address))
     }
 
     /// Frees the least recently used address that has been idle past the
-    /// cooldown and has no connection on it.
+    /// cooldown and has never carried a connection. Only resolved-but-unused
+    /// names give theirs up, so a flood of new names cannot steer an address
+    /// a program still remembers to another name.
     fn reclaim(&mut self, now: Instant) -> Option<u32> {
         let (&address, _) = self
             .by_address
             .iter()
             .filter(|(_, entry)| {
-                entry.leases == 0 && now.saturating_duration_since(entry.last_used) >= COOLDOWN
+                !entry.connected
+                    && entry.leases == 0
+                    && now.saturating_duration_since(entry.last_used) >= COOLDOWN
             })
             .min_by_key(|(_, entry)| entry.last_used)?;
         let entry = self.by_address.remove(&address)?;
@@ -162,6 +171,7 @@ impl FakePool {
         let entry = self.by_address.get_mut(&u32::from(address))?;
         entry.last_used = now;
         entry.leases += 1;
+        entry.connected = true;
         Some(entry.name.clone())
     }
 
@@ -255,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn a_full_pool_reclaims_only_idle_unleased_addresses() {
+    fn a_full_pool_reclaims_only_idle_never_connected_addresses() {
         let mut pool = FakePool::starting(ALIAS_SPACE - MIN_FAKE_ADDRESSES, 0).unwrap();
         assert_eq!(pool.capacity(), MIN_FAKE_ADDRESSES);
         let start = Instant::now();
@@ -285,17 +295,20 @@ mod tests {
             Some("n0.example")
         );
         assert_eq!(pool.in_use(), MIN_FAKE_ADDRESSES as usize);
-        // Released, it is idle again from the release on.
+        // Released and cooled down, it still stays with its name: it has
+        // carried a connection, and a program that kept the address must not
+        // reach another name. Only the never-connected ones are reclaimed.
         pool.release(addresses[0], later);
         let much_later = later + COOLDOWN;
-        let mut taken = Vec::new();
-        for index in 0..MIN_FAKE_ADDRESSES {
-            taken.push(
-                pool.assign(&format!("m{index}.example"), much_later)
-                    .unwrap(),
-            );
-        }
-        assert!(taken.contains(&addresses[0]));
+        let taken: Vec<_> = (0..MIN_FAKE_ADDRESSES)
+            .filter_map(|index| pool.assign(&format!("m{index}.example"), much_later))
+            .collect();
+        assert!(!taken.contains(&addresses[0]));
+        assert_eq!(taken.len(), MIN_FAKE_ADDRESSES as usize - 1);
+        assert_eq!(
+            pool.name(addresses[0], much_later).as_deref(),
+            Some("n0.example")
+        );
     }
 
     #[test]
