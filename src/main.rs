@@ -210,7 +210,7 @@ fn run(command: Command) -> Result<u8, Failure> {
         if bytes.len() as u64 > LIMIT {
             return Err(Failure::new("rpc_input", "Request exceeds limit"));
         }
-        let req = serde_json::from_slice(&bytes)
+        let req = serde_json::from_slice(without_bom(&bytes))
             .map_err(|_| Failure::new("rpc_input", "Expected one JSON request"))?;
         let reply =
             wsl_proxyctl::ipc::request(&req).map_err(|e| Failure::new("rpc_transport", e))?;
@@ -258,13 +258,13 @@ fn run(command: Command) -> Result<u8, Failure> {
             &serde_json::json!({"maintenance":true,"protocol":1,"phase":"idle","operation_generation":record.generation,"version":env!("CARGO_PKG_VERSION"),"pid":std::process::id()}),
         )?;
         use std::io::Read;
-        let mut release = String::new();
+        let mut release = Vec::new();
         io::stdin()
             .lock()
-            .take(10)
-            .read_line(&mut release)
+            .take(16)
+            .read_until(b'\n', &mut release)
             .map_err(|e| Failure::new("maintenance_input", e.to_string()))?;
-        if !matches!(release.as_str(), "" | "release\n" | "release\r\n") {
+        if !maintenance_release(&release) {
             return Err(Failure::new(
                 "maintenance_input",
                 "Expected release or end of input",
@@ -315,7 +315,7 @@ fn run(command: Command) -> Result<u8, Failure> {
         }
     }
     let watch = ProtectionWatch::spawn(Arc::clone(&controller), None);
-    for line in io::stdin().lock().lines() {
+    for (index, line) in io::stdin().lock().lines().enumerate() {
         // A broken input or output stream must still reach the stop below,
         // exactly like EOF. One undecodable line is reported and reading goes on.
         let line = match line {
@@ -331,7 +331,12 @@ fn run(command: Command) -> Result<u8, Failure> {
                 break;
             }
         };
-        let result = serde_json::from_str(&line)
+        let line = if index == 0 {
+            line.strip_prefix('\u{feff}').unwrap_or(&line)
+        } else {
+            &line
+        };
+        let result = serde_json::from_str(line)
             .map_err(|e| Failure::new("invalid_request", e.to_string()))
             .and_then(|req| command::dispatch(req, &mut owned(&controller)));
         if let Err(e) = result
@@ -359,6 +364,70 @@ fn main() -> ExitCode {
                 eprintln!("{}", write_error.message);
             }
             ExitCode::from(code)
+        }
+    }
+}
+
+/// `bytes` without one UTF-8 BOM at its start. Windows PowerShell 5.1 begins a
+/// child's standard input with a BOM when the console input code page is
+/// UTF-8 (`chcp 65001`, or Windows set to use UTF-8 for all languages, as on
+/// GitHub's Windows runners). The installer talks to `rpc` and `maintenance`
+/// that way; without this, such a console reported every finished install or
+/// uninstall as failed and could not shut down an idle backend.
+fn without_bom(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes)
+}
+
+/// Whether the installer's last line to a maintenance helper releases it:
+/// `release` with LF or CRLF, or end of input, after an optional BOM.
+fn maintenance_release(line: &[u8]) -> bool {
+    matches!(without_bom(line), b"" | b"release\n" | b"release\r\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{maintenance_release, without_bom};
+
+    #[test]
+    fn only_one_leading_bom_is_dropped_from_a_request() {
+        assert_eq!(
+            without_bom(b"\xEF\xBB\xBF{\"command\":\"status\"}"),
+            b"{\"command\":\"status\"}"
+        );
+        assert_eq!(without_bom(b"{}"), b"{}");
+        assert_eq!(
+            without_bom(b"\xEF\xBB\xBF\xEF\xBB\xBF{}"),
+            b"\xEF\xBB\xBF{}"
+        );
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(without_bom(
+                b"\xEF\xBB\xBF{\"command\":\"status\"}"
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn maintenance_release_accepts_a_utf8_bom_and_nothing_else() {
+        for line in [
+            &b""[..],
+            b"release\n",
+            b"release\r\n",
+            b"\xEF\xBB\xBF",
+            b"\xEF\xBB\xBFrelease\n",
+            b"\xEF\xBB\xBFrelease\r\n",
+        ] {
+            assert!(maintenance_release(line), "{line:?}");
+        }
+        for line in [
+            &b"release"[..],
+            b"\xEF\xBB\xBFrelease",
+            b"Release\n",
+            b"release now\n",
+            b"\xEF\xBB\xBF\xEF\xBB\xBFrelease\n",
+            b"\n",
+        ] {
+            assert!(!maintenance_release(line), "{line:?}");
         }
     }
 }
