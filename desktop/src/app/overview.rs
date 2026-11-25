@@ -122,7 +122,7 @@ impl Desktop {
     }
 
     /// 目标发行版已不在 WSL 注册表里：正常停止清不掉它的规则，只能放弃本次记录。
-    fn target_gone(&self) -> bool {
+    pub(crate) fn target_gone(&self) -> bool {
         self.phase() == "recovery_required" && self.status["target_registered"] == false
     }
 
@@ -202,6 +202,7 @@ impl Desktop {
     }
 
     /// 唯一的主操作，跟着状态走：先连上后台，再选目标、保存，最后启动或停止。
+    /// 托盘菜单的主操作（[`Self::tray_snapshot`]）照同样的顺序选。
     fn protection_action(&self, cx: &Context<Self>) -> Button {
         let locked = self.locked();
         if !self.status_valid {
@@ -241,30 +242,16 @@ impl Desktop {
                 .label("去选择目标")
                 .icon(design_icon("environment", 15., SURFACE))
                 .primary()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.page = Page::Environment;
-                    cx.notify();
-                }));
+                .on_click(cx.listener(|this, _, _, cx| this.open_page(Page::Environment, cx)));
         }
         // 首页不保存任何内容：带用户去有未保存修改的那一页，在那里看清改了什么再保存。
         if self.unsaved_message().is_some() {
-            let page = match self.unsaved.first() {
-                Some(SaveScope::Settings) => Page::Settings,
-                Some(SaveScope::Policy) => Page::Policy,
-                Some(SaveScope::Environment) | None => Page::Environment,
-            };
+            let page = self.unsaved_page();
             return Button::new("overview-go-save")
                 .label("去保存修改")
                 .icon(design_icon("save", 15., SURFACE))
                 .primary()
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.page = page;
-                    // 和从侧栏进入设置页一样，顺带检查一次 WSL 平台。
-                    if page == Page::Settings {
-                        this.check_wsl_platform(cx);
-                    }
-                    cx.notify();
-                }));
+                .on_click(cx.listener(move |this, _, _, cx| this.open_page(page, cx)));
         }
         self.button(
             "overview-session-action",
@@ -275,6 +262,53 @@ impl Desktop {
         )
         .icon(design_icon("play", 15., SURFACE))
         .primary()
+    }
+
+    /// 有未保存修改的那一页；规则页、设置页都没有时是环境页（配置还没保存过）。
+    pub(crate) fn unsaved_page(&self) -> Page {
+        match self.unsaved.first() {
+            Some(SaveScope::Settings) => Page::Settings,
+            Some(SaveScope::Policy) => Page::Policy,
+            Some(SaveScope::Environment) | None => Page::Environment,
+        }
+    }
+
+    /// 托盘要显示的状态和菜单里的主操作。主操作和 [`Self::protection_action`] 的选择一致，
+    /// 改其中一个时两边一起改。
+    pub(crate) fn tray_snapshot(&self) -> super::tray::Snapshot {
+        use super::tray::{Look, Primary, Snapshot};
+        let look = Look::from_status(self.status_valid, self.phase());
+        let primary = if !self.status_valid {
+            Primary::Reconnect
+        } else if self.target_gone() {
+            Primary::Abandon
+        } else if self.phase() != "idle" {
+            Primary::Stop
+        } else if self.selected.is_none() {
+            Primary::ChooseTarget
+        } else if self.unsaved_message().is_some() {
+            Primary::GoSave
+        } else {
+            Primary::Start
+        };
+        // 只在后台确认有接管记录时写目标名；状态没确认时那份状态已经过时。
+        let target = matches!(look, Look::Managed | Look::Scoped | Look::Recovery)
+            .then(|| self.status_target())
+            .flatten()
+            .map(str::to_owned);
+        let running = self.busy.or(self.reading_kind.filter(|_| self.reading));
+        let busy = match running {
+            Some(kind) => Some(format!("正在{}…", kind.label())),
+            None if self.confirmation.is_some() => Some("等待在主窗口确认".to_owned()),
+            None => None,
+        };
+        Snapshot {
+            look,
+            target,
+            primary,
+            busy,
+            autostart: self.autostart_enabled,
+        }
     }
 
     /// 保护链路：目标 WSL → Windows 入口 → 宿主 SOCKS5 → 住宅出口，竖线后是系统 DNS。

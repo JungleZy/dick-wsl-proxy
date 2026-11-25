@@ -224,6 +224,8 @@ The desktop UI is in Chinese; the labels above are translations.
 ### Tray and closing the window
 
 - **Closing the window only hides it to the tray; the proxy keeps running.** If the tray icon could not be shown (for example, Explorer was not ready at login), closing quits the window and leaves the backend running.
+- **The tray icon shows whether a takeover is running.** A green shield with a light sweeping along its pulse line means a takeover is running; a still grey shield means idle; red means recovery is needed; amber with a flat line means the backend state is unconfirmed (a takeover may still be in effect). Hover to see the state and the target distribution.
+- Click the tray icon to open the main window. The right-click menu shows the current state at the top, and its main action follows the state like the main button on Home (**Start takeover**, **Stop and restore direct**, **Reconnect backend** and so on). It also offers **Check public exit**, **View connection records**, **View run log** and **Start at login**.
 - **Exit** in the tray menu: when idle, it shuts the backend down and quits; during a takeover it asks first, then stops the takeover, restores direct routing, shuts the backend down and quits. It does not quit if any step fails.
 - If the desktop process is killed or crashes, the backend keeps running; reopen the app to reconnect.
 - Only one desktop window runs at a time. Opening it again brings the existing window to the front.
