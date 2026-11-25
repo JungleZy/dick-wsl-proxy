@@ -800,6 +800,42 @@ fn a_guest_slow_to_close_after_a_delivered_response_is_not_a_failure() {
 }
 
 #[test]
+fn an_upload_cut_at_the_half_close_deadline_resets_the_origin() {
+    let (client, ingress) = tcp_pair();
+    let (upstream, mut origin) = tcp_pair();
+    // The origin answers and closes its side, then stops reading; the guest
+    // keeps uploading, so its data piles up in the relay until the deadline.
+    origin.write_all(b"response").unwrap();
+    origin.shutdown(Shutdown::Write).unwrap();
+    let uploader = thread::spawn(move || {
+        let mut client = client;
+        let chunk = [7; 64 * 1024];
+        while client.write_all(&chunk).is_ok() {}
+    });
+    let shared = Shared::with_flows(FlowStats::new(), half_close_limits());
+    let flow = shared.flows.begin("tcp");
+    let error = relay(ingress, upstream, &shared, &flow).unwrap_err();
+    assert_eq!(error.to_string(), "TCP half-close deadline");
+    // A clean end here would let the origin take the cut upload as whole.
+    let mut buffer = [0; 64 * 1024];
+    let error = loop {
+        match origin.read(&mut buffer) {
+            Ok(0) => panic!("the origin saw a clean end of a cut upload"),
+            Ok(_) => {}
+            Err(error) => break error,
+        }
+    };
+    assert!(
+        matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+        ),
+        "{error:?}"
+    );
+    uploader.join().unwrap();
+}
+
+#[test]
 fn an_origin_silent_after_the_guest_closed_is_still_a_failure() {
     let (mut client, ingress) = tcp_pair();
     let (upstream, _origin) = tcp_pair();

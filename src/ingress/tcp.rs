@@ -229,12 +229,17 @@ pub(super) fn relay(
     flow: &Flow,
 ) -> io::Result<Ended> {
     let ended = exchange(&mut client, &mut upstream, shared, flow);
-    // Pass a failure on as one. Closed gracefully, the other side would see
-    // a clean end and could take a cut transfer as complete (HTTP/1.0
-    // without a length, FTP data, raw TCP). Linger is per socket, so the
-    // last close of any handle, including the registration's, sends the RST.
+    // Pass a failure on as one. Closed gracefully, a side would see a clean
+    // end and could take a cut transfer as complete (HTTP/1.0 without a
+    // length, FTP data, raw TCP, an upload). A failure cuts both directions,
+    // so both sides get the reset; one already broken loses nothing by it.
+    // Linger is per socket, so the last close of any handle, including the
+    // registration's, sends the RST.
     match &ended {
-        Err(_) => abort_on_close(&client),
+        Err(_) => {
+            abort_on_close(&client);
+            abort_on_close(&upstream);
+        }
         Ok(Ended::ClientReset) => abort_on_close(&upstream),
         Ok(Ended::Closed) => {}
     }
@@ -295,8 +300,9 @@ fn exchange(
                 // The origin closed and everything it sent has reached the
                 // guest's socket; only the guest has yet to close its side. A
                 // slow reader still draining its own receive buffer does this,
-                // so nothing failed in forwarding.
-                if response.shutdown && !request.eof {
+                // so nothing failed in forwarding. Upload data the origin has
+                // not taken is different: that upload was cut.
+                if response.shutdown && !request.eof && !request.wants_write() {
                     return Ok(Ended::Closed);
                 }
                 return Err(io::Error::new(
