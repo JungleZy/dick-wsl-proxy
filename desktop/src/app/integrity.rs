@@ -31,8 +31,13 @@ pub(crate) fn warn() {
         .ok()
         .and_then(|path| path.parent().map(|parent| parent.display().to_string()))
         .unwrap_or_else(|| "（无法读取）".into());
-    let text = wide(&message(&directory));
-    let caption = wide("WSL Proxy 无法在当前位置运行");
+    alert("WSL Proxy 无法在当前位置运行", &message(&directory));
+}
+
+/// 在还没有窗口可用时说明问题：弹出系统提示框，用户确认后返回。
+pub(crate) fn alert(caption: &str, text: &str) {
+    let text = wide(text);
+    let caption = wide(caption);
     unsafe {
         MessageBoxW(
             null_mut(),

@@ -67,10 +67,18 @@ pub fn run() {
                 cx.new(|cx| Desktop::new(window, cx))
             });
             if let Err(error) = opened {
-                eprintln!("无法打开 WSL 代理控制台：{error}");
-            } else {
-                tray::start();
+                // 这是 GUI 程序，没有控制台可看。不退出的话，进程没有窗口、没有托盘，
+                // 却一直占着单实例锁，之后再打开 EXE 也毫无反应。
+                integrity::alert(
+                    "WSL Proxy 无法打开窗口",
+                    &format!(
+                        "无法打开 WSL 代理控制台的窗口，点击“确定”后退出。\n\n原因：{error}\n\n后台如果已在运行会保留，接管不受影响。"
+                    ),
+                );
+                cx.quit();
+                return;
             }
+            tray::start();
             cx.activate(true);
         });
 }
