@@ -141,7 +141,7 @@ impl Desktop {
                 format!("无法确认接管状态；{since}。"),
             );
         }
-        let target = text(&self.status, "active_target", "当前目标");
+        let target = self.status_target().unwrap_or("目标发行版").to_owned();
         let generation = self
             .generation()
             .map(|generation| format!(" · 代次 {generation}"))
@@ -165,7 +165,7 @@ impl Desktop {
             "recovery_required" => (
                 StatusTone::Error,
                 "需要恢复",
-                format!("{target} 的上次接管没有正常结束，请停止接管并恢复直连。"),
+                recovery_reason(self.status["issue"].as_str().unwrap_or(""), &target),
             ),
             "idle" => (StatusTone::Off, "未接管", self.idle_hint()),
             _ => (
@@ -174,6 +174,16 @@ impl Desktop {
                 "后台返回了未知的阶段，请刷新后再操作。".to_owned(),
             ),
         }
+    }
+
+    /// 后台状态里的接管目标。需要恢复时 `active_target` 可能为空（例如客机检查没通过），
+    /// 真正要恢复的发行版记在 `recorded_target`，它可能不是界面上选中的那个。
+    fn status_target(&self) -> Option<&str> {
+        self.status["active_target"].as_str().or_else(|| {
+            (self.phase() == "recovery_required")
+                .then(|| self.status["recorded_target"].as_str())
+                .flatten()
+        })
     }
 
     /// 空闲时告诉用户离启动还差什么，顺序和启动前的检查一致。
@@ -321,9 +331,7 @@ impl Desktop {
             }
         };
 
-        let running = valid
-            .then(|| self.status["active_target"].as_str())
-            .flatten();
+        let running = valid.then(|| self.status_target()).flatten();
         let planned = self
             .selected
             .as_deref()
@@ -352,10 +360,17 @@ impl Desktop {
                 "端口仍保留",
                 StatusTone::Warn,
             )
-        } else {
+        } else if valid {
             (
                 format!("端口 {}", self.saved_port),
                 "未监听",
+                StatusTone::Off,
+            )
+        } else {
+            // 状态未确认时可能仍在转发，不能说「未监听」。
+            (
+                format!("端口 {}", self.saved_port),
+                "状态未知",
                 StatusTone::Off,
             )
         };
@@ -399,8 +414,17 @@ impl Desktop {
             } else {
                 format!("{residential_ip}:{residential_port}")
             };
+            // UDP 已阻断是本次接管的已知限制（不会直连），但不是正常状态：
+            // 用待处理色，并且复核过出口后也照样显示，不只留在悬停提示里。
+            let udp_blocked = managed && self.status["startup_verified"]["udp_supported"] == false;
             match exit_verdict {
                 Some(Some(false)) => (value, "出口与住宅地址不一致".to_owned(), StatusTone::Warn),
+                Some(Some(true)) if udp_blocked => (
+                    value,
+                    "出口已核对 · UDP 已阻断".to_owned(),
+                    StatusTone::Warn,
+                ),
+                _ if udp_blocked => (value, "UDP 已阻断".to_owned(), StatusTone::Warn),
                 Some(Some(true)) => (value, "出口已核对".to_owned(), live(forwarding)),
                 _ if managed => (value, format!("UDP {udp}"), live(forwarding)),
                 _ => (value, "第二跳".to_owned(), live(forwarding)),
@@ -847,6 +871,22 @@ fn empty_note(message: impl Into<SharedString>) -> Div {
 }
 
 /// 运行日志时间「2026-11-23 21:16:13」去掉年份；格式不符时原样返回。
+/// 需要恢复的原因。接管中规则失效（目标或 WSL 重启、规则缺失、环境变了）和上次接管
+/// 没有正常结束不是一回事：前者说明此刻目标的新连接可能已不经代理。
+/// 措辞和后台运行日志（`protection_lost_message`）一致。
+fn recovery_reason(issue: &str, target: &str) -> String {
+    let Some(lost) = issue.strip_prefix("protection_lost: ") else {
+        return format!("{target} 的上次接管没有正常结束，请停止接管并恢复直连。");
+    };
+    let cause = match lost.split(':').next().unwrap_or("") {
+        "restarted" => "目标发行版或 WSL 重启过，本次接管的规则已不再生效",
+        "rules_incomplete" | "rules_missing" => "目标里本次接管的规则已缺失或不完整",
+        "environment_changed" => "目标的环境变了，无法再确认本次接管覆盖它的全部流量",
+        _ => "无法再确认本次接管仍然有效",
+    };
+    format!("{target}：{cause}，新连接可能已不经代理。请停止接管并恢复直连，再重新启动接管。")
+}
+
 fn event_time(occurred_at: &str) -> &str {
     occurred_at
         .get(5..)
@@ -866,7 +906,30 @@ fn ago(seconds: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ago, event_time};
+    use super::{ago, event_time, recovery_reason};
+
+    #[test]
+    fn tells_a_lost_takeover_from_one_that_did_not_end_cleanly() {
+        assert_eq!(
+            recovery_reason(
+                "protection_lost: restarted: the target or the WSL VM restarted; this takeover's rules no longer apply",
+                "Dev"
+            ),
+            "Dev：目标发行版或 WSL 重启过，本次接管的规则已不再生效，新连接可能已不经代理。请停止接管并恢复直连，再重新启动接管。"
+        );
+        assert!(
+            recovery_reason("protection_lost: mapping_integrity: x: y", "Dev")
+                .starts_with("Dev：无法再确认本次接管仍然有效，")
+        );
+        assert_eq!(
+            recovery_reason("", "Dev"),
+            "Dev 的上次接管没有正常结束，请停止接管并恢复直连。"
+        );
+        assert_eq!(
+            recovery_reason("managed_readiness_failed: dns", "Dev"),
+            "Dev 的上次接管没有正常结束，请停止接管并恢复直连。"
+        );
+    }
 
     #[test]
     fn formats_event_times_and_snapshot_ages() {
