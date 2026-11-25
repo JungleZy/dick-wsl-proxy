@@ -920,6 +920,70 @@ fn an_expired_answer_is_served_stale_for_a_while_with_a_short_ttl() {
     );
 }
 
+#[test]
+fn a_refresh_drops_an_answer_the_upstream_says_not_to_keep_but_not_on_failure() {
+    let q = query("refresh.example");
+    let now = Instant::now();
+    let later = now + Duration::from_secs(61);
+    let old = response(&q, Ipv4Addr::new(93, 184, 216, 34));
+    let mut zero_ttl = response(&q, Ipv4Addr::new(93, 184, 216, 35));
+    let ttl_at = zero_ttl.len() - 10;
+    zero_ttl[ttl_at..ttl_at + 4].copy_from_slice(&0u32.to_be_bytes());
+    // NXDOMAIN without an SOA in its authority section.
+    let mut no_soa = q.clone();
+    no_soa[2..4].copy_from_slice(&0x8183u16.to_be_bytes());
+    // A normal answer that may not be reused (zero TTL, or an empty one
+    // without SOA): the expired copy must not be served stale any more.
+    for fresh in [zero_ttl, no_soa] {
+        let cache = Cache::default();
+        cache.put(key_for(&q), &old, now);
+        assert!(cache.lookup(&key_for(&q), &q, later).unwrap().stale);
+        cache.refresh(key_for(&q), &fresh, later);
+        assert!(cache.lookup(&key_for(&q), &q, later).is_none());
+    }
+    // A failure (SERVFAIL, REFUSED) keeps the expired copy for its window.
+    for rcode in [2, 5] {
+        let cache = Cache::default();
+        cache.put(key_for(&q), &old, now);
+        cache.refresh(key_for(&q), &negative(&q, rcode, 300, 300), later);
+        assert!(cache.lookup(&key_for(&q), &q, later).unwrap().stale);
+    }
+    // A usable answer replaces it.
+    let cache = Cache::default();
+    cache.put(key_for(&q), &old, now);
+    cache.refresh(
+        key_for(&q),
+        &response(&q, Ipv4Addr::new(93, 184, 216, 36)),
+        later,
+    );
+    let hit = cache.lookup(&key_for(&q), &q, later).unwrap();
+    assert!(!hit.stale);
+    assert!(hit.wire.ends_with(&[93, 184, 216, 36]));
+}
+
+#[test]
+fn background_refreshes_are_capped_and_a_skipped_one_is_not_left_claimed() {
+    let dns = ManagedDns::new(fake_ip_policy(false)).unwrap();
+    let resolver = &dns.resolver;
+    let keys: Vec<_> = (0..=super::MAX_REFRESHES)
+        .map(|index| key_for(&query(&format!("r{index}.example"))))
+        .collect();
+    for key in &keys[..super::MAX_REFRESHES] {
+        assert!(resolver.claim_refresh(key));
+    }
+    // Already being refreshed: not claimed twice, not counted as skipped.
+    assert!(!resolver.claim_refresh(&keys[0]));
+    assert_eq!(resolver.stats.refresh_skips.load(Ordering::Relaxed), 0);
+    // At the cap: skipped and counted, and not marked as running.
+    let extra = &keys[super::MAX_REFRESHES];
+    assert!(!resolver.claim_refresh(extra));
+    assert_eq!(resolver.stats.refresh_skips.load(Ordering::Relaxed), 1);
+    assert!(!resolver.refreshing.lock().unwrap().contains(extra));
+    // Once one finishes, the next query may start its refresh.
+    resolver.refreshing.lock().unwrap().remove(&keys[0]);
+    assert!(resolver.claim_refresh(extra));
+}
+
 fn fake_ip_policy(fake_ip: bool) -> Arc<crate::policy::Policy> {
     let config: crate::policy::Config = serde_json::from_value(serde_json::json!({
         "first_hop": "127.0.0.1:19",

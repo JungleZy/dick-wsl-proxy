@@ -29,6 +29,10 @@ const UPSTREAM_IDLE: Duration = Duration::from_secs(120);
 const MAX_IDLE_UPSTREAMS: usize = flights::MAX_ACTIVE;
 /// Queries per connection before a fresh chain is built.
 const MAX_UPSTREAM_USES: u32 = 100;
+/// Background refreshes of stale answers running at once. Each is a thread
+/// that may wait on the chain; past this many a stale answer is served
+/// without starting another.
+const MAX_REFRESHES: usize = 32;
 const ALIAS_START: u32 = u32::from_be_bytes([198, 18, 0, 1]);
 const ALIAS_SPACE: u32 = 131_070;
 const ALIAS_BLOCK: u32 = 32;
@@ -238,6 +242,8 @@ struct Stats {
     stale_served: AtomicU64,
     refreshes: AtomicU64,
     refresh_failures: AtomicU64,
+    /// Refreshes not started because `MAX_REFRESHES` were already running.
+    refresh_skips: AtomicU64,
     upstream_asks: AtomicU64,
     reused: AtomicU64,
     /// Idle connections that failed when reused; a fresh one followed.
@@ -540,12 +546,7 @@ impl Resolver {
     /// Asks the upstream again for a question whose cached answer has
     /// expired, at most once at a time, and caches what comes back.
     fn refresh(self: &Arc<Self>, key: Key, wire: Vec<u8>) {
-        if !self
-            .refreshing
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key.clone())
-        {
+        if !self.claim_refresh(&key) {
             return;
         }
         let resolver = Arc::clone(self);
@@ -560,7 +561,9 @@ impl Resolver {
                         .flights
                         .run(&key, &wire, || resolver.ask_upstream(&query, &wire))?;
                     Message::response(&answer, &query)?;
-                    resolver.answers.put(key.clone(), &answer, Instant::now());
+                    resolver
+                        .answers
+                        .refresh(key.clone(), &answer, Instant::now());
                     Ok::<(), String>(())
                 })();
                 let counter = if outcome.is_ok() {
@@ -582,6 +585,21 @@ impl Resolver {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&key);
         }
+    }
+
+    /// Marks `key` as being refreshed. False when it already is, or when
+    /// `MAX_REFRESHES` refreshes already run: that one is skipped, the stale
+    /// answer is still served, and the next query for it tries again.
+    fn claim_refresh(&self, key: &Key) -> bool {
+        let mut refreshing = self.refreshing.lock().unwrap_or_else(|e| e.into_inner());
+        if refreshing.contains(key) {
+            return false;
+        }
+        if refreshing.len() >= MAX_REFRESHES {
+            self.stats.refresh_skips.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        refreshing.insert(key.clone())
     }
 
     fn direct_alias(&self, ip: Ipv4Addr) -> Result<Option<Ipv4Addr>, String> {
@@ -688,6 +706,7 @@ impl Resolver {
             "stale_served": count(&self.stats.stale_served),
             "refreshes": count(&self.stats.refreshes),
             "refresh_failures": count(&self.stats.refresh_failures),
+            "refresh_skips": count(&self.stats.refresh_skips),
             "shared_waits": self.flights.joined(),
             "upstream_asks": count(&self.stats.upstream_asks),
             "reused": count(&self.stats.reused),

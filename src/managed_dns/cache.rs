@@ -8,6 +8,29 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// Whether a validated response may be cached.
+enum Usable {
+    Keep(Lifetime),
+    /// A normal answer the upstream says not to reuse.
+    DoNotKeep,
+    /// Not a normal answer: a server error, a truncated or unreadable one.
+    Failure,
+}
+
+fn usable(response: &[u8]) -> Usable {
+    let Ok(flags) = word(response, 2) else {
+        return Usable::Failure;
+    };
+    if flags & 0x0200 != 0 || !matches!(flags & 15, 0 | 3) {
+        return Usable::Failure;
+    }
+    match lifetime(response) {
+        Ok(Some(lifetime)) => Usable::Keep(lifetime),
+        Ok(None) => Usable::DoNotKeep,
+        Err(_) => Usable::Failure,
+    }
+}
+
 /// Upper bound on how long any answer is reused, whatever its TTL.
 const MAX_CACHE_SECONDS: u32 = 3600;
 const MAX_ENTRIES: usize = 4096;
@@ -97,20 +120,35 @@ impl Cache {
     /// without a usable lifetime (zero TTL, truncated, server errors, empty
     /// answers without an SOA) are not kept.
     pub(super) fn put(&self, key: Key, response: &[u8], now: Instant) {
-        let flags = match word(response, 2) {
-            Ok(flags) => flags,
-            Err(_) => return,
-        };
-        if flags & 0x0200 != 0 || !matches!(flags & 15, 0 | 3) {
-            return;
+        if let Usable::Keep(lifetime) = usable(response) {
+            self.insert(key, response, lifetime, now);
         }
-        let Ok(Some(Lifetime {
+    }
+
+    /// Stores what a refresh of an expired answer brought back. Like `put`,
+    /// and when the upstream answered normally (NOERROR or NXDOMAIN, not
+    /// truncated) but said not to keep the answer (zero TTL, an empty answer
+    /// without SOA), the expired copy goes too: it must not be served stale
+    /// again. A failure (SERVFAIL, REFUSED, truncated, unreadable) leaves the
+    /// expired copy to be served stale until its window ends (decision 04).
+    pub(super) fn refresh(&self, key: Key, response: &[u8], now: Instant) {
+        match usable(response) {
+            Usable::Keep(lifetime) => self.insert(key, response, lifetime, now),
+            Usable::DoNotKeep => {
+                self.entries
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&key);
+            }
+            Usable::Failure => {}
+        }
+    }
+
+    fn insert(&self, key: Key, response: &[u8], lifetime: Lifetime, now: Instant) {
+        let Lifetime {
             ttl_offsets,
             seconds,
-        })) = lifetime(response)
-        else {
-            return;
-        };
+        } = lifetime;
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if entries.len() >= MAX_ENTRIES && !entries.contains_key(&key) {
             entries.retain(|_, entry| {
