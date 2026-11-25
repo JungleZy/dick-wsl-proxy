@@ -2,7 +2,7 @@
 
 ## 使用边界
 
-`start` 进入单目标受管模式；原来的 M1 局部端点实验使用 `start-scoped`，不是代理模式。M2 不向 WSL 安装代理，不改 `.wslconfig` 或共享 `resolv.conf`。它管理已验证的 WSL2 NAT 布局中的目标发行版出站流量；不声称能迁移已建立的 TCP、控制 Windows 进程、容器的转发流量或抵御本机管理员。M2 不提供 GPUI。
+`start` 进入单目标受管模式；原来的 M1 局部端点实验使用 `start-scoped`，不是代理模式。M2 不向 WSL 安装代理，不改 `.wslconfig` 或共享 `resolv.conf`。它管理已验证的 WSL2 NAT 布局中的目标发行版出站流量；不声称能迁移已建立的 TCP、控制 Windows 进程或抵御本机管理员；容器的转发流量只覆盖目标里 Docker 的 bridge 网络（[决策 24](../../decisions.md)），其他容器运行时的容器不经代理。M2 不提供 GPUI。
 
 ## 从 PowerShell 启动
 
