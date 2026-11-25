@@ -59,13 +59,13 @@ wsl-proxyctl.exe wsl-platform-update --confirm
 | `output` | `wsl --update` 输出的末尾一段（去掉进度回车和空行，最多 2000 字符），不参与判定 |
 | `checked_at_unix_seconds` | 升级完成的时刻 |
 
-拒绝码：`confirmation_required`、`wsl_update_requires_idle`、`target_already_owned`（有恢复记录或待完成切换）、`wsl_not_installed`、`wsl_update_failed`、`wsl_platform_failed`。升级期间后台拒绝启动、切换、预检、内核准备、出口检测、关闭后台和其他环境操作。
+拒绝码：`confirmation_required`、`wsl_update_requires_idle`、`target_already_owned`（有恢复记录或待完成切换）、`wsl_not_installed`、`wsl_update_failed`、`wsl_platform_failed`。`wsl_update_failed` 只出现在 CLI；经 RPC 时外层是 `desktop_request_failed`，内层是 `wsl_update_command_failed:…` 或 `wsl_not_installed`。升级期间后台拒绝启动、切换、预检、内核准备、出口检测、关闭后台和其他环境操作。
 
 ## 界面
 
 - 设置页新增「WSL 平台」卡片：状态徽标（尚未检查 / 检查中 / 需要处理 / 有提醒 / 正常 / 检查失败）、`WSL 版本`、`WSL2 内核`、`Windows 版本`、`wsl.exe`、`默认版本`、`默认发行版`、`发行版 N 个（M 个 WSL1）`、`权限`，四项检查说明，上次升级结果，以及一段说明：检查只读、升级会替换 WSL 包并可能重启 WSL。
 - 进入设置页时自动做一次静默检查：不占用界面、不弹加载框、不覆盖页面提示，也不进全局错误条；卡片自己的徽标显示「检查中」，失败只写在卡片里。「检查」按钮重新检查。
-- 「升级 WSL」只在空闲、没有其他操作、已确认 `wsl.exe` 存在时可用。确认框说明会替换 WSL 包、可能重启 WSL（发行版里正在运行的程序会停止）、标准用户运行时可能弹出管理员权限提示；确认后走后台环境任务：加载框 → 结果对话框 → 自动重新检查，卡片显示升级后的版本。
+- 「升级 WSL」在空闲、没有其他操作时可用；只有检查结果明确说 `wsl.exe` 未安装时才禁用，没检查过或检查失败时仍可点。确认框说明会替换 WSL 包、可能重启 WSL（所有发行版里的程序和后台服务都会停止）、最多等 30 分钟（超时会结束 `wsl --update`，WSL 可能停在升级到一半）、等待期间不要关闭程序、退出后台或做别的环境操作、失败或没看到结果时用 `wsl --version` 核对，标准用户运行时还提示可能弹出管理员权限提示；确认后走后台环境任务：加载框 → 结果对话框 → 自动重新检查，卡片显示升级后的版本。
 - 升级失败同时进全局错误条和结果对话框，卡片内保留上一次检查结果；运行日志的来源统一为 `wsl`：成功记「WSL 已升级：A → B」「WSL 已是最新」「无法确认是否升级」，失败记一条错误级别记录，原因见结果对话框。
 
 ## 验证（2026-11-24，Windows 本机）
@@ -84,5 +84,5 @@ wsl-proxyctl.exe wsl-platform-update --confirm
 ## 后续
 
 - 升级成功的路径仍未验证：需要在能访问 Store 更新端点的网络里再跑一次，补记下载、安装、重启和版本变化的结果。本机 403 的绕行办法是 `wsl --update --web-download`（从 GitHub 下载，不走 Store 更新通道）、从 Microsoft Store 更新，或换网络重试；提权不能解决。
-- 长期保留这个入口需要在[决策登记](../../decisions.md)新增一条，并改写[接管架构](../../arch/README.md)里关于窗口/特权边界的描述：本次是功能实现，未改这两处，只在这里和 [执行记录索引](../README.md)登记。
+- 长期保留这个入口已登记为[决策 26](../../decisions.md)。
 - `wsl --update` 是否需要管理员权限取决于 WSL 的安装方式；当前不主动提权，失败时把原因和「在管理员终端运行 wsl --update」交给用户。若以后确实遇到只差提权的失败，再考虑「以管理员身份重试」：由桌面用 `runas` 启动一个只执行 `wsl --update` 的提权子进程，而不是让整个界面以管理员运行。

@@ -42,7 +42,7 @@ M0 当时，预检在目标和对照身份、cgroup 边界及工具能力均通�
 | 持锁与进程崩溃 | 一个 `session` 持锁时第二个原生进程发起预检，退出 `3`、`controller_busy`；终止锁持有进程后，新控制器可获得锁并返回空闲。 |
 | 网络是否改变 | 比对独立于控制器采集的 `before-*` / `after-*` 文件，两发行版各自字节一致：包含 DNS 文件摘要和链接目标、双栈路由/策略规则摘要；A 还包含剔除计数器后的 legacy 防火墙摘要。B 没有该工具，明确记录为不可用。 |
 
-编译与质量验证：`cargo test --locked` 通过 8 项测试；`sh -n src/probe.sh`、Windows 目标的 `cargo clippy --locked --target x86_64-pc-windows-gnu --all-targets -- -D warnings`、Windows release 构建均通过。原生 EXE SHA-256：`dc1bcaa4d02f2b7ef41abc444854bfef8417d17a3621545990c20c0ca4bcbf84`。
+编译与质量验证：`cargo test --locked` 通过 8 项测试；`sh -n src/probe.sh`（现为 `src/guest/probe.sh`）、Windows 目标的 `cargo clippy --locked --target x86_64-pc-windows-gnu --all-targets -- -D warnings`、Windows release 构建均通过。原生 EXE SHA-256：`dc1bcaa4d02f2b7ef41abc444854bfef8417d17a3621545990c20c0ca4bcbf84`。
 
 原始证据与 EXE 同目录：`list-lab-only.json`、`preflight-A.json`、`preflight-B.json`、`preflight-without-witness.json`、`preflight-occupied.json`、`input-rejections.json`、`lock-while-held.json`、`status-after-owner-exit.json` 及前后基线。没有把本机整份诊断输出纳入仓库。
 

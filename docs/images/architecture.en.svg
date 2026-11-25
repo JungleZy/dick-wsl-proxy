@@ -1,0 +1,164 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="660" viewBox="0 0 1100 660" role="img" aria-labelledby="title desc">
+  <title id="title">How dick-wsl-proxy works</title>
+  <desc id="desc">New connections from the target WSL2 distribution are redirected by iptables rules to a Windows ingress. Allowlisted TCP goes direct from Windows; other TCP and all UDP go through the host SOCKS5 and then the residential SOCKS5; an unknown owner or a failed hop means the connection is refused, never sent direct. Windows takes over system DNS: allowlisted names go to a domestic DoH resolver, other names get a fake-ip stand-in and are resolved by the residential proxy on connect. Other distributions and native Windows programs keep their original route.</desc>
+  <defs>
+    <filter id="shadow" x="-10%" y="-20%" width="120%" height="150%">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="2" flood-color="#1b412d" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1f8a4c"/>
+    </marker>
+    <marker id="arrow-slate" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#4a6a8c"/>
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#c0392b"/>
+    </marker>
+    <marker id="arrow-ink" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#5b6e62"/>
+    </marker>
+    <marker id="arrow-grey" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#9aa6ae"/>
+    </marker>
+  </defs>
+  <style>
+    text { font-family: 'Segoe UI', 'Helvetica Neue', Arial, 'Noto Sans', sans-serif; }
+    .zone { font-size: 15px; font-weight: 700; letter-spacing: 0.5px; }
+    .title { font-size: 18px; font-weight: 700; fill: #13261b; text-anchor: middle; }
+    .sub { font-size: 15px; fill: #5b6e62; text-anchor: middle; }
+    .label { font-size: 14px; font-weight: 700; text-anchor: middle; }
+    .caption { font-size: 13px; fill: #8a7570; text-anchor: middle; }
+    .legend { font-size: 13.5px; fill: #5b6e62; }
+    .node { fill: #ffffff; stroke: #cfdbd2; stroke-width: 1.2; filter: url(#shadow); }
+  </style>
+
+  <!-- canvas -->
+  <rect x="0.5" y="0.5" width="1099" height="659" rx="18" fill="#ffffff" stroke="#dbe5de"/>
+
+  <!-- zones -->
+  <rect x="16" y="16" width="252" height="532" rx="14" fill="#eef5f0" stroke="#d6e4da"/>
+  <circle cx="34" cy="41" r="5" fill="#1b412d"/>
+  <text x="46" y="46" class="zone" fill="#1b412d">Target WSL2 distro</text>
+
+  <rect x="330" y="16" width="232" height="532" rx="14" fill="#edf2f8" stroke="#d5dfeb"/>
+  <circle cx="348" cy="41" r="5" fill="#2f4a66"/>
+  <text x="360" y="46" class="zone" fill="#2f4a66">Windows · wsl-proxyctl</text>
+
+  <rect x="640" y="16" width="262" height="532" rx="14" fill="#ebf7ef" stroke="#cfe8d7"/>
+  <circle cx="658" cy="41" r="5" fill="#1e7b45"/>
+  <text x="670" y="46" class="zone" fill="#1e7b45">Proxy chain · two hops</text>
+
+  <rect x="930" y="16" width="154" height="600" rx="14" fill="#f4f6f8" stroke="#dde3e8"/>
+
+  <!-- target distro -->
+  <rect x="32" y="64" width="220" height="70" rx="10" class="node"/>
+  <text x="142" y="94" class="title">Apps &amp; containers</text>
+  <text x="142" y="119" class="sub">no proxy settings needed</text>
+
+  <line x1="142" y1="134" x2="142" y2="158" stroke="#5b6e62" stroke-width="2" marker-end="url(#arrow-ink)"/>
+
+  <rect x="32" y="162" width="220" height="338" rx="10" class="node"/>
+  <text x="142" y="196" class="title">iptables rules</text>
+  <text x="142" y="221" class="sub">match this distro by cgroup</text>
+  <text x="142" y="242" class="sub">redirect new connections</text>
+  <rect x="46" y="300" width="192" height="36" rx="8" fill="#fdecea" stroke="#f1c4bf"/>
+  <text x="142" y="323" class="label" fill="#b3261e">ICMP etc.: dropped</text>
+  <rect x="46" y="350" width="192" height="56" rx="8" fill="#fbf0da" stroke="#ecd3a0"/>
+  <text x="142" y="373" class="label" fill="#8a5a10">Older connections</text>
+  <text x="142" y="394" class="sub" fill="#8a5a10" style="fill:#8a5a10">TCP reset · UDP dropped</text>
+  <rect x="46" y="440" width="192" height="40" rx="8" fill="#f1f5f2" stroke="#d6e1da"/>
+  <text x="142" y="465" class="label" fill="#3d5246">System DNS · port 53</text>
+
+  <!-- distro to Windows -->
+  <line x1="252" y1="210" x2="344" y2="210" stroke="#5b6e62" stroke-width="2.5" marker-end="url(#arrow-ink)"/>
+  <text x="299" y="200" class="label" fill="#5b6e62">TCP · UDP</text>
+  <line x1="252" y1="460" x2="344" y2="460" stroke="#5b6e62" stroke-width="2.5" stroke-dasharray="7 5" marker-end="url(#arrow-ink)"/>
+  <text x="299" y="450" class="label" fill="#5b6e62">DNS</text>
+
+  <!-- Windows ingress -->
+  <rect x="346" y="86" width="200" height="180" rx="10" class="node"/>
+  <text x="446" y="120" class="title">Ingress</text>
+  <text x="446" y="144" class="sub">port 43531</text>
+  <line x1="372" y1="162" x2="520" y2="162" stroke="#e1e8e3"/>
+  <text x="446" y="188" class="sub">looks up the destination</text>
+  <text x="446" y="210" class="sub">verifies the owner</text>
+  <text x="446" y="232" class="sub">routes by the rules</text>
+
+  <!-- refused -->
+  <line x1="446" y1="266" x2="446" y2="288" stroke="#c0392b" stroke-width="2.5" marker-end="url(#arrow-red)"/>
+  <rect x="348" y="290" width="196" height="38" rx="19" fill="#fdecea" stroke="#eab0aa"/>
+  <text x="446" y="314" class="label" fill="#b3261e" style="font-size:14px">✕ Refused, never direct</text>
+  <text x="446" y="350" class="caption">unknown owner · hop failed</text>
+  <text x="446" y="368" class="caption">proxy lacks UDP</text>
+
+  <!-- managed DNS -->
+  <rect x="346" y="400" width="200" height="132" rx="10" class="node"/>
+  <text x="446" y="434" class="title">Managed DNS</text>
+  <text x="446" y="459" class="sub">system resolver only</text>
+  <text x="446" y="480" class="sub">no local fallback</text>
+
+  <!-- direct -->
+  <line x1="546" y1="116" x2="926" y2="116" stroke="#4a6a8c" stroke-width="3" marker-end="url(#arrow-slate)"/>
+  <text x="771" y="104" class="label" fill="#4a6a8c">Allowlisted TCP: direct</text>
+
+  <!-- two hops -->
+  <line x1="546" y1="210" x2="652" y2="210" stroke="#1f8a4c" stroke-width="4" marker-end="url(#arrow-green)"/>
+  <text x="600" y="199" class="label" fill="#1f8a4c">Other TCP</text>
+  <text x="600" y="232" class="label" fill="#1f8a4c">All UDP</text>
+
+  <rect x="656" y="176" width="230" height="68" rx="10" class="node"/>
+  <text x="771" y="205" class="title">Host SOCKS5</text>
+  <text x="771" y="229" class="sub">hop 1 · your existing proxy</text>
+
+  <line x1="771" y1="244" x2="771" y2="276" stroke="#1f8a4c" stroke-width="4" marker-end="url(#arrow-green)"/>
+
+  <rect x="656" y="280" width="230" height="68" rx="10" class="node"/>
+  <text x="771" y="309" class="title">Residential SOCKS5</text>
+  <text x="771" y="333" class="sub">hop 2 · user/password auth</text>
+
+  <line x1="886" y1="314" x2="926" y2="314" stroke="#1f8a4c" stroke-width="4" marker-end="url(#arrow-green)"/>
+
+  <!-- DNS routing -->
+  <line x1="546" y1="446" x2="652" y2="446" stroke="#1f8a4c" stroke-width="2.5" stroke-dasharray="7 5" marker-end="url(#arrow-green)"/>
+  <text x="600" y="436" class="label" fill="#1f8a4c">Other names</text>
+
+  <rect x="656" y="404" width="230" height="90" rx="10" class="node"/>
+  <text x="771" y="433" class="title">fake-ip stand-in</text>
+  <text x="771" y="457" class="sub">answers 198.19.x.x</text>
+  <text x="771" y="479" class="sub">proxy resolves the name</text>
+
+  <line x1="856" y1="404" x2="856" y2="352" stroke="#1f8a4c" stroke-width="2.5" stroke-dasharray="7 5" marker-end="url(#arrow-green)"/>
+  <text x="846" y="383" class="caption" style="fill:#1f8a4c;text-anchor:end;font-weight:700">connect by name</text>
+
+  <line x1="546" y1="512" x2="926" y2="512" stroke="#4a6a8c" stroke-width="2.5" stroke-dasharray="7 5" marker-end="url(#arrow-slate)"/>
+  <text x="771" y="533" class="label" fill="#4a6a8c">Allowlisted names: domestic DoH</text>
+
+  <!-- internet -->
+  <g transform="translate(1007 215)">
+    <circle r="36" fill="#ffffff" stroke="#4a6a8c" stroke-width="2.5"/>
+    <ellipse rx="15" ry="36" fill="none" stroke="#4a6a8c" stroke-width="2"/>
+    <line x1="-36" y1="0" x2="36" y2="0" stroke="#4a6a8c" stroke-width="2"/>
+    <path d="M-31,-18 H31 M-31,18 H31" stroke="#4a6a8c" stroke-width="1.6" fill="none"/>
+  </g>
+  <text x="1007" y="282" class="title">Internet</text>
+
+  <!-- other distros -->
+  <rect x="32" y="566" width="268" height="46" rx="10" fill="#f4f6f8" stroke="#dde3e8"/>
+  <text x="166" y="594" class="sub" style="font-size:14.5px">Other distros, Windows apps</text>
+  <line x1="300" y1="589" x2="926" y2="589" stroke="#9aa6ae" stroke-width="2" stroke-dasharray="7 5" marker-end="url(#arrow-grey)"/>
+  <text x="614" y="580" class="label" fill="#7f8b93">Original route, unaffected</text>
+
+  <!-- legend -->
+  <g class="legend">
+    <line x1="32" y1="638" x2="60" y2="638" stroke="#1f8a4c" stroke-width="4"/>
+    <text x="68" y="643">Two-hop proxy</text>
+    <line x1="186" y1="638" x2="214" y2="638" stroke="#4a6a8c" stroke-width="3"/>
+    <text x="222" y="643">Direct from Windows</text>
+    <line x1="382" y1="638" x2="410" y2="638" stroke="#c0392b" stroke-width="3"/>
+    <text x="418" y="643">Refused / dropped</text>
+    <line x1="562" y1="638" x2="590" y2="638" stroke="#5b6e62" stroke-width="2.5" stroke-dasharray="7 5"/>
+    <text x="598" y="643">Dashed: DNS query</text>
+    <line x1="748" y1="638" x2="776" y2="638" stroke="#9aa6ae" stroke-width="2" stroke-dasharray="7 5"/>
+    <text x="784" y="643">Original route</text>
+  </g>
+</svg>

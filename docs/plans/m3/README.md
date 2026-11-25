@@ -10,21 +10,22 @@
 {"command":"switch","target":"WSLProxyLab-Control","expected_generation":7}
 ```
 
-- `switch` 的 `expected_generation` 必填；`start` / `start_scoped` / `stop` 也可指定。自动化应在读到状态后带上代次；过期命令拒绝，不撤旧规则或重复落新规则。`config_generation` 是网络规则的实例标记，**不能代替**操作代次。
+- `switch` 的 `expected_generation` 必填；`start` / `start_scoped` / `stop` / `abandon` 也可指定。经 `rpc` 发给桌面后台时，`start` / `switch` / `stop` / `abandon` 都必须带，否则报 `expected_generation_required`。自动化应在读到状态后带上代次；过期命令拒绝，不撤旧规则或重复落新规则。`config_generation` 是网络规则的实例标记，**不能代替**操作代次。
 - 切换不需要对照发行版：预检不再实测隔离，改由内核版本把关（[决策 01](../../decisions.md)，目标内核低于 6.18.58.1 时阻断）。不能用 `switch` 静默接管已失去会话的孤儿实例；先明确恢复再启动。
 - 正常停止在同一会话发送 `{"command":"stop"}`；意外退出后，用新的原生进程执行 `wsl-proxyctl.exe status`、`wsl-proxyctl.exe stop`。未带代次的 `stop` 是人工明确恢复命令。成功停止后的重复停止保持空闲，不消耗新代次。
-- 目标在接管中被注销后 `stop` 无法完成（报 `journal_distribution_no_longer_matches_registration`，状态里 `target_registered` 为 `false`）。此时运行 `wsl-proxyctl.exe abandon --confirm`，或在桌面端概览页点「放弃本次记录」：只释放 Windows 侧端口和恢复记录，不碰 WSL。之后先执行一次 `wsl --shutdown`（会关闭所有发行版），清掉 WSL 里可能残留的规则，再预检启动。不要手动删除恢复记录。
+- 目标在接管中被注销后 `stop` 无法完成（报 `journal_distribution_no_longer_matches_registration`，状态里 `target_registered` 为 `false`）。此时运行 `wsl-proxyctl.exe abandon --confirm`，或在桌面端首页点「放弃本次记录」：只释放 Windows 侧端口和恢复记录，不碰 WSL。之后先执行一次 `wsl --shutdown`（会关闭所有发行版），清掉 WSL 里可能残留的规则，再预检启动。不要手动删除恢复记录。
 
 ## 切换顺序与失败处理
 
 | 阶段 | 能改变什么 | 中断后的处理 |
 |---|---|---|
 | 候选预检 | 校验目标注册身份、cgroup、网络、内核能力和策略，只读检查候选规则冲突。同一入口若正由当前活动实例独占，不误报为外部端口冲突。 | B 不具备能力、配置非法或目标端口被外部进程占用时，A 保持不变，不提交切换。 |
+| 同步 B 的时区并重启 B（决策 28） | 经双跳查住宅出口时区，改 B 的 `/etc/localtime`、`/etc/timezone` 和 `/etc/wsl.conf`，然后终止并重新启动 B，B 里所有进程都会结束。随后对 B 再做一次预检。 | 失败时 A 保持不变，不提交切换；B 的时区改动和重启不撤回。 |
 | `releasing_old` | 先持久化唯一操作代次、旧/新目标及规则标识，才开始撤旧规则、清理可确认归属的映射、结束旧 TCP 与释放入口。 | 无法证明旧目标已恢复，保持待恢复，禁止给新目标写规则。 |
 | `old_restored` | 旧目标的内核规则与映射已经核实不存在，监听保管者已释放。允许此时没有活动目标。 | 不重建 A，也不根据候选选择自动启动 B。可显式 `stop` 核实并结束该操作。 |
 | `starting_new` | 重新核对 B，不继承 A 的 cgroup 身份、连接或 DNS 状态。新入口必须独占绑定，DNS 与业务均须通过真实就绪探测。 | 落保护前失败且确定无残留，可回空闲；落保护后失败则 B 保留保护，显式恢复。A 不被自动重新接管。 |
 
-`src/lifecycle.rs` 协调运行状态，`src/transition.rs` 将意图原子写入当前用户 LocalAppData 的 `WSLProxyLab\m3-operation.json`。原有 `m1-active.json` 仍是单个网络实例的恢复凭据。重启时对比两者，并只读检查实际 cgroup、已标记的双栈规则、连接跟踪和端口持有者；不能验证则报告原因，不按旧 UI 的选择或仅凭端口删除网络对象。停止时，目标身份或环境的变化（重启、改名、地址变化等）只记录原因、不阻断删除，但只删本实例精确标签的规则与映射，且只能证明已清空。恢复是**取消未完成切换并回原网**，不是重放 `start`。持久操作代次在空闲时仍保留，防止旧命令在下次运行中生效。
+`src/controller/lifecycle.rs` 协调运行状态，`src/transition.rs` 将意图原子写入当前用户 LocalAppData 的 `WSLProxyLab\m3-operation.json`。原有 `m1-active.json` 仍是单个网络实例的恢复凭据。重启时对比两者，并只读检查实际 cgroup、已标记的双栈规则、连接跟踪和端口持有者；不能验证则报告原因，不按旧 UI 的选择或仅凭端口删除网络对象。停止时，目标身份或环境的变化（重启、改名、地址变化等）只记录原因、不阻断删除，但只删本实例精确标签的规则与映射，且只能证明已清空。恢复是**取消未完成切换并回原网**，不是重放 `start`。持久操作代次在空闲时仍保留，防止旧命令在下次运行中生效。
 
 Linux 侧对变更与核对串行化。候选发行版完成只读内核预检时，用**访客自己的时钟**给出 30 秒期限；Windows 原样传递，在所有权落盘并绑定入口后只申请一次安装许可，由同一访客核验并核销。切换使用旧目标已恢复后的第二次预检期限，不使用释放旧目标之前的结果。这样不比较两台系统的墙上时钟，跨边界耗时不会续期。显式恢复会撤销许可，防止延迟到达的旧安装覆盖恢复结果。正常释放删除已观测到的临时许可；不确定的授权可能留下有期撤销标记，不能授权转发，后续变更会清理过期标记。不清空共享防火墙或连接表。
 

@@ -1,86 +1,545 @@
-# dick-wsl-proxy · `wsl-proxyctl`
+<div align="center">
 
-[简体中文](#简体中文) · [English](#english)
+# dick-wsl-proxy
 
-## 简体中文
+**只接管一个 WSL2 发行版的出站流量：白名单 TCP 直连，其余经「宿主代理 → 住宅 SOCKS5」双跳，任何一跳失败都不会偷偷直连。**
 
-`wsl-proxyctl` 是一个 Windows 命令行工具：它只代理一个 WSL2 发行版中本地进程新建的出站连接，包括已在运行的后台服务。应用不用单独配置代理；其他发行版和 Windows 原生进程保留原有网络路径。工具不修改 Windows 系统代理或 WSL 共享的 `resolv.conf`。
+Windows 桌面端 `wsl-proxy-desktop` · 控制器与命令行 `wsl-proxyctl`
 
-**流量怎么走？** 命中 IP、CIDR、域名或域名后缀白名单的 TCP 连接由 Windows 直连；UDP 不论是否命中白名单都不直连（否则网页能经白名单里的 STUN 服务器，借 WebRTC 拿到 Windows 的真实出口 IP）。其余 IPv4 TCP 连接先经过宿主机已有的 SOCKS5 代理，再经过住宅 SOCKS5 出口；任一跳失败都不会改走直连。目标发行版的系统 DNS（UDP/TCP 53）由 Windows 接管，不回退到本地或运营商解析：
-- **白名单以外的域名默认用 fake-ip。** A 查询当场回一个 `198.19.x.x` 占位地址（AAAA 回空），连接时把域名交给住宅代理去解析。所以在目标里看到这类地址是正常的；不存在的域名表现为连接失败，而不是「域名不存在」。住宅代理不支持按域名连接时，本次接管自动不启用。可用策略 `"fake_ip": false` 或设置页「远端解析」关闭，关闭后这些查询经双跳访问指定的 DNS-over-HTTPS 上游。
-- **命中域名白名单的查询**改由 Windows 直接问国内 DoH 上游（默认阿里 DNS，可在策略或设置页更换，留空即关闭），使直连站点拿到国内地址；国内上游连不上或应答不可用时仍经双跳。
+![平台](https://img.shields.io/badge/平台-Windows%20x64-0078D6)
+![WSL](https://img.shields.io/badge/WSL2-NAT%20模式-4E9A06)
+![源码版本](https://img.shields.io/badge/源码版本-0.1.10-informational)
+![Rust](https://img.shields.io/badge/Rust-2024%20edition-B7410E)
 
-**适用范围。** Windows x64 原生桌面控制台与 CLI，后端按 WSL2 NAT 验证，不是通用 VPN。目标的 WSL 内核低于 6.18.58.1（只在这个版本上实测过其他发行版不受影响）或读不出版本时，预检阻断，需先升级 WSL；升级成功能否过这道门槛没有实测过。目标具备全局 IPv6 地址和默认路由时启用受管 IPv6，否则阻断目标外部 IPv6。普通 UDP（含 QUIC，白名单的也一样）经住宅代理的 UDP Associate 转发；启动时这项探测不通过（例如住宅代理不支持 UDP），接管仍会启动，但本次接管期间这类 UDP 一律拒绝、不会直连，界面显示“UDP 已阻断”，下次启动或切换时重新探测。同一 Windows 账户一次只接管一个发行版；切换前先确认旧目标已恢复，不迁移既有 TCP 连接。目标里 Docker 的容器流量也经代理（只认 bridge 网络，接管中新建的网络最多约 30 秒后纳入），目标访问自己的容器、Windows 经 `localhost` 访问端口映射照常可用（新建的网络同样要等纳入后才行，例如 `docker compose up` 后的头几十秒）；Podman 等其他运行时的容器不经代理，别的发行版的容器不受影响。
+简体中文 · [English](README.en.md)
 
-**接管会改目标的时区并重启目标。** 每次启动或切换到某个目标，预检通过、确认之后、装规则之前，Windows 经双跳查住宅出口所在时区，把目标的时区改成它，并在目标的 `/etc/wsl.conf` 写 `[time] useWindowsTimezone=false`（不然 WSL 下次启动目标时会改回 Windows 的时区），然后只重启这个发行版：其中正在运行的程序都会被结束，时区本来就对也会重启。查不到时区或目标里缺这个时区的数据（`/usr/share/zoneinfo`）时不接管。停止接管不会改回时区。CLI 的 `start`、`switch` 没有确认步骤，同样会重启目标。
+</div>
 
-**规则装上之前就建立的连接，接管期间不能用。** 目标重启后、规则装上前就连上的程序（例如开机自启的 VPN、Tailscale）不会被代理，也不会继续直连：TCP 连接在下一次发包时被重置，应用重连后走代理；UDP 流的包被丢弃。WireGuard 这类固定端口的 UDP 程序会在整个接管期间不通，接管后重启它也没用（端口不变，仍落在旧的连接记录上）；要关掉它的开机自启，等接管开始后再启动，这样它和其他 UDP 一样经住宅代理（没实测）。
+> [!WARNING]
+> **每次启动接管都会重启目标发行版。** 接管前会把目标的时区改成住宅出口所在时区，然后只重启这个发行版，里面正在运行的程序都会被结束。命令行的 `start`、`switch` 没有确认步骤。动手之前请先读[使用前必读](#使用前必读)。
 
-**图形界面。** 将 `wsl-proxy-desktop.exe` 与配套 `wsl-proxyctl.exe` 放在同目录，打开前者。选目标、保存策略并明确启动；关闭窗口只收进托盘，不停止代理。托盘菜单「退出」会在确认后停止接管、恢复直连并关闭后台，再退出程序。桌面被强制结束时后台照旧保留，重新打开可连接已有后台。见 [M4 使用说明和验收边界](docs/plans/m4/README.md)。冷启动或 WSL 重启后，目标内核可能没有加载所需模块；启动接管前的预检发现缺少这些能力时，会先询问是否加载发行版里已有的模块并创建空表（不安装软件、需先停止接管），确认后自动重新预检，并把模块列表和空表初始化写进发行版的开机配置；以后 WSL 启动会自动准备好，不再询问。0.1.10 起还需要 REJECT 模块（用来重置旧连接），之前版本准备过的内核会再询问一次。见 [M6 内核环境准备](docs/plans/m6/README.md)。设置页的「WSL 平台」卡片只读显示 `wsl.exe` 版本、WSL2 内核、默认版本与已注册发行版；没有接管时可以用它显式运行 `wsl --update` 升级 WSL 平台：会终止所有发行版，最多等 30 分钟，超时会结束升级进程，WSL 可能停在升级到一半；等待期间不要关闭程序或做别的环境操作，否则结果可能看不到或被误报为失败。失败、超时或没看到结果时，在 PowerShell 里用 `wsl --version` 核对，必要时自己再运行 `wsl --update`。见 [M7 WSL 平台检查与升级](docs/plans/m7/README.md)。
+| 了解 | 上手 | 参考 | 开发 |
+| --- | --- | --- | --- |
+| [它解决什么问题](#它解决什么问题) | [系统要求](#系统要求) | [策略配置参考](#策略配置参考) | [从源码构建](#从源码构建) |
+| [功能](#功能) | [安装](#安装) | [停止与故障恢复](#停止与故障恢复) | [项目结构](#项目结构) |
+| [工作原理](#工作原理) | [桌面端上手](#桌面端上手) | [常见问题](#常见问题) | [文档导航](#文档导航) |
+| [使用前必读](#使用前必读) | [命令行用法](#命令行用法) | [安全说明](#安全说明) | [参与开发](#参与开发) |
 
-**安装与升级。** Windows x64 候选包采用按用户安装的未签名 ZIP。校验、显式恢复、升级/卸载步骤与已测/未测环境见 [M5 发布说明](docs/plans/m5/README.md)；不要将 ZIP 哈希当作签名。
-`0.1.3` 在保留逐包归属校验的前提下合并 UDP 回包查询：本地 16 并发已连接 UDP 回显 p95 从 348.66 ms 降至 88.55 ms，直连为 6.71 ms。全表均忙时仍拒绝新流。见 [M5 延迟与边界](docs/plans/m5/README.md#013udp-回包并发延迟)。
+## 它解决什么问题
 
-**从哪里开始？** 先按下方的[只读预检](#preflight)检查目标发行版。预检通过后，按 [M2 配置与启动指南](docs/plans/m2/README.md)准备 Windows 侧策略、导入住宅代理设置（写入 EXE 同级的 `desktop.sqlite`，含明文密码），并在 `session` 中启动接管。策略文件里的 `credential` 只是标签，不要把 `.env` 或密码提交到仓库。正常停止时在同一会话发送 `{"command":"stop"}`；如果控制器崩溃，在新的 Windows 进程中依次运行 `wsl-proxyctl.exe status` 和 `wsl-proxyctl.exe stop`，不要把进程退出当作网络已经恢复。
+WSL2 的所有发行版共用 Windows 的网络出口。想让其中**一个**发行版的流量全部走住宅代理，常见做法要么是给每个程序单独配代理（总有漏掉的），要么是在 Windows 上开全局或 TUN 代理（连带影响其他发行版和 Windows 自己）。
 
-## English
+dick-wsl-proxy 在 Windows 侧只接管你指定的那一个发行版：
 
-`wsl-proxyctl` is a Windows CLI that proxies new outbound connections from local processes in **one WSL2 distribution**, including services that were already running. Applications need no proxy settings. Other distributions and native Windows processes keep their original routes; the controller changes neither the Windows system proxy nor WSL’s shared `resolv.conf`.
+- 目标里的程序不用配任何代理。命令行、后台服务、Docker 容器发出的新连接都会被接管。
+- 其他发行版和 Windows 原生程序照旧走原来的网络。
+- 不改 Windows 系统代理，不改 WSL 共享的 `resolv.conf` 和 `.wslconfig`，不在 WSL 里装代理软件或监听端口。
+- 出问题时宁可断网，也不让流量绕开代理直连出去。只有你主动停止接管，网络才恢复原样。
 
-**Where does traffic go?** Windows connects directly for TCP connections matching an allowlisted IP, CIDR, domain, or domain suffix. UDP never goes direct, allowlisted or not; otherwise a web page could use WebRTC with an allowlisted STUN server to learn the real Windows exit IP. Other IPv4 TCP connections use the host’s existing SOCKS5 proxy and then a residential SOCKS5 proxy. If either hop fails, the connection fails rather than going direct. Windows takes over the target’s system DNS (UDP/TCP port 53) and never falls back to a local or ISP resolver:
-- **Names outside the allowlist use fake-ip by default.** An A query is answered at once with a `198.19.x.x` stand-in (AAAA gets an empty answer), and the connection hands the name to the residential proxy to resolve. Such addresses inside the target are expected; a name that does not exist shows up as a failed connection rather than NXDOMAIN. If the residential proxy cannot connect by name, the takeover runs without fake-ip. Turn it off with `"fake_ip": false` in the policy or **Remote resolution** in Settings; those queries then use the two hops to reach the configured DNS-over-HTTPS upstream.
-- **Queries for allowlisted domains** go directly from Windows to a domestic DoH upstream (AliDNS by default; change it in the policy or Settings, or leave it empty to turn it off), so direct sites get nearby addresses. If that upstream cannot be reached or answers unusably, the query still goes through the two hops.
+它不是通用 VPN：只管一个 WSL2 发行版，后端只在 WSL2 NAT 网络模式下验证过。同一 Windows 账户一次只接管一个发行版；切换时先确认旧目标已恢复，再接管新目标，已建立的 TCP 连接不会迁移过去。
 
-**Supported scope.** The Windows x64 native desktop and CLI share the controller tested on WSL2 NAT. It is not a general-purpose VPN. A target whose WSL kernel is older than 6.18.58.1 (the only kernel on which other distributions were seen to stay untouched) or cannot be read is refused by the preflight until WSL is updated; whether an update gets past this floor has not been tested. A target with a global IPv6 address and default route uses managed IPv6 interception, while external IPv6 is blocked when those prerequisites are absent. Application UDP, including QUIC and allowlisted destinations, uses the residential UDP Associate. If that startup probe fails (for example, the residential proxy lacks UDP support), takeover still starts, but such UDP is refused, never sent direct, for the rest of that session; the desktop shows UDP as blocked, and the next start or switch probes again. Only one distribution per account can be active. Switching restores the old target before enabling the new one; existing TCP connections do not migrate. Traffic from the target's Docker containers is proxied too (bridge networks only; a network created during a takeover is covered within about 30 seconds), while the target can still reach its own containers and published ports stay reachable from Windows through `localhost` (for a new network only once it is covered, e.g. in the first seconds after `docker compose up`); containers of other runtimes such as Podman are not proxied, and other distributions' containers are left alone.
+## 功能
 
-**A takeover sets the target's timezone and restarts the target.** On every start of, or switch to, a target (after the preflight passes and you confirm, before any rule is installed), Windows looks up the residential exit's timezone through the two hops, sets the target to it, writes `[time] useWindowsTimezone=false` into the target's `/etc/wsl.conf` (otherwise WSL puts the Windows timezone back the next time the target starts), and then restarts only that distribution. Every program running in it is ended, even when the timezone was already right. If the timezone cannot be looked up, or the target lacks its data under `/usr/share/zoneinfo`, the takeover does not start. Stopping does not restore the old timezone. The CLI `start` and `switch` commands ask for no confirmation and restart the target as well.
+- **按发行版接管**：在目标里装一组带本实例标记的 iptables 规则，按 cgroup 只匹配这个发行版的进程，把新连接引到 Windows 上的入口。
+- **白名单直连**：支持 IP、CIDR、精确域名、域名后缀四种写法，命中的 TCP 由 Windows 直接连。新建的配置库会预填一批国内常用服务的域名后缀。
+- **双跳代理**：其余流量先经宿主机上已有的 SOCKS5 代理（第一跳），再经住宅 SOCKS5 代理（第二跳，用户名密码认证）出去。
+- **失败不放行**：任何一跳失败，连接就失败；故障时保持阻断，不会降级成直连。
+- **系统 DNS 接管**：目标的系统 DNS 由 Windows 处理，永远不回落到本地或运营商的解析器。白名单以外的域名默认用 fake-ip 交给住宅代理解析，白名单域名直接问国内 DoH。
+- **UDP 与 QUIC**：经住宅代理的 UDP Associate 转发；代理不支持 UDP 时，本次接管期间这类 UDP 一律拒绝，不会直连。
+- **IPv6**：目标有全局 IPv6 时一并接管，没有时把目标的外部 IPv6 全部阻断。
+- **Docker 容器**：目标里 Docker bridge 网络的容器流量也经代理。
+- **时区跟随出口**：接管时把目标的时区改成住宅出口所在时区，避免时区和 IP 对不上。
+- **桌面端**：首页监控保护状态和流量；环境页管理发行版（新建、编辑、备份、删除、改时区）；规则、连接记录、运行日志、设置；托盘常驻。
+- **崩溃可恢复**：接管状态写进恢复记录，控制器崩溃后端口仍被一个持有进程占着、规则保持阻断；用 `status` 和 `stop` 显式恢复。
 
-**Connections opened before the rules are in place stop working during the takeover.** A program that connects after the restart but before the rules are installed (a VPN or Tailscale started at boot, for example) is neither proxied nor left direct: its TCP connections are reset on their next packet, and the application reconnects through the proxy; its UDP packets are dropped. A fixed-port UDP program such as WireGuard stays down for the whole takeover, and restarting it does not help (same port, same old connection-tracking entry); turn off its start at boot and start it once the takeover is running, so its traffic goes through the residential proxy like other UDP (not tested).
+## 工作原理
 
-**Desktop.** Keep `wsl-proxy-desktop.exe` and the matching `wsl-proxyctl.exe` together and launch the desktop executable. Choose a target, save the policy, and explicitly start it. Closing the window only hides it to the tray; the proxy keeps running. **Exit** in the tray menu stops the takeover after confirmation, restores direct routing, shuts the background controller down, and then quits. If the desktop process is killed, the controller keeps running; reopen to reconnect. See the [M4 operator guide](docs/plans/m4/README.md). A cold WSL kernel may have none of the required modules loaded. If the preflight before a start finds them missing, the desktop asks whether to load modules already shipped with the distribution and create empty tables; it installs nothing, then reruns the preflight. The same confirmation also installs a boot-time module list and a oneshot that registers the empty tables, so later WSL starts need no prompt. From 0.1.10 the REJECT modules (used to reset old connections) are needed too, so a kernel prepared by an earlier version is asked once more. See [M6](docs/plans/m6/README.md). The **WSL platform** card in Settings reports the `wsl.exe` version, WSL2 kernel, default version and registered distributions; while idle it can also run `wsl --update` explicitly. That stops every distribution and waits at most 30 minutes; past that the update process is ended and WSL may be left half updated. Keep the app and its backend open and start no other environment task meanwhile, or the result may be lost or reported as a failure. After a failure, a timeout or no result, check with `wsl --version` in PowerShell and run `wsl --update` yourself if needed. See [M7](docs/plans/m7/README.md).
+![工作原理：目标发行版的新连接经 iptables 规则引到 Windows 入口；白名单 TCP 直连，其余 TCP 和全部 UDP 经宿主 SOCKS5、住宅 SOCKS5 双跳，失败就拒绝；系统 DNS 由 Windows 接管](docs/images/architecture.zh.svg)
 
-**Install and upgrade.** The Windows x64 candidate is an unsigned per-user ZIP. See [M5 release and recovery notes](docs/plans/m5/README.md) for verification, safe maintenance and the support matrix. The ZIP checksum does not authenticate its publisher.
-Version `0.1.3` batches UDP reply checks without caching destinations. Local connected UDP echo p95 at concurrency 16 fell from 348.66 ms to 88.55 ms (direct: 6.71 ms). A genuinely busy mapping table still rejects new flows.
+1. 启动接管时，控制器以 root 身份在目标里安装规则，把目标发出的新连接引到 Windows 在 WSL 虚拟网卡上监听的入口（默认端口 43531）。
+2. 入口收到连接后，经一个只读查询进程向目标内核的连接跟踪表查原来的目的地址。查询进程由 `wsl.exe` 拉起，只走标准输入输出，不监听端口。查不到、或者核对后不属于本次接管，就拒绝，不猜目的地址。
+3. 核实之后再按规则决定直连还是走双跳。
 
-**Getting started.** Run the [read-only preflight](#preflight) below for the target distribution. Once it passes, follow the [M2 setup guide](docs/plans/m2/README.md) for the Windows policy file, credential import, and `session` commands. Reference the residential credential by name in the policy; never commit the `.env` file or a password. To stop normally, send `{"command":"stop"}` in the active session. If the controller crashes, run `wsl-proxyctl.exe status` and then `wsl-proxyctl.exe stop` from a new Windows process. Process exit alone does not mean the original network path has been restored.
+### 流量去向
 
-<a id="preflight"></a>
-
-## 构建与只读预检 · Build and run a read-only preflight
-
-在装有 Rust 工具链（支持 Rust 2024 edition）的 Windows 上，从仓库根目录打开 PowerShell。用 `list` 输出中的目标注册名替换示例。
-
-From the repository root, open PowerShell on Windows with a Rust toolchain that supports the 2024 edition. Replace the example target name with a registered name from `list`.
-
-```powershell
-cargo build --locked --release
-$ctl = '.\target\release\wsl-proxyctl.exe'
-& $ctl list
-& $ctl preflight WSLProxyLab-Target
-```
-
-`list` 不会启动发行版。`preflight` 可能唤醒所选目标发行版，但不安装引流规则。查看 JSON 中的 `passed` 和 `blockers`；`passed: true` 仅表示预检通过，不表示代理已启用。
-
-`list` does not start distributions. `preflight` may wake the selected target, but installs no traffic rules. Check `passed` and `blockers` in the JSON output. `passed: true` means the checks passed, not that the proxy is active.
-
-如果阻断项含 `capability.kernel.*` 或 `baseline.ip*tables*`，说明共享 WSL 内核处于冷启动状态。在桌面点「启动接管」时，预检报告这些阻断后会询问是否加载；也可以运行下面的命令。它加载目标发行版里已有的模块、注册空表，并写入发行版的 `/etc/modules-load.d/wsl-proxy.conf` 与 `wsl-proxy-tables.service`，让以后 WSL 启动时自动准备好；不安装软件，删除这两个文件即可取消开机加载。
-
-If the blockers contain `capability.kernel.*` or `baseline.ip*tables*`, the shared WSL kernel is cold. When the desktop preflight reports them before a start, it asks whether to load them; the commands below do the same. It loads modules already shipped with the target, registers empty tables, and installs a boot-time module list plus a oneshot in the distribution, so later WSL starts are ready without asking; it installs no packages, and deleting those two files restores the prompt.
-
-```powershell
-& $ctl prepare-kernel WSLProxyLab-Target --confirm
-& $ctl preflight WSLProxyLab-Target
-```
-
-## 文档怎么维护 · Documentation guide
-
-| 文档 / Document | 内容 / Purpose |
+| 流量 | 去向 |
 | --- | --- |
-| [架构 / Architecture](docs/arch/README.md) | 现行设计与隔离边界 / Current design and isolation boundaries |
-| [讨论 / Discussions](docs/discussions/) · [决策 / Decisions](docs/decisions.md) | 讨论保留论证过程；定论并入架构并登记决策 / Keep rationale in discussions; record decisions and fold accepted designs into the architecture |
-| [开发计划 / Roadmap](docs/plans/README.md) | 里程碑、验收条件与执行记录 / Milestones, acceptance criteria, and implementation records |
-| [M2：策略与 DNS / Policy and DNS](docs/plans/m2/README.md) | 策略 JSON、凭据导入、会话示例 / Policy JSON, credential import, and session examples |
-| [M3：切换与恢复 / Switching and recovery](docs/plans/m3/README.md) | 切换顺序、异常恢复与实测边界 / Switch sequence, crash recovery, and limits of the validation evidence |
-| [M4：桌面操作 / Desktop operation](docs/plans/m4/README.md) | 原生双件启动、关闭窗口与后台的区别、诊断与恢复 / Native binary pair, reconnect, diagnostics and recovery |
-| [M5：发布与兼容性 / Release and compatibility](docs/plans/m5/README.md) | 安装、升级、卸载、兼容矩阵与性能证据 / Per-user installation, recovery, measured scope and limits |
-| [M6：内核环境准备 / Kernel preparation](docs/plans/m6/README.md) | 冷启动后显式加载目标已有模块、注册空表 / Explicit module loading and empty tables after a cold kernel |
+| 命中白名单的 TCP | Windows 直接连接 |
+| 其余 TCP（启用受管 IPv6 时含 IPv6） | 宿主 SOCKS5 → 住宅 SOCKS5；任何一跳失败，连接就失败 |
+| UDP，含 QUIC，**白名单的也一样** | 经两跳代理的 UDP Associate；启动时探测不通过，本次接管期间一律拒绝，界面显示「UDP 已阻断」 |
+| 系统 DNS（目标 `resolv.conf` 里的解析器，UDP/TCP 53） | 由 Windows 处理，见下一节 |
+| 直接问其他 DNS 服务器的 53 端口（例如 `dig @1.1.1.1`） | 拒绝，既不经代理也不直连 |
+| ICMP 等 TCP、UDP 以外的协议 | 丢弃 |
+| IPv6 | 目标有全局 IPv6 地址和默认路由时按上面的规则接管；没有时，除回环外全部阻断 |
+
+UDP 不直连是有意为之：网页可以借白名单里的 STUN 服务器，通过 WebRTC 拿到 Windows 的真实出口 IP。
+
+**Docker 容器**：只认目标里 Docker 的 bridge 网络，接管中新建的网络最多约 30 秒后纳入。目标访问自己的容器、Windows 经 `localhost` 访问端口映射都照常可用；新建的网络同样要等纳入之后，例如 `docker compose up` 后的头几十秒。Podman 等其他运行时的容器不经代理，别的发行版的容器不受影响。
+
+### DNS 怎么解析
+
+- **白名单以外的域名默认用 fake-ip。** A 查询当场回一个 `198.19.x.x` 占位地址（TTL 1 秒），AAAA、HTTPS/SVCB 查询回空。程序连这个地址时，入口把域名交给住宅代理去解析。住宅代理不支持按域名连接时，本次接管自动不启用 fake-ip。
+- **关闭 fake-ip 后**，这些查询经两跳代理去问策略里的 DoH 上游 `dns_upstream`。新建配置库预填的是 Google DoH（`8.8.8.8:443`、`dns.google`）。
+- **白名单域名**直接由 Windows 问国内 DoH 上游，默认阿里 DNS（`223.5.5.5:443`、`dns.alidns.com`），让直连站点拿到国内地址。国内上游连不上或应答不可用时，改经两跳代理再问。返回给目标的是 `198.18.x.x` 别名地址，连这个别名的 TCP 才会直连。
+- **缓存**：过期一小时内的旧应答会先返回（TTL 记 30 秒），同时在后台刷新。旧应答同样来自配置的上游，不算本地解析。
+
+## 使用前必读
+
+**1. 接管会改目标的时区，并重启目标。**
+每次启动接管或切换到某个目标，都发生在预检通过、确认之后、装规则之前：
+
+- Windows 经两跳代理访问 `my.ippure.com`，查住宅出口所在的时区；
+- 把目标的时区改成它；
+- 在目标的 `/etc/wsl.conf` 写 `[time] useWindowsTimezone=false`，不然下次 WSL 启动目标时会改回 Windows 的时区；
+- 然后只重启这个发行版，里面正在运行的程序都会被结束。时区本来就对，也照样重启。
+
+查不到时区，或者目标里缺这个时区的数据（`/usr/share/zoneinfo`），就不接管。停止接管不会把时区改回去。
+
+**2. 接管前就建立的连接，在接管期间不能用。**
+目标重启后、规则装上前就连上的程序（例如开机自启的 VPN、Tailscale）不会被代理，也不会继续直连：
+
+- TCP 连接在下一次发包时被重置，程序重连后走代理；
+- UDP 流的包被丢弃。WireGuard 这类固定端口的 UDP 程序会在整个接管期间都不通，接管后重启它也没用（端口不变，仍落在旧的连接记录上）。可以关掉它的开机自启，等接管开始后再启动，这样它和其他 UDP 一样经住宅代理（没实测）。
+
+**3. 有全局 IPv6 的目标不能用域名白名单。**
+这时策略里只要有域名或域名后缀白名单，启动就会被拒（`ipv6_domain_allowlist_unsupported`）。新建的配置库默认就带一批国内后缀，要先清空规则页的两列域名规则。被拒发生在改时区、重启目标之后。
+
+**4. fake-ip 带来的两个现象。**
+在目标里看到 `198.19.x.x` 地址是正常的。不存在的域名表现为连接失败，而不是「域名不存在」（NXDOMAIN）。
+
+**5. 住宅代理的密码以明文保存。**
+住宅服务器、用户名和密码保存在 EXE 同目录的 `desktop.sqlite` 里，没有额外加密，只靠 Windows 账户的文件权限保护。卸载不会删除它。不要把 `.env` 或密码提交到仓库。
+
+**6. 程序退出不等于网络已恢复。**
+关窗、强制结束进程、控制器崩溃都不会恢复直连，规则会一直保持阻断。要恢复，必须显式停止，见[停止与故障恢复](#停止与故障恢复)。
+
+**7. 隔离只在一个内核版本上实测过。**
+「其他发行版不受影响」只在 WSL 内核 6.18.58.1 上实测过。目标内核低于这个版本或读不出版本时，预检直接阻断，需要先升级 WSL。升级后能不能过这道门槛，没有实测过。
+
+**8. 发布包没有签名。**
+SHA-256 校验值只能证明文件完整，不能证明是谁发布的。
+
+## 系统要求
+
+**Windows 侧**
+
+- Windows x64。运行不需要管理员权限。
+- 本机已有一个 SOCKS5 代理入口，作为第一跳。地址必须是回环 IPv4，且不需要认证，例如本机代理软件开放的 SOCKS5 端口。新建的配置库预填 `127.0.0.1:7892`。
+- 一个住宅 SOCKS5 代理，使用用户名密码认证。
+- 想让 UDP（含 QUIC）可用，宿主代理和住宅代理**都**要支持 UDP Associate。任何一端不支持，接管照样启动，但 UDP 会被拒绝。
+
+**目标发行版**
+
+- WSL2，网络模式是 NAT。WSL1、mirrored、bridged 等模式不支持。
+- WSL 内核不低于 6.18.58.1。
+- systemd 是 PID 1。
+- 有 `iptables-legacy` 和 `ip6tables-legacy`。
+- 内核能力：`xt_cgroup`、`nf_conntrack`、`nf_nat`、`iptable_nat`、`ip6table_nat`，以及 IPv4、IPv6 的 REJECT。冷启动后缺这些模块时，可以让程序加载发行版里已有的模块，见下文。
+- 有 `/usr/bin/python3`。注意：预检目前不检查这一项，缺了要到改完时区、重启目标之后才会失败。
+- 有 `/usr/share/zoneinfo` 时区数据，以及 `awk`、`od`、`sha256sum`、`ip` 等基础命令。
+
+## 安装
+
+> [!NOTE]
+> **目前 GitHub Releases 上还没有任何发布包。** 发布流水线还没有被 tag 触发过，仓库里已有的 `v0.1.4`–`v0.1.7` tag 都早于这条流水线。第一个版本发布之前，请[从源码构建](#从源码构建)。下面是发布之后的安装方法。
+
+### 下载预编译包
+
+发布流水线在推送 `v*` tag 时运行：在 GitHub 的 Windows 构建机上原生编译，跑完格式检查、clippy、全部测试、导入表检查和安装冒烟测试后打包，以**预发布（pre-release）**的形式发到 [GitHub Releases](https://github.com/JungleZy/dick-wsl-proxy/releases)。每个版本附两个文件：
+
+- `wsl-proxy-<版本>-windows-x64.zip`：两个 EXE、安装与卸载脚本、构建记录和第三方许可证清单；
+- `wsl-proxy-<版本>-windows-x64.zip.sha256`：校验值。
+
+在 PowerShell 里：
+
+```powershell
+# 1. 核对校验值，和发布页上的值比较
+Get-FileHash -Algorithm SHA256 .\wsl-proxy-<版本>-windows-x64.zip
+
+# 2. 解压到一个新的目录（不要解压到安装目录里）
+Expand-Archive .\wsl-proxy-<版本>-windows-x64.zip -DestinationPath .\wsl-proxy-<版本>
+cd .\wsl-proxy-<版本>
+
+# 3. 安装到当前用户，默认位置 %LOCALAPPDATA%\Programs\WslProxy
+.\install.ps1
+```
+
+- 在允许运行该脚本的普通 PowerShell 里执行，不需要管理员权限。不要为此改执行策略来绕过本机限制。
+- 可以用 `-InstallDir` 指定其他位置。目录有限制：本地盘、不超过 180 个字符、父目录归当前用户、SYSTEM 或 Administrators 所有。完整条件见 [M5 发布说明](docs/plans/m5/README.md)。
+- 安装器只复制文件：不建快捷方式、不改 PATH、不写注册表。装完请打开安装目录里的 `wsl-proxy-desktop.exe`。
+
+### 升级与卸载
+
+1. **先停止接管，再关窗。** 安装器在有接管进行中、需要恢复、或安装目录里的桌面窗口还开着时会拒绝操作，而且从不结束任何进程。
+2. **升级**：在新包的解压目录里，对同一个 `-InstallDir` 运行 `.\install.ps1`。降级默认拒绝，要加 `-AllowDowngrade`。
+3. **卸载**：在解压目录里运行 `.\uninstall.ps1`。卸载只删程序文件，下面三样会留下：
+   - 安装目录里的 `desktop.sqlite`，含明文住宅密码；
+   - `%LOCALAPPDATA%\WSLProxyLab`，里面是控制锁、恢复记录和 DNS 别名账本；
+   - 开机自启的注册表项。所以卸载前请先在「设置 › 桌面运行」关掉开机自启。
+
+   要彻底清除，就手动删掉前两个目录。
+4. 后台以管理员身份运行时，普通权限的 PowerShell 连不上它，安装器会报控制锁被占用、不改任何文件；这时在管理员 PowerShell 里运行脚本。
+5. 文件替换中途被打断时，从完整的解压目录加 `-Recover` 重跑同一条命令。
+
+### 自行编译
+
+见下文[从源码构建](#从源码构建)。
+
+## 桌面端上手
+
+把 `wsl-proxy-desktop.exe` 和同一版本的 `wsl-proxyctl.exe` 放在同一个目录（安装后已经是这样），打开前者。第一次打开时，它会以当前用户身份在后台拉起 `wsl-proxyctl.exe` 作为常驻后台。
+
+1. **设置**页：
+   - 填住宅代理的服务器 IPv4、端口、用户名、密码（密码明文显示）；
+   - 在「网络与 DNS」里确认宿主 SOCKS5 地址，按需修改 DNS；
+   - 点「保存设置」。
+   - 想先确认住宅代理连得上，可以点「住宅代理」分区里的「检测」。它会弹确认框：直接连接那一路会把账号密码不经第一跳、明文发出去。
+2. **规则**页：在 IP / CIDR、精确域名、域名后缀三列里按行填写直连规则，点「保存规则」。新建的配置库已预填一批国内常用服务的后缀。
+3. **环境**页：给要接管的发行版点「设为目标」，确认后立即保存。只设目标不会接管网络。
+4. **首页**：点「启动接管」。
+   - 程序先自动预检。
+   - 缺内核模块时，会询问是否加载发行版里已有的模块。
+   - 然后弹确认框，写明会改时区并重启目标。确认后开始接管。
+5. **停止**：点首页的「停止接管」，或托盘菜单的「停止并恢复直连」。
+
+### 六个页面
+
+| 页面 | 用途 |
+| --- | --- |
+| 首页 | 保护状态、保护链路、流量图、事件时间线。主按钮随状态变化：去选择目标 / 去保存修改 / 启动接管 / 停止接管 / 放弃本次记录 / 重新连接 |
+| 环境 | 发行版列表与详情；设为目标；新增、编辑组件、改时区、备份、删除发行版（这五项要求当前没有接管） |
+| 规则 | 直连规则三列：IP / CIDR、精确域名、域名后缀 |
+| 连接 | 连接记录（已结束的连接保留最新 50,000 条）、「复核公网出口」、「导出脱敏诊断」、「重置 DNS 别名」 |
+| 日志 | 运行日志，支持搜索，可按全部、错误、警告筛选 |
+| 设置 | 住宅代理、网络与 DNS、转发限制、桌面运行（开机自启）、WSL 平台、关于 |
+
+### 托盘与关窗
+
+- **关窗只收进托盘，代理照常运行。** 托盘图标没能显示时（例如开机时 Explorer 还没就绪），点关闭会直接退出界面，后台保留。
+- 托盘菜单的「退出」：空闲时直接关后台再退出；接管中先确认，再停止接管、恢复直连、关闭后台，最后退出。任何一步没完成都不会退出。
+- 桌面被强制结束或崩溃时，后台照旧保留，重新打开就能连上。
+- 同一时间只运行一个桌面窗口。再次打开会把已有窗口唤到前台。
+
+### 冷启动后的内核模块
+
+WSL 冷启动或重启后，共享内核可能还没加载所需的模块。启动接管前的预检发现缺少这些能力时，桌面会询问是否加载。确认后它会做三件事：
+
+- 只加载目标 `/lib/modules` 里已有的模块，并注册空的 filter/nat 表；
+- 把模块列表写进 `/etc/modules-load.d/wsl-proxy.conf`；
+- 写入并启用一个 `wsl-proxy-tables.service`，以后 WSL 启动时自动准备好。
+
+它不安装软件包，也不改 `.wslconfig`。0.1.10 起还需要 REJECT 模块（用来重置旧连接），用旧版本准备过的内核会再询问一次。目标内核低于 6.18.58.1 时不会询问，因为加载模块解决不了，需要先升级 WSL。详见 [M6](docs/plans/m6/README.md)。
+
+### WSL 平台与升级
+
+「设置 › WSL 平台」只读显示 `wsl.exe` 版本、WSL2 内核、默认版本和已注册的发行版。没有接管时，可以从这里显式运行 `wsl --update`。注意：
+
+- 它会终止所有发行版；
+- 最多等 30 分钟，超时会结束升级进程，WSL 可能停在升级到一半；
+- 等待期间不要关闭程序、退出后台或做别的环境操作，否则结果可能看不到，或被误报为失败；
+- 失败、超时或没看到结果时，在 PowerShell 里用 `wsl --version` 核对，必要时自己再运行一次 `wsl --update`。
+
+详见 [M7](docs/plans/m7/README.md)。
+
+### 环境管理
+
+环境页可以新建发行版（默认 Ubuntu-24.04，可选装 zsh、Chrome、中文环境和输入法），也可以编辑组件、改时区、备份到文件、删除。
+
+- 编辑组件、改时区会重启发行版；
+- 删除会注销发行版，并删除其中的全部文件；
+- 读取环境详情会启动没在运行的发行版。
+
+## 命令行用法
+
+所有操作也都能用 `wsl-proxyctl.exe` 在 PowerShell 里完成。
+
+> [!NOTE]
+> 除 `rpc` 外，命令行子命令都要先拿当前 Windows 账户唯一的控制锁。桌面后台在运行时，它们会报 `controller_busy`（退出码 3）。这时改用 `rpc` 把请求交给后台，或者先从托盘退出桌面端。
+
+### 预检
+
+```powershell
+$ctl = '.\wsl-proxyctl.exe'
+& $ctl list                        # 列出已注册的发行版，不启动任何发行版
+& $ctl preflight Ubuntu-24.04      # 只读预检；换成 list 里的名字
+```
+
+`preflight` 可能唤醒目标，但不装任何规则。看输出 JSON 里的 `passed` 和 `blockers`：`passed: true` 只表示检查通过，不表示代理已经启用。退出码 0 表示通过，2 表示被阻断。
+
+如果阻断项里有 `capability.kernel.*` 或 `baseline.ip*tables*`，说明共享内核处于冷启动状态，可以加载模块后重新预检：
+
+```powershell
+& $ctl prepare-kernel Ubuntu-24.04 --confirm
+& $ctl preflight Ubuntu-24.04
+```
+
+`prepare-kernel` 要求当前没有接管，效果和桌面端的询问一样。要取消开机加载：先在目标里运行 `systemctl disable wsl-proxy-tables.service`，再删除 `/etc/modules-load.d/wsl-proxy.conf` 和 `/etc/systemd/system/wsl-proxy-tables.service`。
+
+### 导入住宅代理设置
+
+准备一个 `.env` 文件。只允许下面四个键，`ip` 必须是 IPv4：
+
+```ini
+ip=203.0.113.10
+port=1080
+username=user01
+password=change-me
+```
+
+```powershell
+& $ctl import-credential --name my-residence --env-file D:\path\to\residential.env
+```
+
+设置写进 EXE 同目录的 `desktop.sqlite`，密码是明文。`--name` 只是记进策略的标签。不再使用时，可以用 `forget-credential --name my-residence` 清空这些字段。
+
+### 启动、查看、停止
+
+准备一份策略 JSON（字段见[策略配置参考](#策略配置参考)），然后进入会话模式，逐行提交 JSON 命令：
+
+```powershell
+& $ctl session
+```
+
+```jsonl
+{"command":"start","target":"Ubuntu-24.04","profile":"D:\\path\\to\\policy.json"}
+{"command":"status"}
+{"command":"stop"}
+```
+
+- `start` 的流程是：预检 → 同步时区并重启目标（**没有确认步骤**） → 再预检 → 装规则 → 就绪探测。DNS 和 HTTPS 就绪探测都通过才返回 `forwarding_managed`。任何一步失败都进入「需要恢复」状态，要显式 `stop`。
+- `profile` 也可以指向 EXE 同目录的 `desktop.sqlite`。这时桌面端必须先保存过一次设置，只用命令行导入不算，否则报 `desktop_store_not_saved`。
+- 会话的标准输入关闭（EOF）时，也会停止接管。
+
+### 子命令一览
+
+| 子命令 | 作用 |
+| --- | --- |
+| `list` | 列出发行版，只读，不唤醒任何发行版 |
+| `preflight <目标> [--port 43531]` | 只读预检，可能唤醒目标 |
+| `prepare-kernel <目标> --confirm` | 加载已有模块、注册空表、写开机配置；要求空闲 |
+| `wsl-platform` | 只读报告 WSL 平台信息 |
+| `wsl-platform-update --confirm` | 运行 `wsl --update`；要求空闲，会终止所有发行版 |
+| `start <目标> --profile <策略> [--port 43531]` | 启动接管（会改时区并重启目标），之后留在前台，标准输入关闭时停止 |
+| `switch <目标> --expected-generation <N>` | 切换目标（会改新目标的时区并重启它）；只能在持有接管的 `session` 里发，或经 `rpc` 交给桌面后台 |
+| `status` | 输出当前状态 JSON |
+| `stop [--expected-generation <N>]` | 停止接管或执行恢复；空闲时重复执行仍成功 |
+| `abandon --confirm` | 目标已被注销、`stop` 无法完成时，放弃本次记录 |
+| `import-credential --name <标签> --env-file <路径>` | 导入住宅代理设置 |
+| `forget-credential --name <标签>` | 清空住宅代理设置 |
+| `reset-dns-aliases --confirm` | 白名单域名的别名地址用尽时清空账本；要求空闲 |
+| `session` | 会话模式：逐行读 JSON 命令，标准输入关闭时停止接管 |
+| `rpc` | 从标准输入读一条 JSON 请求，交给正在运行的桌面后台 |
+
+`status` 里的 `phase` 有四种取值：`idle`（空闲）、`forwarding_managed`（接管中）、`forwarding_scoped`（诊断模式）、`recovery_required`（需要恢复）。更多细节见 [M2](docs/plans/m2/README.md)、[M3](docs/plans/m3/README.md)。
+
+## 策略配置参考
+
+策略是一份 JSON 文件，上限 1 MiB，未知字段会被拒绝。最小示例：
+
+```json
+{
+  "first_hop": "127.0.0.1:7892",
+  "credential": "my-residence",
+  "dns_upstream": "8.8.8.8:443",
+  "dns_tls_name": "dns.google",
+  "direct_ips": [],
+  "direct_domains": [],
+  "direct_suffixes": []
+}
+```
+
+| 字段 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `first_hop` | 是 | | 第一跳 SOCKS5，必须是回环 IPv4:端口 |
+| `credential` | 是 | | 住宅设置的标签，不参与查找 |
+| `dns_upstream` | 是 | | 经两跳代理访问的 DoH 上游，写 IPv4:端口 |
+| `dns_tls_name` | 是 | | 上游的 TLS 主机名，用于证书校验 |
+| `direct_ips` | 是 | | 直连的 IP 或 CIDR，IPv4、IPv6 都可以；CIDR 要写网络地址 |
+| `direct_domains` | 是 | | 直连的精确域名 |
+| `direct_suffixes` | 是 | | 直连的域名后缀，同时匹配它自己和所有子域 |
+| `health_domain` | 否 | `ippure.com` | 就绪探测访问的 HTTPS 域名，不能命中白名单 |
+| `fake_ip` | 否 | `true` | 白名单以外的域名用占位地址、交给住宅代理解析 |
+| `direct_dns_upstream` | 否 | `"223.5.5.5:443"` | 白名单域名用的国内 DoH，必须是公网 IPv4:端口；写 `null` 关闭 |
+| `direct_dns_tls_name` | 否 | `dns.alidns.com` | 国内 DoH 的 TLS 主机名 |
+| `max_tcp_connections` | 否 | `256` | 并发 TCP 上限（含 DNS over TCP），16–1024；满了直接拒绝新连接，不排队 |
+| `tcp_idle_timeout_seconds` | 否 | `1800` | 两个方向都没有数据多久后断开，30–86400 |
+| `tcp_half_close_timeout_seconds` | 否 | `60` | 一方结束后另一方多久没数据就断开，5–3600 |
+
+- 入口端口不写在策略里，用 `--port` 指定，默认 43531，必须不小于 1024。
+- 白名单不能命中 `my.ippure.com`（时区查询要经代理）和 `health_domain`。
+- 桌面端的设置页、规则页就是这份策略的图形界面，保存在 `desktop.sqlite` 里。
+
+## 停止与故障恢复
+
+**正常停止**
+
+- 桌面端：首页「停止接管」，或托盘「停止并恢复直连」。
+- 命令行：在原会话里发送 `{"command":"stop"}`。
+
+**窗口已关、后台还在运行**
+
+在安装目录里，经后台停止：
+
+```powershell
+$ctl = Join-Path $env:LOCALAPPDATA 'Programs\WslProxy\wsl-proxyctl.exe'
+$state = '{"command":"status"}' | & $ctl rpc | ConvertFrom-Json
+@{command='stop'; expected_generation=$state.operation_generation} | ConvertTo-Json -Compress | & $ctl rpc
+'{"command":"status"}' | & $ctl rpc
+```
+
+恢复到 `idle` 后，可以发送 `{"command":"shutdown_daemon"}` 让后台退出。
+
+**控制器崩溃之后**
+
+在一个新的 PowerShell 里依次运行：
+
+```powershell
+& $ctl status    # 应显示 recovery_required；可能唤醒目标
+& $ctl stop      # 撤规则、删映射、释放端口、删除恢复记录
+```
+
+期望结果是 `phase` 为 `idle`、`active_target` 为 `null`。`controller_busy` 表示另有程序持锁，不代表已经恢复。
+
+**目标在接管中被注销**
+
+`stop` 会报 `journal_distribution_no_longer_matches_registration`。这时运行 `& $ctl abandon --confirm`（桌面端是首页的「放弃本次记录」），然后执行一次 `wsl --shutdown`，清掉 WSL 里可能残留的规则。
+
+> [!IMPORTANT]
+> 不要手动删除 `%LOCALAPPDATA%\WSLProxyLab` 里的 `m1-active.json`、`m3-operation.json`，也不要清空共享的防火墙规则或连接跟踪表。删掉恢复记录不会恢复网络，只会让程序失去恢复所需的信息。
+
+## 常见问题
+
+**目标里的域名解析成 `198.19.x.x`，正常吗？**
+正常，这是 fake-ip 的占位地址。程序连这个地址时，入口会把真实域名交给住宅代理去解析。白名单域名则会解析成 `198.18.x.x` 别名地址。
+
+**访问一个不存在的域名，为什么报连接失败，而不是「域名不存在」？**
+开启 fake-ip 时，所有白名单以外的域名都先拿到一个占位地址，要等住宅代理去解析时才知道域名不存在。想要原来的行为，可以在设置页「网络与 DNS › 远端解析」关掉，或在策略里写 `"fake_ip": false`。
+
+**界面显示「UDP 已阻断」？**
+说明启动时的 UDP 探测没通过：宿主代理或住宅代理至少有一个不支持 UDP Associate。本次接管期间所有 UDP（含 QUIC）都被拒绝，不会直连；TCP 和系统 DNS 不受影响。下次启动或切换时会重新探测。
+
+**白名单里的网站，为什么 UDP 也走代理？**
+防止 WebRTC 泄露真实出口 IP。网页会向 STUN 服务器发 UDP 请求，借此拿到自己的公网地址；如果白名单里的 STUN 服务器能被直连，网页就能看到 Windows 的真实出口 IP。
+
+**为什么目标被重启了、时区也变了？**
+这是接管流程的一部分，见[使用前必读](#使用前必读)第 1 条。
+
+**启动报 `ipv6_domain_allowlist_unsupported`？**
+目标有全局 IPv6，而策略里有域名或域名后缀白名单。清空规则页的两列域名规则后再启动。
+
+**命令行报 `controller_busy`？**
+桌面后台或另一个会话正持有控制锁。改用 `'{"command":"status"}' | .\wsl-proxyctl.exe rpc`，或者先从托盘退出桌面端。
+
+**`dig @8.8.8.8 example.com` 这样直接指定 DNS 服务器会失败？**
+是的。目标里只有系统解析器的查询会被接管；直接发往其他 DNS 服务器 53 端口的查询会被拒绝，既不经代理也不直连。程序自带的 DoH/DoT 是普通 TCP 连接，照常走代理。
+
+**预检阻断，提示内核低于 6.18.58.1？**
+需要先升级 WSL：桌面端在「设置 › WSL 平台」，或在 PowerShell 里运行 `wsl --update`。
+
+**关掉窗口后，代理还在运行吗？**
+在。关窗只是收进托盘，后台继续持有接管。要停止，用首页的「停止接管」或托盘菜单。
+
+**卸载后怎么彻底清除？**
+先在设置里关掉开机自启，再卸载，然后手动删除安装目录（含 `desktop.sqlite`）和 `%LOCALAPPDATA%\WSLProxyLab`。目标里的 `/etc/wsl.conf` 时区设置、`/etc/modules-load.d/wsl-proxy.conf` 和 `wsl-proxy-tables.service` 需要在发行版里自己删除。
+
+## 从源码构建
+
+最终的编译、测试和打包都要在 Windows 上，用 Windows 的 Rust 工具链完成。控制器和桌面端都是 Windows 程序，很多代码在 Linux 上不参与编译，所以在 WSL 里编译通过说明不了 Windows 版本能用。
+
+**准备**
+
+- Rust stable，host 是 `x86_64-pc-windows-msvc`。项目使用 Rust 2024 edition；仓库没有固定最低版本，维护者用的是 1.100.0。
+- Visual Studio 的 C++ 生成工具。
+- Windows SDK：编译桌面端时要用其中的 `fxc.exe` 编译着色器，也可以用环境变量 `GPUI_FXC_PATH` 指定位置。
+- 不要设置 `RUSTFLAGS`。仓库的 `.cargo/config.toml` 为 MSVC 目标开启了静态 C 运行库（`+crt-static`），设了 `RUSTFLAGS` 这项配置就不生效，编出的 EXE 会依赖 VC++ 运行库。
+- 打包需要 Python 3.11 或更高版本。
+
+**构建与测试**（在仓库根目录的 PowerShell 里）
+
+```powershell
+cargo build --locked --release                                       # 只编控制器 wsl-proxyctl
+cargo build --locked --release -p wsl-proxyctl -p wsl-proxy-desktop  # 控制器加桌面端
+cargo test --locked --workspace
+```
+
+产物在 `target\release\`。默认的 Cargo 成员只有控制器，只编命令行时不需要编译 GPUI。
+
+**打包**
+
+发布包的打包步骤以 [`.github/workflows/release.yml`](.github/workflows/release.yml) 为准：先检查导入表，再导出 `cargo metadata`、写构建记录，然后用 `scripts/package-windows.py` 打包，最后跑安装冒烟测试。各脚本的参数和本机验收记录见 [M5](docs/plans/m5/README.md)。脚本拒绝覆盖已有的输出文件；`work/`、`dist/` 不在 `.gitignore` 里，建议输出到仓库外的目录。
+
+在 WSL 里可以用 `scripts/build-desktop-windows.sh` 交叉编译出 Windows EXE，但这只算开发中途的检查，产物不能进发布包。
+
+## 项目结构
+
+```text
+src/                  控制器 wsl-proxyctl
+  command.rs, main.rs   命令行与会话命令
+  controller*, transition*  接管的启停、切换与恢复记录
+  ingress*              Windows 入口：TCP、UDP 与 IPv6 转发
+  managed_dns*          受管 DNS：缓存、fake-ip、白名单别名账本
+  policy*               策略解析、双跳拨号、国内域名后缀清单
+  query_bridge*         经 wsl.exe 向目标内核查原目的地址
+  ipc*                  桌面端与后台之间的命名管道
+  environment*          发行版管理与时区同步
+  guest/                在目标里运行的脚本：规则、预检、内核准备、探测
+desktop/              GPUI 桌面端 wsl-proxy-desktop
+packaging/windows/    install.ps1、uninstall.ps1、common.ps1
+scripts/              打包、构建记录、导入表检查、发布说明、安装冒烟测试
+.github/workflows/    release.yml 发布流水线
+docs/                 架构、决策、开发计划、讨论、审查
+design/               桌面端界面规范与早期原型
+```
+
+## 文档导航
+
+| 文档 | 内容 |
+| --- | --- |
+| [接管架构](docs/arch/README.md) | 现行设计与隔离边界 |
+| [设计决策](docs/decisions.md) | 编号固定的决策登记，被取代的保留原条目 |
+| [讨论](docs/discussions/) | 方案论证过程；定下来的结论并入架构并登记决策 |
+| [审查](docs/review/) | 项目、代码与界面的审查记录 |
+| [开发计划](docs/plans/README.md) | 里程碑、验收条件与执行记录 |
+| [M0：目标识别与预检](docs/plans/m0/README.md) | 发行版枚举、身份识别、只读预检 |
+| [M1：可逆的业务入口](docs/plans/m1/README.md) | 规则安装、连接归属核对、崩溃恢复 |
+| [M2：双跳、白名单与 DNS](docs/plans/m2/README.md) | 策略 JSON、凭据导入、会话命令、分流与故障语义 |
+| [M3：切换与恢复](docs/plans/m3/README.md) | 切换顺序、操作代次、异常恢复 |
+| [M4：桌面端](docs/plans/m4/README.md) | 桌面操作、后台与故障边界、住宅代理检测 |
+| [M5：发布与兼容性](docs/plans/m5/README.md) | 安装、升级、卸载、支持范围、性能实测、发布流水线 |
+| [M6：内核环境准备](docs/plans/m6/README.md) | 冷启动后加载已有模块、注册空表 |
+| [M7：WSL 平台检查与升级](docs/plans/m7/README.md) | 只读检查与显式 `wsl --update` |
+| [界面设计规范](design/ui-design-spec.md) | 桌面端界面现状，以代码为准 |
+
+## 参与开发
+
+欢迎提 Issue 和 Pull Request。动手之前请先读 [AGENTS.md](AGENTS.md)，要点如下：
+
+- **验证必须在 Windows 上做。** 最终的编译、测试、运行都要用 Windows 的 Rust 工具链，构建同一份工作区代码。WSL 里的 `cargo build`、`cargo test` 和交叉编译只算中途检查，不能写成「已通过」。
+- **提交前跑一遍流水线里的检查：**
+
+  ```powershell
+  cargo fmt --all --check
+  cargo clippy --locked --workspace --all-targets -- -D warnings
+  cargo test --locked --workspace
+  python src/guest/test_kernel.py
+  python src/guest/test_https_probe.py
+  python src/guest/test_kernel_env.py
+  python scripts/test_package_windows.py
+  ```
+
+- **文档规矩：**
+  - `docs/arch/` 只写现行设计；
+  - 讨论放 `docs/discussions/`，审查记录放 `docs/review/`；
+  - 定下来的决策登记在 `docs/decisions.md`；
+  - 文件名写成 `日期-类别-内容.md`，不用提交号；
+  - 举例不用真人的名字。
+- **不要提交** `.env`、密码或任何住宅代理凭据。
+
+## 安全说明
+
+- 住宅代理凭据以明文保存在 EXE 同目录的 `desktop.sqlite`，只靠 Windows 账户的文件权限保护。
+- 桌面端和后台之间的命名管道只接受同一 Windows 账户、且完整性级别不低于后台自身的进程（[决策 21](docs/decisions.md)）。后台以管理员身份运行时，普通权限的进程连不上它。
+- 「检测住宅代理」里直接连接的那一路，会把 SOCKS5 用户名和密码不经第一跳、明文发出去，住宅服务商也会看到真实 IP。所以检测前会先弹确认框。
+- 「导出脱敏诊断」只保留状态和数值计数，不含目的地址、域名和凭据，但仍请按内部资料处理。
+- 发布包没有签名，第三方许可证还没审完，所以发布为预发布版本。
+- 本项目不防御本机管理员，也不防御目标发行版里的 root。
