@@ -204,6 +204,11 @@ fn policy_field_error(error: &str) -> Option<String> {
 
 fn humanize_code(code: &str, message: &str) -> String {
     match code {
+        // 管道只对同一账户开放；这里还被拒绝，就是后台以管理员身份运行、
+        // 而这个界面不是（决策 21）。
+        "ipc_unavailable" if message.trim() == "Windows error 5" => {
+            "后台正以管理员身份运行，当前界面权限较低，连不上它。请同样以管理员身份打开界面；或者在任务管理器里结束 wsl-proxyctl.exe 后台进程，再正常打开。".into()
+        }
         "desktop_request_failed" | "controller_error" => humanize_error(message),
         "not_registered" => "找不到指定的 WSL 环境，请刷新列表后重试。".into(),
         "ambiguous_target" => "目标 WSL 名称不唯一，请刷新列表后重试。".into(),
@@ -958,6 +963,16 @@ mod tests {
         );
         // A code that merely starts with a field name is not a field error.
         assert!(!humanize_error("first_hop_unreachable").contains("填写有误"));
+    }
+
+    #[test]
+    fn explains_an_elevated_controller_the_window_cannot_reach() {
+        assert!(
+            humanize_error("ipc_unavailable: Windows error 5")
+                .starts_with("后台正以管理员身份运行")
+        );
+        // A missing controller is still told apart (`DAEMON_ABSENT`).
+        assert!(!humanize_error("ipc_unavailable: Windows error 2").contains("管理员"));
     }
 
     #[test]

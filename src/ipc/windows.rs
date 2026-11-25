@@ -23,7 +23,8 @@ mod inner {
         SDDL_REVISION_1,
     };
     use windows_sys::Win32::Security::{
-        GetTokenInformation, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, SECURITY_ATTRIBUTES,
+        TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_ID_INFO,
@@ -443,6 +444,80 @@ mod inner {
         Ok(())
     }
 
+    /// `SECURITY_MANDATORY_HIGH_RID`: an elevated ("run as administrator") process.
+    const HIGH_INTEGRITY_RID: u32 = 0x3000;
+
+    /// The integrity level of `process`, as the RID of its mandatory label:
+    /// 0x2000 for an ordinary process, 0x3000 when elevated.
+    fn integrity_rid(process: HANDLE) -> io::Result<u32> {
+        let mut token = null_mut();
+        if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let token = Handle::checked(token)?;
+        let mut needed = 0;
+        unsafe { GetTokenInformation(token.0, TokenIntegrityLevel, null_mut(), 0, &mut needed) };
+        if needed < size_of::<TOKEN_MANDATORY_LABEL>() as u32 || needed > 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ipc_invalid_token",
+            ));
+        }
+        // TOKEN_MANDATORY_LABEL contains a pointer; a byte vector need not
+        // have its alignment.
+        let mut storage = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
+        if unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenIntegrityLevel,
+                storage.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let label = unsafe { &*storage.as_ptr().cast::<TOKEN_MANDATORY_LABEL>() };
+        let sid = label.Label.Sid;
+        let count = if sid.is_null() {
+            0
+        } else {
+            unsafe { *GetSidSubAuthorityCount(sid) }
+        };
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ipc_invalid_token",
+            ));
+        }
+        Ok(unsafe { *GetSidSubAuthority(sid, u32::from(count) - 1) })
+    }
+
+    /// Decision 21: a peer below the controller's own integrity level is
+    /// refused, so an ordinary process of the same account cannot have an
+    /// elevated controller act for it.
+    fn verify_integrity(process: HANDLE, minimum: u32) -> io::Result<()> {
+        if integrity_rid(process)? < minimum {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "ipc_untrusted_peer_integrity",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The pipe's security descriptor. Only this account may open it; when
+    /// the controller runs elevated the pipe also carries a high integrity
+    /// label, so an ordinary process of the account cannot open it at all.
+    fn pipe_sddl(sid: &str, integrity: u32) -> String {
+        if integrity >= HIGH_INTEGRITY_RID {
+            format!("D:P(A;;GA;;;{sid})S:(ML;;NWNR;;;HI)")
+        } else {
+            format!("D:P(A;;GA;;;{sid})")
+        }
+    }
+
     fn pipe_process_id(pipe: HANDLE, server: bool) -> io::Result<u32> {
         let mut pid = 0;
         let success = unsafe {
@@ -497,7 +572,8 @@ mod inner {
         }
 
         fn server(name: &[u16], sid: &str) -> io::Result<Self> {
-            let sddl = wide(OsStr::new(&format!("D:P(A;;GA;;;{sid})")))?;
+            let integrity = integrity_rid(unsafe { GetCurrentProcess() })?;
+            let sddl = wide(OsStr::new(&pipe_sddl(sid, integrity)))?;
             let mut descriptor = null_mut();
             if unsafe {
                 ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -840,6 +916,8 @@ mod inner {
         sid: &str,
         mut handler: impl FnMut(Value) -> (Value, bool),
     ) -> Result<(), String> {
+        let minimum = integrity_rid(unsafe { GetCurrentProcess() })
+            .map_err(|error| report("ipc_identity_unavailable", error))?;
         loop {
             match pipe.connect() {
                 Ok(()) => {}
@@ -852,6 +930,7 @@ mod inner {
             let terminate = (|| -> io::Result<bool> {
                 let peer = peer_process(pipe.handle.0, false)?;
                 verify_owner(peer.0, sid)?;
+                verify_integrity(peer.0, minimum)?;
                 pipe.reset(FRAME_TIMEOUT);
                 let req = framing::read_frame(&mut pipe)?;
                 let (response, terminate) = handler(req);
@@ -882,6 +961,22 @@ mod inner {
         use super::*;
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::{Arc, atomic::AtomicUsize};
+
+        #[test]
+        fn an_elevated_pipe_is_labeled_high_and_lower_peers_are_refused() {
+            let sid = current_sid().unwrap();
+            assert_eq!(pipe_sddl(&sid, 0x2000), format!("D:P(A;;GA;;;{sid})"));
+            assert_eq!(
+                pipe_sddl(&sid, HIGH_INTEGRITY_RID),
+                format!("D:P(A;;GA;;;{sid})S:(ML;;NWNR;;;HI)")
+            );
+            let own = integrity_rid(unsafe { GetCurrentProcess() }).unwrap();
+            assert!(own >= 0x2000, "{own:#x}");
+            assert!(verify_integrity(unsafe { GetCurrentProcess() }, own).is_ok());
+            let refused = verify_integrity(unsafe { GetCurrentProcess() }, own + 1).unwrap_err();
+            assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(refused.to_string(), "ipc_untrusted_peer_integrity");
+        }
 
         fn fixture() -> (Vec<u16>, String, Executable, Pipe) {
             static NEXT: AtomicU64 = AtomicU64::new(0);
