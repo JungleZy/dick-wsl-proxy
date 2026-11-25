@@ -1142,7 +1142,11 @@ impl Desktop {
                     } else {
                         let switch_blocked = kernel_gap && pending_kind == Some(Kind::Switch);
                         self.pending_prepare = None;
-                        let mut notice = if blockers.is_empty() {
+                        let mut notice = if let Some(notice) =
+                            super::backend::kernel_release_notice(&blockers)
+                        {
+                            notice
+                        } else if blockers.is_empty() {
                             "预检未通过，请检查当前环境。".into()
                         } else {
                             format!("预检未通过：{}", blockers.join("；"))
@@ -1303,8 +1307,20 @@ impl Desktop {
             }
             Kind::Start | Kind::Switch | Kind::Stop => {
                 if value["passed"] == false {
+                    let blockers: Vec<String> = value["blockers"]
+                        .as_array()
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| item.as_str().map(str::to_owned))
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     self.preflight = Some(value);
-                    self.fail("操作前预检未通过；请查看阻断项。", cx);
+                    match super::backend::kernel_release_notice(&blockers) {
+                        Some(notice) => self.fail(notice, cx),
+                        None => self.fail("操作前预检未通过；请查看阻断项。", cx),
+                    }
                 } else {
                     let udp_blocked =
                         kind != Kind::Stop && value["startup_verified"]["udp_supported"] == false;

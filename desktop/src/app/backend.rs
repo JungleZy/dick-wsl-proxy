@@ -391,6 +391,21 @@ fn humanize_detail(detail: &str) -> String {
     "操作失败，请检查当前状态后重试。".into()
 }
 
+/// The preflight blocker for a target WSL kernel older than the one
+/// cross-distribution isolation was verified on (decision 01).
+pub(crate) const KERNEL_RELEASE_UNVERIFIED: &str = "kernel.release_unverified";
+
+/// What to tell the user when the preflight refused the target's kernel:
+/// nothing in the distribution can fix it, only a newer WSL.
+pub(crate) fn kernel_release_notice(blockers: &[String]) -> Option<String> {
+    blockers
+        .iter()
+        .any(|blocker| blocker == KERNEL_RELEASE_UNVERIFIED)
+        .then(|| {
+            "目标的 WSL 内核低于已验证的 6.18.58.1：在更旧的内核上，接管可能波及别的发行版，所以不接管。请在「设置 › WSL 平台」里升级 WSL 后重试。".into()
+        })
+}
+
 /// Blockers that only loading the target's own modules and empty tables can
 /// clear. Used to decide whether a failed preflight should ask the user to
 /// prepare the kernel instead of just listing the codes.
@@ -406,7 +421,12 @@ pub(crate) fn kernel_gap(blockers: &[String]) -> bool {
 /// start from idle can do it, and only once per attempt: a switch keeps the old
 /// target running, and repeating the question after a failed attempt is noise.
 pub(crate) fn offer_kernel_prepare(kind: Option<Kind>, offered: bool, blockers: &[String]) -> bool {
-    kind == Some(Kind::Start) && !offered && kernel_gap(blockers)
+    // An old kernel stays refused whatever is loaded: asking would only lead
+    // to a second refusal.
+    kind == Some(Kind::Start)
+        && !offered
+        && kernel_gap(blockers)
+        && kernel_release_notice(blockers).is_none()
 }
 
 /// The overview notice for one explicit kernel preparation. `true` means the
@@ -715,9 +735,9 @@ pub(crate) fn worker() -> (Sender<Job>, Receiver<Reply>) {
 mod tests {
     use super::Kind;
     use super::{
-        humanize_error, kernel_gap, kernel_prepare_notice, offer_kernel_prepare,
-        residential_probe_badge, residential_stage_text, wsl_check_text, wsl_platform_badge,
-        wsl_update_notice,
+        KERNEL_RELEASE_UNVERIFIED, humanize_error, kernel_gap, kernel_prepare_notice,
+        kernel_release_notice, offer_kernel_prepare, residential_probe_badge,
+        residential_stage_text, wsl_check_text, wsl_platform_badge, wsl_update_notice,
     };
     use serde_json::json;
 
@@ -745,6 +765,27 @@ mod tests {
             false,
             &["host_port_unavailable".to_owned()]
         ));
+    }
+
+    #[test]
+    fn an_old_kernel_gets_its_own_notice_and_no_kernel_preparation() {
+        let blockers = vec![KERNEL_RELEASE_UNVERIFIED.to_string()];
+        assert!(
+            kernel_release_notice(&blockers)
+                .unwrap()
+                .contains("WSL 平台")
+        );
+        assert!(!kernel_gap(&blockers));
+        let both = vec![
+            KERNEL_RELEASE_UNVERIFIED.to_string(),
+            "capability.kernel.module.xt_cgroup.unverified".to_string(),
+        ];
+        assert!(!offer_kernel_prepare(Some(Kind::Start), false, &both));
+        assert!(offer_kernel_prepare(Some(Kind::Start), false, &both[1..]));
+        assert_eq!(
+            kernel_release_notice(&["capability.kernel.module.xt_cgroup.unverified".into()]),
+            None
+        );
     }
 
     #[test]

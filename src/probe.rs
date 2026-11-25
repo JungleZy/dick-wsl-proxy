@@ -158,6 +158,35 @@ fn default_gateway(routes: &str) -> Option<Ipv4Addr> {
     if count == 1 { gateway } else { None }
 }
 
+/// The WSL kernel on which cross-distribution isolation was verified on a
+/// real machine (decision 01): with one distribution taken over, another
+/// distribution's own traffic stayed direct. A target on an older kernel is
+/// refused; newer kernels are assumed to behave the same.
+pub(crate) const VERIFIED_KERNEL: [u32; 4] = [6, 18, 58, 1];
+pub(crate) const KERNEL_RELEASE_UNVERIFIED: &str = "kernel.release_unverified";
+
+/// Whether `release` (`/proc/sys/kernel/osrelease`) is at least
+/// [`VERIFIED_KERNEL`], comparing its leading dotted numbers. Unreadable or
+/// unparsable counts as not verified.
+fn kernel_release_verified(release: &str) -> bool {
+    let prefix = release
+        .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .next()
+        .unwrap_or_default();
+    let Some(mut parts) = prefix
+        .split('.')
+        .map(|part| part.parse::<u32>().ok())
+        .collect::<Option<Vec<u32>>>()
+    else {
+        return false;
+    };
+    if parts.len() < 3 {
+        return false;
+    }
+    parts.resize(parts.len().max(VERIFIED_KERNEL.len()), 0);
+    parts.as_slice() >= VERIFIED_KERNEL.as_slice()
+}
+
 fn snapshot(
     registered_name: &str,
     evidence: BTreeMap<String, Observation>,
@@ -301,6 +330,9 @@ fn snapshot(
             blockers.push(format!("capability.{key}.{expected}.unverified"));
         }
     }
+    if !kernel_release_verified(get("kernel.release")) {
+        blockers.push(KERNEL_RELEASE_UNVERIFIED.into());
+    }
     let mut baseline_fingerprints = BTreeMap::new();
     for key in [
         "resolv_conf",
@@ -418,6 +450,58 @@ mod tests {
             default_gateway("default via 10.0.0.1 nexthop via 10.0.0.2"),
             None
         );
+    }
+
+    #[test]
+    fn kernels_older_than_the_verified_one_are_refused() {
+        for release in [
+            "6.18.58.1-microsoft-standard-WSL2",
+            "6.18.58.2-microsoft-standard-WSL2",
+            "6.18.59-microsoft-standard-WSL2",
+            "6.19.1",
+            "7.0.0-microsoft-standard-WSL2",
+            "6.18.58.1.1",
+        ] {
+            assert!(kernel_release_verified(release), "{release}");
+        }
+        for release in [
+            "6.18.58.0-microsoft-standard-WSL2",
+            "6.18.58-microsoft-standard-WSL2",
+            "6.6.87.2-microsoft-standard-WSL2",
+            "5.15.167.4-microsoft-standard-WSL2",
+            "6.18",
+            "",
+            "microsoft",
+            "6..58.1",
+            "6.18.58.1.",
+            "99999999999.1.1",
+        ] {
+            assert!(!kernel_release_verified(release), "{release}");
+        }
+        let mut evidence = BTreeMap::new();
+        let blocked = snapshot("WSLProxyLab-Target", BTreeMap::new()).unwrap();
+        assert!(
+            blocked
+                .blockers
+                .iter()
+                .any(|b| b == KERNEL_RELEASE_UNVERIFIED)
+        );
+        evidence.insert(
+            "kernel.release".into(),
+            Observation {
+                status: "ok".into(),
+                value: "6.18.58.1-microsoft-standard-WSL2".into(),
+            },
+        );
+        let verified = snapshot("WSLProxyLab-Target", evidence).unwrap();
+        assert!(
+            !verified
+                .blockers
+                .iter()
+                .any(|b| b == KERNEL_RELEASE_UNVERIFIED)
+        );
+        // Not a capability: preparing the kernel cannot clear it.
+        assert!(!KERNEL_RELEASE_UNVERIFIED.starts_with("capability."));
     }
 
     #[test]
