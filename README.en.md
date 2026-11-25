@@ -8,7 +8,7 @@ Windows desktop app `wsl-proxy-desktop` · controller and CLI `wsl-proxyctl`
 
 ![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078D6)
 ![WSL](https://img.shields.io/badge/WSL2-NAT%20mode-4E9A06)
-![Source version](https://img.shields.io/badge/source%20version-0.1.10-informational)
+![Source version](https://img.shields.io/badge/source%20version-0.1.11-informational)
 ![Rust](https://img.shields.io/badge/Rust-2024%20edition-B7410E)
 
 [简体中文](README.md) · English
@@ -230,7 +230,7 @@ After WSL starts cold or restarts, the shared kernel may not have the required m
 - writes the module list to `/etc/modules-load.d/wsl-proxy.conf`;
 - writes and enables a `wsl-proxy-tables.service`, so later WSL starts are ready without asking.
 
-It installs no packages and does not touch `.wslconfig`. From 0.1.10 the REJECT modules (used to reset old connections) are needed too, so a kernel prepared by an earlier version is asked once more. If the target kernel is older than 6.18.58.1 the app does not offer this, because loading modules cannot fix it; update WSL first. See [M6](docs/plans/m6/README.md).
+It installs no packages and does not touch `.wslconfig`. From 0.1.11 the REJECT modules (used to reset old connections) are needed too, so a kernel prepared by an earlier version is asked once more. If the target kernel is older than 6.18.58.1 the app does not offer this, because loading modules cannot fix it; update WSL first. See [M6](docs/plans/m6/README.md).
 
 ### WSL platform and updates
 

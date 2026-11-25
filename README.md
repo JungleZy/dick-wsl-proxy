@@ -8,7 +8,7 @@ Windows 桌面端 `wsl-proxy-desktop` · 控制器与命令行 `wsl-proxyctl`
 
 ![平台](https://img.shields.io/badge/平台-Windows%20x64-0078D6)
 ![WSL](https://img.shields.io/badge/WSL2-NAT%20模式-4E9A06)
-![源码版本](https://img.shields.io/badge/源码版本-0.1.10-informational)
+![源码版本](https://img.shields.io/badge/源码版本-0.1.11-informational)
 ![Rust](https://img.shields.io/badge/Rust-2024%20edition-B7410E)
 
 简体中文 · [English](README.en.md)
@@ -228,7 +228,7 @@ WSL 冷启动或重启后，共享内核可能还没加载所需的模块。启�
 - 把模块列表写进 `/etc/modules-load.d/wsl-proxy.conf`；
 - 写入并启用一个 `wsl-proxy-tables.service`，以后 WSL 启动时自动准备好。
 
-它不安装软件包，也不改 `.wslconfig`。0.1.10 起还需要 REJECT 模块（用来重置旧连接），用旧版本准备过的内核会再询问一次。目标内核低于 6.18.58.1 时不会询问，因为加载模块解决不了，需要先升级 WSL。详见 [M6](docs/plans/m6/README.md)。
+它不安装软件包，也不改 `.wslconfig`。0.1.11 起还需要 REJECT 模块（用来重置旧连接），用旧版本准备过的内核会再询问一次。目标内核低于 6.18.58.1 时不会询问，因为加载模块解决不了，需要先升级 WSL。详见 [M6](docs/plans/m6/README.md)。
 
 ### WSL 平台与升级
 
