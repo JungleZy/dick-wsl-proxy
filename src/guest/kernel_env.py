@@ -13,7 +13,6 @@ import os
 import re
 import shutil
 import subprocess
-import time
 
 PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 TIMEOUT = 8
@@ -198,8 +197,8 @@ def autoload_content(modules):
 def write_autoload(modules):
     """Persist the proven module set for systemd-modules-load at every boot.
 
-    A differing existing file is copied aside before being replaced. A write
-    failure is reported but does not undo the modules loaded for this session.
+    An existing file is replaced in place, without a backup. A write failure
+    is reported but does not undo the modules loaded for this session.
     """
     result = {
         "path": AUTOLOAD,
@@ -215,15 +214,10 @@ def write_autoload(modules):
     temporary = AUTOLOAD + ".tmp"
     try:
         os.makedirs(os.path.dirname(AUTOLOAD), exist_ok=True)
-        if os.path.exists(AUTOLOAD) and read_text(AUTOLOAD) != content:
-            backup = "{}.bak-{}-{}".format(
-                AUTOLOAD,
-                time.strftime("%Y%m%d%H%M%S", time.gmtime()),
-                os.getpid(),
-            )
-            with open(AUTOLOAD, "rb") as source, open(backup, "wb") as target:
-                shutil.copyfileobj(source, target)
-            result["backup"] = backup
+        # The file is this product's own and is regenerated from the proven
+        # modules, so it is replaced without a backup: decision 15 allows only
+        # these two files and the enable link. "backup" stays in the result
+        # format the controller checks, always None.
         with open(temporary, "w", encoding="ascii") as handle:
             handle.write(content)
             handle.flush()

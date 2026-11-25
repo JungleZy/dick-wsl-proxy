@@ -52,6 +52,23 @@ class Autoload(unittest.TestCase):
         self.assertIn("\nip_tables\nxt_cgroup\n", text)
         self.assertEqual(text.count("wsl-proxyctl"), 1)
 
+    def test_rewriting_a_different_file_leaves_no_backup(self):
+        # Decision 15: only the two files and the enable link, never a
+        # .bak copy beside them.
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "modules-load.d", "wsl-proxy.conf")
+            os.makedirs(os.path.dirname(path))
+            with open(path, "w", encoding="ascii") as handle:
+                handle.write("# older content\nnf_nat\n")
+            with patch.object(kernel_env, "AUTOLOAD", path):
+                result = kernel_env.write_autoload(["xt_cgroup", "nf_nat"])
+            self.assertTrue(result["written"])
+            self.assertIsNone(result["backup"])
+            self.assertEqual(os.listdir(os.path.dirname(path)), ["wsl-proxy.conf"])
+            with open(path, encoding="ascii") as handle:
+                self.assertEqual(handle.read(), kernel_env.autoload_content(["xt_cgroup", "nf_nat"]))
+
     def test_the_persistent_path_is_fixed(self):
         self.assertEqual(
             kernel_env.AUTOLOAD,
