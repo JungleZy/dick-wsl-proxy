@@ -774,6 +774,45 @@ fn a_quiet_connection_closes_at_the_configured_idle_deadline() {
     );
 }
 
+fn half_close_limits() -> crate::policy::Limits {
+    crate::policy::Limits {
+        max_tcp: 16,
+        tcp_idle: Duration::from_secs(60),
+        half_close: Duration::from_millis(300),
+    }
+}
+
+#[test]
+fn a_guest_slow_to_close_after_a_delivered_response_is_not_a_failure() {
+    let (mut client, ingress) = tcp_pair();
+    let (upstream, mut origin) = tcp_pair();
+    // The origin answers and closes; the guest has everything in its own
+    // buffer but keeps its side open past the half-close deadline.
+    origin.write_all(b"whole response").unwrap();
+    origin.shutdown(Shutdown::Write).unwrap();
+    let shared = Shared::with_flows(FlowStats::new(), half_close_limits());
+    let flow = shared.flows.begin("tcp");
+    let ended = relay(ingress, upstream, &shared, &flow).unwrap();
+    assert_eq!(ended, super::tcp::Ended::Closed);
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).unwrap();
+    assert_eq!(response, b"whole response");
+}
+
+#[test]
+fn an_origin_silent_after_the_guest_closed_is_still_a_failure() {
+    let (mut client, ingress) = tcp_pair();
+    let (upstream, _origin) = tcp_pair();
+    // The guest sends its request and closes; the origin never answers.
+    client.write_all(b"request").unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let shared = Shared::with_flows(FlowStats::new(), half_close_limits());
+    let flow = shared.flows.begin("tcp");
+    let error = relay(ingress, upstream, &shared, &flow).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(error.to_string(), "TCP half-close deadline");
+}
+
 #[test]
 fn a_guest_reset_ends_the_relay_without_a_failure() {
     let (client, ingress) = tcp_pair();

@@ -201,6 +201,8 @@ enum Side {
 /// How a relay ended without a failure.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Ended {
+    /// Both sides closed, or the origin closed and the guest kept its side
+    /// open past the half-close deadline after receiving everything.
     Closed,
     /// The guest application reset or aborted its own connection, as clients
     /// do when they close with unread data or give up on a response. That is
@@ -266,6 +268,13 @@ pub(super) fn relay(
                 *half_closed.get_or_insert(now)
             };
             if now.duration_since(since) >= shared.limits.half_close {
+                // The origin closed and everything it sent has reached the
+                // guest's socket; only the guest has yet to close its side. A
+                // slow reader still draining its own receive buffer does this,
+                // so nothing failed in forwarding.
+                if response.shutdown && !request.eof {
+                    return Ok(Ended::Closed);
+                }
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "TCP half-close deadline",
