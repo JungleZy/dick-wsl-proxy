@@ -710,6 +710,48 @@ fn key_for(query_wire: &[u8]) -> cache::Key {
 }
 
 #[test]
+fn a_direct_answer_the_whitelist_would_refuse_is_asked_through_the_chain() {
+    let wire = query("allowed.example");
+    let message = Message::query(&wire).unwrap();
+    let aliases = Mutex::new(Aliases::default());
+    let public = response(&wire, Ipv4Addr::new(93, 184, 216, 34));
+    assert!(direct_answer_usable(&message, &public));
+    assert!(resolve(&wire, Ok(public), true, &aliases).is_ok());
+    let mut zero_ttl = response(&wire, Ipv4Addr::new(93, 184, 216, 34));
+    let at = zero_ttl.len() - 10;
+    zero_ttl[at..at + 4].copy_from_slice(&0u32.to_be_bytes());
+    let mut other_id = response(&wire, Ipv4Addr::new(93, 184, 216, 34));
+    other_id[1] ^= 1;
+    for refused in [
+        response(&wire, Ipv4Addr::new(10, 0, 0, 1)),
+        response(&wire, Ipv4Addr::UNSPECIFIED),
+        response(&wire, Ipv4Addr::new(127, 0, 0, 1)),
+        zero_ttl,
+        other_id,
+    ] {
+        // `answer_for` would fail on these and leave the guest without a reply.
+        assert!(resolve(&wire, Ok(refused.clone()), true, &aliases).is_err());
+        assert!(!direct_answer_usable(&message, &refused));
+    }
+    assert!(direct_answer_usable(
+        &message,
+        &negative(&wire, 3, 300, 300)
+    ));
+    // Whether SERVFAIL and REFUSED fall back is an open decision; for now
+    // they pass on as before.
+    assert!(direct_answer_usable(
+        &message,
+        &negative(&wire, 2, 300, 300)
+    ));
+    let aaaa = typed("allowed.example", 28);
+    let aaaa_message = Message::query(&aaaa).unwrap();
+    assert!(direct_answer_usable(
+        &aaaa_message,
+        &negative(&aaaa, 0, 300, 300)
+    ));
+}
+
+#[test]
 fn a_cached_answer_counts_its_ttl_down_and_answers_the_new_query() {
     let cache = Cache::default();
     let first = query("cached.example");

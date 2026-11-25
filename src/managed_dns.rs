@@ -37,7 +37,7 @@ mod http;
 use http::read_http;
 use http::{DeadlineStream, post_query};
 mod wire;
-use wire::{Message, finish_answer, reserved};
+use wire::{Message, direct_answer_usable, finish_answer, reserved};
 mod ledger;
 use ledger::AliasLedger;
 mod cache;
@@ -607,7 +607,7 @@ impl Resolver {
             Some((upstream, name)) => self
                 .exchange_via(Route::Direct(upstream, name), wire)
                 .ok()
-                .filter(|answer| Message::response(answer, query).is_ok())
+                .filter(|answer| direct_answer_usable(query, answer))
                 .map_or_else(|| self.exchange_via(Route::Chain, wire), Ok),
             None => self.exchange_via(Route::Chain, wire),
         }

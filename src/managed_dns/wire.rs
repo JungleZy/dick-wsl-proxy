@@ -356,6 +356,62 @@ pub(super) fn finish_answer(
     if !direct || response.flags & 15 != 0 || response.answers.is_empty() {
         return Ok(response_wire.to_vec());
     }
+    let (destinations, ttl) = whitelisted_destinations(query, response_wire, response)?;
+    // Flatten the authenticated CNAME chain onto the original whitelisted name.
+    // Publishing an alias under a shared canonical owner would let the guest's
+    // DNS cache lend that alias to unrelated names using the same CDN target.
+    let mut wire = header(query, response.flags & !0x0420, destinations.len() as u16);
+    let mut patches = Vec::with_capacity(destinations.len());
+    for _ in &destinations {
+        put_name(&mut wire, &query.question.name);
+        wire.extend_from_slice(&1u16.to_be_bytes());
+        wire.extend_from_slice(&1u16.to_be_bytes());
+        wire.extend_from_slice(&0u32.to_be_bytes());
+        wire.extend_from_slice(&4u16.to_be_bytes());
+        patches.push(wire.len());
+        wire.extend_from_slice(&[0; 4]);
+    }
+    if wire.len() > limit {
+        return Ok(header(query, (response.flags | 0x0200) & !0x0020, 0));
+    }
+    let mut table = aliases
+        .lock()
+        .map_err(|_| "DNS alias table lock poisoned")?;
+    let assigned = table.assign(&query.question.name, &destinations, ttl, Instant::now())?;
+    for (at, alias) in patches.into_iter().zip(assigned) {
+        wire[at..at + 4].copy_from_slice(&alias.octets());
+    }
+    Ok(wire)
+}
+
+/// Whether a direct (domestic) upstream's answer can be handed on as is. One
+/// that does not match the question, or a whitelisted A answer that
+/// `finish_answer` would refuse, is asked again through the chain instead of
+/// leaving the guest without a reply (decision 18). Error codes pass: whether
+/// SERVFAIL or REFUSED should fall back too is an open decision.
+pub(super) fn direct_answer_usable(query: &Message, answer: &[u8]) -> bool {
+    let Ok(response) = Message::response(answer, query) else {
+        return false;
+    };
+    if query.question.kind != 1
+        || query.dnssec
+        || response.flags & 0x0200 != 0
+        || response.flags & 15 != 0
+        || response.answers.is_empty()
+    {
+        return true;
+    }
+    whitelisted_destinations(query, answer, &response).is_ok()
+}
+
+/// The addresses a whitelisted A answer resolves to and its shortest TTL,
+/// after checking the CNAME chain from the question name, the record types,
+/// the TTLs and that every address is a public destination. Assigns nothing.
+fn whitelisted_destinations(
+    query: &Message,
+    response_wire: &[u8],
+    response: &Message,
+) -> Result<(Vec<Ipv4Addr>, u32), String> {
     let mut current = query.question.name.clone();
     let mut visited = HashSet::new();
     let mut selected = Vec::new();
@@ -398,41 +454,15 @@ pub(super) fn finish_answer(
     if selected.len() != response.answers.len() || ttl == 0 {
         return Err("unrelated records or zero TTL in whitelisted DNS answer".into());
     }
-    // Flatten the authenticated CNAME chain onto the original whitelisted name.
-    // Publishing an alias under a shared canonical owner would let the guest's
-    // DNS cache lend that alias to unrelated names using the same CDN target.
-    let addresses: Vec<_> = selected
-        .into_iter()
-        .filter(|record| record.kind == 1)
-        .collect();
-    let mut wire = header(query, response.flags & !0x0420, addresses.len() as u16);
-    let mut destinations = Vec::with_capacity(addresses.len());
-    let mut patches = Vec::with_capacity(addresses.len());
-    for record in addresses {
+    let mut destinations = Vec::new();
+    for record in selected.into_iter().filter(|record| record.kind == 1) {
         let ip = a_address(response_wire, record)?;
         if !public_destination(ip) {
             return Err("whitelisted DNS resolved to an unsafe IPv4 destination".into());
         }
-        put_name(&mut wire, &query.question.name);
-        wire.extend_from_slice(&1u16.to_be_bytes());
-        wire.extend_from_slice(&1u16.to_be_bytes());
-        wire.extend_from_slice(&0u32.to_be_bytes());
-        wire.extend_from_slice(&4u16.to_be_bytes());
-        patches.push(wire.len());
         destinations.push(ip);
-        wire.extend_from_slice(&[0; 4]);
     }
-    if wire.len() > limit {
-        return Ok(header(query, (response.flags | 0x0200) & !0x0020, 0));
-    }
-    let mut table = aliases
-        .lock()
-        .map_err(|_| "DNS alias table lock poisoned")?;
-    let assigned = table.assign(&query.question.name, &destinations, ttl, Instant::now())?;
-    for (at, alias) in patches.into_iter().zip(assigned) {
-        wire[at..at + 4].copy_from_slice(&alias.octets());
-    }
-    Ok(wire)
+    Ok((destinations, ttl))
 }
 
 pub(super) fn a_address(wire: &[u8], record: &Record) -> Result<Ipv4Addr, String> {
