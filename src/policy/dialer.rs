@@ -133,6 +133,9 @@ struct Stats {
     discarded: AtomicU64,
     /// Pooled tunnels that broke on their CONNECT.
     stale_on_connect: AtomicU64,
+    /// Fresh chains asked again step by step because a pipelined CONNECT
+    /// went unanswered before pipelining had ever worked.
+    unanswered_retries: AtomicU64,
     prepared: AtomicU64,
     prepare_failures: AtomicU64,
     last_prepare_error: Mutex<Option<String>>,
@@ -204,6 +207,7 @@ impl Dialer {
             "by_name": count(&self.stats.by_name),
             "discarded": count(&self.stats.discarded),
             "stale_on_connect": count(&self.stats.stale_on_connect),
+            "unanswered_retries": count(&self.stats.unanswered_retries),
             "prepared": count(&self.stats.prepared),
             "prepare_failures": count(&self.stats.prepare_failures),
             "last_prepare_error": *self.stats.last_prepare_error.lock().unwrap_or_else(|e| e.into_inner()),
@@ -274,6 +278,9 @@ impl Dialer {
             Err(Setup::Unanswered(message))
                 if pipelined && !self.pipeline_proven.load(Ordering::Relaxed) =>
             {
+                self.stats
+                    .unanswered_retries
+                    .fetch_add(1, Ordering::Relaxed);
                 let deadline = Instant::now() + SETUP_TIMEOUT;
                 let mut stream = self
                     .open_residential(deadline)

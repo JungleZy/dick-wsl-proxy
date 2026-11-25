@@ -1728,6 +1728,7 @@ mod tests {
         inner.join().unwrap();
         outer.join().unwrap();
         assert!(!policy.dialer.pipeline.load(Ordering::Relaxed));
+        assert_eq!(policy.dialer.report()["unanswered_retries"], 1);
     }
 
     #[test]
@@ -1752,11 +1753,13 @@ mod tests {
             }
         });
         drop(policy.chain(origin).unwrap());
-        // A retry would need a third first-hop tunnel and fail differently.
         assert_eq!(
             policy.chain(origin).unwrap_err(),
             "SOCKS5 chain reply closed"
         );
+        // Counted before the retry connects, so this holds even though a
+        // retry here would fail and report the same error.
+        assert_eq!(policy.dialer.report()["unanswered_retries"], 0);
         inner.join().unwrap();
         outer.join().unwrap();
         assert!(policy.dialer.pipeline.load(Ordering::Relaxed));
