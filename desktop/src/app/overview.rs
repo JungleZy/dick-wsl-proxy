@@ -400,20 +400,28 @@ impl Desktop {
             .note("双跳代理的第一跳，在「设置」页修改")
             .note_if(running_policy, "接管中改的设置要下次启动接管才生效");
 
-        let residential_ip = text(&self.residential, "ip", "");
+        // 后台解析住宅地址前会去掉首尾空格，库里存的是原样输入。
+        let residential_ip = text(&self.residential, "ip", "").trim().to_owned();
         let residential_port = Self::profile_field_value(&self.residential, "port", false);
+        let saved_residential = if residential_ip.is_empty() || residential_port.is_empty() {
+            residential_ip
+        } else {
+            format!("{residential_ip}:{residential_port}")
+        };
+        // 出口核对比的是运行中的住宅地址，所以接管中显示它；之后保存的新地址下次启动才生效。
+        let running_residential = running_policy
+            .then(|| active_policy["residential"].as_str())
+            .flatten();
+        let (residential, residential_pending) =
+            residential_address(saved_residential, running_residential);
         let exit = &self.status["recent_exit"];
         let exit_verdict =
             (valid && exit.is_object()).then(|| exit["matches_residential"].as_bool());
         let udp = self.udp_state_label();
-        let (exit_value, exit_detail, exit_tone) = if residential_ip.is_empty() {
+        let (exit_value, exit_detail, exit_tone) = if residential.is_empty() {
             ("未配置".to_owned(), "第二跳".to_owned(), StatusTone::Warn)
         } else {
-            let value = if residential_port.is_empty() {
-                residential_ip
-            } else {
-                format!("{residential_ip}:{residential_port}")
-            };
+            let value = residential;
             // UDP 已阻断是本次接管的已知限制（不会直连），但不是正常状态：
             // 用待处理色，并且复核过出口后也照样显示，不只留在悬停提示里。
             let udp_blocked = managed && self.status["startup_verified"]["udp_supported"] == false;
@@ -425,6 +433,9 @@ impl Desktop {
                     StatusTone::Warn,
                 ),
                 _ if udp_blocked => (value, "UDP 已阻断".to_owned(), StatusTone::Warn),
+                _ if residential_pending.is_some() => {
+                    (value, "新值下次启动生效".to_owned(), live(forwarding))
+                }
                 Some(Some(true)) => (value, "出口已核对".to_owned(), live(forwarding)),
                 _ if managed => (value, format!("UDP {udp}"), live(forwarding)),
                 _ => (value, "第二跳".to_owned(), live(forwarding)),
@@ -444,11 +455,23 @@ impl Desktop {
             None => "未检测".to_owned(),
         };
         let exit_tip = Tip::new("住宅出口")
-            .row("地址", exit_value.clone())
+            .row(
+                if running_residential.is_some() {
+                    "运行中"
+                } else {
+                    "地址"
+                },
+                exit_value.clone(),
+            )
+            .row_some("已保存", residential_pending)
             .row("公网出口", exit_summary)
             .row("UDP", udp)
             .note("双跳代理的第二跳，流量最终从这里出网")
-            .note("接管中可以在「连接」页复核公网出口");
+            .note("接管中可以在「连接」页复核公网出口")
+            .note_if(
+                running_residential.is_some(),
+                "接管中改的设置要下次启动接管才生效",
+            );
 
         let (dns_host, dns_host_pending) = config("dns_tls_name");
         let (dns_upstream, dns_upstream_pending) = config("dns_upstream");
@@ -904,9 +927,56 @@ fn ago(seconds: u64) -> String {
     }
 }
 
+/// 住宅节点显示的地址和待生效的新值。接管中是运行中的地址（出口核对比的就是它），
+/// 已保存的不同就是下次启动才生效的新值；没在接管时就是已保存的地址。
+fn residential_address(saved: String, running: Option<&str>) -> (String, Option<String>) {
+    match running.filter(|running| !running.is_empty()) {
+        Some(running) if running != saved => {
+            let pending = if saved.is_empty() {
+                "未配置".to_owned()
+            } else {
+                saved
+            };
+            (running.to_owned(), Some(pending))
+        }
+        Some(running) => (running.to_owned(), None),
+        None => (saved, None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ago, event_time, recovery_reason};
+    use super::{ago, event_time, recovery_reason, residential_address};
+
+    #[test]
+    fn a_takeover_shows_the_residential_address_it_runs_with() {
+        // 接管中改了住宅地址：显示运行中的旧地址，新地址作为下次启动生效的值。
+        assert_eq!(
+            residential_address("203.0.113.7:1080".into(), Some("198.51.100.9:1080")),
+            (
+                "198.51.100.9:1080".to_owned(),
+                Some("203.0.113.7:1080".to_owned())
+            )
+        );
+        assert_eq!(
+            residential_address("198.51.100.9:1080".into(), Some("198.51.100.9:1080")),
+            ("198.51.100.9:1080".to_owned(), None)
+        );
+        // 接管中清空了住宅设置：本次接管仍用原地址。
+        assert_eq!(
+            residential_address(String::new(), Some("198.51.100.9:1080")),
+            ("198.51.100.9:1080".to_owned(), Some("未配置".to_owned()))
+        );
+        // 没在接管，或后台没报运行中的地址：显示已保存的。
+        assert_eq!(
+            residential_address("203.0.113.7:1080".into(), None),
+            ("203.0.113.7:1080".to_owned(), None)
+        );
+        assert_eq!(
+            residential_address("203.0.113.7:1080".into(), Some("")),
+            ("203.0.113.7:1080".to_owned(), None)
+        );
+    }
 
     #[test]
     fn tells_a_lost_takeover_from_one_that_did_not_end_cleanly() {

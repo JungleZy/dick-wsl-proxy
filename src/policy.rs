@@ -567,8 +567,12 @@ impl Policy {
         self.limits
     }
 
+    /// What this takeover runs with, for the status reply. The residential
+    /// endpoint is here because settings saved during a takeover only apply
+    /// to the next one: the desktop shows the address the exit check is
+    /// against, not the one saved since. Never the username or password.
     pub(crate) fn public_summary(&self) -> serde_json::Value {
-        serde_json::json!({"first_hop":self.first_hop,"credential":self.credential_ref,"dns_upstream":self.dns_upstream,"dns_tls_name":self.dns_tls_name,"health_domain":self.health_domain,"tunnels":self.dialer.report()})
+        serde_json::json!({"first_hop":self.first_hop,"residential":self.residential.endpoint(),"credential":self.credential_ref,"dns_upstream":self.dns_upstream,"dns_tls_name":self.dns_tls_name,"health_domain":self.health_domain,"tunnels":self.dialer.report()})
     }
 
     pub(crate) fn matches_residence(&self, ip: Ipv4Addr) -> bool {
@@ -1328,6 +1332,18 @@ mod tests {
             credential::fixture(residential),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn the_running_summary_names_the_residential_endpoint_but_not_the_login() {
+        let summary = policy(
+            "127.0.0.1:18080".parse().unwrap(),
+            "198.51.100.9:1080".parse().unwrap(),
+        )
+        .public_summary();
+        assert_eq!(summary["residential"], "198.51.100.9:1080");
+        let text = summary.to_string();
+        assert!(!text.contains("fixture-user") && !text.contains("fixture-password"));
     }
 
     #[test]
