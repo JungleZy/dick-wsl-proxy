@@ -1732,6 +1732,45 @@ mod tests {
     }
 
     #[test]
+    fn a_proxy_that_hangs_on_the_dropped_connect_is_caught_within_seconds() {
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let residential = TcpListener::bind("127.0.0.1:0").unwrap();
+        let residential_endpoint = endpoint(&residential);
+        let origin: SocketAddrV4 = "192.0.2.1:443".parse().unwrap();
+        let policy = policy(endpoint(&first), residential_endpoint);
+        let outer = first_hop_tunnels(first, residential_endpoint, 2);
+        let inner = thread::spawn(move || {
+            // Accepts the credentials, then neither answers the CONNECT read
+            // with them nor closes.
+            let mut hung = accept(&residential);
+            assert_eq!(read::<3>(&mut hung), [5, 1, 2]);
+            hung.write_all(&[5, 2]).unwrap();
+            read_credentials(&mut hung);
+            request(&mut hung, origin);
+            hung.write_all(&[1, 0]).unwrap();
+            // Step by step, the same proxy answers.
+            let mut stream = accept(&residential);
+            assert_eq!(read::<3>(&mut stream), [5, 1, 2]);
+            stream.write_all(&[5, 2]).unwrap();
+            read_credentials(&mut stream);
+            stream.write_all(&[1, 0]).unwrap();
+            request(&mut stream, origin);
+            success(&mut stream);
+            drop(hung);
+        });
+        let started = std::time::Instant::now();
+        drop(policy.chain(origin).unwrap());
+        let elapsed = started.elapsed();
+        inner.join().unwrap();
+        outer.join().unwrap();
+        // Well inside the 16 s the readiness DNS probe waits, instead of the
+        // 15 s setup deadline plus a retry.
+        assert!(elapsed < Duration::from_secs(8), "{elapsed:?}");
+        assert!(!policy.dialer.pipeline.load(Ordering::Relaxed));
+        assert_eq!(policy.dialer.report()["unanswered_retries"], 1);
+    }
+
+    #[test]
     fn once_pipelining_has_worked_an_unanswered_connect_fails_without_a_retry() {
         let first = TcpListener::bind("127.0.0.1:0").unwrap();
         let residential = TcpListener::bind("127.0.0.1:0").unwrap();

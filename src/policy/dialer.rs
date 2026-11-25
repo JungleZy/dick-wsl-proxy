@@ -66,6 +66,13 @@ const BURST_WINDOW: Duration = Duration::from_secs(3);
 /// was seen to close one, but never below `MIN_POOL_IDLE`.
 const POOL_IDLE: Duration = Duration::from_secs(20);
 const MIN_POOL_IDLE: Duration = Duration::from_secs(2);
+/// How long a pipelined CONNECT waits for its first reply byte while
+/// pipelining has not yet worked on this takeover (decision 22). A proxy
+/// that drops the CONNECT read with the credentials and hangs would
+/// otherwise hold the first chain for the full setup deadline, longer than
+/// the readiness DNS probe waits. A slow target misjudged here only turns
+/// pipelining off for this takeover.
+const UNPROVEN_REPLY_WAIT: Duration = Duration::from_secs(4);
 
 /// How a residential handshake failed: refused or broken for real, or in a
 /// way that only shows the proxy could not take pipelined requests.
@@ -561,8 +568,13 @@ impl Dialer {
                 "residential SOCKS5 authentication rejected".into(),
             ));
         }
+        let first_deadline = if self.pipeline_proven.load(Ordering::Relaxed) {
+            deadline
+        } else {
+            deadline.min(Instant::now() + UNPROVEN_REPLY_WAIT)
+        };
         let mut first = [0; 1];
-        receive(stream, &mut first, deadline).map_err(Setup::Unanswered)?;
+        receive(stream, &mut first, first_deadline).map_err(Setup::Unanswered)?;
         if first[0] != 5 {
             return Err(Setup::Failed("SOCKS5 CONNECT rejected or malformed".into()));
         }
