@@ -100,6 +100,8 @@ pub(crate) struct Desktop {
     pub(crate) exiting: bool,
     /// 退出时联系不上后台：等加载框关掉后询问是否只退出界面。
     pub(crate) exit_anyway_pending: bool,
+    /// 询问「仍然退出界面」时的标题和说明；`None` 用联系不上后台的通用说明。
+    pub(crate) exit_anyway_reason: Option<(&'static str, &'static str)>,
     pub(crate) export_path: Option<String>,
     pub(crate) environment_editor: Option<EnvironmentEditor>,
     pub(crate) environment_edit_target: Option<String>,

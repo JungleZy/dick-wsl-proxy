@@ -257,6 +257,7 @@ impl Desktop {
             kernel_prepare_offered: false,
             exiting: false,
             exit_anyway_pending: false,
+            exit_anyway_reason: None,
             export_path: None,
             environment_editor: None,
             environment_edit_target: None,
@@ -702,18 +703,20 @@ impl Desktop {
         while let Ok(reply) = self.replies.try_recv() {
             self.handle_reply(reply, window, cx);
         }
-        self.handle_tray_action(window, cx);
-        // 退出进行中不轮询：后台关闭后再查状态只会报连不上。
-        if !self.exiting && self.last_poll.elapsed() >= STATUS_POLL_INTERVAL {
-            self.last_poll = Instant::now();
-            self.send(Kind::Status, json!({"command":"status"}), cx);
-        }
         let operation_active = self.busy.is_some() || self.reading;
         if self.loading_dialog_open && !operation_active {
             window.close_dialog(cx);
             self.loading_dialog_open = false;
         } else if operation_active && !self.loading_dialog_open {
             self.open_loading_dialog(window, cx);
+        }
+        // 托盘动作放在关加载框之后：`close_dialog` 关的是最上层的对话框，
+        // 托盘「停止」在同一帧打开的确认框会被当成加载框关掉，留下关不掉的加载框。
+        self.handle_tray_action(window, cx);
+        // 退出进行中不轮询：后台关闭后再查状态只会报连不上。
+        if !self.exiting && self.last_poll.elapsed() >= STATUS_POLL_INTERVAL {
+            self.last_poll = Instant::now();
+            self.send(Kind::Status, json!({"command":"status"}), cx);
         }
         if self.confirmation_pending && !self.loading_dialog_open {
             self.confirmation_pending = false;

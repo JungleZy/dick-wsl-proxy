@@ -703,6 +703,25 @@ impl Desktop {
     /// 联系不上后台时无法确认它是否还在运行，由用户决定是否只退出界面，避免程序无法退出。
     pub(crate) fn finish_exit(&mut self, result: Result<Value, String>, cx: &mut Context<Self>) {
         match result {
+            // 后台进程已经不在（例如接管中崩溃或被结束）：没有谁关闭过接管，
+            // 它最后报告的阶段不是空闲时，目标里的规则可能还在，不能说成「已关闭」。
+            Ok(value)
+                if value["absent"] == true
+                    && self.status["phase"]
+                        .as_str()
+                        .is_some_and(|phase| phase != "idle") =>
+            {
+                self.exiting = false;
+                self.fail(
+                    "后台已经不在运行，而它最后报告的状态不是空闲，接管可能没有停止，程序没有退出。点「刷新」重新连接后台后再停止接管。",
+                    cx,
+                );
+                self.exit_anyway_reason = Some((
+                    "后台已经不在运行",
+                    "后台最后报告的状态是接管中或需要恢复，之后进程没了，没有人停止过接管：目标 WSL 里的接管规则可能还在，新连接会不通。重新打开程序（或点「刷新」）会重新拉起后台，再停止接管就能恢复直连。仍然退出的话，只关闭界面。",
+                ));
+                self.exit_anyway_pending = true;
+            }
             Ok(_) => {
                 self.notice = "后台已关闭，正在退出。".into();
                 self.error = false;
@@ -727,24 +746,21 @@ impl Desktop {
         }
     }
 
-    pub(crate) fn open_exit_anyway_dialog(&self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_exit_anyway_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (title, description) = self.exit_anyway_reason.take().unwrap_or((
+            "联系不上后台",
+            "无法确认后台是否还在运行。仍然退出的话，只关闭界面：后台如果还在运行会保留，接管不会停止。之后可以重新打开程序再从托盘退出。",
+        ));
         window.open_alert_dialog(cx, move |dialog, _, _| {
             dialog
                 .confirm()
-                .title(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::NORMAL)
-                        .child("联系不上后台"),
-                )
+                .title(div().text_sm().font_weight(FontWeight::NORMAL).child(title))
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("仍然退出界面")
                         .cancel_text("取消"),
                 )
-                .description(div().text_sm().child(
-                    "无法确认后台是否还在运行。仍然退出的话，只关闭界面：后台如果还在运行会保留，接管不会停止。之后可以重新打开程序再从托盘退出。",
-                ))
+                .description(div().text_sm().child(description))
                 .on_ok(move |_, _, cx| {
                     if !super::tray::quit_application() {
                         cx.quit();
@@ -756,6 +772,15 @@ impl Desktop {
     }
 
     pub(crate) fn probe(&mut self, cx: &mut Context<Self>) {
+        // 托盘也能触发检测。确认框开着时发出修改类请求会清掉待确认的操作，
+        // 之后点「确认」不会有任何反应，所以先拒绝。
+        if self.locked() {
+            self.fail(
+                "当前有操作在进行或等待确认，完成或取消后再检测公网出口。",
+                cx,
+            );
+            return;
+        }
         if self.phase() != "forwarding_managed" {
             self.fail("只有接管中的目标才能检测公网出口。", cx);
             return;
