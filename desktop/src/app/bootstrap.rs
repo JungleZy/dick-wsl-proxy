@@ -26,7 +26,7 @@ use super::model::{
     EnvironmentProgress, EnvironmentResult, Field, Fields, LogFilter, Page, RuntimeLog,
     progress_marker,
 };
-use super::state::Desktop;
+use super::state::{Desktop, Reminder};
 use super::theme::{RUST, TEAL};
 
 /// 保存结果通知的编号：同一时间只留一条，新的结果顶替旧的。
@@ -47,6 +47,27 @@ fn push_save_notice(result: Result<String, String>, window: &mut Window, cx: &mu
     }
     .id::<SaveNotice>();
     window.remove_notification::<SaveNotice>(cx);
+    window.push_notification(notification, cx);
+}
+
+/// 提醒通知的编号：和保存结果分开，两种通知互不顶替。
+struct ReminderNotice;
+
+/// 弹出提醒：警告类（如 UDP 已阻断）要用户自己关掉，其余 5 秒后自动消失。
+/// 同保存结果通知一样不设通知类型，图标颜色自己给。
+fn push_reminder(reminder: Reminder, window: &mut Window, cx: &mut App) {
+    let notification = if reminder.warning {
+        Notification::new()
+            .message(reminder.message)
+            .icon(design_icon("info", 16., RUST))
+            .autohide(false)
+    } else {
+        Notification::new()
+            .message(reminder.message)
+            .icon(design_icon("info", 16., TEAL))
+    }
+    .id::<ReminderNotice>();
+    window.remove_notification::<ReminderNotice>(cx);
     window.push_notification(notification, cx);
 }
 
@@ -289,6 +310,7 @@ impl Desktop {
             residential_probe_at: None,
             residential_probe_checking: false,
             save_notice: None,
+            reminder: None,
         };
         this.send(Kind::Bootstrap, Value::Null, cx);
         cx.spawn_in(window, async move |view, cx| {
@@ -742,6 +764,9 @@ impl Desktop {
         if let Some(result) = self.save_notice.take() {
             push_save_notice(result, window, cx);
         }
+        if let Some(reminder) = self.reminder.take() {
+            push_reminder(reminder, window, cx);
+        }
         if matches!(
             self.busy,
             Some(Kind::EnvironmentCreate | Kind::EnvironmentEdit)
@@ -984,6 +1009,10 @@ impl Desktop {
                             job["target"].as_str().unwrap_or("未知环境")
                         )
                     };
+                    self.reminder = Some(Reminder {
+                        message: self.notice.clone(),
+                        warning: true,
+                    });
                 }
                 // 连接记录独立于当前接管状态，后台空闲时也要预先读取，
                 // 这样打开连接页可以直接看到历史记录。
@@ -1046,8 +1075,14 @@ impl Desktop {
                             None => scope.saved_notice().into(),
                         }
                     };
-                    // 用户发起的保存（含环境页「设为目标」）用保存结果通知提示。
-                    if !clearing_target {
+                    // 用户发起的保存（含环境页「设为目标」）用保存结果通知提示；
+                    // 自动清除目标不是用户发起的，作为提醒弹出，要用户自己关掉。
+                    if clearing_target {
+                        self.reminder = Some(Reminder {
+                            message: self.notice.clone(),
+                            warning: true,
+                        });
+                    } else {
                         self.save_notice = Some(Ok(self.notice.clone()));
                     }
                 }
@@ -1271,9 +1306,9 @@ impl Desktop {
                     self.preflight = Some(value);
                     self.fail("操作前预检未通过；请查看阻断项。", cx);
                 } else {
-                    self.notice = if kind != Kind::Stop
-                        && value["startup_verified"]["udp_supported"] == false
-                    {
+                    let udp_blocked =
+                        kind != Kind::Stop && value["startup_verified"]["udp_supported"] == false;
+                    self.notice = if udp_blocked {
                         format!(
                             "{}已完成，但住宅出口没有通过 UDP 探测：非白名单 UDP（含 QUIC）已阻断，不会直连；TCP 和系统 DNS 照常经代理链。",
                             kind.label()
@@ -1281,6 +1316,12 @@ impl Desktop {
                     } else {
                         format!("{}已完成；请以后台状态为准。", kind.label())
                     };
+                    if udp_blocked {
+                        self.reminder = Some(Reminder {
+                            message: self.notice.clone(),
+                            warning: true,
+                        });
+                    }
                     self.preflight = None;
                 }
             }
@@ -1306,6 +1347,10 @@ impl Desktop {
                     if self.phase() == "idle" {
                         self.notice = "当前没有正在接管的目标。".into();
                         self.error = false;
+                        self.reminder = Some(Reminder {
+                            message: self.notice.clone(),
+                            warning: false,
+                        });
                         cx.notify();
                     } else {
                         self.prepare(Kind::Stop, window, cx);

@@ -142,4 +142,13 @@ pub(crate) struct Desktop {
     /// `Err` 是可读的失败原因。推通知要用 `Window`，所以先记在这里，下一次界面刷新时用
     /// gpui-kit 的 Notification 弹出，弹出后清空。
     pub(crate) save_notice: Option<Result<String, String>>,
+    /// 不是错误、但用户需要看到的结果（UDP 已阻断、目标已自动清除等），由 tick 弹成通知。
+    /// 全局错误条只显示错误，没有它这些话只写进 `notice`，哪里都看不到。
+    pub(crate) reminder: Option<Reminder>,
+}
+
+/// 一条待弹出的提醒。`warning` 的要用户自己关掉；其余几秒后自动消失。
+pub(crate) struct Reminder {
+    pub(crate) message: String,
+    pub(crate) warning: bool,
 }
