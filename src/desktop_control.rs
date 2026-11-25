@@ -355,9 +355,65 @@ fn log_source(command: &str) -> String {
     }
 }
 
+/// The code a failure is logged under. Environment jobs and some requests
+/// wrap theirs in `desktop_request_failed` (or `controller_error`) with the
+/// specific code leading the message (`environment_name_exists`,
+/// `environment_setup_failed:…`); the wrapper alone says nothing, and the
+/// desktop sends the user to this log while such a job runs. Only the code
+/// is logged, never the rest of the message: that can carry wsl.exe or guest
+/// script output, paths and what the user typed.
+fn failure_code(response: &Value) -> Option<&str> {
+    let code = response.get("code")?.as_str()?;
+    if !matches!(code, "desktop_request_failed" | "controller_error") {
+        return Some(code);
+    }
+    // Like the desktop's `humanize_error`: a code is the whole message or
+    // what comes before its first ':', and has an underscore, so a message
+    // that is plain prose ("cannot connect to …") keeps the wrapper.
+    let inner = response["message"].as_str().and_then(|message| {
+        let message = message.trim();
+        let token = message.split_once(':').map_or(message, |(code, _)| code);
+        (token.contains('_')
+            && token
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'))
+        .then_some(token)
+    });
+    Some(inner.unwrap_or(code))
+}
+
+/// What failed, in the run log's words.
+fn failed_action(command: &str) -> &'static str {
+    match command {
+        "environment_create" => "新建环境",
+        "environment_edit" => "编辑环境",
+        "environment_backup" => "备份环境",
+        "environment_delete" => "删除环境",
+        "wsl_platform_update" => "升级 WSL",
+        "start" => "启动接管",
+        "switch" => "切换目标",
+        "stop" => "停止接管",
+        "preflight" => "预检",
+        "prepare_kernel" => "准备内核环境",
+        "profile_save" => "保存配置",
+        _ => "操作",
+    }
+}
+
 fn command_log(command: &str, response: &Value) -> (&'static str, String, String) {
-    if let Some(code) = response.get("code").and_then(Value::as_str) {
-        return ("error", log_source(command), format!("操作失败（{code}）"));
+    if let Some(code) = failure_code(response) {
+        let action = failed_action(command);
+        // 「升级 WSL 失败」：西文和中文之间留空格。
+        let gap = if action.ends_with(|c: char| c.is_ascii_alphanumeric()) {
+            " "
+        } else {
+            ""
+        };
+        return (
+            "error",
+            log_source(command),
+            format!("{action}{gap}失败（{code}）"),
+        );
     }
     if matches!(command, "start" | "switch" | "stop") && response["passed"] == false {
         let blockers = response["blockers"].as_array().map_or(0, Vec::len);
@@ -792,6 +848,58 @@ mod tests {
             residential_probe_confirmed(&json!({"command":"residential_probe","confirm":true}))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn a_failure_is_logged_with_its_own_code_and_no_free_text() {
+        // An environment job reports its failure wrapped; the log names the
+        // operation and the inner code, not the wsl.exe output or the path.
+        let (level, source, message) = command_log(
+            "environment_create",
+            &json!({"code":"desktop_request_failed","message":"environment_distribution_install_failed:Wsl/InstallDistro/0x80072ee7 C:\\Users\\someone\\WSL"}),
+        );
+        assert_eq!(
+            (level, source.as_str(), message.as_str()),
+            (
+                "error",
+                "environment_create",
+                "新建环境失败（environment_distribution_install_failed）"
+            )
+        );
+        let (_, _, message) = command_log(
+            "environment_backup",
+            &json!({"code":"desktop_request_failed","message":"environment_backup_exists"}),
+        );
+        assert_eq!(message, "备份环境失败（environment_backup_exists）");
+        let (_, source, message) = command_log(
+            "wsl_platform_update",
+            &json!({"code":"desktop_request_failed","message":"wsl_update_command_failed: exit 1"}),
+        );
+        assert_eq!(
+            (source.as_str(), message.as_str()),
+            ("wsl", "升级 WSL 失败（wsl_update_command_failed）")
+        );
+        // A specific code is kept as it is.
+        let (_, _, message) = command_log(
+            "start",
+            &json!({"code":"timezone_sync_failed","message":"timezone_lookup_failed"}),
+        );
+        assert_eq!(message, "启动接管失败（timezone_sync_failed）");
+        // A wrapped message that does not lead with a code keeps the wrapper:
+        // no word of prose is logged as if it were one.
+        for prose in [
+            "Windows error 5",
+            "cannot connect to first-hop for residential UDP",
+            "policy contains an endpoint loop",
+            "policy: endpoint loop",
+            "wsl_exit_failed 1",
+        ] {
+            let (_, _, message) = command_log(
+                "environment_delete",
+                &json!({"code":"desktop_request_failed","message":prose}),
+            );
+            assert_eq!(message, "删除环境失败（desktop_request_failed）", "{prose}");
+        }
     }
 
     #[test]
