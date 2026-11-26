@@ -1219,9 +1219,11 @@ class FakeTables:
 class BlockTests(unittest.TestCase):
     """Decision 33: the drop-only rules of a lost managed takeover."""
 
-    def execute(self, p, operation_name, fake, drift="boot_changed"):
+    def execute(self, p, operation_name, fake, drift="boot_changed", bridges=None):
         operation = request(p)
         operation["operation"] = operation_name
+        if bridges is not None:
+            operation["bridges"] = bridges
         failure = kernel.Failure(drift) if drift else None
         with (
             patch.object(kernel, "guest_lock"),
@@ -1247,7 +1249,7 @@ class BlockTests(unittest.TestCase):
                 if ipv6 is not None:
                     p["ipv6"] = ipv6
                 fake = FakeTables()  # a new VM: nothing of this takeover left
-                self.assertEqual(self.execute(p, "block", fake), {"ok": True, "operation": "block", "blocked": {"rules": 4}})
+                self.assertEqual(self.execute(p, "block", fake), {"ok": True, "operation": "block", "blocked": {"rules": 4, "bridges": []}})
                 rules = self.blocked(p, fake)
                 self.assertEqual(sorted(map(kernel.rule_key, rules)), sorted(map(kernel.rule_key, kernel.block_rules(p) + kernel.block_rules(p, ipv6=True))))
                 # Drops everything the target starts except to loopback,
@@ -1258,7 +1260,7 @@ class BlockTests(unittest.TestCase):
                 calls = []
                 original = fake.transaction
                 with patch.object(fake, "transaction", side_effect=lambda *a, **k: (calls.append((a, k)), original(*a, **k))):
-                    self.assertEqual(self.execute(p, "block", fake)["blocked"], {"rules": 4})
+                    self.assertEqual(self.execute(p, "block", fake)["blocked"], {"rules": 4, "bridges": []})
                 self.assertEqual(len(calls), 2)
                 for (table, lines), _ in calls:
                     self.assertEqual([line[0] for line in lines], ["-D", "-D", "-I", "-I"])
@@ -1289,6 +1291,54 @@ class BlockTests(unittest.TestCase):
                     for table in family.values():
                         self.assertEqual(table["rules"], [], name)
                         self.assertEqual(set(table["chains"]), {"OUTPUT"}, name)
+
+    def test_a_block_also_drops_what_the_targets_bridges_forward(self):
+        p = comprehensive_plan()
+        # A VM restart: only the names Windows saw are left.
+        fake = FakeTables()
+        result = self.execute(p, "block", fake, bridges=["docker0"])
+        self.assertEqual(result["blocked"], {"rules": 4 + 2 * 5, "bridges": ["docker0"]})
+        forward = fake.state["v4"]["mangle"]["rules"]
+        self.assertEqual(forward, kernel.block_forward_rules(p, ["docker0"]))
+        self.assertEqual([rule[-1] for rule in forward], ["RETURN", "RETURN", "RETURN", "RETURN", "DROP"])
+        self.assertTrue(all(rule[rule.index("-i") + 1] == "docker0" for rule in forward))
+        # Later rounds without names (the custodian): kept from the earlier
+        # block, plus what the target's dockerd and per-network rules show.
+        with patch.object(kernel, "docker_networks", return_value={"br-acc14c99a879": {"v4": [], "v6": []}}):
+            operation = request(p)
+            operation["operation"] = "block"
+            with (
+                patch.object(kernel, "guest_lock"),
+                patch.object(kernel, "guard", side_effect=kernel.Failure("boot_changed")),
+                patch.object(kernel, "Conntrack") as conntrack,
+                patch.object(kernel, "firewall", side_effect=fake.firewall),
+                patch.object(kernel, "legacy_firewall", side_effect=fake.legacy),
+                patch.object(kernel, "transaction", side_effect=fake.transaction),
+            ):
+                conntrack.return_value.dump.return_value = []
+                again = kernel.execute(operation)["blocked"]
+        self.assertEqual(again["bridges"], ["br-acc14c99a879", "docker0"])
+        self.assertEqual(len(fake.state["v4"]["mangle"]["rules"]), 10)
+        # A stop removes them with the rest; a check never calls them complete.
+        self.assertFalse(self.execute(p, "inspect", fake, drift=None)["ownership"]["rules_complete"])
+        self.execute(p, "remove", fake)
+        for family in fake.state.values():
+            for table in family.values():
+                self.assertEqual(table["rules"], [])
+
+    def test_block_bridges_are_validated_and_for_the_block_only(self):
+        p = comprehensive_plan()
+        for bad in (["eth0"], ["lo"], ["bad name"], "docker0", ["x"] * 65):
+            with self.subTest(bad=bad), self.assertRaisesRegex(kernel.Failure, "invalid_block_bridges"):
+                self.execute(p, "block", FakeTables(), bridges=bad)
+        with self.assertRaisesRegex(kernel.Failure, "invalid_block_bridges"):
+            self.execute(p, "inspect", FakeTables(), drift=None, bridges=["docker0"])
+        # A block FORWARD rule of another shape is not this instance's.
+        fake = FakeTables()
+        self.execute(p, "block", fake, bridges=["docker0"])
+        fake.state["v4"]["mangle"]["rules"][-1][-1] = "ACCEPT"
+        with self.assertRaisesRegex(kernel.Failure, "foreign_instance_rule"):
+            self.execute(p, "remove", fake)
 
     def test_a_block_rule_of_another_shape_is_refused(self):
         p = comprehensive_plan()

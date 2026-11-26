@@ -167,7 +167,7 @@ impl Desktop {
                 "需要恢复",
                 recovery_reason(
                     self.status["issue"].as_str().unwrap_or(""),
-                    self.status["protection_check"]["fallback_block"]["state"].as_str(),
+                    block_state(&self.status["protection_check"]["fallback_block"]),
                     &target,
                 ),
             ),
@@ -957,7 +957,22 @@ fn empty_note(message: impl Into<SharedString>) -> Div {
 /// 措辞和后台运行日志（`protection_lost_message`）一致。
 ///
 /// `block` 是后台在目标里断网的结果（决策 33）：`installed`、`failed`、
-/// `target_stopped`，还没断过时为 `None`。断网只拦目标本机进程，容器不在其内。
+/// `target_stopped`，还没断过时为 `None`。断网时目标记下的 Docker 网络转发出去的流量也一并丢弃，`bridges` 为空时容器不在其内。
+/// The block's state for [`recovery_reason`]: an installed block that also
+/// drops what the target's Docker bridges forward reads apart (decision 33).
+fn block_state(block: &serde_json::Value) -> Option<&str> {
+    match block["state"].as_str() {
+        Some("installed")
+            if block["bridges"]
+                .as_array()
+                .is_some_and(|bridges| !bridges.is_empty()) =>
+        {
+            Some("installed_with_containers")
+        }
+        state => state,
+    }
+}
+
 fn recovery_reason(issue: &str, block: Option<&str>, target: &str) -> String {
     if issue.starts_with("managed_install_unverified:container_networks_unavailable") {
         return format!(
@@ -981,8 +996,11 @@ fn recovery_reason(issue: &str, block: Option<&str>, target: &str) -> String {
     };
     let then = "请停止接管并恢复直连，再重新启动接管。";
     match block {
+        Some("installed_with_containers") => format!(
+            "{target}：{cause}。已在目标里断网：目标本机进程的新连接一律丢弃，目标的 Docker 容器转发出去的也一并丢弃（接管期间没见过的网络除外）。{then}"
+        ),
         Some("installed") => format!(
-            "{target}：{cause}。已在目标里断网：目标本机进程的新连接一律丢弃，但目标的 Docker 容器不在其内，可能直连。{then}"
+            "{target}：{cause}。已在目标里断网：目标本机进程的新连接一律丢弃，但没有记下目标的 Docker 网络，若目标里有容器，它们可能直连。{then}"
         ),
         Some("failed") => {
             format!("{target}：{cause}，在目标里断网没有成功，新连接可能直连。{then}")
@@ -1032,7 +1050,7 @@ fn residential_address(saved: String, running: Option<&str>) -> (String, Option<
 
 #[cfg(test)]
 mod tests {
-    use super::{ago, event_time, recovery_reason, residential_address};
+    use super::{ago, block_state, event_time, recovery_reason, residential_address};
 
     #[test]
     fn a_takeover_shows_the_residential_address_it_runs_with() {
@@ -1119,9 +1137,20 @@ mod tests {
         let installed = recovery_reason(lost, Some("installed"), "Dev");
         assert!(installed.contains("已在目标里断网"), "{installed}");
         assert!(
-            installed.contains("目标的 Docker 容器不在其内，可能直连"),
+            installed.contains("没有记下目标的 Docker 网络"),
             "{installed}"
         );
+        let covered = recovery_reason(lost, Some("installed_with_containers"), "Dev");
+        assert!(covered.contains("容器转发出去的也一并丢弃"), "{covered}");
+        assert_eq!(
+            block_state(&serde_json::json!({"state": "installed", "bridges": ["docker0"]})),
+            Some("installed_with_containers")
+        );
+        assert_eq!(
+            block_state(&serde_json::json!({"state": "installed", "bridges": []})),
+            Some("installed")
+        );
+        assert_eq!(block_state(&serde_json::json!(null)), None);
         assert!(
             recovery_reason(lost, Some("failed"), "Dev").contains("断网没有成功，新连接可能直连")
         );

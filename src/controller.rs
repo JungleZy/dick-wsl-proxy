@@ -44,8 +44,9 @@ struct Watch {
 /// The drop-only rules of a lost takeover (decision 33), as last seen.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum BlockState {
-    /// In place in the target as it ran at that round.
-    Installed,
+    /// In place in the target as it ran at that round, dropping also what
+    /// these Docker bridges of the target forward.
+    Installed(Vec<String>),
     /// Could not be put in place; the target may be direct.
     Failed(String),
     /// Not running: nothing can leave it. Blocked again when it runs.
@@ -55,7 +56,9 @@ enum BlockState {
 impl BlockState {
     fn view(&self) -> serde_json::Value {
         match self {
-            Self::Installed => serde_json::json!({"state": "installed", "error": null}),
+            Self::Installed(bridges) => {
+                serde_json::json!({"state": "installed", "error": null, "bridges": bridges})
+            }
             Self::Failed(error) => serde_json::json!({"state": "failed", "error": error}),
             Self::TargetStopped => serde_json::json!({"state": "target_stopped", "error": null}),
         }
@@ -175,6 +178,18 @@ fn drift_kind(reason: &str) -> Drift {
         Drift::Restarted
     } else {
         Drift::Changed
+    }
+}
+
+/// What a block says about the target's containers (decision 33).
+pub(crate) fn containers_blocked(bridges: &[String]) -> String {
+    if bridges.is_empty() {
+        "没有记下目标的 Docker 网络，若目标里有容器，它们转发出去的流量不在其内".to_owned()
+    } else {
+        format!(
+            "目标的 Docker 网络（{}）转发出去的流量也一并丢弃；接管期间没见过的网络不在其内",
+            bridges.join("、")
+        )
     }
 }
 
@@ -459,7 +474,7 @@ impl Controller {
                 ..Watch::default()
             };
         }
-        self.record_block(kernel::block(&round.plan))
+        self.record_block(kernel::block(&round.plan, &[]))
     }
 
     /// Where the block of the recorded takeover stands, for its status.
@@ -479,7 +494,7 @@ impl Controller {
         result: Result<kernel::Blocked, String>,
     ) -> Option<(&'static str, String)> {
         let state = match result {
-            Ok(_) => BlockState::Installed,
+            Ok(blocked) => BlockState::Installed(blocked.bridges),
             Err(error) => BlockState::Failed(error),
         };
         self.note_block(state)
@@ -490,18 +505,33 @@ impl Controller {
             return None;
         }
         let note = match &state {
-            BlockState::Installed => Some((
+            BlockState::Installed(bridges) => Some((
                 "warning",
-                "已在目标里断网：目标本机进程新发起的连接一律丢弃（回环除外），目标的 Docker 容器不在其内。请停止接管并恢复直连，再重新启动接管。".to_owned(),
+                format!(
+                    "已在目标里断网：目标本机进程新发起的连接一律丢弃（回环除外），{}。请停止接管并恢复直连，再重新启动接管。",
+                    containers_blocked(bridges)
+                ),
             )),
             BlockState::Failed(error) => Some((
                 "error",
-                format!("在目标里断网失败（{error}），目标的新连接可能直连。下一轮核对会再试；请尽快停止接管。"),
+                format!(
+                    "在目标里断网失败（{error}），目标的新连接可能直连。下一轮核对会再试；请尽快停止接管。"
+                ),
             )),
             BlockState::TargetStopped => None,
         };
         self.watch.block = Some(state);
         note
+    }
+
+    /// The target's Docker bridges this takeover covered, for a block of
+    /// `plan` (decision 33).
+    pub(crate) fn block_bridges(&self, plan: &Plan) -> Vec<String> {
+        if self.watch.cookie == plan.cookie {
+            self.watch.networks.clone()
+        } else {
+            Vec::new()
+        }
     }
 
     fn record_watch(
@@ -1098,10 +1128,19 @@ mod tests {
     #[test]
     fn a_block_is_logged_when_it_changes_not_every_round() {
         let mut controller = Controller::default();
-        let installed = || Ok(kernel::Blocked { rules: 4 });
+        let installed = || {
+            Ok(kernel::Blocked {
+                rules: 14,
+                bridges: vec!["docker0".into()],
+            })
+        };
         let (level, message) = controller.record_block(installed()).unwrap();
         assert_eq!(level, "warning");
-        assert!(message.contains("目标的 Docker 容器不在其内"), "{message}");
+        assert!(
+            message.contains("目标的 Docker 网络（docker0）转发出去的流量也一并丢弃"),
+            "{message}"
+        );
+        assert!(containers_blocked(&[]).contains("不在其内"));
         assert_eq!(controller.record_block(installed()), None);
         let (level, message) = controller
             .record_block(Err("block:wsl_exit_failed".into()))
@@ -1117,7 +1156,7 @@ mod tests {
         assert!(controller.record_block(installed()).is_some());
         assert_eq!(
             controller.watch.block.as_ref().map(BlockState::view),
-            Some(serde_json::json!({"state": "installed", "error": null}))
+            Some(serde_json::json!({"state": "installed", "error": null, "bridges": ["docker0"]}))
         );
     }
 

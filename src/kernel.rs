@@ -130,8 +130,12 @@ pub fn anchor(p: &Plan) -> Result<bool, String> {
         .ok_or_else(|| "kernel_missing_anchor_result".into())
 }
 
-pub fn block(p: &Plan) -> Result<Blocked, String> {
-    invoke(p, "block", None)?
+///
+/// `bridges` are the target's Docker bridges seen during the takeover; the
+/// guest adds those its per-network rules, an earlier block and the target's
+/// dockerd show, and drops what they forward too.
+pub fn block(p: &Plan, bridges: &[String]) -> Result<Blocked, String> {
+    invoke_with(p, "block", None, Some(bridges))?
         .blocked
         .ok_or_else(|| "kernel_missing_block_result".into())
 }
@@ -166,6 +170,8 @@ struct Request<'a> {
     peer: Option<SocketAddrV4>,
     #[serde(skip_serializing_if = "Option::is_none")]
     deadline: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bridges: Option<&'a [String]>,
 }
 
 #[derive(Deserialize)]
@@ -197,14 +203,26 @@ struct Anchored {
     bound: bool,
 }
 
-/// What a block left: how many drop-only rules are in place (decision 33).
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+/// What a block left: how many drop-only rules are in place, and the
+/// target's Docker bridges whose forwarding they drop too (decision 33).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Blocked {
     pub rules: u32,
+    #[serde(default)]
+    pub bridges: Vec<String>,
 }
 
 fn invoke(p: &Plan, operation: &str, deadline: Option<u64>) -> Result<Response, String> {
+    invoke_with(p, operation, deadline, None)
+}
+
+fn invoke_with(
+    p: &Plan,
+    operation: &str,
+    deadline: Option<u64>,
+    bridges: Option<&[String]>,
+) -> Result<Response, String> {
     validate(p)?;
     let request = Request {
         operation,
@@ -212,6 +230,7 @@ fn invoke(p: &Plan, operation: &str, deadline: Option<u64>) -> Result<Response, 
         protocol: None,
         peer: None,
         deadline,
+        bridges,
     };
     let bytes = serde_json::to_vec(&request)
         .map_err(|error| format!("kernel_request_encoding_failed: {error}"))?;
@@ -563,7 +582,10 @@ mod tests {
             )
             .unwrap()
             .blocked,
-            Some(Blocked { rules: 4 })
+            Some(Blocked {
+                rules: 4,
+                bridges: Vec::new()
+            })
         );
         assert!(parse_response(r#"{"ok":true,"operation":"block"}"#, "block").is_err());
         // The anchor result belongs to the anchor operation only, and an

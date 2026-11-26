@@ -92,8 +92,14 @@ def endpoint6(value):
 
 def validate(request):
     fields = {"operation", "plan", "protocol", "peer"}
-    require(isinstance(request, dict) and set(request) in (fields, fields | {"deadline"}), "invalid_request")
+    require(isinstance(request, dict) and set(request) in (fields, fields | {"deadline"}, fields | {"bridges"}), "invalid_request")
     operation = request["operation"]
+    if "bridges" in request:
+        # The target's Docker bridges Windows saw during the takeover, for
+        # the block only (decision 33).
+        bridges = request["bridges"]
+        require(operation == "block" and isinstance(bridges, list) and len(bridges) <= 64, "invalid_block_bridges")
+        require(all(isinstance(name, str) and BRIDGE_NAME.fullmatch(name) and name not in ("eth0", "lo") for name in bridges), "invalid_block_bridges")
     require(operation in ("precheck", "arm", "install", "remove", "inspect", "lookup", "sync_networks", "block", "anchor"), "invalid_operation")
     require((operation == "arm") == ("deadline" in request), "unexpected_or_missing_grant_deadline")
     if operation == "arm":
@@ -576,6 +582,38 @@ def block_rules(p, ipv6=False):
         [*base, "-m", "conntrack", "--ctdir", "ORIGINAL", "!", "--ctorigdst", loopback, *comment, "-j", "DROP"],
         [*base, "!", "-d", loopback, "-m", "conntrack", "--ctstate", "INVALID,UNTRACKED", *comment, "-j", "DROP"],
     ]
+
+
+def block_forward_rules(p, bridges, ipv6=False):
+    """While blocked (decision 33), what the target's Docker bridges forward,
+    dropped in the gate's table: the drop-only rules match the target's own
+    processes by cgroup, which forwarded container traffic has none of.
+    Replies to connections opened into a container, traffic within the same
+    bridge and the scopes that never leave the host still pass."""
+    if p.get("system_dns") is None:
+        return []
+    comment = ["-m", "comment", "--comment", block_tag(p, ipv6)]
+    family = "v6" if ipv6 else "v4"
+    rules = []
+    for name in sorted(set(bridges)):
+        rules.append(["-A", "FORWARD", "-i", name, "-m", "conntrack", "--ctdir", "REPLY", *comment, "-j", "RETURN"])
+        rules.append(["-A", "FORWARD", "-i", name, "-o", name, *comment, "-j", "RETURN"])
+        rules.extend(["-A", "FORWARD", "-i", name, "-d", scope, *comment, "-j", "RETURN"] for scope in LOCAL_SCOPES[family])
+        rules.append(["-A", "FORWARD", "-i", name, *comment, "-j", "DROP"])
+    return rules
+
+
+def block_forward_owner(p, rule, ipv6=False):
+    """The bridge a block FORWARD rule of this instance is for, or None when
+    `rule` is not exactly one of them."""
+    names = [rule[index + 1] for index, token in enumerate(rule[:-1]) if token == "-i"]
+    if len(names) != 1 or not BRIDGE_NAME.fullmatch(names[0]) or names[0] in ("eth0", "lo"):
+        return None
+    try:
+        key = rule_key(rule)
+    except Failure:
+        return None
+    return names[0] if key in {rule_key(candidate) for candidate in block_forward_rules(p, [names[0]], ipv6)} else None
 
 
 def forward_gate(forward_chain, forward_bridges, comment, mark=None, ingress=None):
@@ -1081,7 +1119,11 @@ def inspect_firewall(p, tables, existing, ipv6=False, backend="nft"):
         for rule in table["rules"]:
             if blocking is not None and blocking in rule:
                 key = rule_key(rule)
-                require(name == "filter" and key in blocked, "foreign_instance_rule")
+                require(
+                    (name == "filter" and key in blocked)
+                    or (name == gate_table(backend) and rule[1] == "FORWARD" and block_forward_owner(p, rule, ipv6) is not None),
+                    "foreign_instance_rule",
+                )
                 require(existing, "instance_rule_collision")
                 require(key not in seen[name], "duplicate_instance_rule")
                 seen[name].add(key)
@@ -1979,19 +2021,35 @@ def execute(request):
                 # restart the old ones read the same but still match the
                 # cgroup namespace that is gone, and `--path /` resolves
                 # anew only when a rule goes in. A stop removes them.
+                # The target's containers forward without a cgroup; their
+                # bridges are what Windows saw during the takeover, what this
+                # takeover's per-network rules or an earlier block cover, and
+                # what the target's dockerd reports now if it answers.
                 require(p.get("system_dns") is not None, "block_needs_managed_mode")
+                bridges = set(request.get("bridges") or [])
+                found = {}
                 for ipv6 in (False, True):
-                    _, found = inspect_firewall(p, firewall(ipv6=ipv6), True, ipv6=ipv6)
-                    old = [["-D", *rule[1:]] for rule in found["filter"] if block_tag(p, ipv6) in rule]
-                    fresh = [["-I", rule[1], "1", *rule[2:]] for rule in reversed(block_rules(p, ipv6))]
-                    transaction("filter", old + fresh, ipv6=ipv6)
+                    _, found[ipv6] = inspect_firewall(p, firewall(ipv6=ipv6), True, ipv6=ipv6)
+                    bridges.update(installed_networks(p, found[ipv6], ipv6))
+                    bridges.update(filter(None, (block_forward_owner(p, rule, ipv6) for rule in found[ipv6]["mangle"] if block_tag(p, ipv6) in rule)))
+                try:
+                    bridges.update(docker_networks() or {})
+                except Failure:
+                    pass
+                insert = lambda rule: ["-I", rule[1], "1", *rule[2:]]
+                for ipv6 in (False, True):
+                    for table, wanted in (("filter", block_rules(p, ipv6)), ("mangle", block_forward_rules(p, bridges, ipv6))):
+                        old = [["-D", *rule[1:]] for rule in found[ipv6][table] if block_tag(p, ipv6) in rule]
+                        if old or wanted:
+                            transaction(table, old + [insert(rule) for rule in reversed(wanted)], ipv6=ipv6)
                 in_place = 0
                 for ipv6 in (False, True):
                     _, found = inspect_firewall(p, firewall(ipv6=ipv6), True, ipv6=ipv6)
-                    have = sorted(rule_key(rule) for rule in found["filter"] if block_tag(p, ipv6) in rule)
-                    require(have == sorted(rule_key(rule) for rule in block_rules(p, ipv6)), "block_not_in_place")
-                    in_place += len(have)
-                return {"ok": True, "operation": operation, "blocked": {"rules": in_place}}
+                    for table, wanted in (("filter", block_rules(p, ipv6)), ("mangle", block_forward_rules(p, bridges, ipv6))):
+                        have = sorted(rule_key(rule) for rule in found[table] if block_tag(p, ipv6) in rule)
+                        require(have == sorted(rule_key(rule) for rule in wanted), "block_not_in_place")
+                        in_place += len(have)
+                return {"ok": True, "operation": operation, "blocked": {"rules": in_place, "bridges": sorted(bridges)}}
             elif operation == "anchor":
                 # Decision 37: the probe found the rules no longer matching
                 # the target. Re-insert this instance's cgroup-matched OUTPUT

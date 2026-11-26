@@ -174,7 +174,9 @@ impl ProtectionWatch {
                     // rechecked this takeover, so a stop, which removes the
                     // block with the rest, can never have run in between.
                     if let Some(plan) = &outcome.block
-                        && let Some((level, message)) = guard.record_block(kernel::block(plan))
+                        && let bridges = guard.block_bridges(plan)
+                        && let Some((level, message)) =
+                            guard.record_block(kernel::block(plan, &bridges))
                     {
                         log(level, &message, None);
                     }
@@ -197,7 +199,11 @@ const DAEMON_LOCK_WAIT: Duration = Duration::from_secs(10);
 /// the block run under it, so a controller starting meanwhile (which would
 /// get `controller_busy` for those seconds) and any stop it runs come before
 /// or after, never in between. Logs only when the outcome changes.
-fn custodian_round(cookie: u32, store: &Option<PathBuf>, last: &mut Option<Result<(), String>>) {
+fn custodian_round(
+    cookie: u32,
+    store: &Option<PathBuf>,
+    last: &mut Option<Result<Vec<String>, String>>,
+) {
     // A live controller checks for itself; do not duplicate its guest calls.
     if host::acquire().is_err() {
         return;
@@ -214,19 +220,24 @@ fn custodian_round(cookie: u32, store: &Option<PathBuf>, last: &mut Option<Resul
     if !round.current() {
         return;
     }
-    let outcome = kernel::block(round.plan()).map(|_| ());
+    let outcome = kernel::block(round.plan(), &[]).map(|blocked| blocked.bridges);
     if last.as_ref() == Some(&outcome) {
         return;
     }
     if let Some(path) = store {
         let (level, message) = match &outcome {
-            Ok(()) => (
+            Ok(bridges) => (
                 "warning",
-                "后台不在，已由端口持有进程在目标里断网：目标本机进程新发起的连接一律丢弃（回环除外），目标的 Docker 容器不在其内。请重新连接后台，停止接管并恢复直连。".to_owned(),
+                format!(
+                    "后台不在，已由端口持有进程在目标里断网：目标本机进程新发起的连接一律丢弃（回环除外），{}。请重新连接后台，停止接管并恢复直连。",
+                    controller::containers_blocked(bridges)
+                ),
             ),
             Err(error) => (
                 "error",
-                format!("后台不在，端口持有进程在目标里断网失败（{error}），目标的新连接可能直连。请尽快重新连接后台并停止接管。"),
+                format!(
+                    "后台不在，端口持有进程在目标里断网失败（{error}），目标的新连接可能直连。请尽快重新连接后台并停止接管。"
+                ),
             ),
         };
         let _ = desktop_store::append_runtime_log(
