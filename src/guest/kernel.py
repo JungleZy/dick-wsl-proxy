@@ -1045,7 +1045,34 @@ def transaction(table, lines, test=False, ipv6=False):
     run(arguments, document)
 
 
-def install_rules(p, test=False):
+# Reading the target's Docker networks at install: a few tries, so a dockerd
+# whose API is not up yet right after the target booted is still covered from
+# the first commit. Bounded well inside the 30 s guest deadline (3 s a read).
+INSTALL_NETWORK_TRIES = 4
+INSTALL_NETWORK_PAUSE = 1
+
+
+def install_networks(p, pause=time.sleep):
+    """The target's Docker networks to commit with the base rules (decision
+    24), {} when no dockerd runs here, or None when a running dockerd still
+    cannot be read: then only the base rules go in and the sync that follows
+    reports the failure, as before."""
+    if p.get("system_dns") is None:
+        return {}
+    for attempt in range(INSTALL_NETWORK_TRIES):
+        try:
+            return docker_networks() or {}
+        except Failure:
+            if attempt + 1 < INSTALL_NETWORK_TRIES:
+                pause(INSTALL_NETWORK_PAUSE)
+    return None
+
+
+def install_rules(p, test=False, networks=None):
+    """Commits this instance's rules. `networks` (managed mode only) adds the
+    per-network rules to the same transactions, placed exactly where a
+    following `sync_networks` would put them, so the target's containers are
+    never forwarded unredirected between the two."""
     chain, _, hooks, body, guards = artifacts(p)
     insert = lambda rule: ["-I", rule[1], "1", *rule[2:]]
     builtin = ("PREROUTING", "INPUT", "FORWARD", "OUTPUT", "POSTROUTING")
@@ -1061,23 +1088,32 @@ def install_rules(p, test=False):
             *(insert(rule) for rule in reversed([rule for rule in rules if rule[1] in builtin])),
         ]
 
+    def with_networks(base, table, ipv6=False):
+        # As in sync_networks: each -I ... 1 lands on top, so they go in
+        # backwards to keep the subnet RETURNs ahead of their jump or drop.
+        if not networks:
+            return base
+        nat, filtered = network_rules(p, networks, ipv6)
+        return base + [insert(rule) for rule in reversed(nat if table == "nat" else filtered)]
+
     # Guards commit before redirection. An interrupted installation denies only
     # target workload traffic; the journal can recover either partial phase.
     if p.get("system_dns") is not None:
-        transaction("filter", lines(instance_chains(p), "filter", guards), test)
+        transaction("filter", with_networks(lines(instance_chains(p), "filter", guards), "filter"), test)
         v6_owned = instance_chains(p, ipv6=True)
         if p.get("ipv6") is not None:
             _, _, _, v6_hooks, v6_body, v6_guards = ipv6_artifacts(p)
             # Like IPv4: the OUTPUT jumps go ahead of pre-existing accepts, or
             # ICMPv6 and other non-TCP/UDP packets could leave before the drop.
-            transaction("filter", lines(v6_owned, "filter", v6_guards), test, ipv6=True)
-            transaction("nat", lines(v6_owned, "nat", v6_body + v6_hooks), test, ipv6=True)
+            transaction("filter", with_networks(lines(v6_owned, "filter", v6_guards), "filter", ipv6=True), test, ipv6=True)
+            transaction("nat", with_networks(lines(v6_owned, "nat", v6_body + v6_hooks), "nat", ipv6=True), test, ipv6=True)
         else:
-            transaction("filter", lines(v6_owned, "filter", ipv6_guards(p)), test, ipv6=True)
+            transaction("filter", with_networks(lines(v6_owned, "filter", ipv6_guards(p)), "filter", ipv6=True), test, ipv6=True)
+        # -N fails on a concurrent name collision; never flush an existing chain.
+        transaction("nat", with_networks(lines(instance_chains(p), "nat", body + hooks), "nat"), test)
     else:
         transaction("filter", [insert(rule) for rule in guards], test)
-    # -N fails on a concurrent name collision; never flush an existing chain.
-    transaction("nat", lines(instance_chains(p), "nat", body + hooks), test)
+        transaction("nat", lines(instance_chains(p), "nat", body + hooks), test)
 
 
 # nfnetlink_conntrack UAPI. All CTA scalar payloads below are network-order;
@@ -1658,10 +1694,13 @@ def execute(request):
                     inspect_firewall(p, firewall(ipv6=True), False, ipv6=True)
                 require(not inspect_mappings(p, ct), "instance_connmark_collision")
                 require(not inspect_ipv6_mappings(p, ct), "instance_ipv6_connmark_collision")
+                # Read before anything commits, so the retries never sit
+                # between the guards and the redirection.
+                networks = install_networks(p) if operation == "install" else None
                 # --test checks extension support without committing any table.
-                install_rules(p, test=True)
+                install_rules(p, test=True, networks=networks)
                 if operation == "install":
-                    install_rules(p)
+                    install_rules(p, networks=networks)
                 else:
                     # Windows and the WSL VM need not agree on wall-clock seconds.
                     # Issue and validate in the guest; RPC transit can only shorten the window.

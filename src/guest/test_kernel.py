@@ -1522,6 +1522,103 @@ class ContainerNetworkTests(unittest.TestCase):
         result, calls = self.sync(p, tables, tables6, old)
         self.assertEqual((result["synced"]["added"], result["synced"]["removed"], calls), ([], [], []))
 
+    def installed(self, p, networks):
+        """The tables `install_rules` leaves behind, applied as iptables
+        would apply each restore document in order."""
+        state = {"v4": {}, "v6": {}}
+
+        def apply(table, lines, test=False, ipv6=False):
+            if test:
+                return
+            current = state["v6" if ipv6 else "v4"].setdefault(table, {"chains": {"OUTPUT": "ACCEPT"}, "rules": []})
+            rules = current["rules"]
+            for line in lines:
+                if line[0] == "-N":
+                    self.assertNotIn(line[1], current["chains"])
+                    current["chains"][line[1]] = "-"
+                elif line[0] == "-A":
+                    rules.append(list(line))
+                elif line[0] == "-I":
+                    self.assertEqual(line[2], "1")
+                    first = next((index for index, rule in enumerate(rules) if rule[1] == line[1]), len(rules))
+                    rules.insert(first, ["-A", line[1], *line[3:]])
+                else:
+                    self.fail(line)
+
+        with patch.object(kernel, "transaction", side_effect=apply) as transact:
+            kernel.install_rules(p, networks=networks)
+        return state, [(call.args[0], call.kwargs.get("ipv6", False)) for call in transact.call_args_list]
+
+    def test_install_commits_the_network_rules_with_the_base_rules(self):
+        for ipv6 in (None, {"guest": "2001:db8:1::2", "ingress": "[fe80::1%2]:43771"}):
+            with self.subTest(managed_ipv6=ipv6 is not None):
+                p = comprehensive_plan()
+                p["ipv6"] = ipv6
+                state, order = self.installed(p, WANTED)
+                # Still drops before redirection, IPv4 nat last.
+                self.assertEqual(order[0], ("filter", False))
+                self.assertEqual(order[-1], ("nat", False))
+                present, rules = kernel.inspect_firewall(p, state["v4"], True)
+                _, ipv6_rules = kernel.inspect_firewall(p, state["v6"], True, ipv6=True)
+                self.assertTrue(kernel.rules_complete(p, present, rules, ipv6_rules))
+                # Exactly what a sync right after would want: nothing to add or remove.
+                self.assertEqual(kernel.network_changes(p, rules, WANTED), ([], []))
+                self.assertEqual(kernel.network_changes(p, ipv6_rules, WANTED, ipv6=True), ([], []))
+                self.assertEqual(sorted(kernel.installed_networks(p, rules)), sorted(WANTED))
+                # And the same rules a base install followed by a sync leaves.
+                base, _ = self.installed(p, None)
+                self.assertEqual(kernel.installed_networks(p, {table: base["v4"][table]["rules"] for table in base["v4"]}), {})
+                for family in ("v4", "v6"):
+                    for table in state[family]:
+                        merged = with_networks(copy.deepcopy(base[family]), p, WANTED, ipv6=family == "v6")
+                        self.assertEqual(sorted(map(kernel.rule_key, state[family][table]["rules"])), sorted(map(kernel.rule_key, merged[table]["rules"])), (family, table))
+
+    def test_install_without_networks_commits_only_the_base_rules(self):
+        p = comprehensive_plan()
+        for networks in (None, {}):
+            with self.subTest(networks=networks):
+                state, _ = self.installed(p, networks)
+                expected = snapshot(p)
+                self.assertEqual(sorted(map(kernel.rule_key, state["v4"]["nat"]["rules"])), sorted(map(kernel.rule_key, expected["nat"]["rules"])))
+                self.assertEqual(sorted(map(kernel.rule_key, state["v4"]["filter"]["rules"])), sorted(map(kernel.rule_key, expected["filter"]["rules"])))
+
+    def test_install_retries_a_dockerd_that_is_not_answering_yet(self):
+        p = comprehensive_plan()
+        pauses = []
+        failure = kernel.Failure("docker_networks_unavailable")
+        with patch.object(kernel, "docker_networks", side_effect=[failure, kernel.Failure("docker_socket_missing"), WANTED]) as ask:
+            self.assertEqual(kernel.install_networks(p, pause=pauses.append), WANTED)
+        self.assertEqual(ask.call_count, 3)
+        self.assertEqual(pauses, [kernel.INSTALL_NETWORK_PAUSE] * 2)
+        # Gives up after a bounded number of tries: base rules only, the
+        # following sync reports the failure.
+        pauses.clear()
+        with patch.object(kernel, "docker_networks", side_effect=failure) as ask:
+            self.assertIsNone(kernel.install_networks(p, pause=pauses.append))
+        self.assertEqual(ask.call_count, kernel.INSTALL_NETWORK_TRIES)
+        self.assertLessEqual(kernel.INSTALL_NETWORK_TRIES * 3 + len(pauses) * kernel.INSTALL_NETWORK_PAUSE, 20)
+        # No dockerd: nothing to cover, no retry.
+        with patch.object(kernel, "docker_networks", return_value=None) as ask:
+            self.assertEqual(kernel.install_networks(p, pause=pauses.append), {})
+        self.assertEqual(ask.call_count, 1)
+        # Scoped mode never reads Docker.
+        with patch.object(kernel, "docker_networks") as ask:
+            self.assertEqual(kernel.install_networks(plan()), {})
+        ask.assert_not_called()
+
+    def test_only_the_install_itself_reads_the_networks(self):
+        p = comprehensive_plan()
+        for operation_name, reads in (("precheck", False), ("install", True)):
+            with self.subTest(operation=operation_name):
+                operation = request(p)
+                operation["operation"] = operation_name
+                with patch.object(kernel, "guest_lock"), patch.object(kernel, "guard"), patch.object(kernel, "grant"), patch.object(kernel, "Conntrack"), patch.object(kernel, "firewall", return_value={}), patch.object(kernel, "inspect_firewall"), patch.object(kernel, "inspect_mappings", return_value=[]), patch.object(kernel, "inspect_ipv6_mappings", return_value=[]), patch.object(kernel, "install_networks", return_value=WANTED) as ask, patch.object(kernel, "install_rules") as install:
+                    kernel.execute(operation)
+                self.assertEqual(ask.called, reads)
+                expected = WANTED if reads else None
+                self.assertTrue(all(call.kwargs.get("networks") == expected for call in install.call_args_list))
+                self.assertEqual([call.kwargs.get("test", False) for call in install.call_args_list], [True, False] if reads else [True])
+
     def test_sync_extends_only_a_complete_takeover_of_this_identity(self):
         p = comprehensive_plan()
         partial = snapshot(p)
