@@ -952,6 +952,11 @@ fn empty_note(message: impl Into<SharedString>) -> Div {
 /// 没有正常结束不是一回事：前者说明此刻目标的新连接可能已不经代理。
 /// 措辞和后台运行日志（`protection_lost_message`）一致。
 fn recovery_reason(issue: &str, target: &str) -> String {
+    if issue.starts_with("managed_install_unverified:container_networks_unavailable") {
+        return format!(
+            "{target}：读不出目标里 Docker 的网络，目标本机的流量已阻断，但目标的容器没有被拦住，可能直连。请停止接管并恢复直连，确认 Docker 正常后再启动。"
+        );
+    }
     let Some(lost) = issue.strip_prefix("protection_lost: ") else {
         return format!("{target} 的上次接管没有正常结束，请停止接管并恢复直连。");
     };
@@ -1052,6 +1057,13 @@ mod tests {
         assert_eq!(
             recovery_reason("managed_readiness_failed: dns", "Dev"),
             "Dev 的上次接管没有正常结束，请停止接管并恢复直连。"
+        );
+        assert!(
+            recovery_reason(
+                "managed_install_unverified:container_networks_unavailable:install:docker_networks_unavailable; ingress_stop:None",
+                "Dev"
+            )
+            .starts_with("Dev：读不出目标里 Docker 的网络，目标本机的流量已阻断，但目标的容器没有被拦住，可能直连。")
         );
     }
 

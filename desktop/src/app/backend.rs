@@ -342,7 +342,7 @@ fn humanize_code(code: &str, message: &str) -> String {
             "同一源端口的上一条连接还没关闭完，新连接被直接断开，不会直连；应用重试即可。".into()
         }
         "managed_install_unverified" if message.contains("container_networks_unavailable") => {
-            "目标里的 Docker 正在运行，但读不出它的网络，无法确认容器流量会经代理，接管没有生效；当前状态需要恢复。请先停止并恢复直连，确认 Docker 正常后再启动。".into()
+            "目标里的 Docker 正在运行，但读不出它的网络，接管没有生效：目标本机的流量已阻断，但目标的容器没有被拦住，可能直连。请先停止并恢复直连，确认 Docker 正常后再启动。".into()
         }
         "managed_install_unverified" => {
             "接管规则安装结果未确认，当前状态需要恢复；请先停止并恢复直连后重试。".into()
@@ -1035,6 +1035,12 @@ mod tests {
                 "controller_error · managed_install_unverified:container_networks_unavailable:docker_networks_unavailable; ingress_stop:None"
             )
             .starts_with("目标里的 Docker 正在运行，但读不出它的网络")
+        );
+        assert!(
+            humanize_error(
+                "managed_install_unverified:container_networks_unavailable:docker_networks_unavailable"
+            )
+            .contains("目标的容器没有被拦住，可能直连")
         );
         assert!(
             humanize_error("managed_install_unverified:install:wsl_exit_failed")

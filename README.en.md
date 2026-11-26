@@ -77,7 +77,7 @@ It is not a general-purpose VPN: it handles one WSL2 distribution, and the backe
 
 UDP never goes direct on purpose: a web page could use an allowlisted STUN server through WebRTC to learn the real Windows exit IP.
 
-**Docker containers**: only the target's Docker bridge networks are covered, and a network created during a takeover is covered within about 30 seconds. The target can still reach its own containers, and published ports stay reachable from Windows through `localhost`; a new network works only once it is covered, e.g. in the first seconds after `docker compose up`. Containers of other runtimes such as Podman are not proxied, and other distributions' containers are left alone.
+**Docker containers**: only the target's Docker bridge networks are covered, and a network created during a takeover is covered within about 30 seconds. The target can still reach its own containers, and published ports stay reachable from Windows through `localhost`; a new network works only once it is covered, e.g. in the first seconds after `docker compose up`. Containers of other runtimes such as Podman are not proxied, and other distributions' containers are left alone. If the target's Docker is running but its networks cannot be read when a takeover starts (for example its API never answers), the start fails and the takeover needs recovery: the target's own traffic is blocked, but **the target's containers are not stopped and may connect directly** until you stop the takeover.
 
 ### How names are resolved
 
