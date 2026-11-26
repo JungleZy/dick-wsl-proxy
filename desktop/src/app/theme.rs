@@ -40,6 +40,10 @@ pub(crate) const STATUS_OK: u32 = 0x1f9d50;
 pub(crate) const STATUS_WARN: u32 = 0xd97706;
 pub(crate) const STATUS_ERROR: u32 = 0xd71019;
 pub(crate) const STATUS_OFF: u32 = 0xa3b0a7;
+/// 托盘图标「未接管」的盾牌色。托盘不跟随界面主题、不经过 `resolve_color`，
+/// 任务栏可能浅也可能深，所以比 `STATUS_OFF` 深一档，浅色任务栏上也看得清。
+/// 其余状态直接用 `STATUS_OK`、`STATUS_WARN`、`STATUS_ERROR` 的白天值。
+pub(crate) const TRAY_IDLE: u32 = 0x86938b;
 /// 首页流量图的上行（亮绿）；下行用正文色 `INK`，两条线靠明暗分开。
 pub(crate) const CHART_UP: u32 = 0x2fa85a;
 /// 「直连」路由：没走代理链，用中性的石板蓝，免得和强调色、「双跳」的绿色混在一起。

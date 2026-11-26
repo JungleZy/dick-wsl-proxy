@@ -737,6 +737,8 @@ impl Desktop {
         // 托盘动作放在关加载框之后：`close_dialog` 关的是最上层的对话框，
         // 托盘「停止」在同一帧打开的确认框会被当成加载框关掉，留下关不掉的加载框。
         self.handle_tray_action(window, cx);
+        // 每次都发布：窗口藏在托盘里时不重绘，托盘图标只能靠这里跟上状态。
+        super::tray::publish(self.tray_snapshot());
         // 退出进行中不轮询：后台关闭后再查状态只会报连不上。
         if !self.exiting && self.last_poll.elapsed() >= STATUS_POLL_INTERVAL {
             self.last_poll = Instant::now();
@@ -1358,36 +1360,64 @@ impl Desktop {
     }
 
     /// 托盘菜单的动作。退出进行中不再响应：后台可能已经关闭。
+    /// 菜单是按点开那一刻的状态画的，到这里状态可能已经变了，所以每个动作照旧自己检查。
     fn handle_tray_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(action) = super::tray::consume_action().filter(|_| !self.exiting) {
-            match action {
-                super::tray::TrayAction::Exit => self.request_exit(cx),
-                super::tray::TrayAction::Refresh => self.refresh_or_reconnect(cx),
-                super::tray::TrayAction::Start => {
-                    self.page = Page::Overview;
-                    match self.phase() {
-                        "idle" => self.prepare(Kind::Start, window, cx),
-                        "unknown" => self.fail("后台状态未确认，请先刷新。", cx),
-                        _ => self.fail("当前已有接管任务，请先停止接管并恢复直连。", cx),
-                    }
+        use super::tray::Command;
+        let Some(action) = super::tray::consume_action().filter(|_| !self.exiting) else {
+            return;
+        };
+        match action {
+            // 托盘自己打开窗口，不经过界面。
+            Command::Open => {}
+            Command::Exit => self.request_exit(cx),
+            Command::Reconnect => self.refresh_or_reconnect(cx),
+            Command::ChooseTarget => self.open_page(Page::Environment, cx),
+            Command::GoSave => self.open_page(self.unsaved_page(), cx),
+            Command::Connections => self.open_page(Page::Connection, cx),
+            Command::Logs => self.open_page(Page::Logs, cx),
+            Command::Start => {
+                self.page = Page::Overview;
+                match self.phase() {
+                    "idle" => self.prepare(Kind::Start, window, cx),
+                    "unknown" => self.fail("后台状态未确认，请先刷新。", cx),
+                    _ => self.fail("当前已有接管任务，请先停止接管并恢复直连。", cx),
                 }
-                super::tray::TrayAction::Stop => {
-                    self.page = Page::Overview;
-                    if self.phase() == "idle" {
-                        self.notice = "当前没有正在接管的目标。".into();
-                        self.error = false;
-                        self.reminder = Some(Reminder {
-                            message: self.notice.clone(),
-                            warning: false,
-                        });
-                        cx.notify();
-                    } else {
-                        self.prepare(Kind::Stop, window, cx);
-                    }
+            }
+            Command::Stop => {
+                self.page = Page::Overview;
+                if self.phase() == "idle" {
+                    self.notice = "当前没有正在接管的目标。".into();
+                    self.error = false;
+                    self.reminder = Some(Reminder {
+                        message: self.notice.clone(),
+                        warning: false,
+                    });
+                    cx.notify();
+                } else {
+                    self.prepare(Kind::Stop, window, cx);
                 }
-                super::tray::TrayAction::Probe => {
-                    self.page = Page::Connection;
-                    self.probe(cx);
+            }
+            Command::Abandon => {
+                self.page = Page::Overview;
+                if self.target_gone() {
+                    self.prepare(Kind::Abandon, window, cx);
+                } else {
+                    self.fail(
+                        "目标发行版仍在 WSL 注册表里，不需要放弃记录；请用「停止并恢复直连」。",
+                        cx,
+                    );
+                }
+            }
+            Command::Probe => {
+                self.page = Page::Connection;
+                self.probe(cx);
+            }
+            Command::Autostart => {
+                let wanted = !self.autostart_enabled;
+                self.set_autostart(wanted, cx);
+                // 没改成：窗口还藏在托盘里，叫出来让用户看到错误条。
+                if self.autostart_enabled != wanted {
+                    super::tray::show_main_window();
                 }
             }
         }

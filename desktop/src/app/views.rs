@@ -295,6 +295,20 @@ impl Desktop {
             )
     }
 
+    /// 切到某一页，并像从侧栏进入一样读这一页需要的数据。侧栏、首页主按钮和托盘菜单共用。
+    pub(crate) fn open_page(&mut self, page: Page, cx: &mut Context<Self>) {
+        self.page = page;
+        match page {
+            Page::Overview => self.refresh_events(cx),
+            // 切到环境页不自动读详情：读详情要在发行版里跑检查，没启动的会被拉起来。
+            Page::Environment | Page::Policy => {}
+            Page::Connection => self.refresh_connection_history(cx),
+            Page::Logs => self.refresh_logs(cx),
+            Page::Settings => self.check_wsl_platform(cx),
+        }
+        cx.notify();
+    }
+
     fn nav_button(
         &self,
         page: Page,
@@ -311,7 +325,6 @@ impl Desktop {
             Page::Logs => "nav-logs",
             Page::Settings => "nav-settings",
         };
-        let key_page = page;
         let icon_color = if self.page == page { ACCENT } else { MUTED };
         let mut button = div()
             .id(id)
@@ -328,31 +341,10 @@ impl Desktop {
             .px(px(6.))
             .rounded_md()
             .text_sm()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.page = page;
-                match page {
-                    Page::Overview => this.refresh_events(cx),
-                    // 切到环境页不自动读详情：读详情要在发行版里跑检查，没启动的会被拉起来。
-                    Page::Environment => {}
-                    Page::Connection => this.refresh_connection_history(cx),
-                    Page::Logs => this.refresh_logs(cx),
-                    Page::Settings => this.check_wsl_platform(cx),
-                    _ => {}
-                }
-                cx.notify();
-            }))
+            .on_click(cx.listener(move |this, _, _, cx| this.open_page(page, cx)))
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                 if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                    this.page = key_page;
-                    match key_page {
-                        Page::Overview => this.refresh_events(cx),
-                        Page::Environment => {}
-                        Page::Connection => this.refresh_connection_history(cx),
-                        Page::Logs => this.refresh_logs(cx),
-                        Page::Settings => this.check_wsl_platform(cx),
-                        _ => {}
-                    }
-                    cx.notify();
+                    this.open_page(page, cx);
                 }
             }));
         button = if self.page == page {
