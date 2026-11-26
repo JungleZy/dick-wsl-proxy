@@ -311,6 +311,7 @@ impl Desktop {
             residential_probe_checking: false,
             save_notice: None,
             reminder: None,
+            island_enabled: super::island::enabled_preference(),
             updater: super::update::Updater::new(),
         };
         this.send(Kind::Bootstrap, Value::Null, cx);
@@ -737,8 +738,18 @@ impl Desktop {
         // 托盘动作放在关加载框之后：`close_dialog` 关的是最上层的对话框，
         // 托盘「停止」在同一帧打开的确认框会被当成加载框关掉，留下关不掉的加载框。
         self.handle_tray_action(window, cx);
-        // 每次都发布：窗口藏在托盘里时不重绘，托盘图标只能靠这里跟上状态。
-        super::tray::publish(self.tray_snapshot());
+        // 每次都发布：窗口藏在托盘里时不重绘，托盘图标和状态岛只能靠这里跟上状态。
+        let snapshot = self.tray_snapshot();
+        let rates = self
+            .traffic_history
+            .last()
+            .map(|sample| super::island::Rates {
+                up: sample.tx,
+                down: sample.rx,
+            });
+        let details = self.island_details();
+        super::island::sync(&snapshot, rates, details, super::theme::is_dark(), cx);
+        super::tray::publish(snapshot);
         // 退出进行中不轮询：后台关闭后再查状态只会报连不上。
         if !self.exiting && self.last_poll.elapsed() >= STATUS_POLL_INTERVAL {
             self.last_poll = Instant::now();
@@ -769,6 +780,7 @@ impl Desktop {
             push_save_notice(result, window, cx);
         }
         if let Some(reminder) = self.reminder.take() {
+            super::island::notify(&reminder.message, reminder.warning, cx);
             push_reminder(reminder, window, cx);
         }
         if matches!(
@@ -1411,6 +1423,10 @@ impl Desktop {
             Command::Probe => {
                 self.page = Page::Connection;
                 self.probe(cx);
+            }
+            Command::Island => {
+                let wanted = !self.island_enabled;
+                self.set_island(wanted, cx);
             }
             Command::Autostart => {
                 let wanted = !self.autostart_enabled;

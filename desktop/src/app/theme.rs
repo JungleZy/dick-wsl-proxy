@@ -89,7 +89,7 @@ const DARK_SELECTION: u32 = 0x1c3f28;
 const DARK_CHART_UP: u32 = 0x47c86d;
 const DARK_ROUTE_DIRECT: u32 = 0x9db6d3;
 const DARK_ROUTE_DIRECT_BG: u32 = 0x1c2430;
-const PREFERENCES_KEY: &str = "Software\\WSLProxyLab";
+pub(crate) const PREFERENCES_KEY: &str = "Software\\WSLProxyLab";
 const THEME_VALUE: &str = "DesktopTheme";
 
 static DARK_MODE: AtomicBool = AtomicBool::new(false);

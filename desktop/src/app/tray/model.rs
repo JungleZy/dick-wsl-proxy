@@ -66,7 +66,7 @@ pub(crate) enum Primary {
 }
 
 impl Primary {
-    fn command(self) -> Command {
+    pub(crate) fn command(self) -> Command {
         match self {
             Self::Reconnect => Command::Reconnect,
             Self::ChooseTarget => Command::ChooseTarget,
@@ -78,7 +78,7 @@ impl Primary {
     }
 
     /// 只是带用户去某一页，不发请求，界面忙的时候也能点。
-    fn navigates(self) -> bool {
+    pub(crate) fn navigates(self) -> bool {
         matches!(self, Self::ChooseTarget | Self::GoSave)
     }
 }
@@ -94,6 +94,8 @@ pub(crate) struct Snapshot {
     /// 这时会发请求的菜单项置灰：点了界面也会拒绝。
     pub(crate) busy: Option<String>,
     pub(crate) autostart: bool,
+    /// 屏幕顶部状态岛是否打开。
+    pub(crate) island: bool,
 }
 
 impl Snapshot {
@@ -104,6 +106,7 @@ impl Snapshot {
         primary: Primary::Reconnect,
         busy: None,
         autostart: false,
+        island: true,
     };
 
     /// 一行状态，例如「接管中 · Ubuntu-24.04」。
@@ -139,11 +142,12 @@ pub(crate) enum Command {
     Connections,
     Logs,
     Autostart,
+    Island,
     Exit,
 }
 
 impl Command {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::Open,
         Self::Reconnect,
         Self::ChooseTarget,
@@ -155,6 +159,7 @@ impl Command {
         Self::Connections,
         Self::Logs,
         Self::Autostart,
+        Self::Island,
         Self::Exit,
     ];
 
@@ -171,7 +176,7 @@ impl Command {
             .copied()
     }
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Open => "打开 WSL Proxy",
             Self::Reconnect => "重新连接后台",
@@ -184,6 +189,7 @@ impl Command {
             Self::Connections => "查看连接记录",
             Self::Logs => "查看运行日志",
             Self::Autostart => "开机自动启动",
+            Self::Island => "显示顶部状态岛",
             Self::Exit => "退出",
         }
     }
@@ -244,6 +250,13 @@ pub(crate) fn menu(snapshot: &Snapshot) -> Vec<Entry> {
             label: Command::Autostart.label(),
             enabled: true,
             checked: snapshot.autostart,
+            default: false,
+        },
+        Entry::Item {
+            command: Command::Island,
+            label: Command::Island.label(),
+            enabled: true,
+            checked: snapshot.island,
             default: false,
         },
         Entry::Separator,
@@ -379,24 +392,27 @@ mod tests {
     }
 
     #[test]
-    fn the_autostart_item_shows_the_current_setting() {
-        let checked = |autostart| {
-            menu(&Snapshot {
-                autostart,
-                ..Snapshot::INITIAL
-            })
-            .into_iter()
-            .find_map(|entry| match entry {
+    fn the_autostart_and_island_items_show_the_current_settings() {
+        let checked = |snapshot: Snapshot, wanted: Command| {
+            menu(&snapshot).into_iter().find_map(|entry| match entry {
                 Entry::Item {
-                    command: Command::Autostart,
-                    checked,
-                    ..
-                } => Some(checked),
+                    command, checked, ..
+                } if command == wanted => Some(checked),
                 _ => None,
             })
         };
-        assert_eq!(checked(true), Some(true));
-        assert_eq!(checked(false), Some(false));
+        for on in [true, false] {
+            let autostart = Snapshot {
+                autostart: on,
+                ..Snapshot::INITIAL
+            };
+            assert_eq!(checked(autostart, Command::Autostart), Some(on));
+            let island = Snapshot {
+                island: on,
+                ..Snapshot::INITIAL
+            };
+            assert_eq!(checked(island, Command::Island), Some(on));
+        }
     }
 
     #[test]

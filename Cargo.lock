@@ -8127,6 +8127,7 @@ version = "0.1.12"
 dependencies = [
  "embed-resource",
  "gpui-kit",
+ "raw-window-handle",
  "serde_json",
  "windows-sys 0.61.2",
  "winreg 0.55.0",

@@ -65,6 +65,31 @@ impl Desktop {
         }
     }
 
+    /// 打开或关掉屏幕顶部状态岛。偏好写不进去时照样切换这一次，只是下次启动恢复原样。
+    pub(crate) fn set_island(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if enabled {
+            super::island::open(cx);
+        } else {
+            super::island::close(cx);
+        }
+        self.island_enabled = enabled;
+        match super::island::persist_enabled(enabled) {
+            Ok(()) => {
+                self.notice = if enabled {
+                    "已打开屏幕顶部状态岛。".into()
+                } else {
+                    "已关闭屏幕顶部状态岛。".into()
+                };
+                self.error = false;
+                cx.notify();
+            }
+            Err(error) => self.fail(
+                format!("状态岛设置没能保存，下次启动会恢复原样：{error}"),
+                cx,
+            ),
+        }
+    }
+
     pub(crate) fn fail(&mut self, error: impl Into<String>, cx: &mut Context<Self>) {
         self.notice = super::backend::humanize_error(&error.into());
         self.error = true;

@@ -2430,6 +2430,8 @@ impl Desktop {
         // 开机自启沿用已经配好主题色的 Checkbox；gpui-kit 的 Switch 颜色没有跟应用主题设置。
         let autostart = self.autostart_enabled;
         let autostart_view = view.clone();
+        let island = self.island_enabled;
+        let island_view = view.clone();
         let runtime = SettingPage::new("桌面运行").resettable(false).group(
             SettingGroup::new()
                 .item(setting_row("开机自动启动", move |_| {
@@ -2440,6 +2442,14 @@ impl Desktop {
                         .on_click(move |checked: &bool, _, cx: &mut App| {
                             view.update(cx, |this, cx| this.set_autostart(*checked, cx));
                         })
+                }))
+                .item(setting_row("屏幕顶部状态岛", move |_| {
+                    let view = island_view.clone();
+                    Checkbox::new("settings-island").checked(island).on_click(
+                        move |checked: &bool, _, cx: &mut App| {
+                            view.update(cx, |this, cx| this.set_island(*checked, cx));
+                        },
+                    )
                 }))
                 .item(value_item("关闭窗口", "隐藏到托盘"))
                 .item(value_item("托盘退出", "停止接管并关闭后台"))

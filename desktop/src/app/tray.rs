@@ -149,7 +149,7 @@ pub(crate) fn quit_application() -> bool {
     unsafe { PostMessageW(main, WM_CLOSE, 0, 0) != 0 }
 }
 
-fn request_action(command: Command) {
+pub(crate) fn request_action(command: Command) {
     *ACTION.lock().unwrap_or_else(PoisonError::into_inner) = Some(command);
 }
 
@@ -461,6 +461,8 @@ fn show_menu(hwnd: HWND) {
         Some(Command::Open) => show_main_window(),
         // 勾选即生效，不用打开窗口；失败时界面会把窗口叫出来说明原因。
         Some(Command::Autostart) => request_action(Command::Autostart),
+        // 开关状态岛同样不用打开窗口。
+        Some(Command::Island) => request_action(Command::Island),
         // 其余命令要在窗口里确认或显示结果。退出也不直接关窗：
         // 后台要先停止接管、关闭，界面确认后才真正退出。
         Some(command) => {
@@ -493,7 +495,9 @@ fn find_main_window(excluded: HWND) -> HWND {
         };
         let is_tray_window = class_length > 0
             && String::from_utf16_lossy(&class[..class_length as usize]) == TRAY_CLASS;
-        if pid == search.pid && hwnd != search.excluded && !is_tray_window {
+        // 状态岛和主窗口同属这个进程、同一个 gpui 窗口类，只能按句柄排除。
+        let is_island = hwnd == super::island::hwnd();
+        if pid == search.pid && hwnd != search.excluded && !is_tray_window && !is_island {
             search.hwnd = hwnd;
             0
         } else {

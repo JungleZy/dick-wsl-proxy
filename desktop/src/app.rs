@@ -14,6 +14,7 @@ mod drafts;
 mod environment_facts;
 mod instance;
 mod integrity;
+mod island;
 mod model;
 mod overview;
 mod policy;
@@ -53,8 +54,8 @@ pub fn run() {
             options.window_min_size = Some(size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)));
             let opened = gpui_kit::open_window(options, cx, |window, cx| {
                 window.set_window_title(TITLE);
-                window.on_window_should_close(cx, |_window, _cx| {
-                    if tray::consume_exit_request() {
+                window.on_window_should_close(cx, |_window, cx| {
+                    let closing = if tray::consume_exit_request() {
                         true
                     } else if tray::ready() {
                         tray::hide_main_window();
@@ -63,7 +64,12 @@ pub fn run() {
                         // 托盘图标没显示：藏起来就找不回窗口，所以照常关闭。
                         // 后台留着，再次打开 EXE 会重新连上。
                         true
+                    };
+                    // 岛也是 gpui 窗口：它还开着，主窗口关了进程也不会退出。
+                    if closing {
+                        island::close(cx);
                     }
+                    closing
                 });
                 cx.new(|cx| Desktop::new(window, cx))
             });
@@ -80,6 +86,9 @@ pub fn run() {
                 return;
             }
             tray::start();
+            if island::enabled_preference() {
+                island::open(cx);
+            }
             cx.activate(true);
         });
 }
