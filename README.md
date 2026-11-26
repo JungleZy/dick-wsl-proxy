@@ -8,7 +8,7 @@ Windows 桌面端 `wsl-proxy-desktop` · 控制器与命令行 `wsl-proxyctl`
 
 ![平台](https://img.shields.io/badge/平台-Windows%20x64-0078D6)
 ![WSL](https://img.shields.io/badge/WSL2-NAT%20模式-4E9A06)
-![源码版本](https://img.shields.io/badge/源码版本-0.1.12-informational)
+![源码版本](https://img.shields.io/badge/源码版本-0.1.13-informational)
 [![最新发布](https://img.shields.io/github/v/release/JungleZy/dick-wsl-proxy?include_prereleases&label=最新发布)](https://github.com/JungleZy/dick-wsl-proxy/releases)
 ![Rust](https://img.shields.io/badge/Rust-2024%20edition-B7410E)
 [![许可证](https://img.shields.io/badge/许可证-MIT-blue)](LICENSE)
