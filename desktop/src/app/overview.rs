@@ -165,7 +165,11 @@ impl Desktop {
             "recovery_required" => (
                 StatusTone::Error,
                 "需要恢复",
-                recovery_reason(self.status["issue"].as_str().unwrap_or(""), &target),
+                recovery_reason(
+                    self.status["issue"].as_str().unwrap_or(""),
+                    self.status["protection_check"]["fallback_block"]["state"].as_str(),
+                    &target,
+                ),
             ),
             "idle" => (StatusTone::Off, "未接管", self.idle_hint()),
             _ => (
@@ -951,7 +955,10 @@ fn empty_note(message: impl Into<SharedString>) -> Div {
 /// 需要恢复的原因。接管中规则失效（目标或 WSL 重启、规则缺失、环境变了）和上次接管
 /// 没有正常结束不是一回事：前者说明此刻目标的新连接可能已不经代理。
 /// 措辞和后台运行日志（`protection_lost_message`）一致。
-fn recovery_reason(issue: &str, target: &str) -> String {
+///
+/// `block` 是后台在目标里断网的结果（决策 33）：`installed`、`failed`、
+/// `target_stopped`，还没断过时为 `None`。断网只拦目标本机进程，容器不在其内。
+fn recovery_reason(issue: &str, block: Option<&str>, target: &str) -> String {
     if issue.starts_with("managed_install_unverified:container_networks_unavailable") {
         return format!(
             "{target}：读不出目标里 Docker 的网络，目标本机的流量已阻断，但目标的容器没有被拦住，可能直连。请停止接管并恢复直连，确认 Docker 正常后再启动。"
@@ -966,7 +973,19 @@ fn recovery_reason(issue: &str, target: &str) -> String {
         "environment_changed" => "目标的环境变了，无法再确认本次接管覆盖它的全部流量",
         _ => "无法再确认本次接管仍然有效",
     };
-    format!("{target}：{cause}，新连接可能已不经代理。请停止接管并恢复直连，再重新启动接管。")
+    let then = "请停止接管并恢复直连，再重新启动接管。";
+    match block {
+        Some("installed") => format!(
+            "{target}：{cause}。已在目标里断网：目标本机进程的新连接一律丢弃，但目标的 Docker 容器不在其内，可能直连。{then}"
+        ),
+        Some("failed") => {
+            format!("{target}：{cause}，在目标里断网没有成功，新连接可能直连。{then}")
+        }
+        Some("target_stopped") => {
+            format!("{target}：{cause}。目标现在没有运行；它再启动时会先在里面断网。{then}")
+        }
+        _ => format!("{target}：{cause}，新连接可能已不经代理。{then}"),
+    }
 }
 
 fn event_time(occurred_at: &str) -> &str {
@@ -1042,29 +1061,46 @@ mod tests {
         assert_eq!(
             recovery_reason(
                 "protection_lost: restarted: the target or the WSL VM restarted; this takeover's rules no longer apply",
+                None,
                 "Dev"
             ),
             "Dev：目标发行版或 WSL 重启过，本次接管的规则已不再生效，新连接可能已不经代理。请停止接管并恢复直连，再重新启动接管。"
         );
         assert!(
-            recovery_reason("protection_lost: mapping_integrity: x: y", "Dev")
+            recovery_reason("protection_lost: mapping_integrity: x: y", None, "Dev")
                 .starts_with("Dev：无法再确认本次接管仍然有效，")
         );
         assert_eq!(
-            recovery_reason("", "Dev"),
+            recovery_reason("", None, "Dev"),
             "Dev 的上次接管没有正常结束，请停止接管并恢复直连。"
         );
         assert_eq!(
-            recovery_reason("managed_readiness_failed: dns", "Dev"),
+            recovery_reason("managed_readiness_failed: dns", None, "Dev"),
             "Dev 的上次接管没有正常结束，请停止接管并恢复直连。"
         );
         assert!(
             recovery_reason(
                 "managed_install_unverified:container_networks_unavailable:install:docker_networks_unavailable; ingress_stop:None",
+                None,
                 "Dev"
             )
             .starts_with("Dev：读不出目标里 Docker 的网络，目标本机的流量已阻断，但目标的容器没有被拦住，可能直连。")
         );
+    }
+
+    #[test]
+    fn says_how_the_block_after_a_loss_went() {
+        let lost = "protection_lost: restarted: the target or the WSL VM restarted; this takeover's rules no longer apply";
+        let installed = recovery_reason(lost, Some("installed"), "Dev");
+        assert!(installed.contains("已在目标里断网"), "{installed}");
+        assert!(
+            installed.contains("目标的 Docker 容器不在其内，可能直连"),
+            "{installed}"
+        );
+        assert!(
+            recovery_reason(lost, Some("failed"), "Dev").contains("断网没有成功，新连接可能直连")
+        );
+        assert!(recovery_reason(lost, Some("target_stopped"), "Dev").contains("目标现在没有运行"));
     }
 
     #[test]

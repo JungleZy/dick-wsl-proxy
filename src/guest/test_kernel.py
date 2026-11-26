@@ -1144,6 +1144,129 @@ class FirewallTests(unittest.TestCase):
                     conntrack.assert_not_called()
 
 
+class FakeTables:
+    """Both address families of a guest's legacy tables, applying restore
+    documents as iptables would: -N, -A, -I <chain> 1, -D, -X."""
+
+    def __init__(self, v4=None, v6=None):
+        self.state = {"v4": copy.deepcopy(v4 or {}), "v6": copy.deepcopy(v6 or {})}
+
+    def firewall(self, ipv6=False):
+        return copy.deepcopy(self.state["v6" if ipv6 else "v4"])
+
+    def transaction(self, table, lines, test=False, ipv6=False):
+        if test:
+            return
+        current = self.state["v6" if ipv6 else "v4"].setdefault(table, {"chains": {"OUTPUT": "ACCEPT"}, "rules": []})
+        rules = current["rules"]
+        for line in lines:
+            if line[0] == "-N":
+                current["chains"][line[1]] = "-"
+            elif line[0] == "-A":
+                rules.append(list(line))
+            elif line[0] == "-I":
+                assert line[2] == "1", line
+                first = next((index for index, rule in enumerate(rules) if rule[1] == line[1]), len(rules))
+                rules.insert(first, ["-A", line[1], *line[3:]])
+            elif line[0] == "-D":
+                rules.remove(["-A", *line[1:]])
+            elif line[0] == "-X":
+                assert not any(rule[1] == line[1] or rule[-1] == line[1] for rule in rules), line
+                del current["chains"][line[1]]
+            else:
+                raise AssertionError(line)
+
+    def rules(self, tag):
+        return [rule for family in self.state.values() for table in family.values() for rule in table["rules"] if tag in rule]
+
+
+class BlockTests(unittest.TestCase):
+    """Decision 33: the drop-only rules of a lost managed takeover."""
+
+    def execute(self, p, operation_name, fake, drift="boot_changed"):
+        operation = request(p)
+        operation["operation"] = operation_name
+        failure = kernel.Failure(drift) if drift else None
+        with (
+            patch.object(kernel, "guest_lock"),
+            patch.object(kernel, "guard", side_effect=failure),
+            patch.object(kernel, "grant"),
+            patch.object(kernel, "grant_pending", return_value=False),
+            patch.object(kernel, "Conntrack") as conntrack,
+            patch.object(kernel, "docker_networks", return_value=None),
+            patch.object(kernel, "firewall", side_effect=fake.firewall),
+            patch.object(kernel, "transaction", side_effect=fake.transaction),
+        ):
+            conntrack.return_value.dump.return_value = []
+            return kernel.execute(operation)
+
+    def blocked(self, p, fake):
+        return fake.rules(kernel.block_tag(p)) + fake.rules(kernel.block_tag(p, ipv6=True))
+
+    def test_block_after_a_vm_restart_drops_the_targets_traffic_once(self):
+        for ipv6 in (None, {"guest": "2001:db8:1::2", "ingress": "[fe80::1%2]:43771"}):
+            with self.subTest(managed_ipv6=ipv6 is not None):
+                p = comprehensive_plan()
+                if ipv6 is not None:
+                    p["ipv6"] = ipv6
+                fake = FakeTables()  # a new VM: nothing of this takeover left
+                self.assertEqual(self.execute(p, "block", fake), {"ok": True, "operation": "block", "blocked": {"rules": 4}})
+                rules = self.blocked(p, fake)
+                self.assertEqual(sorted(map(kernel.rule_key, rules)), sorted(map(kernel.rule_key, kernel.block_rules(p) + kernel.block_rules(p, ipv6=True))))
+                # Drops everything the target starts except to loopback,
+                # including the system DNS address.
+                self.assertTrue(all(rule[-1] == "DROP" and ["-m", "cgroup", "--path", "/"] == rule[2:6] for rule in rules))
+                self.assertFalse(any(p["system_dns"] in rule for rule in rules))
+                # Again: replaced in one transaction per family, never doubled.
+                calls = []
+                original = fake.transaction
+                with patch.object(fake, "transaction", side_effect=lambda *a, **k: (calls.append((a, k)), original(*a, **k))):
+                    self.assertEqual(self.execute(p, "block", fake)["blocked"], {"rules": 4})
+                self.assertEqual(len(calls), 2)
+                for (table, lines), _ in calls:
+                    self.assertEqual([line[0] for line in lines], ["-D", "-D", "-I", "-I"])
+                self.assertEqual(len(self.blocked(p, fake)), 4)
+
+    def test_a_stop_removes_the_block_alone_or_next_to_the_old_rules(self):
+        p = comprehensive_plan()
+        for name, fake, drift in (
+            ("vm_restarted", FakeTables(), "boot_changed"),
+            ("target_restarted", FakeTables(snapshot(p), ipv6_snapshot(p)), "cgroup_namespace_changed"),
+            ("rules_incomplete", FakeTables({"filter": snapshot(p)["filter"]}, ipv6_snapshot(p)), None),
+        ):
+            with self.subTest(name):
+                self.execute(p, "block", fake, drift)
+                self.assertEqual(len(self.blocked(p, fake)), 4)
+                # The periodic check: still lost, never complete.
+                if drift:
+                    with self.assertRaisesRegex(kernel.Failure, "stale_identity_has_owned_artifacts"):
+                        self.execute(p, "inspect", fake, drift)
+                else:
+                    ownership = self.execute(p, "inspect", fake, drift)["ownership"]
+                    self.assertTrue(ownership["rules_present"])
+                    self.assertFalse(ownership["rules_complete"])
+                result = self.execute(p, "remove", fake, drift)
+                self.assertEqual(result["unproven_mappings"], 0)
+                self.assertEqual(self.blocked(p, fake), [])
+                for family in fake.state.values():
+                    for table in family.values():
+                        self.assertEqual(table["rules"], [], name)
+                        self.assertEqual(set(table["chains"]), {"OUTPUT"}, name)
+
+    def test_a_block_rule_of_another_shape_is_refused(self):
+        p = comprehensive_plan()
+        fake = FakeTables()
+        self.execute(p, "block", fake)
+        rule = fake.state["v4"]["filter"]["rules"][0]
+        rule[rule.index("DROP")] = "ACCEPT"
+        with self.assertRaisesRegex(kernel.Failure, "foreign_instance_rule"):
+            self.execute(p, "remove", fake)
+
+    def test_block_is_for_a_managed_takeover_only(self):
+        with self.assertRaisesRegex(kernel.Failure, "block_needs_managed_mode"):
+            self.execute(plan(), "block", FakeTables())
+
+
 class InspectionTests(unittest.TestCase):
     def observe(self, p, tables, entries=None, ipv6_entries=None, identity_error=None, pending=False):
         operation = request(p)

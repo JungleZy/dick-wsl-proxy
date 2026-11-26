@@ -99,6 +99,17 @@ pub fn sync_networks(p: &Plan) -> Result<Synced, String> {
         .ok_or_else(|| "kernel_missing_network_sync".into())
 }
 
+/// Drops everything the target's own processes start, except to loopback, in
+/// the target as it runs now, whatever drifted (decision 33). Only for a lost
+/// managed takeover, and only under the controller lock with the takeover
+/// rechecked, so it can never run after the stop that would remove it. A stop
+/// removes these rules with the rest. The target's containers are not covered.
+pub fn block(p: &Plan) -> Result<Blocked, String> {
+    invoke(p, "block", None)?
+        .blocked
+        .ok_or_else(|| "kernel_missing_block_result".into())
+}
+
 /// The target's Docker bridge networks next to the bridges this takeover has
 /// per-network rules for. `wanted` and `in_sync` are `None` when the networks
 /// could not be read, with the reason in `error`.
@@ -147,6 +158,15 @@ struct Response {
     networks: Option<Networks>,
     #[serde(default)]
     synced: Option<Synced>,
+    #[serde(default)]
+    blocked: Option<Blocked>,
+}
+
+/// What a block left: how many drop-only rules are in place (decision 33).
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Blocked {
+    pub rules: u32,
 }
 
 fn invoke(p: &Plan, operation: &str, deadline: Option<u64>) -> Result<Response, String> {
@@ -201,6 +221,9 @@ fn parse_response(output: &str, operation: &str) -> Result<Response, String> {
     }
     if response.synced.is_some() != (operation == "sync_networks") {
         return Err("kernel_unexpected_or_missing_network_sync".into());
+    }
+    if response.blocked.is_some() != (operation == "block") {
+        return Err("kernel_unexpected_or_missing_block_result".into());
     }
     if let Some(ownership) = &response.ownership
         && ((ownership.rules_complete && !ownership.rules_present)
@@ -492,6 +515,24 @@ mod tests {
         let networks = parse_response(report, "inspect").unwrap().networks.unwrap();
         assert_eq!(networks.in_sync, Some(false));
         assert_eq!(networks.wanted.unwrap().len(), 2);
+        // The block result belongs to the block operation only (decision 33).
+        assert_eq!(
+            parse_response(
+                r#"{"ok":true,"operation":"block","blocked":{"rules":4}}"#,
+                "block"
+            )
+            .unwrap()
+            .blocked,
+            Some(Blocked { rules: 4 })
+        );
+        assert!(parse_response(r#"{"ok":true,"operation":"block"}"#, "block").is_err());
+        assert!(
+            parse_response(
+                r#"{"ok":true,"operation":"remove","unproven_mappings":0,"blocked":{"rules":0}}"#,
+                "remove"
+            )
+            .is_err()
+        );
         let synced = r#"{"ok":true,"operation":"sync_networks","synced":{"current":["docker0"],"added":["docker0"],"removed":[]}}"#;
         assert_eq!(
             parse_response(synced, "sync_networks")

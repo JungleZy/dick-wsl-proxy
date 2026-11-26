@@ -124,30 +124,39 @@ impl ProtectionWatch {
                     };
                     let target = round.target().to_owned();
                     let outcome = guard.finish_watch(round, finding);
+                    let log = |level: &str, message: &str, outcome: Option<&str>| {
+                        if let Some(path) = &store {
+                            let _ = desktop_store::append_runtime_log(
+                                path,
+                                level,
+                                "protection",
+                                message,
+                                outcome,
+                                Some(&target),
+                                None,
+                            );
+                        }
+                    };
+                    if let Some(reason) = &outcome.lost {
+                        log(
+                            "error",
+                            &protection_lost_message(reason),
+                            Some("recovery_required"),
+                        );
+                    }
+                    if let Some((level, message)) = &outcome.note {
+                        log(level, message, None);
+                    }
+                    // Decision 33: block while still holding the lock that
+                    // rechecked this takeover, so a stop, which removes the
+                    // block with the rest, can never have run in between.
+                    if let Some(plan) = &outcome.block
+                        && let Some((level, message)) = guard.record_block(kernel::block(plan))
+                    {
+                        log(level, &message, None);
+                    }
                     drop(guard);
                     next = Instant::now() + PROTECTION_CHECK_INTERVAL;
-                    if let (Some((level, message)), Some(path)) = (outcome.note, &store) {
-                        let _ = desktop_store::append_runtime_log(
-                            path,
-                            level,
-                            "protection",
-                            &message,
-                            None,
-                            Some(&target),
-                            None,
-                        );
-                    }
-                    if let (Some(reason), Some(path)) = (outcome.lost, &store) {
-                        let _ = desktop_store::append_runtime_log(
-                            path,
-                            "error",
-                            "protection",
-                            &protection_lost_message(&reason),
-                            Some("recovery_required"),
-                            Some(&target),
-                            None,
-                        );
-                    }
                 }
             })
             .ok();
@@ -175,6 +184,12 @@ fn protection_lost_message(reason: &str) -> String {
         ),
         _ => "无法再确认本次接管仍然有效".to_owned(),
     };
+    if matches!(kind, "restarted" | "rules_incomplete" | "rules_missing") {
+        // Decision 33: the block follows at once; its own line says how it went.
+        return format!(
+            "{cause}，它的新连接可能已不经代理，正在目标里断网。请停止接管并恢复，再重新启动接管。"
+        );
+    }
     format!("{cause}，它的新连接可能已不经代理。请停止接管并恢复，再重新启动接管。")
 }
 

@@ -36,6 +36,39 @@ struct Watch {
     networks: Vec<String>,
     /// Why they could not be read or synced in the last round, if so.
     network_error: Option<String>,
+    /// After a loss that leaves the target direct, the drop-only rules
+    /// (decision 33): where they stand as of the last round.
+    block: Option<BlockState>,
+}
+
+/// The drop-only rules of a lost takeover (decision 33), as last seen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BlockState {
+    /// In place in the target as it ran at that round.
+    Installed,
+    /// Could not be put in place; the target may be direct.
+    Failed(String),
+    /// Not running: nothing can leave it. Blocked again when it runs.
+    TargetStopped,
+}
+
+impl BlockState {
+    fn view(&self) -> serde_json::Value {
+        match self {
+            Self::Installed => serde_json::json!({"state": "installed", "error": null}),
+            Self::Failed(error) => serde_json::json!({"state": "failed", "error": error}),
+            Self::TargetStopped => serde_json::json!({"state": "target_stopped", "error": null}),
+        }
+    }
+}
+
+/// Losses after which the target's own new connections leave directly: its
+/// rules are gone or no longer apply (decision 33). Not a changed
+/// environment or unprovable mappings, where the rules still stand.
+fn blockable(reason: &str) -> bool {
+    ["restarted", "rules_missing", "rules_incomplete"]
+        .iter()
+        .any(|kind| reason.starts_with(&format!("protection_lost: {kind}:")))
 }
 
 /// The outcome of one guest observation, judged only by its evidence.
@@ -134,6 +167,9 @@ fn unix_seconds() -> Option<u64> {
 pub(crate) struct WatchRound {
     plan: Plan,
     generation: u64,
+    /// The loss is already recorded and leaves the target direct: this round
+    /// only (re)blocks it (decision 33).
+    block: bool,
 }
 
 /// What [`WatchRound::observe`] found, for [`Controller::finish_watch`].
@@ -145,6 +181,8 @@ enum Finding {
     RunningListFailed(String),
     NotRunning,
     Inspected(Observed, Option<NetworkUpdate>),
+    /// A blocking round found the target registered and running.
+    BlockDue,
 }
 
 /// The target's Docker networks after a round, and what changed (decision 24).
@@ -160,6 +198,9 @@ struct NetworkUpdate {
 pub(crate) struct WatchOutcome {
     pub(crate) lost: Option<String>,
     pub(crate) note: Option<(&'static str, String)>,
+    /// Block this plan's target now, still under the controller lock that
+    /// rechecked the takeover, then report through [`Controller::record_block`].
+    pub(crate) block: Option<Plan>,
 }
 
 impl WatchRound {
@@ -231,7 +272,11 @@ impl WatchRound {
                     .iter()
                     .any(|name| name.eq_ignore_ascii_case(&current.name)) =>
             {
-                self.inspect()
+                if self.block {
+                    Finding::BlockDue
+                } else {
+                    self.inspect()
+                }
             }
             Ok(_) => Finding::NotRunning,
             Err(error) => Finding::RunningListFailed(error),
@@ -254,15 +299,18 @@ impl Controller {
                 ..Watch::default()
             };
         }
-        if self.watch.lost.is_some() {
-            return None;
-        }
+        let block = match &self.watch.lost {
+            None => false,
+            Some(reason) if blockable(reason) => true,
+            Some(_) => return None,
+        };
         let record = transition::load()
             .ok()
             .filter(|record| record.pending.is_none())?;
         Some(WatchRound {
             plan,
             generation: record.generation,
+            block,
         })
     }
 
@@ -280,8 +328,41 @@ impl Controller {
         finding: WatchFinding,
     ) -> WatchOutcome {
         let mut note = None;
-        let lost = self.record_watch(round, finding, &mut note);
-        WatchOutcome { lost, note }
+        let mut block = None;
+        let lost = self.record_watch(round, finding, &mut note, &mut block);
+        WatchOutcome { lost, note, block }
+    }
+
+    /// Records what a block did and says what is worth a log line: each
+    /// change of where the block stands, not every round.
+    pub(crate) fn record_block(
+        &mut self,
+        result: Result<kernel::Blocked, String>,
+    ) -> Option<(&'static str, String)> {
+        let state = match result {
+            Ok(_) => BlockState::Installed,
+            Err(error) => BlockState::Failed(error),
+        };
+        self.note_block(state)
+    }
+
+    fn note_block(&mut self, state: BlockState) -> Option<(&'static str, String)> {
+        if self.watch.block.as_ref() == Some(&state) {
+            return None;
+        }
+        let note = match &state {
+            BlockState::Installed => Some((
+                "warning",
+                "已在目标里断网：目标本机进程新发起的连接一律丢弃（回环除外），目标的 Docker 容器不在其内。请停止接管并恢复直连，再重新启动接管。".to_owned(),
+            )),
+            BlockState::Failed(error) => Some((
+                "error",
+                format!("在目标里断网失败（{error}），目标的新连接可能直连。下一轮核对会再试；请尽快停止接管。"),
+            )),
+            BlockState::TargetStopped => None,
+        };
+        self.watch.block = Some(state);
+        note
     }
 
     fn record_watch(
@@ -289,11 +370,16 @@ impl Controller {
         round: WatchRound,
         finding: WatchFinding,
         note: &mut Option<(&'static str, String)>,
+        block: &mut Option<Plan>,
     ) -> Option<String> {
         let unchanged = matches!(&self.live, Some((plan, _)) if *plan == round.plan)
             && self.readiness.as_ref().is_some_and(Result::is_ok)
             && self.watch.cookie == round.plan.cookie
-            && self.watch.lost.is_none()
+            && (if round.block {
+                self.watch.lost.as_deref().is_some_and(blockable)
+            } else {
+                self.watch.lost.is_none()
+            })
             && transition::load().is_ok_and(|record| {
                 record.pending.is_none() && record.generation == round.generation
             });
@@ -301,6 +387,21 @@ impl Controller {
             return None;
         }
         let finding = finding.0;
+        if round.block {
+            match finding {
+                Finding::BlockDue => {
+                    self.watch.target_running = Some(true);
+                    *block = Some(round.plan);
+                }
+                Finding::NotRunning => {
+                    self.watch.target_running = Some(false);
+                    *note = self.note_block(BlockState::TargetStopped);
+                }
+                // Unregistered or unreadable: nothing to block, nothing new.
+                _ => {}
+            }
+            return None;
+        }
         if !matches!(finding, Finding::RegistryUnreadable(_)) {
             self.watch.checked_unix_seconds = unix_seconds();
         }
@@ -321,6 +422,8 @@ impl Controller {
                 self.watch.last_error = None;
                 None
             }
+            // Only blocking rounds, handled above, report this.
+            Finding::BlockDue => None,
             Finding::Inspected(observed, update) => {
                 self.watch.target_running = Some(true);
                 if let Some(update) = update {
@@ -332,7 +435,15 @@ impl Controller {
                         self.watch.last_error = None;
                         None
                     }
-                    Observed::Lost(reason) => self.lose(reason),
+                    Observed::Lost(reason) => {
+                        let reason = self.lose(reason);
+                        // Block in the same locked section the finding was
+                        // accepted in; later rounds keep it in place.
+                        if reason.as_deref().is_some_and(blockable) {
+                            *block = Some(round.plan.clone());
+                        }
+                        reason
+                    }
                     Observed::Unverified(error) => self.unverified(error),
                 }
             }
@@ -401,6 +512,7 @@ impl Controller {
             "lost": self.watch.lost,
             "container_networks": self.watch.networks,
             "container_network_error": self.watch.network_error,
+            "fallback_block": self.watch.block.as_ref().map(BlockState::view),
         })
     }
 
@@ -755,6 +867,52 @@ mod tests {
                 Observed::Unverified(error.into())
             );
         }
+    }
+
+    #[test]
+    fn only_losses_that_leave_the_target_direct_are_blocked() {
+        assert!(blockable(RESTARTED));
+        assert!(blockable(
+            "protection_lost: rules_missing: this takeover's rules are gone from the target"
+        ));
+        assert!(blockable(
+            "protection_lost: rules_incomplete: this takeover's rules are missing or incomplete in the target"
+        ));
+        // The rules still stand, or there is no target left to block.
+        assert!(!blockable(&changed("guest_address_changed")));
+        assert!(!blockable(
+            "protection_lost: mapping_integrity: 2 connection-tracking entries carry this takeover's mark without a provable mapping"
+        ));
+        assert!(!blockable(
+            "protection_lost: target_unregistered: the target distribution is no longer registered"
+        ));
+        assert!(!blockable("protection_lost: restartedish: x"));
+    }
+
+    #[test]
+    fn a_block_is_logged_when_it_changes_not_every_round() {
+        let mut controller = Controller::default();
+        let installed = || Ok(kernel::Blocked { rules: 4 });
+        let (level, message) = controller.record_block(installed()).unwrap();
+        assert_eq!(level, "warning");
+        assert!(message.contains("目标的 Docker 容器不在其内"), "{message}");
+        assert_eq!(controller.record_block(installed()), None);
+        let (level, message) = controller
+            .record_block(Err("block:wsl_exit_failed".into()))
+            .unwrap();
+        assert_eq!(level, "error");
+        assert!(message.contains("可能直连"), "{message}");
+        assert_eq!(
+            controller.record_block(Err("block:wsl_exit_failed".into())),
+            None
+        );
+        // A stopped target needs no line; blocking it again does.
+        assert_eq!(controller.note_block(BlockState::TargetStopped), None);
+        assert!(controller.record_block(installed()).is_some());
+        assert_eq!(
+            controller.watch.block.as_ref().map(BlockState::view),
+            Some(serde_json::json!({"state": "installed", "error": null}))
+        );
     }
 
     #[test]

@@ -94,7 +94,7 @@ def validate(request):
     fields = {"operation", "plan", "protocol", "peer"}
     require(isinstance(request, dict) and set(request) in (fields, fields | {"deadline"}), "invalid_request")
     operation = request["operation"]
-    require(operation in ("precheck", "arm", "install", "remove", "inspect", "lookup", "sync_networks"), "invalid_operation")
+    require(operation in ("precheck", "arm", "install", "remove", "inspect", "lookup", "sync_networks", "block"), "invalid_operation")
     require((operation == "arm") == ("deadline" in request), "unexpected_or_missing_grant_deadline")
     if operation == "arm":
         require(integer(request["deadline"], 1, 0xffffffffffffffff), "invalid_grant_deadline")
@@ -544,6 +544,29 @@ def ipv6_guards(p):
     ]
 
 
+def block_tag(p, ipv6=False):
+    return ("wsl-proxyctl-m2v6k:" if ipv6 else "wsl-proxyctl-m2k:") + f"{p['cookie']:08x}:" + plan_digest(p)[:16]
+
+
+def block_rules(p, ipv6=False):
+    """The drop-only rules a lost managed takeover leaves in the target
+    (decision 33): everything the target's own processes start, except to
+    loopback, is dropped, the same shape as IPv6 block mode. No redirection,
+    no DNS. Replies to connections opened into the target still pass. The
+    target's forwarded container traffic is not covered. Matched with
+    `--path /` in whatever cgroup namespace the target runs in now, so they
+    apply after a restart, when the takeover's own rules no longer do."""
+    if p.get("system_dns") is None:
+        return []
+    loopback = "::1/128" if ipv6 else "127.0.0.0/8"
+    comment = ["-m", "comment", "--comment", block_tag(p, ipv6)]
+    base = ["-A", "OUTPUT", "-m", "cgroup", "--path", "/"]
+    return [
+        [*base, "-m", "conntrack", "--ctdir", "ORIGINAL", "!", "--ctorigdst", loopback, *comment, "-j", "DROP"],
+        [*base, "!", "-d", loopback, "-m", "conntrack", "--ctstate", "INVALID,UNTRACKED", *comment, "-j", "DROP"],
+    ]
+
+
 def forward_gate(forward_chain, forward_bridges, comment, mark=None, ingress=None):
     """The FORWARD hook and its chains. Replies to connections opened from
     elsewhere pass; this instance's redirected flows are accepted; then the
@@ -976,11 +999,15 @@ def inspect_firewall(p, tables, existing, ipv6=False):
     # `rules_complete` still compares against today's exact set.
     for rule in legacy_rules(p, ipv6):
         expected["nat" if rule[1] == "PREROUTING" else "filter"].append(rule_key(rule))
+    # The drop-only rules of a lost takeover (decision 33): removed with the
+    # rest, never part of a complete set, and they need none of the chains.
+    blocking = block_tag(p, ipv6) if p.get("system_dns") is not None else None
+    blocked = {rule_key(rule) for rule in block_rules(p, ipv6)}
     found = {"nat": [], "filter": []}
     seen = {"nat": set(), "filter": set()}
     observed_chains = set()
     present = False
-    prefixes = tuple("wsl-proxyctl-" + mode + ":" + cookie + ":" for mode in ("m1", "m2", "m2v6", "m2n", "m2v6n"))
+    prefixes = tuple("wsl-proxyctl-" + mode + ":" + cookie + ":" for mode in ("m1", "m2", "m2v6", "m2n", "m2v6n", "m2k", "m2v6k"))
     for name, table in tables.items():
         for owned_chain in reserved.intersection(table["chains"]):
             require(existing and chains.get(owned_chain) == name and table["chains"][owned_chain] == "-", "instance_chain_collision")
@@ -988,6 +1015,14 @@ def inspect_firewall(p, tables, existing, ipv6=False):
             observed_chains.add(owned_chain)
             present |= owned_chain == chain
         for rule in table["rules"]:
+            if blocking is not None and blocking in rule:
+                key = rule_key(rule)
+                require(name == "filter" and key in blocked, "foreign_instance_rule")
+                require(existing, "instance_rule_collision")
+                require(key not in seen[name], "duplicate_instance_rule")
+                seen[name].add(key)
+                found[name].append(rule)
+                continue
             candidate = tag in rule or any(value in rule for value in reserved)
             if candidate:
                 key = rule_key(rule)
@@ -1005,11 +1040,12 @@ def inspect_firewall(p, tables, existing, ipv6=False):
                 continue
             require(not any(token.startswith(prefixes) for token in rule), "foreign_instance_rule")
             require(not mark_mentions(rule, p["cookie"]), "instance_mark_rule_collision")
+    guarded = [rule for rule in found["filter"] if blocking is None or blocking not in rule]
     if found["nat"]:
         require(present, "owned_chain_missing")
-    if ipv6 and p.get("ipv6") is not None and found["filter"]:
+    if ipv6 and p.get("ipv6") is not None and guarded:
         require(v6_guard in observed_chains, "owned_ipv6_guard_chain_missing")
-    if not ipv6 and p.get("system_dns") is not None and found["filter"]:
+    if not ipv6 and p.get("system_dns") is not None and guarded:
         require("WPM2G_" + cookie in observed_chains, "owned_guard_chain_missing")
     return present, found
 
@@ -1669,7 +1705,7 @@ def execute(request):
         try:
             guard(p, check_resolver=operation not in ("remove", "inspect"), write_tools=operation != "inspect")
         except Failure as error:
-            if operation not in ("inspect", "remove"):
+            if operation not in ("inspect", "remove", "block"):
                 raise
             # After any identity or environment drift (restart, rename, new
             # addresses, a workload outside the cgroup, ...), only inspect and
@@ -1764,6 +1800,26 @@ def execute(request):
                 entries, ipv6_entries, unproven = mapping_partition(p, ct)
                 require(not entries and not ipv6_entries, "owned_conntrack_residual")
                 unproven_left = unproven
+            elif operation == "block":
+                # A lost managed takeover only (decision 33). Every time,
+                # one transaction per family deletes whatever drop-only rules
+                # are there and inserts them again: after a target-only
+                # restart the old ones read the same but still match the
+                # cgroup namespace that is gone, and `--path /` resolves
+                # anew only when a rule goes in. A stop removes them.
+                require(p.get("system_dns") is not None, "block_needs_managed_mode")
+                for ipv6 in (False, True):
+                    _, found = inspect_firewall(p, firewall(ipv6=ipv6), True, ipv6=ipv6)
+                    old = [["-D", *rule[1:]] for rule in found["filter"] if block_tag(p, ipv6) in rule]
+                    fresh = [["-I", rule[1], "1", *rule[2:]] for rule in reversed(block_rules(p, ipv6))]
+                    transaction("filter", old + fresh, ipv6=ipv6)
+                in_place = 0
+                for ipv6 in (False, True):
+                    _, found = inspect_firewall(p, firewall(ipv6=ipv6), True, ipv6=ipv6)
+                    have = sorted(rule_key(rule) for rule in found["filter"] if block_tag(p, ipv6) in rule)
+                    require(have == sorted(rule_key(rule) for rule in block_rules(p, ipv6)), "block_not_in_place")
+                    in_place += len(have)
+                return {"ok": True, "operation": operation, "blocked": {"rules": in_place}}
             elif operation == "sync_networks":
                 # Only an active, complete takeover of this exact identity is
                 # extended (the guard above refused any drift); after a stop
