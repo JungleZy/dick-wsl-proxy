@@ -144,11 +144,11 @@ SHA-256 校验值只能证明文件完整，不能证明是谁发布的。v0.1.1
 ## 安装
 
 > [!NOTE]
-> 预编译包从 [v0.1.11](https://github.com/JungleZy/dick-wsl-proxy/releases/tag/v0.1.11) 起发布在 GitHub Releases，都标为预发布：没有签名，第三方许可证还没审完。更早的 `v0.1.4`–`v0.1.7` tag 没有发布包。
+> 预编译包从 [v0.1.11](https://github.com/JungleZy/dick-wsl-proxy/releases/tag/v0.1.11) 起发布在 GitHub Releases：v0.1.11 是预发布，v0.1.12 起是正式发布。包没有代码签名，第三方许可证的再分发义务还没人确认。更早的 `v0.1.4`–`v0.1.7` tag 没有发布包。
 
 ### 下载预编译包
 
-发布流水线在推送 `v*` tag 时运行：在 GitHub 的 Windows 构建机上原生编译，跑完格式检查、clippy、全部测试、导入表检查和安装冒烟测试后打包，以**预发布（pre-release）**的形式发到 [GitHub Releases](https://github.com/JungleZy/dick-wsl-proxy/releases)。每个版本附两个文件：
+发布流水线在推送 `v*` tag 时运行：在 GitHub 的 Windows 构建机上原生编译，跑完格式检查、clippy、全部测试、导入表检查和安装冒烟测试后打包，发布到 [GitHub Releases](https://github.com/JungleZy/dick-wsl-proxy/releases)。每个版本附两个文件：
 
 - `wsl-proxy-<版本>-windows-x64.zip`：两个 EXE、安装与卸载脚本、构建记录和第三方许可证清单；
 - `wsl-proxy-<版本>-windows-x64.zip.sha256`：校验值。
@@ -567,7 +567,7 @@ design/               桌面端界面规范与早期原型
 - 桌面端和后台之间的命名管道只接受同一 Windows 账户、且完整性级别不低于后台自身的进程（[决策 21](docs/decisions.md)）。后台以管理员身份运行时，普通权限的进程连不上它。
 - 「检测住宅代理」里直接连接的那一路，会把 SOCKS5 用户名和密码不经第一跳、明文发出去，住宅服务商也会看到真实 IP。所以检测前会先弹确认框。
 - 「导出脱敏诊断」只保留状态和数值计数，不含目的地址、域名和凭据，但仍请按内部资料处理。
-- 发布包没有签名，第三方许可证的再分发义务还没人确认，所以发布为预发布版本。v0.1.11 之后的发布包带 GitHub 构建来源证明，见[安装](#安装)。
+- 发布包没有签名，第三方许可证的再分发义务还没人确认；v0.1.12 起仍作为正式版本发布，这两点写在每个版本发布说明的「已知限制」里。v0.1.11 之后的发布包带 GitHub 构建来源证明，见[安装](#安装)。
 - 本项目不防御本机管理员，也不防御目标发行版里的 root。
 
 ## 许可证

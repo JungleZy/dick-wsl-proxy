@@ -144,11 +144,11 @@ The SHA-256 checksum shows the file is intact; it does not identify the publishe
 ## Installation
 
 > [!NOTE]
-> Prebuilt packages are published on GitHub Releases from [v0.1.11](https://github.com/JungleZy/dick-wsl-proxy/releases/tag/v0.1.11) on, all marked as pre-releases: they are unsigned and the third-party license review is unfinished. The older `v0.1.4`–`v0.1.7` tags have no packages.
+> Prebuilt packages are published on GitHub Releases from [v0.1.11](https://github.com/JungleZy/dick-wsl-proxy/releases/tag/v0.1.11) on: v0.1.11 is a pre-release, and from v0.1.12 on they are regular releases. The packages are unsigned and nobody has yet confirmed the third-party redistribution obligations. The older `v0.1.4`–`v0.1.7` tags have no packages.
 
 ### Download a release package
 
-The release pipeline runs when a `v*` tag is pushed. It builds natively on a GitHub Windows runner, runs the format check, clippy, every test, an import-table check and an install smoke test, then packages and publishes a **pre-release** on [GitHub Releases](https://github.com/JungleZy/dick-wsl-proxy/releases). Each version has two files:
+The release pipeline runs when a `v*` tag is pushed. It builds natively on a GitHub Windows runner, runs the format check, clippy, every test, an import-table check and an install smoke test, then packages and publishes a release on [GitHub Releases](https://github.com/JungleZy/dick-wsl-proxy/releases). Each version has two files:
 
 - `wsl-proxy-<version>-windows-x64.zip`: both EXEs, the install and uninstall scripts, the build record and the third-party license inventory;
 - `wsl-proxy-<version>-windows-x64.zip.sha256`: the checksum.
@@ -571,7 +571,7 @@ Issues and pull requests are welcome. Contributions of code and documentation ar
 - The named pipe between the desktop app and the backend accepts only processes of the same Windows account whose integrity level is not lower than the backend's ([decision 21](docs/decisions.md)). When the backend runs as administrator, normal-privilege processes cannot reach it.
 - The direct path of the residential proxy test sends the SOCKS5 username and password in plain text without the first hop, and the residential provider sees your real IP. The app therefore asks for confirmation before testing.
 - "Export redacted diagnostics" keeps only states and numeric counters, with no destination addresses, domains or credentials; still treat the file as internal.
-- Release packages are unsigned and nobody has yet confirmed the third-party redistribution obligations, which is why they are published as pre-releases. Packages released after v0.1.11 carry a GitHub build provenance attestation; see [Installation](#installation).
+- Release packages are unsigned and nobody has yet confirmed the third-party redistribution obligations; from v0.1.12 on they are still published as regular releases, and each release note lists both under its known limitations. Packages released after v0.1.11 carry a GitHub build provenance attestation; see [Installation](#installation).
 - This project does not defend against a local administrator or against root inside the target distribution.
 
 ## License

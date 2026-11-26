@@ -205,14 +205,14 @@ jobs:
         with:
           subject-path: artifact/dist/wsl-proxy-${{ needs.package.outputs.version }}-windows-x64.zip
 
-      # Published as a pre-release: the package is unsigned and its
-      # third-party licenses are still under review (docs/plans/m5/README.md).
+      # A normal release, which GitHub marks Latest by version and date. The
+      # package is unsigned and the third-party redistribution review is still
+      # open; the release notes say both (decision 32, docs/plans/m5/README.md).
       - name: Create the release
         run: |
           gh release create "$TAG" \
             "artifact/dist/wsl-proxy-$VERSION-windows-x64.zip" \
             "artifact/dist/wsl-proxy-$VERSION-windows-x64.zip.sha256" \
             --verify-tag \
-            --prerelease \
             --title "WSL Proxy $VERSION" \
             --notes-file artifact/dist/release-notes.md

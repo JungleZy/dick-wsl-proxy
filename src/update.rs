@@ -25,7 +25,7 @@ pub const REPOSITORY: &str = "JungleZy/dick-wsl-proxy";
 pub const RELEASES_PAGE: &str = "https://github.com/JungleZy/dick-wsl-proxy/releases";
 
 const API_HOST: &str = "api.github.com";
-/// Every release so far is a pre-release, which `/releases/latest` never
+/// Releases up to v0.1.11 are pre-releases, which `/releases/latest` never
 /// returns, so the newest one is picked from the most recent page of the list.
 const RELEASES_PER_PAGE: u32 = 30;
 const LIST_LIMIT: u64 = 4 * 1024 * 1024;
