@@ -964,14 +964,16 @@ fn recovery_reason(issue: &str, block: Option<&str>, target: &str) -> String {
             "{target}：读不出目标里 Docker 的网络，目标本机的流量已阻断，但目标的容器没有被拦住，可能直连。请停止接管并恢复直连，确认 Docker 正常后再启动。"
         );
     }
-    let Some(lost) = issue.strip_prefix("protection_lost: ") else {
-        return format!("{target} 的上次接管没有正常结束，请停止接管并恢复直连。");
-    };
-    let cause = match lost.split(':').next().unwrap_or("") {
-        "restarted" => "目标发行版或 WSL 重启过，本次接管的规则已不再生效",
-        "rules_incomplete" | "rules_missing" => "目标里本次接管的规则已缺失或不完整",
-        "environment_changed" => "目标的环境变了，无法再确认本次接管覆盖它的全部流量",
-        _ => "无法再确认本次接管仍然有效",
+    let cause = match issue.strip_prefix("protection_lost: ") {
+        Some(lost) => match lost.split(':').next().unwrap_or("") {
+            "restarted" => "目标发行版或 WSL 重启过，本次接管的规则已不再生效",
+            "rules_incomplete" | "rules_missing" => "目标里本次接管的规则已缺失或不完整",
+            "environment_changed" => "目标的环境变了，无法再确认本次接管覆盖它的全部流量",
+            _ => "无法再确认本次接管仍然有效",
+        },
+        // A controller that started again only blocks once the rules are gone.
+        None if block.is_some() => "上次接管没有正常结束，本次接管的规则已失效",
+        None => return format!("{target} 的上次接管没有正常结束，请停止接管并恢复直连。"),
     };
     let then = "请停止接管并恢复直连，再重新启动接管。";
     match block {
@@ -1101,6 +1103,11 @@ mod tests {
             recovery_reason(lost, Some("failed"), "Dev").contains("断网没有成功，新连接可能直连")
         );
         assert!(recovery_reason(lost, Some("target_stopped"), "Dev").contains("目标现在没有运行"));
+        // A controller that started again after the one that ran it ended.
+        assert!(
+            recovery_reason("", Some("installed"), "Dev")
+                .starts_with("Dev：上次接管没有正常结束，本次接管的规则已失效。已在目标里断网")
+        );
     }
 
     #[test]

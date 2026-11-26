@@ -117,7 +117,7 @@ impl Controller {
             },
         );
         Ok(
-            json!({"phase":"recovery_required","operation_generation":op.generation,"active_target":protected_target,"recorded_target":owner.as_ref().map(|p|&p.target.name),"config_generation":owner.as_ref().map(|p|p.cookie),"dns_managed":false,"pending":intent.map(|i|json!({"kind":i.kind,"stage":i.stage,"old":i.old.as_ref().map(|p|&p.target.name),"new":i.new.as_ref().map(|p|&p.target.name)})),"observation":evidence,"target_registered":target_registered,"issue":self.readiness.as_ref().and_then(|r|r.as_ref().err())}),
+            json!({"phase":"recovery_required","operation_generation":op.generation,"active_target":protected_target,"recorded_target":owner.as_ref().map(|p|&p.target.name),"config_generation":owner.as_ref().map(|p|p.cookie),"dns_managed":false,"pending":intent.map(|i|json!({"kind":i.kind,"stage":i.stage,"old":i.old.as_ref().map(|p|&p.target.name),"new":i.new.as_ref().map(|p|&p.target.name)})),"observation":evidence,"target_registered":target_registered,"issue":self.readiness.as_ref().and_then(|r|r.as_ref().err()),"protection_check":owner.as_ref().map(|p|self.recovery_block_view(p))}),
         )
     }
     pub fn switch_source(&self, expected: u64) -> Result<(&Plan, &Runtime), String> {

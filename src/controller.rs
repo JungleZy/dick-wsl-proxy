@@ -62,6 +62,70 @@ impl BlockState {
     }
 }
 
+/// Decision 33 once the controller that ran a takeover is gone: one round for
+/// the managed takeover the journal still records, run by a controller that
+/// started again (and so has no live takeover) or, with no controller at all,
+/// by the port custodian. The slow part is read-only; the block itself runs
+/// only after [`Self::current`] rechecks the record under the lock that a stop
+/// needs too, so it never follows the stop that would remove it.
+pub(crate) struct RecoveryRound {
+    plan: Plan,
+    generation: u64,
+}
+
+impl RecoveryRound {
+    /// The recorded managed takeover, when no operation is in flight.
+    pub(crate) fn recorded() -> Option<Self> {
+        let record = transition::load()
+            .ok()
+            .filter(|record| record.pending.is_none())?;
+        let plan = journal::load().ok().flatten()?;
+        plan.system_dns.is_some().then_some(Self {
+            plan,
+            generation: record.generation,
+        })
+    }
+
+    pub(crate) fn plan(&self) -> &Plan {
+        &self.plan
+    }
+
+    /// Slow and read-only: whether the target is registered, running, and
+    /// its rules gone or no longer applying. Never wakes a stopped target.
+    pub(crate) fn due(&self) -> bool {
+        let Ok(all) = host::distributions() else {
+            return false;
+        };
+        let Some(current) = all
+            .into_iter()
+            .find(|d| d.id.eq_ignore_ascii_case(&self.plan.target.id))
+        else {
+            return false;
+        };
+        match host::running_distributions() {
+            Ok(names)
+                if names
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&current.name)) => {}
+            _ => return false,
+        }
+        recovery_due(&classify(kernel::inspect_detail(&self.plan)))
+    }
+
+    /// Still the same recorded takeover with nothing in flight.
+    pub(crate) fn current(&self) -> bool {
+        journal::load().ok().flatten().as_ref() == Some(&self.plan)
+            && transition::load().is_ok_and(|record| {
+                record.pending.is_none() && record.generation == self.generation
+            })
+    }
+}
+
+/// Whether what a recovery round observed calls for a block.
+fn recovery_due(observed: &Observed) -> bool {
+    matches!(observed, Observed::Lost(reason) if blockable(reason))
+}
+
 /// Losses after which the target's own new connections leave directly: its
 /// rules are gone or no longer apply (decision 33). Not a changed
 /// environment or unprovable mappings, where the rules still stand.
@@ -331,6 +395,43 @@ impl Controller {
         let mut block = None;
         let lost = self.record_watch(round, finding, &mut note, &mut block);
         WatchOutcome { lost, note, block }
+    }
+
+    /// A recovery round for the takeover this controller only knows from the
+    /// journal (it started after the one that ran it ended).
+    pub(crate) fn recovery_round(&self) -> Option<RecoveryRound> {
+        if self.live.is_some() {
+            return None;
+        }
+        RecoveryRound::recorded()
+    }
+
+    /// Blocks the recorded target after a due recovery round, if nothing
+    /// changed meanwhile, and says what is worth a log line.
+    pub(crate) fn finish_recovery(
+        &mut self,
+        round: RecoveryRound,
+    ) -> Option<(&'static str, String)> {
+        if self.live.is_some() || !round.current() {
+            return None;
+        }
+        if self.watch.cookie != round.plan.cookie {
+            self.watch = Watch {
+                cookie: round.plan.cookie,
+                ..Watch::default()
+            };
+        }
+        self.record_block(kernel::block(&round.plan))
+    }
+
+    /// Where the block of the recorded takeover stands, for its status.
+    pub(crate) fn recovery_block_view(&self, plan: &Plan) -> serde_json::Value {
+        match &self.watch.block {
+            Some(block) if self.watch.cookie == plan.cookie => {
+                serde_json::json!({"fallback_block": block.view()})
+            }
+            _ => serde_json::json!({"fallback_block": null}),
+        }
     }
 
     /// Records what a block did and says what is worth a log line: each
@@ -887,6 +988,23 @@ mod tests {
             "protection_lost: target_unregistered: the target distribution is no longer registered"
         ));
         assert!(!blockable("protection_lost: restartedish: x"));
+    }
+
+    #[test]
+    fn a_recovery_round_blocks_only_when_the_rules_no_longer_apply() {
+        assert!(recovery_due(&Observed::Lost(RESTARTED.into())));
+        assert!(recovery_due(&classify(Err(
+            "inspect:kernel_operation_failed: stale_identity_has_owned_artifacts: boot_changed"
+                .into()
+        ))));
+        // Rules intact after a controller crash: the held ports keep it closed.
+        assert!(!recovery_due(&Observed::Protected));
+        assert!(!recovery_due(&Observed::Unverified(
+            "inspect:wsl_deadline_exceeded".into()
+        )));
+        assert!(!recovery_due(&Observed::Lost(changed(
+            "guest_address_changed"
+        ))));
     }
 
     #[test]

@@ -1,8 +1,12 @@
 //! A non-forwarding Windows process keeps exclusive sockets reserved if the controller dies.
 //! It receives Winsock duplication tickets on an anonymous pipe, never accepts a connection,
 //! and releases them only after an explicit, journal-backed stop has removed the guest rules.
+/// How often a waiting custodian runs its idle round.
+pub const IDLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[cfg(windows)]
 mod windows {
+    use super::IDLE_INTERVAL;
     use crate::plan::Plan;
     use socket2::Socket;
     use std::io::{Read, Write};
@@ -66,10 +70,18 @@ mod windows {
             }
         }
         fn wait(&self, millis: u32) -> Result<(), String> {
-            if unsafe { WaitForSingleObject(self.0, millis) } == WAIT_OBJECT_0 {
+            if self.signaled_within(millis)? {
                 Ok(())
             } else {
                 Err("lease_wait_failed_or_timeout".into())
+            }
+        }
+        /// Whether the event was signaled within `millis`; false on a timeout.
+        fn signaled_within(&self, millis: u32) -> Result<bool, String> {
+            match unsafe { WaitForSingleObject(self.0, millis) } {
+                WAIT_OBJECT_0 => Ok(true),
+                WAIT_TIMEOUT => Ok(false),
+                _ => Err("lease_wait_failed".into()),
             }
         }
     }
@@ -154,7 +166,9 @@ mod windows {
         }
         result
     }
-    pub fn worker(plan: &Plan) -> Result<(), String> {
+    /// Holds the reserved ports until an explicit stop releases them. While
+    /// it waits, `idle` runs about every [`IDLE_INTERVAL`] (decision 33).
+    pub fn worker(plan: &Plan, mut idle: impl FnMut()) -> Result<(), String> {
         let stop = Event::create(&name(plan, "stop"))?;
         let done = Event::create(&name(plan, "done"))?;
         let mut data = WSADATA::default();
@@ -203,7 +217,9 @@ mod windows {
             .and_then(|_| out.flush())
             .map_err(|e| e.to_string())?;
         drop(out);
-        stop.wait(INFINITE)?;
+        while !stop.signaled_within(IDLE_INTERVAL.as_millis() as u32)? {
+            idle();
+        }
         drop(sockets);
         unsafe { WSACleanup() };
         drop(stop); // No new recovery observer can see a stale custodian after `done`.
@@ -236,7 +252,7 @@ mod unsupported {
     ) -> Result<(), String> {
         Err("Windows required".into())
     }
-    pub fn worker(_: &Plan) -> Result<(), String> {
+    pub fn worker(_: &Plan, _: impl FnMut()) -> Result<(), String> {
         Err("Windows required".into())
     }
     pub fn alive(_: &Plan) -> Result<bool, String> {

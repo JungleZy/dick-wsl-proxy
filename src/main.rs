@@ -108,9 +108,32 @@ impl ProtectionWatch {
                         continue;
                     };
                     let round = guard.watch_round();
+                    let recovery = round.is_none().then(|| guard.recovery_round()).flatten();
                     drop(guard);
                     let Some(round) = round else {
                         next = Instant::now() + PROTECTION_CHECK_INTERVAL;
+                        // Decision 33: a takeover this controller only knows
+                        // from the journal is blocked when its rules are gone.
+                        if let Some(recovery) = recovery
+                            && recovery.due()
+                            && !stopping.load(Ordering::Acquire)
+                            && let Some(mut guard) = try_owned(&controller)
+                        {
+                            let target = recovery.plan().target.name.clone();
+                            let note = guard.finish_recovery(recovery);
+                            drop(guard);
+                            if let (Some((level, message)), Some(path)) = (note, &store) {
+                                let _ = desktop_store::append_runtime_log(
+                                    path,
+                                    level,
+                                    "protection",
+                                    &message,
+                                    None,
+                                    Some(&target),
+                                    None,
+                                );
+                            }
+                        }
                         continue;
                     };
                     let finding = round.observe();
@@ -162,6 +185,57 @@ impl ProtectionWatch {
             .ok();
         Self { stop, worker }
     }
+}
+
+/// Decision 33 with no controller left: while no process holds this user's
+/// controller lock, the port custodian blocks the recorded target whose
+/// rules are gone. The read-only check runs without the lock; the recheck and
+/// the block run under it, so a controller starting meanwhile (which would
+/// get `controller_busy` for those seconds) and any stop it runs come before
+/// or after, never in between. Logs only when the outcome changes.
+fn custodian_round(cookie: u32, store: &Option<PathBuf>, last: &mut Option<Result<(), String>>) {
+    // A live controller checks for itself; do not duplicate its guest calls.
+    if host::acquire().is_err() {
+        return;
+    }
+    let Some(round) = controller::RecoveryRound::recorded() else {
+        return;
+    };
+    if round.plan().cookie != cookie || !round.due() {
+        return;
+    }
+    let Ok(_lock) = host::acquire() else {
+        return;
+    };
+    if !round.current() {
+        return;
+    }
+    let outcome = kernel::block(round.plan()).map(|_| ());
+    if last.as_ref() == Some(&outcome) {
+        return;
+    }
+    if let Some(path) = store {
+        let (level, message) = match &outcome {
+            Ok(()) => (
+                "warning",
+                "后台不在，已由端口持有进程在目标里断网：目标本机进程新发起的连接一律丢弃（回环除外），目标的 Docker 容器不在其内。请重新连接后台，停止接管并恢复直连。".to_owned(),
+            ),
+            Err(error) => (
+                "error",
+                format!("后台不在，端口持有进程在目标里断网失败（{error}），目标的新连接可能直连。请尽快重新连接后台并停止接管。"),
+            ),
+        };
+        let _ = desktop_store::append_runtime_log(
+            path,
+            level,
+            "protection",
+            &message,
+            None,
+            Some(&round.plan().target.name),
+            None,
+        );
+    }
+    *last = Some(outcome);
 }
 
 /// The operator-facing log line for a `protection_lost: <kind>: ...` reason.
@@ -244,7 +318,10 @@ fn run(command: Command) -> Result<u8, Failure> {
             .map_err(|e| Failure::new("lease_journal", e))?
             .filter(|p| p.cookie == cookie)
             .ok_or_else(|| Failure::new("lease_journal", "Instance no longer present"))?;
-        lease::worker(&plan).map_err(|e| Failure::new("lease_worker", e))?;
+        let store = desktop_store::path().ok();
+        let mut last = None;
+        lease::worker(&plan, || custodian_round(cookie, &store, &mut last))
+            .map_err(|e| Failure::new("lease_worker", e))?;
         return Ok(0);
     }
     let _lock = host::acquire().map_err(|e| match e {
