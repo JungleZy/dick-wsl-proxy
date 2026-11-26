@@ -513,6 +513,7 @@ desktop/              GPUI desktop app wsl-proxy-desktop
 packaging/windows/    install.ps1, uninstall.ps1, common.ps1
 scripts/              packaging, build record, import check, release notes, install smoke test
 .github/workflows/    release.yml release pipeline
+CHANGELOG.md          per-version change list in Chinese; the release notes take their Changes section from it
 docs/                 architecture, decisions, roadmap, discussions, reviews
 design/               desktop UI specification and early prototypes
 ```

@@ -2,8 +2,10 @@
 """Write the GitHub release notes for one tagged Windows package.
 
 The release notes (--output) carry the tag message (the maintainer's own
-summary), the download with its SHA-256, every commit since the previous v*
-tag grouped by type, install guidance and the known limitations. The run
+summary), the download with its SHA-256, this version's Chinese change list
+from CHANGELOG.md, install guidance and the known limitations. The change
+list must name every non-merge commit since the previous v* tag (the tagged
+commit itself may go without its hash) and every entry must be in Chinese. The run
 summary (--summary) is the same document plus how the package was built and
 checked: the source commit, toolchain and runner, the C runtime import check,
 the test counts read from the CI logs and the install smoke test. Those two
@@ -27,18 +29,8 @@ import sys
 import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
-GROUPS = (
-    ("feat", "新功能"),
-    ("fix", "修复"),
-    ("perf", "性能"),
-    ("refactor", "重构"),
-    ("docs", "文档"),
-    ("test", "测试"),
-    ("build", "构建与维护"),
-    ("ci", "构建与维护"),
-    ("chore", "构建与维护"),
-)
-SUBJECT = re.compile(r"^(?P<type>[a-z]+)(?:\([^)]*\))?!?:\s*(?P<text>.+)$")
+CHANGELOG = ROOT / "CHANGELOG.md"
+CJK = re.compile(r"[\u4e00-\u9fff]")
 
 
 def git(*args):
@@ -66,16 +58,44 @@ def tag_message(tag):
 
 
 def commits(previous, tag):
+    """Short hashes of the non-merge commits since the previous v* tag."""
     span = f"{previous}..{tag}" if previous else tag
-    lines = git("log", "--no-merges", "--format=%h%x09%s", span).splitlines()
-    grouped = {}
-    for line in lines:
-        short, subject = line.split("\t", 1)
-        match = SUBJECT.match(subject)
-        kind = dict(GROUPS).get(match["type"], "其他") if match else "其他"
-        text = match["text"] if match else subject
-        grouped.setdefault(kind, []).append(f"- {text}（`{short}`）")
-    return len(lines), grouped
+    return git("log", "--no-merges", "--format=%h", span).split()
+
+
+def tag_exists(name):
+    try:
+        git("rev-parse", "--verify", "--quiet", "refs/tags/" + name)
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
+def changelog(version, hashes, tagged, complete):
+    """This version's section of CHANGELOG.md. Every entry must carry Chinese;
+    with `complete`, every hash in `hashes` except the tagged commit must
+    appear. Errors name hashes and line numbers only: a CI console may not
+    encode Chinese text (cp1252)."""
+    text = CHANGELOG.read_text(encoding="utf-8")
+    heading = re.search(rf"^## v?{re.escape(version)}(?![0-9.]).*$", text, re.M)
+    if not heading:
+        raise SystemExit(f"CHANGELOG.md has no section for {version}")
+    following = re.search(r"^## ", text[heading.end():], re.M)
+    end = heading.end() + following.start() if following else len(text)
+    section = text[heading.end():end].strip()
+    first_line = text.count("\n", 0, heading.end()) + 1
+    entries = [(first_line + offset, line) for offset, line in enumerate(text[heading.end():end].split("\n"))
+               if line.startswith("- ")]
+    if not entries:
+        raise SystemExit(f"CHANGELOG.md section {version} lists no changes")
+    english = [number for number, line in entries if not CJK.search(line)]
+    if english:
+        raise SystemExit(f"CHANGELOG.md entries without Chinese on lines {english}")
+    if complete:
+        missing = [h for h in hashes if not tagged.startswith(h) and h[:7] not in section]
+        if missing:
+            raise SystemExit(f"CHANGELOG.md section {version} does not list commits {missing}")
+    return section
 
 
 def test_counts(logs):
@@ -126,7 +146,12 @@ def main():
     toolchain = Path(args.toolchain).read_text(encoding="utf-8").strip()
     commit = git("rev-list", "-n", "1", args.tag).strip()
     previous = previous_tag(args.tag)
-    total, grouped = commits(previous, args.tag)
+    hashes = commits(previous, args.tag)
+    total = len(hashes)
+    # A dry run of a version that is already tagged only tests the pipeline:
+    # its commits since that tag belong to no release yet.
+    complete = not (args.tag == "HEAD" and tag_exists("v" + version))
+    changes = changelog(version, hashes, commit, complete)
     counts = test_counts(args.logs)
     repo = f"https://github.com/{args.repository}" if args.repository else ""
 
@@ -200,10 +225,7 @@ def main():
     ]
     if repo and previous:
         out += [f"完整对比：{repo}/compare/{previous}...{args.tag}", ""]
-    order = [label for _, label in GROUPS] + ["其他"]
-    for label in dict.fromkeys(order):
-        if label in grouped:
-            out += [f"### {label}", "", *grouped[label], ""]
+    out += [changes, ""]
     out += [
         "## 安装、升级与卸载",
         "",

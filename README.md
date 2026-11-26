@@ -511,6 +511,7 @@ desktop/              GPUI 桌面端 wsl-proxy-desktop
 packaging/windows/    install.ps1、uninstall.ps1、common.ps1
 scripts/              打包、构建记录、导入表检查、发布说明、安装冒烟测试
 .github/workflows/    release.yml 发布流水线
+CHANGELOG.md          每个版本的中文变更，发布说明的「变更」取自这里
 docs/                 架构、决策、开发计划、讨论、审查
 design/               桌面端界面规范与早期原型
 ```

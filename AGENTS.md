@@ -20,3 +20,9 @@
 - 发布打包同样在 Windows 上做：进包的 EXE 必须是 Windows 上编译出来的，`scripts/package-windows.py` 也在 Windows 上运行；WSL 交叉编译的 EXE 不能进发布包（维护者约定）。
 - 构建命令用现有文档里的原生 Windows 命令（`README.md`「从源码构建」；`docs/plans/m4/README.md` 原生 Windows 构建；发布包以 `.github/workflows/release.yml` 为准）。
 - 调不到 Windows（interop 报错、Windows 侧缺工具链）就停下，如实报告「未在 Windows 验证」，把要在 PowerShell 里跑的命令交给用户，不要拿 WSL 的结果代替。
+
+## 发布规矩
+
+- GitHub Releases 上的发布信息全部用中文：tag 注释、Release 正文的每一节，包括「变更」。产品名、文件名、命令、版本号、提交号这类原样保留（维护者约定）。
+- 「变更」取自根目录 `CHANGELOG.md` 里这一版的一节：上一个 `v*` tag 以来每个提交（合并提交除外）一条中文说明，带提交号，和改版本号放在同一个提交里写好。缺条目或某条没有中文，试跑和发布都会失败（`scripts/release-notes.py`）。提交信息不受这条影响。
+- Release 正文不放「构建」和「发布前的检查」两节，它们只写进 Actions 运行的摘要页（维护者约定；`docs/plans/m5/README.md` 发布流水线第 7 步）。
