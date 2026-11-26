@@ -12,7 +12,7 @@ pub(crate) enum ComponentState {
     /// 装过但缺东西，通常是旧版本建的环境；「编辑 → 保存设置」会按当前脚本补齐。
     Incomplete,
     /// 程序在，但本工具写的文件（输入法启动脚本、chrome 启动器）不在，多半是自己装的。
-    /// 只列出缺什么，不提示「编辑 → 保存设置」：那会跑 apt、把系统语言改成中文并重启发行版。
+    /// 只列出缺什么，不提示「编辑 → 保存设置」：那会跑 apt、把系统语言改成 en_US 并重启发行版。
     Foreign,
     Missing,
     /// 后台没返回判断所需的字段。
@@ -62,8 +62,9 @@ pub(crate) fn zsh(features: &Value) -> Component {
     }
 }
 
-/// Chrome 要浏览器本体和 `chrome` 启动器（带关闭 QUIC 等启动参数）。装了中文输入法时，
-/// 启动器还得是导出输入法变量的新版，否则从 Windows 打开的 Chrome 打不了中文。
+/// Chrome 要浏览器本体和 `chrome` 启动器（带关闭 QUIC 等启动参数）。启动器还得是新版：
+/// 让 Chrome 的语言和 Intl 区域都是 en-US，并导出输入法变量。旧版启动器让 Chrome 用
+/// zh-CN，不管装没装输入法都要补齐。
 pub(crate) fn chrome(features: &Value) -> Component {
     let (Some(browser), Some(launcher)) =
         (flag(features, "chrome"), word(features, "chrome_launcher"))
@@ -79,16 +80,15 @@ pub(crate) fn chrome(features: &Value) -> Component {
     }
     match launcher {
         "missing" => gaps.push("缺 chrome 启动器"),
-        "outdated" if flag(features, "chinese") == Some(true) => {
-            gaps.push("chrome 启动器是旧版，不带输入法设置")
-        }
+        "outdated" => gaps.push("chrome 启动器是旧版，Chrome 语言是 zh-CN"),
         _ => {}
     }
     Component::from_gaps(browser && launcher == "missing", gaps)
 }
 
-/// 中文环境和输入法：zh_CN.UTF-8、fcitx5、GTK 输入法模块（Chrome 靠它接输入法）和
-/// 带 `--disable=wayland` 的启动脚本。只生成了中文 locale 不算装过：装 Chrome 也会生成它。
+/// 中文输入法：zh_CN.UTF-8（不是默认语言）、fcitx5、GTK 输入法模块（Chrome 靠它接输入法）
+/// 和带 `--disable=wayland`、不再导出 zh_CN 的启动脚本。只生成了中文 locale 不算装过：
+/// 旧版本装 Chrome 也会生成它。
 pub(crate) fn chinese(features: &Value) -> Component {
     let (Some(fcitx5), Some(locale), Some(gtk), Some(profile)) = (
         flag(features, "chinese"),
@@ -231,16 +231,19 @@ mod tests {
         assert_eq!(input.gaps, ["缺 GTK 输入法模块", "输入法启动脚本是旧版"]);
         let browser = chrome(&facts);
         assert_eq!(browser.state, ComponentState::Incomplete);
-        assert_eq!(browser.gaps, ["chrome 启动器是旧版，不带输入法设置"]);
+        assert_eq!(browser.gaps, ["chrome 启动器是旧版，Chrome 语言是 zh-CN"]);
     }
 
+    /// 旧版启动器都让 Chrome 用 zh-CN，没装输入法也要补齐。
     #[test]
-    fn an_old_launcher_is_fine_without_the_input_method() {
+    fn an_old_launcher_needs_completing_without_the_input_method() {
         let mut facts = current();
         facts["chinese"] = json!(false);
         facts["input_profile"] = json!("missing");
         facts["chrome_launcher"] = json!("outdated");
-        assert_eq!(chrome(&facts).state, ComponentState::Ready);
+        let browser = chrome(&facts);
+        assert_eq!(browser.state, ComponentState::Incomplete);
+        assert_eq!(browser.gaps, ["chrome 启动器是旧版，Chrome 语言是 zh-CN"]);
         assert_eq!(chinese(&facts).state, ComponentState::Missing);
     }
 

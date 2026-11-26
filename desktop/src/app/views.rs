@@ -37,6 +37,9 @@ const LOG_ROW_HEIGHT: f32 = 54.;
 /// Editing an environment enables systemd and then terminates the distribution.
 const EDIT_RESTART_WARNING: &str =
     "保存后会开启 systemd 并重启该发行版，其中正在运行的程序会被关闭，请先保存好工作。";
+/// The edit form reruns the setup script; with Chrome or the input method
+/// selected it resets the system language. Changing only the timezone does not.
+const EDIT_LANGUAGE_NOTE: &str = "勾了 Chrome 或中文输入法时，保存会把系统语言设为 en_US（LANG=en_US.UTF-8、LANGUAGE=en_US:en）。";
 
 pub(crate) fn card_header(title: &'static str, caption: &'static str) -> Div {
     let mut title_view = div()
@@ -558,7 +561,7 @@ impl Desktop {
                 reached(if creating { 90 } else { 60 }),
             ),
             (
-                "中文环境和输入法",
+                "中文输入法",
                 self.environment_chinese,
                 reached(if creating { 90 } else { 80 }),
             ),
@@ -1168,7 +1171,7 @@ impl Desktop {
                                 .rounded_md()
                                 .child(
                                     Checkbox::new("env-install-chinese")
-                                        .label("中文环境和输入法")
+                                        .label("中文输入法")
                                         .checked(self.environment_chinese)
                                         .disabled(locked || (!creating && self.environment_chinese))
                                         .on_click(cx.listener(|this, checked, _, cx| {
@@ -1180,12 +1183,19 @@ impl Desktop {
                 ),
         );
         if !creating {
-            body = body.child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(AMBER))
-                    .child(EDIT_RESTART_WARNING),
-            );
+            body = body
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(AMBER))
+                        .child(EDIT_RESTART_WARNING),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(AMBER))
+                        .child(EDIT_LANGUAGE_NOTE),
+                );
         }
         body = body.child(div().flex_1());
         let action_bar = ButtonGroup::new("environment-editor-actions")
@@ -1269,14 +1279,14 @@ impl Desktop {
                 "图形浏览器和 chrome 启动器",
             ))
             .child(component_feature(
-                "中文环境和输入法",
+                "中文输入法",
                 chinese,
-                "zh_CN.UTF-8 和 fcitx5 拼音",
+                "fcitx5 拼音和 zh_CN 语言包",
             ));
         // 编辑时已装的组件默认勾选，保存会按当前版本的安装脚本重装，缺的东西随之补上。
         let repair_hint = incomplete.then(|| {
             div().text_sm().text_color(rgb(AMBER)).child(
-                "有组件需要补齐：点右上角「编辑」后直接「保存设置」，会按当前版本重装勾选的组件（保存会重启该发行版）。",
+                "有组件需要补齐：点右上角「编辑」后直接「保存设置」，会按当前版本重装勾选的组件（保存会重启该发行版；装了 Chrome 或中文输入法时，系统语言会改成 en_US）。",
             )
         });
         let systemd = match environment_facts::systemd(features) {

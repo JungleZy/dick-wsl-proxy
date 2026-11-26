@@ -294,7 +294,8 @@ if [ "$run_apt" = 1 ]; then
             fi
         done
     fi
-    for package in systemd systemd-sysv iptables; do
+    # locales provides locale-gen and update-locale for the en_US default below.
+    for package in systemd systemd-sysv iptables locales; do
         if apt-cache show "$package" >/dev/null 2>&1; then
             packages="$packages $package"
         fi
@@ -307,7 +308,7 @@ if [ "$run_apt" = 1 ]; then
     if [ "$install_chrome" = 1 ]; then
         apt-get update
         chrome_packages="ca-certificates wget gnupg"
-        for package in locales language-pack-zh-hans language-pack-zh-hans-base fonts-noto-cjk fonts-noto-color-emoji; do
+        for package in locales fonts-noto-cjk fonts-noto-color-emoji; do
             if apt-cache show "$package" >/dev/null 2>&1; then
                 chrome_packages="$chrome_packages $package"
             fi
@@ -324,11 +325,12 @@ if [ "$run_apt" = 1 ]; then
         cat > /usr/local/bin/chrome <<'CHROME'
 #!/bin/sh
 set -eu
-# Windows starts GUI programs without a login shell, so the variables from
-# /etc/profile.d are not present; export them here as well.
-export LANG=zh_CN.UTF-8
-export LANGUAGE=zh_CN:zh
-export LC_ALL=zh_CN.UTF-8
+# Chrome on Linux ignores --lang: its UI language and the JavaScript Intl locale
+# come from LANGUAGE, LC_ALL and LANG. Windows starts GUI programs without a
+# login shell and a shell may carry another language, so set them here.
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+unset LC_ALL
 if command -v fcitx5 >/dev/null 2>&1 && [ -n "${{DISPLAY:-}}${{WAYLAND_DISPLAY:-}}" ]; then
     export GTK_IM_MODULE=fcitx
     export QT_IM_MODULE=fcitx
@@ -349,7 +351,9 @@ elif command -v google-chrome >/dev/null 2>&1; then
 else
     exit 127
 fi
-launch_args="--lang=zh-CN --accept-lang=zh-CN,zh --disable-quic --disable-features=AsyncDns"
+# --accept-lang sets navigator.languages and Accept-Language and wins over the
+# languages a Chrome profile has saved.
+launch_args="--accept-lang=en-US,en --disable-quic --disable-features=AsyncDns"
 if [ "$(id -u)" = 0 ]; then
     launch_args="$launch_args --no-sandbox"
 fi
@@ -365,15 +369,30 @@ fi
 PROFILE
     fi
 
-    if [ "$install_chinese" = 1 ] || [ "$install_chrome" = 1 ]; then
+    # The system language is LANG=en_US.UTF-8 and LANGUAGE=en_US:en with no
+    # LC_ALL, so a Chrome started without the launcher (google-chrome, an
+    # automation tool) also reports en-US. The input method adds zh_CN.UTF-8
+    # without making it the default.
+    if [ "$new_environment" = 1 ] || [ "$install_chrome" = 1 ] || [ "$install_chinese" = 1 ]; then
+        system_locales="en_US.UTF-8"
+        if [ "$install_chinese" = 1 ]; then
+            system_locales="$system_locales zh_CN.UTF-8"
+        fi
         if [ -f /etc/locale.gen ]; then
-            sed -i 's/^# *zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/' /etc/locale.gen || true
+            for system_locale in $system_locales; do
+                sed -i "s/^# *$system_locale UTF-8/$system_locale UTF-8/" /etc/locale.gen || true
+            done
         fi
         if command -v locale-gen >/dev/null 2>&1; then
-            locale-gen zh_CN.UTF-8 || true
+            # The list holds the fixed locale names above.
+            locale-gen $system_locales || true
         fi
         if command -v update-locale >/dev/null 2>&1; then
-            update-locale LANG=zh_CN.UTF-8 LANGUAGE=zh_CN:zh LC_ALL=zh_CN.UTF-8 || true
+            # --reset drops what an older version wrote, including its LC_ALL.
+            update-locale --reset LANG=en_US.UTF-8 LANGUAGE=en_US:en || true
+        fi
+        if [ -f /etc/locale.conf ] && [ ! -L /etc/locale.conf ]; then
+            printf '%s\n' 'LANG=en_US.UTF-8' 'LANGUAGE=en_US:en' > /etc/locale.conf
         fi
     fi
 
@@ -382,10 +401,9 @@ PROFILE
             im-config -n fcitx5 || true
         fi
         install -d -m 0755 /etc/profile.d /etc/skel/.config/autostart
+        # The language stays the system default (en_US); only the input method
+        # variables are set here.
         cat > /etc/profile.d/wsl-proxy-chinese-input.sh <<'PROFILE'
-export LANG=zh_CN.UTF-8
-export LANGUAGE=zh_CN:zh
-export LC_ALL=zh_CN.UTF-8
 export GTK_IM_MODULE=fcitx
 export QT_IM_MODULE=fcitx
 export XMODIFIERS=@im=fcitx
@@ -407,6 +425,31 @@ DESKTOP
         if [ -d /root ]; then
             install -d -m 0755 /root/.config/autostart
             cp /etc/skel/.config/autostart/fcitx5.desktop /root/.config/autostart/fcitx5.desktop
+        fi
+        # fcitx5 builds a missing profile from the system language, and under
+        # en_US that holds the keyboard alone. A user without a profile of
+        # their own starts from this one, so Pinyin is there from the start.
+        # A file someone else wrote is left alone.
+        install -d -m 0755 /etc/xdg/fcitx5
+        if [ ! -e /etc/xdg/fcitx5/profile ] || grep -q 'wsl-proxy' /etc/xdg/fcitx5/profile; then
+            cat > /etc/xdg/fcitx5/profile <<'FCITX'
+# Written by wsl-proxy: the default for users without ~/.config/fcitx5/profile.
+[Groups/0]
+Name=Default
+Default Layout=us
+DefaultIM=pinyin
+
+[Groups/0/Items/0]
+Name=keyboard-us
+Layout=
+
+[Groups/0/Items/1]
+Name=pinyin
+Layout=
+
+[GroupOrder]
+0=Default
+FCITX
         fi
     fi
 fi
@@ -509,6 +552,7 @@ chrome=false
 if command -v google-chrome >/dev/null 2>&1 || command -v google-chrome-stable >/dev/null 2>&1; then chrome=true; fi
 # Pieces the current setup script installs. An environment made by an older
 # version can have fcitx5 without them, and the IME then does not work in Chrome.
+# Older versions also exported zh_CN from both files, which made Chrome zh-CN.
 zh_locale=false
 if locale -a 2>/dev/null | grep -Eiq '^zh_CN\.utf-?8$'; then zh_locale=true; fi
 fcitx5_gtk=false
@@ -518,12 +562,18 @@ done
 input_profile=missing
 if [ -f /etc/profile.d/wsl-proxy-chinese-input.sh ]; then
     input_profile=outdated
-    if grep -q -e '--disable=wayland' /etc/profile.d/wsl-proxy-chinese-input.sh 2>/dev/null; then input_profile=current; fi
+    if grep -q -e '--disable=wayland' /etc/profile.d/wsl-proxy-chinese-input.sh 2>/dev/null \
+        && ! grep -q 'zh_CN' /etc/profile.d/wsl-proxy-chinese-input.sh 2>/dev/null; then
+        input_profile=current
+    fi
 fi
 chrome_launcher=missing
 if [ -f /usr/local/bin/chrome ]; then
     chrome_launcher=outdated
-    if grep -q 'GTK_IM_MODULE' /usr/local/bin/chrome 2>/dev/null; then chrome_launcher=current; fi
+    if grep -q 'GTK_IM_MODULE' /usr/local/bin/chrome 2>/dev/null \
+        && grep -q 'LANGUAGE=en_US:en' /usr/local/bin/chrome 2>/dev/null; then
+        chrome_launcher=current
+    fi
 fi
 # Takeover basics, reported as facts; preflight decides whether takeover works.
 systemd_configured=false
@@ -986,13 +1036,16 @@ mod tests {
         assert!(script.contains("GTK_IM_MODULE=fcitx"));
         assert_eq!(script.matches("export GTK_IM_MODULE=fcitx").count(), 2);
         assert!(script.contains("XMODIFIERS=@im=fcitx"));
-        assert!(script.contains("zh_CN.UTF-8"));
+        assert!(script.contains(r#"system_locales="$system_locales zh_CN.UTF-8""#));
+        assert!(script.contains("update-locale --reset LANG=en_US.UTF-8 LANGUAGE=en_US:en"));
+        assert!(!script.contains("LANG=zh_CN"));
+        assert!(!script.contains("LC_ALL=zh_CN"));
         assert!(script.contains("google-chrome-stable"));
         assert!(script.contains("language-pack-zh-hans"));
         assert!(script.contains("fonts-noto-cjk"));
         assert!(script.contains("/usr/local/bin/chrome"));
-        assert!(script.contains("--lang=zh-CN"));
-        assert!(script.contains("--accept-lang=zh-CN,zh"));
+        assert!(!script.contains("--lang="));
+        assert!(script.contains("--accept-lang=en-US,en"));
         assert!(script.contains("--disable-quic"));
         assert!(script.contains("--disable-features=AsyncDns"));
         assert!(script.contains("alias chrome='/usr/local/bin/chrome'"));
@@ -1003,8 +1056,94 @@ mod tests {
         assert!(script.contains("wsl_conf_set boot systemd true"));
         assert!(script.contains("wsl_conf_set user default \"$environment_user\""));
         assert!(script.contains("wsl_conf_set time useWindowsTimezone false"));
-        assert!(script.contains("for package in systemd systemd-sysv iptables"));
+        assert!(script.contains("for package in systemd systemd-sysv iptables locales"));
         assert!(!script.contains("> /etc/wsl.conf"));
+    }
+
+    /// The reference environment runs Chrome under LANG=en_US.UTF-8 and
+    /// LANGUAGE=en_US:en with no LC_ALL, and Chrome then reports en-US for both
+    /// navigator.languages and Intl. Every new environment gets that default,
+    /// with or without Chrome; only the input method adds zh_CN, and not as the
+    /// default.
+    #[test]
+    fn new_environments_default_to_the_en_us_system_language() {
+        let script = setup_script(InstallOptions {
+            username: Some("dev".into()),
+            password: Some("secret".into()),
+            ..InstallOptions::default()
+        });
+        let locale_block = script
+            .split("system_locales=\"en_US.UTF-8\"\n")
+            .nth(1)
+            .expect("locale block")
+            .split("\n    fi\n")
+            .next()
+            .expect("locale block end");
+        assert!(script.contains(
+            r#"if [ "$new_environment" = 1 ] || [ "$install_chrome" = 1 ] || [ "$install_chinese" = 1 ]; then"#
+        ));
+        assert!(locale_block.contains("locale-gen $system_locales"));
+        assert!(locale_block.contains("update-locale --reset LANG=en_US.UTF-8 LANGUAGE=en_US:en"));
+        assert!(locale_block.contains("'LANG=en_US.UTF-8' 'LANGUAGE=en_US:en' > /etc/locale.conf"));
+        assert!(!script.contains("LC_ALL=en_US"));
+    }
+
+    /// Under en_US fcitx5 would build a keyboard-only profile on first start,
+    /// so the input method ships a system-wide default with Pinyin.
+    #[test]
+    fn input_method_ships_a_pinyin_default_for_the_en_us_system() {
+        let script = setup_script(InstallOptions {
+            chinese: true,
+            ..InstallOptions::default()
+        });
+        let profile = script
+            .split("cat > /etc/xdg/fcitx5/profile <<'FCITX'\n")
+            .nth(1)
+            .expect("fcitx5 profile")
+            .split("\nFCITX\n")
+            .next()
+            .expect("profile end");
+        assert!(profile.starts_with("# Written by wsl-proxy"));
+        assert!(profile.contains("DefaultIM=pinyin\n"));
+        assert!(profile.contains("Name=keyboard-us\n"));
+        assert!(profile.contains("Name=pinyin\n"));
+        assert!(profile.ends_with("[GroupOrder]\n0=Default"));
+        assert!(script.contains("grep -q 'wsl-proxy' /etc/xdg/fcitx5/profile"));
+    }
+
+    #[test]
+    fn chrome_launcher_runs_chrome_in_en_us() {
+        for chinese in [false, true] {
+            let script = setup_script(InstallOptions {
+                chrome: true,
+                chinese,
+                ..InstallOptions::default()
+            });
+            let launcher = script
+                .split("cat > /usr/local/bin/chrome <<'CHROME'")
+                .nth(1)
+                .expect("chrome launcher")
+                .split("\nCHROME\n")
+                .next()
+                .expect("launcher body");
+            assert!(launcher.contains("export LANG=en_US.UTF-8\n"));
+            assert!(launcher.contains("export LANGUAGE=en_US:en\n"));
+            assert!(launcher.contains("unset LC_ALL\n"));
+            assert!(launcher.contains("--accept-lang=en-US,en"));
+            assert!(!launcher.contains("zh_CN"));
+            assert!(!launcher.contains("zh-CN"));
+            assert!(!launcher.contains("--lang="));
+            // The Chrome packages no longer carry the zh_CN language pack.
+            let chrome_install = script
+                .split("    if [ \"$install_chrome\" = 1 ]; then\n")
+                .nth(1)
+                .expect("chrome install")
+                .split("cat > /usr/local/bin/chrome")
+                .next()
+                .expect("chrome install end");
+            assert!(chrome_install.contains("fonts-noto-cjk"));
+            assert!(!chrome_install.contains("language-pack"));
+        }
     }
 
     /// The detail view calls a file `current` only when it carries the marker the
@@ -1039,11 +1178,17 @@ mod tests {
                 "grep -q -e '--disable=wayland' /etc/profile.d/wsl-proxy-chinese-input.sh"
             )
         );
+        // An older profile exported zh_CN; the current one must not match that.
+        assert!(!profile.contains("zh_CN"));
+        assert!(inspect.contains("! grep -q 'zh_CN' /etc/profile.d/wsl-proxy-chinese-input.sh"));
         assert!(launcher.contains("GTK_IM_MODULE"));
         assert!(inspect.contains("grep -q 'GTK_IM_MODULE' /usr/local/bin/chrome"));
+        assert!(launcher.contains("LANGUAGE=en_US:en"));
+        assert!(inspect.contains("grep -q 'LANGUAGE=en_US:en' /usr/local/bin/chrome"));
         assert!(setup.contains("fcitx5-frontend-gtk3"));
         assert!(inspect.contains("/gtk-3.0/*/immodules/im-fcitx5.so"));
-        assert!(setup.contains("locale-gen zh_CN.UTF-8"));
+        assert!(setup.contains(r#"system_locales="$system_locales zh_CN.UTF-8""#));
+        assert!(setup.contains("locale-gen $system_locales"));
         assert!(inspect.contains(r"'^zh_CN\.utf-?8$'"));
         assert!(setup.contains("wsl_conf_set boot systemd true"));
         assert!(inspect.contains("wsl_conf_get boot systemd"));

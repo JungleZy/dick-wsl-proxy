@@ -298,3 +298,19 @@ UDP 活跃表实际达到 128 条，发生 70 次安静映射回收，容量拒�
 - **转发限制可配置（R7）：**默认值改为并发 TCP 256 条、空闲断开 30 分钟、半关闭等待 60 秒，可在策略（M2）和桌面端设置页修改，启动或切换接管时固定，改完下次启动生效。IPv6 UDP 映射和 TCP 上的 DNS 仍各自 120 秒空闲回收，不跟着变。连接没有数据时，转发线程改为等 socket 就绪（最长 1 秒检查一次期限），不再每 5 毫秒醒一次，空闲长连接不再持续占 CPU。「活动连接」的显示上限从 256 行提到 1,024 行，只影响显示。
 - **环境操作改为后台任务（M9）：**新建、编辑、备份、删除环境的请求校验后立刻返回，操作在后台线程执行，桌面端每秒查询一次结果，进度仍读进度文件；不再受 240 秒等待上限影响。执行期间，状态查询等请求照常处理；启动、切换、预检、出口检测、关闭后台、其它环境操作和查看同一环境被拒绝。窗口关掉重开会提示后台仍在执行；结果写进运行日志。结果只交付一次，已结束未取走的结果会被下一个任务覆盖。
 - **推翻的既有记录：**删除规则不再要求旧身份完全一致，取代 M1「不以旧身份删除现有内核对象」的保守策略（决策 07）；未写完的别名记录可以被确认后的重置清掉，取代原代码注释「残留的 pending 文件绝不等于允许重置」（决策 08）。
+
+## 新建环境的语言改成 en-US（0.1.14 之后）
+
+**状态：代码已改。2026-11-26 Windows 原生 `cargo fmt --all --check`、`cargo clippy --locked --workspace --all-targets -- -D warnings`、`cargo test --locked --workspace`（桌面端 106 项，控制器 29 + 279 项）都通过；`cfg(unix)` 的脚本单测在 Windows 上不跑。没有用桌面端真的新建或编辑过发行版。**
+
+> 第一次在 Windows 上跑时控制器没有重编：`src/environment.rs` 的修改时间早于上一次编译，Cargo 当它没变，跑的是旧脚本和旧测试（控制器 276 项，没有新加的三项）。`touch` 之后重跑才编进新代码。在 Windows 上验证前，先看输出里有没有 `Compiling wsl-proxyctl`（clippy 是 `Checking wsl-proxyctl`）和新测试的名字。
+
+维护者的参考环境（Ubuntu 24.04）：系统 `LANG=en_US.UTF-8`、`LANGUAGE=en_US:en`，不设 `LC_ALL`；Chrome 不带语言参数，`navigator.language` 和 Intl 区域都是 en-US。此前新建环境时，勾了 Chrome 或中文环境，系统语言就被改成 zh_CN（连 `LC_ALL` 一起设），`chrome` 启动器也导出 zh_CN 并带 `--lang=zh-CN --accept-lang=zh-CN,zh`，两项都是 zh-CN。维护者定：新建环境照参考环境来，系统语言也改，不只改启动器。
+
+- **Linux 版 Chrome 的语言从哪来**（2026-11-26 在参考环境里实测，headless 和 WSLg 有界面两种都测了）：`navigator.language(s)` 和 `Accept-Language` 由 `--accept-lang` 决定；不带这个参数时，用配置目录里保存的语言（`intl.selected_languages`），新配置目录取环境变量。Intl 区域只跟环境变量走，`LANGUAGE` 优先于 `LANG`。`--lang` 不起作用。
+- **系统语言：**新建环境（带 `apt-get` 的发行版；别的发行版不跑这段脚本）一律设置；编辑时勾了 Chrome 或中文输入法也设置。生成 en_US.UTF-8，执行 `update-locale --reset LANG=en_US.UTF-8 LANGUAGE=en_US:en`：`--reset` 去掉旧版本写的 `LC_ALL`，旧值会作为注释行留在 `/etc/default/locale`。`/etc/locale.conf` 是普通文件时写入同样两行。基础包加了 `locales`。生成或设置失败不中断安装（`|| true`），这和以前一样。
+- **`chrome` 启动器：**导出 `LANG=en_US.UTF-8`、`LANGUAGE=en_US:en`，执行 `unset LC_ALL`，参数改成 `--accept-lang=en-US,en`，去掉不起作用的 `--lang`。Chrome 的软件包不再带 `language-pack-zh-hans`，只留 CJK 字体。
+- **中文输入法（原「中文环境和输入法」）：**照旧装 fcitx5 拼音和 zh_CN 语言包，也生成 zh_CN.UTF-8，但不设成默认语言。`/etc/profile.d/wsl-proxy-chinese-input.sh` 只导出输入法变量，不再导出 `LANG`/`LANGUAGE`/`LC_ALL`。fcitx5 第一次启动时按系统语言生成配置，en_US 下只有英文键盘、没有拼音（2026-11-26 实测，zh_CN 下才有 `DefaultIM=pinyin`），所以另写一份系统级默认配置 `/etc/xdg/fcitx5/profile`（英文键盘加拼音，拼音为默认），没有自己配置的用户第一次启动就用它；同名文件不是本工具写的就不覆盖。桌面端的选项和详情卡改名为「中文输入法」。
+- **旧环境：**检查脚本把不带 `LANGUAGE=en_US:en` 的启动器、带 `zh_CN` 的输入法启动脚本都算旧版，详情页显示「需要补齐」。Chrome 卡片的缺项改为「chrome 启动器是旧版，Chrome 语言是 zh-CN」，没装输入法也会提示。补齐用「编辑 → 保存设置」，这会把系统语言改成 en_US 并重启发行版；补齐提示和编辑表单都写明了这一点（只改时区不动系统语言）。维护者确认保留对旧环境的这个标记。
+- **没覆盖到的：**旧环境里不经启动器（直接运行 `google-chrome`）打开过的 Chrome，配置目录里保存了 `zh-CN,zh`。补齐之后，经启动器打开是 en-US；不经启动器打开时，`navigator.language` 仍是 zh-CN（Intl 是 en-US），要在 Chrome 设置的「语言」里改。本工具不改用户的 Chrome 配置目录。系统语言是 en_US 时在 Chrome 里实际打中文没有测过，只测了 fcitx5 第一次启动拿到的是带拼音的配置。
+- **中途检查（WSL，不算验证）：**从 Rust 源码抠出安装脚本、启动器、输入法启动脚本和检查脚本，`sh -n` 都通过。在一个 `LANG`/`LANGUAGE`/`LC_ALL` 全是 zh_CN 的 shell 里运行新启动器，Chrome 收到的是 en_US 的环境变量和 `--accept-lang=en-US,en`，页面读到 `en-US | en-US;en | en-US`（`navigator.language`、`navigator.languages`、Intl 区域）。用有界面的 Chrome 测了旧配置目录：旧启动器建的、直接运行 `google-chrome` 建的，经新启动器打开都是 en-US。检查脚本对新版两份文件报 `current`，对 HEAD 版本写的报 `outdated`。fcitx5 用独立的 D-Bus 会话和空配置目录、不接显示器启动：不放系统级配置时 en_US 下只生成英文键盘，放了源码里这份配置后生成 `DefaultIM=pinyin`。
