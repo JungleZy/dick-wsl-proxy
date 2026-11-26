@@ -94,7 +94,7 @@ def validate(request):
     fields = {"operation", "plan", "protocol", "peer"}
     require(isinstance(request, dict) and set(request) in (fields, fields | {"deadline"}), "invalid_request")
     operation = request["operation"]
-    require(operation in ("precheck", "arm", "install", "remove", "inspect", "lookup", "sync_networks", "block"), "invalid_operation")
+    require(operation in ("precheck", "arm", "install", "remove", "inspect", "lookup", "sync_networks", "block", "anchor"), "invalid_operation")
     require((operation == "arm") == ("deadline" in request), "unexpected_or_missing_grant_deadline")
     if operation == "arm":
         require(integer(request["deadline"], 1, 0xffffffffffffffff), "invalid_grant_deadline")
@@ -397,6 +397,12 @@ def artifacts(p):
     return chain, tag, hooks, body, guards
 
 
+# Reserved (240.0.0.0/4): never redirected (the redirect chain returns it
+# before marking) and dropped by the local guard, so a probe never leaves
+# while the rules hold; if they no longer match the target it goes nowhere.
+PROBE = ("240.0.0.1", 9)
+
+
 def m2_artifacts(p):
     cookie = f"{p['cookie']:08x}"
     chain, guard_chain = "WPM2_" + cookie, "WPM2G_" + cookie
@@ -408,7 +414,11 @@ def m2_artifacts(p):
     ingress, ingress_port = endpoint(p["ingress"])
     local = ["-m", "cgroup", "--path", "/"]
     fresh = ["-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL"]
-    hooks, body = [], []
+    # Counting only, no target (decision 37): the probe the periodic check
+    # sends from the target to PROBE must bump both, one per table, or another
+    # distribution re-added the rules under its own cgroup namespace.
+    probe = ["-d", PROBE[0] + "/32", "-p", "tcp", "-m", "tcp", "--dport", str(PROBE[1]), *local, *comment]
+    hooks, body = [["-A", "OUTPUT", *probe]], []
     # These exclusions precede marking: a direct forged ingress packet can
     # never acquire an owned original-destination proof.
     for protocol in ("tcp", "udp"):
@@ -447,6 +457,7 @@ def m2_artifacts(p):
         hooks.append(["-A", "PREROUTING", "!", "-i", "eth0", "-p", protocol, "-m", protocol, *fresh, *comment, "-j", bridge_chain])
         hooks.append(["-A", "POSTROUTING", "-d", ingress + "/32", "-p", protocol, "-m", protocol, "--dport", str(ingress_port), "-m", "conntrack", "--ctdir", "ORIGINAL", "--ctstate", "DNAT", "-m", "connmark", "--mark", mark, *comment, "-j", "SNAT", "--to-source", p["guest"]])
     guards = [
+        ["-A", "OUTPUT", *probe],
         ["-A", "OUTPUT", *local, "-m", "conntrack", "!", "--ctorigdst", "127.0.0.0/8", *comment, "-j", guard_chain],
         ["-A", "OUTPUT", "!", "-d", "127.0.0.0/8", *local, "-m", "conntrack", "--ctstate", "INVALID,UNTRACKED", *comment, "-j", guard_chain],
         ["-A", guard_chain, "-m", "conntrack", "--ctdir", "REPLY", *comment, "-j", "RETURN"],
@@ -1123,6 +1134,56 @@ def displaced(tables, found, backend="nft"):
                 return True
         return False
     return behind("filter", "OUTPUT"), behind(gate_table(backend), "FORWARD")
+
+
+def probe_rules(p):
+    """{table: the counting rule the probe must bump} (decision 37)."""
+    _, _, hooks, _, guards = artifacts(p)
+    pick = lambda rules: next(rule for rule in rules if rule[1] == "OUTPUT" and PROBE[0] + "/32" in rule and "-j" not in rule)
+    return {"nat": pick(hooks), "filter": pick(guards)}
+
+
+def probe_counts(p):
+    """Packets counted so far by the probe rules, per table."""
+    wanted = {table: rule_key(rule) for table, rule in probe_rules(p).items()}
+    counts = {}
+    for table, key in wanted.items():
+        for line in run(["iptables-nft-save", "-c", "-t", table]).splitlines():
+            match = re.match(r"\[(\d+):\d+\] (-A OUTPUT .*)", line)
+            if match:
+                try:
+                    found = rule_key(shlex.split(match.group(2)))
+                except (Failure, ValueError):
+                    continue
+                if found == key:
+                    counts[table] = counts.get(table, 0) + int(match.group(1))
+    return counts
+
+
+def probe_bound(p):
+    """Whether this instance's cgroup rules still match the target: one TCP
+    SYN to PROBE from here, which both probe rules must count. A restore of a
+    whole nft table from another distribution re-adds them under that
+    distribution's cgroup namespace, and the text stays the same (decision 37)."""
+    before = probe_counts(p)
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.setblocking(False)
+        try:
+            probe.connect(PROBE)
+        except OSError:
+            pass  # In progress, or refused by the guard's DROP: either way sent.
+    finally:
+        probe.close()
+    after = probe_counts(p)
+    return all(after.get(table, 0) > before.get(table, 0) for table in ("nat", "filter"))
+
+
+def anchored_rules(p, ipv6=False):
+    """{table: this instance's cgroup-matched OUTPUT rules} in install order:
+    the ones a restore from another distribution rebinds."""
+    tables = base_tables(p, ipv6)
+    return {table: [rule for rule in tables.get(table, []) if rule[1] == "OUTPUT" and "cgroup" in rule] for table in ("nat", "filter")}
 
 
 def legacy_leftovers(p):
@@ -1864,6 +1925,8 @@ def execute(request):
                         # Ahead of the FORWARD gate: the target's own
                         # processes are still guarded, its containers may not be.
                         "forward_displaced": complete and gate_behind,
+                        # Only asked of complete managed rules of this identity.
+                        "rules_bound": probe_bound(p) if complete and identity_matches and p.get("system_dns") is not None else True,
                     }
                     require(identity_matches or not (ownership["rules_present"] or ownership["mappings_present"]), "stale_identity_has_owned_artifacts: " + str(drift))
                     if not ownership["rules_present"] and not ownership["mappings_present"]:
@@ -1929,6 +1992,25 @@ def execute(request):
                     require(have == sorted(rule_key(rule) for rule in block_rules(p, ipv6)), "block_not_in_place")
                     in_place += len(have)
                 return {"ok": True, "operation": operation, "blocked": {"rules": in_place}}
+            elif operation == "anchor":
+                # Decision 37: the probe found the rules no longer matching
+                # the target. Re-insert this instance's cgroup-matched OUTPUT
+                # rules from here, one transaction per table, delete and insert
+                # together, text unchanged; then probe again. Only for a
+                # complete managed takeover of this exact identity (the guard
+                # above refused any drift).
+                require(p.get("system_dns") is not None, "anchor_needs_managed_mode")
+                tables, ipv6_tables = firewall(), firewall(ipv6=True)
+                present, rules = inspect_firewall(p, tables, True)
+                _, ipv6_rules = inspect_firewall(p, ipv6_tables, True, ipv6=True)
+                require(rules_complete(p, present, rules, ipv6_rules), "anchor_without_complete_rules")
+                insert = lambda rule: ["-I", rule[1], "1", *rule[2:]]
+                for ipv6, found in ((False, rules), (True, ipv6_rules)):
+                    for table, wanted in anchored_rules(p, ipv6).items():
+                        old = [rule for rule in found[table] if rule[1] == "OUTPUT" and "cgroup" in rule]
+                        if old or wanted:
+                            transaction(table, [["-D", *rule[1:]] for rule in old] + [insert(rule) for rule in reversed(wanted)], ipv6=ipv6)
+                return {"ok": True, "operation": operation, "anchored": {"bound": probe_bound(p)}}
             elif operation == "sync_networks":
                 # Only an active, complete takeover of this exact identity is
                 # extended (the guard above refused any drift); after a stop
