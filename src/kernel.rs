@@ -9,30 +9,17 @@ const SCRIPT: &str = include_str!("guest/kernel.py");
 pub struct GrantWindow {
     cookie: u32,
     deadline: u64,
-    legacy_foreign_rules: u32,
-}
-
-impl GrantWindow {
-    /// Rules in the shared legacy tables that are not this instance's, as the
-    /// precheck saw them (decision 37): some distribution writes legacy
-    /// iptables, and another distribution's legacy write rebinds this
-    /// instance's rules to it. A hint only.
-    pub fn legacy_foreign_rules(&self) -> u32 {
-        self.legacy_foreign_rules
-    }
 }
 
 /// Checks the target, required kernel features and absence of an existing owner.
 /// This must succeed before persisting a new installation journal.
 pub fn precheck(p: &Plan) -> Result<GrantWindow, String> {
-    let response = invoke(p, "precheck", None)?;
-    let deadline = response
+    let deadline = invoke(p, "precheck", None)?
         .grant_deadline
         .ok_or("kernel_missing_guest_grant_window")?;
     Ok(GrantWindow {
         cookie: p.cookie,
         deadline,
-        legacy_foreign_rules: response.legacy_foreign_rules.unwrap_or(0),
     })
 }
 
@@ -70,6 +57,11 @@ pub struct Ownership {
     /// mappings. Never deleted; the periodic check counts any as a loss.
     #[serde(default)]
     pub unproven_mappings: u32,
+    /// The rules are complete, but another tool's rule now sits ahead of
+    /// this takeover's FORWARD gate (decision 37): the target's own
+    /// processes are still guarded, its containers may not be.
+    #[serde(default)]
+    pub forward_displaced: bool,
 }
 
 impl Ownership {
@@ -91,33 +83,16 @@ pub fn inspect(p: &Plan) -> Result<Ownership, String> {
 /// As `inspect`, plus the guest's reason when it could not confirm this
 /// generation's identity (restart, rename, new address, foreign workload, ...).
 pub fn inspect_detail(p: &Plan) -> Result<(Ownership, Option<String>), String> {
-    inspect_networks(p).map(|inspection| (inspection.ownership, inspection.drift))
-}
-
-/// What one guest inspect saw.
-pub struct Inspection {
-    pub ownership: Ownership,
-    /// Why the guest could not confirm this generation's identity, if so.
-    pub drift: Option<String>,
-    /// The target's Docker networks against this takeover's per-network rules.
-    pub networks: Option<Networks>,
-    /// Rules in the shared legacy tables that are not this instance's
-    /// (decision 37). A hint only.
-    pub legacy_foreign_rules: u32,
+    inspect_networks(p).map(|(ownership, drift, _)| (ownership, drift))
 }
 
 /// As `inspect_detail`, plus how the target's Docker networks compare with
 /// this takeover's per-network rules; reported only for a complete managed
 /// takeover of the same identity (decision 24). Changes nothing.
-pub fn inspect_networks(p: &Plan) -> Result<Inspection, String> {
+pub fn inspect_networks(p: &Plan) -> Result<(Ownership, Option<String>, Option<Networks>), String> {
     let response = invoke(p, "inspect", None)?;
     let ownership = response.ownership.ok_or("kernel_missing_ownership")?;
-    Ok(Inspection {
-        ownership,
-        drift: response.identity_error,
-        networks: response.networks,
-        legacy_foreign_rules: response.legacy_foreign_rules.unwrap_or(0),
-    })
+    Ok((ownership, response.identity_error, response.networks))
 }
 
 /// Brings the per-network rules in line with the target's Docker bridge
@@ -190,8 +165,6 @@ struct Response {
     synced: Option<Synced>,
     #[serde(default)]
     blocked: Option<Blocked>,
-    #[serde(default)]
-    legacy_foreign_rules: Option<u32>,
 }
 
 /// What a block left: how many drop-only rules are in place (decision 33).
@@ -256,9 +229,6 @@ fn parse_response(output: &str, operation: &str) -> Result<Response, String> {
     }
     if response.blocked.is_some() != (operation == "block") {
         return Err("kernel_unexpected_or_missing_block_result".into());
-    }
-    if response.legacy_foreign_rules.is_some() && !matches!(operation, "precheck" | "inspect") {
-        return Err("kernel_unexpected_legacy_rule_count".into());
     }
     if let Some(ownership) = &response.ownership
         && ((ownership.rules_complete && !ownership.rules_present)
@@ -516,37 +486,13 @@ mod tests {
                         mappings_present,
                         rules_complete: false,
                         unproven_mappings: 1,
+                        forward_displaced: false,
                     };
                     assert_eq!(ownership.clean(), !rules_present && !mappings_present);
                     assert!(serde_json::to_string(&ownership).is_ok());
                 }
             }
         }
-    }
-
-    #[test]
-    fn the_foreign_legacy_rule_count_comes_only_with_precheck_and_inspect() {
-        let inspect = r#"{"ok":true,"operation":"inspect","ownership":{"identity_matches":true,"rules_present":true,"rules_complete":true,"mappings_present":false},"legacy_foreign_rules":3}"#;
-        assert_eq!(
-            parse_response(inspect, "inspect")
-                .unwrap()
-                .legacy_foreign_rules,
-            Some(3)
-        );
-        let precheck =
-            r#"{"ok":true,"operation":"precheck","grant_deadline":5,"legacy_foreign_rules":0}"#;
-        assert_eq!(
-            parse_response(precheck, "precheck")
-                .unwrap()
-                .legacy_foreign_rules,
-            Some(0)
-        );
-        let block =
-            r#"{"ok":true,"operation":"block","blocked":{"rules":4},"legacy_foreign_rules":1}"#;
-        assert_eq!(
-            parse_response(block, "block").err().as_deref(),
-            Some("kernel_unexpected_legacy_rule_count")
-        );
     }
 
     #[test]

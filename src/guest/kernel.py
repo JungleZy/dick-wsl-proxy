@@ -189,7 +189,7 @@ def guard(p, check_resolver=True, write_tools=True):
                 require((executable.st_dev, executable.st_ino) == (init.st_dev, init.st_ino), "workload_outside_distro_cgroup")
         except (FileNotFoundError, ProcessLookupError):
             require(not os.path.exists(entry.path), "unverifiable_workload")
-    for command in (("ip", "iptables-legacy-save", "iptables-legacy-restore") if write_tools else ("ip", "iptables-legacy-save")):
+    for command in (("ip", "iptables-nft-save", "iptables-nft-restore") if write_tools else ("ip", "iptables-nft-save")):
         require(shutil.which(command, path="/usr/sbin:/usr/bin:/sbin:/bin") is not None, "missing_prerequisite: " + command)
     addresses = json.loads(run(["ip", "-j", "-4", "address", "show", "dev", "eth0"]))
     require(isinstance(addresses, list) and len(addresses) == 1, "guest_interface_ambiguous")
@@ -198,7 +198,7 @@ def guard(p, check_resolver=True, write_tools=True):
     routes = json.loads(run(["ip", "-j", "-4", "route", "show", "default"]))
     require(isinstance(routes, list) and len(routes) == 1 and routes[0].get("dev") == "eth0" and routes[0].get("gateway") == endpoint(p["ingress"])[0], "gateway_changed_or_ambiguous")
     if p.get("system_dns") is not None:
-        for command in (("ip6tables-legacy-save", "ip6tables-legacy-restore") if write_tools else ("ip6tables-legacy-save",)):
+        for command in (("ip6tables-nft-save", "ip6tables-nft-restore") if write_tools else ("ip6tables-nft-save",)):
             require(shutil.which(command, path="/usr/sbin:/usr/bin:/sbin:/bin") is not None, "missing_prerequisite: " + command)
         if check_resolver:
             resolver_layout(p, read_text("/etc/resolv.conf"))
@@ -589,7 +589,48 @@ def forward_gate(forward_chain, forward_bridges, comment, mark=None, ingress=Non
     return rules
 
 
-def instance_chains(p, ipv6=False):
+GATE_CHAINS = ("WPM2F_", "WPM2FB_", "WPM2VF_", "WPM2VFB_")
+
+
+def gate_table(backend="nft"):
+    """Where the FORWARD gate lives. Through nft it is the mangle table,
+    which Docker never writes: on a restart Docker puts its own jumps back on
+    top of the filter FORWARD chain, ahead of anything there (decision 37).
+    An older version kept it in the legacy filter table."""
+    return "mangle" if backend == "nft" else "filter"
+
+
+def gate_rule(rule):
+    return rule[1] == "FORWARD" or rule[1].startswith(GATE_CHAINS)
+
+
+def split_guards(rules, backend="nft"):
+    """{table: rules} for rules of a guard list: the FORWARD gate apart from
+    the local guard, keeping their order."""
+    tables = {}
+    for rule in rules:
+        tables.setdefault(gate_table(backend) if gate_rule(rule) else "filter", []).append(rule)
+    return tables
+
+
+def base_tables(p, ipv6=False, backend="nft"):
+    """{table: rules} of this instance's base rules in one family, without
+    the per-network rules."""
+    if not ipv6:
+        _, _, hooks, body, guards = artifacts(p)
+        nat = hooks + body
+    elif p.get("ipv6") is not None:
+        _, _, _, hooks, body, guards = ipv6_artifacts(p)
+        nat = hooks + body
+    else:
+        nat, guards = [], ipv6_guards(p)
+    tables = split_guards(guards, backend)
+    if nat:
+        tables["nat"] = list(nat)
+    return tables
+
+
+def instance_chains(p, ipv6=False, backend="nft"):
     """Every chain this instance owns in one address family, with its table,
     in creation order."""
     cookie = f"{p['cookie']:08x}"
@@ -601,7 +642,7 @@ def instance_chains(p, ipv6=False):
         names = (("WPM2V_", "nat"), ("WPM2VB_", "nat"), ("WPM2VG_", "filter"), ("WPM2VF_", "filter"), ("WPM2VFB_", "filter"))
     else:
         names = (("WPM2VF_", "filter"), ("WPM2VFB_", "filter"))
-    return {prefix + cookie: table for prefix, table in names}
+    return {prefix + cookie: gate_table(backend) if prefix in GATE_CHAINS else table for prefix, table in names}
 
 
 def all_instance_chains(cookie):
@@ -830,7 +871,7 @@ def network_rule_owner(p, rule, ipv6=False):
 def installed_networks(p, found, ipv6=False):
     """{bridge: [(table, rule)]} for this instance's per-network rules in `found`."""
     result = {}
-    for table in ("nat", "filter"):
+    for table in ("nat", "filter", "mangle"):
         for rule in found.get(table, []):
             name = network_rule_owner(p, rule, ipv6)
             if name is not None:
@@ -879,7 +920,7 @@ def network_changes(p, found, wanted, ipv6=False):
     removals, additions = [], []
     for name in sorted(set(installed) | set(wanted)):
         nat, filtered = network_rules(p, {name: wanted[name]} if name in wanted else {}, ipv6)
-        want = [("nat", rule) for rule in nat] + [("filter", rule) for rule in filtered]
+        want = [("nat", rule) for rule in nat] + [(table, rule) for table, rules in split_guards(filtered).items() for rule in rules]
         have = installed.get(name, [])
         if sorted((table, rule_key(rule)) for table, rule in want) != sorted((table, rule_key(rule)) for table, rule in have):
             removals.extend(have)
@@ -899,7 +940,21 @@ def network_report(p, rules, ipv6_rules):
     return {"installed": installed, "wanted": sorted(wanted), "in_sync": in_sync, "error": None}
 
 def firewall(ipv6=False):
-    output = run(["ip6tables-legacy-save" if ipv6 else "iptables-legacy-save"])
+    """The tables this instance writes, through iptables-nft (decision 37)."""
+    return parse_firewall(run(["ip6tables-nft-save" if ipv6 else "iptables-nft-save"]))
+
+
+def legacy_firewall(ipv6=False):
+    """The legacy tables, where an older version wrote this instance's rules:
+    read only to find and remove those. Without the legacy tool nothing can
+    have been written there."""
+    tool = "ip6tables-legacy-save" if ipv6 else "iptables-legacy-save"
+    if shutil.which(tool, path="/usr/sbin:/usr/bin:/sbin:/bin") is None:
+        return {}
+    return parse_firewall(run([tool]))
+
+
+def parse_firewall(output):
     tables, table = {}, None
     for line in output.splitlines():
         if not line or line.startswith("#"):
@@ -983,28 +1038,26 @@ def rule_key(rule):
     return rule[1], tuple(sorted(result))
 
 
-def inspect_firewall(p, tables, existing, ipv6=False):
+def inspect_firewall(p, tables, existing, ipv6=False, backend="nft"):
     chain, tag, hooks, body, guards = artifacts(p)
     if ipv6 and p.get("ipv6") is not None:
         v6_chain, v6_guard, tag, hooks, body, guards = ipv6_artifacts(p)
         chain = v6_chain
     cookie = f"{p['cookie']:08x}"
     reserved = all_instance_chains(cookie)
-    chains = instance_chains(p, ipv6)
-    expected = {
-        "nat": [rule_key(rule) for rule in hooks + body] if (not ipv6 or p.get("ipv6") is not None) else [],
-        "filter": [rule_key(rule) for rule in (ipv6_guards(p) if ipv6 else guards)],
-    }
+    chains = instance_chains(p, ipv6, backend)
+    expected = {table: [rule_key(rule) for rule in rules] for table, rules in base_tables(p, ipv6, backend).items()}
     # An older version's hooks are this instance's too, for removal only;
     # `rules_complete` still compares against today's exact set.
     for rule in legacy_rules(p, ipv6):
-        expected["nat" if rule[1] == "PREROUTING" else "filter"].append(rule_key(rule))
+        table = "nat" if rule[1] == "PREROUTING" else (gate_table(backend) if gate_rule(rule) else "filter")
+        expected.setdefault(table, []).append(rule_key(rule))
     # The drop-only rules of a lost takeover (decision 33): removed with the
     # rest, never part of a complete set, and they need none of the chains.
     blocking = block_tag(p, ipv6) if p.get("system_dns") is not None else None
     blocked = {rule_key(rule) for rule in block_rules(p, ipv6)}
-    found = {"nat": [], "filter": []}
-    seen = {"nat": set(), "filter": set()}
+    found = {"nat": [], "filter": [], "mangle": []}
+    seen = {"nat": set(), "filter": set(), "mangle": set()}
     observed_chains = set()
     present = False
     prefixes = tuple("wsl-proxyctl-" + mode + ":" + cookie + ":" for mode in ("m1", "m2", "m2v6", "m2n", "m2v6n", "m2k", "m2v6k"))
@@ -1050,38 +1103,65 @@ def inspect_firewall(p, tables, existing, ipv6=False):
     return present, found
 
 
-def foreign_legacy_rules(dumps, owned):
-    """How many rules in the shared legacy tables are not this instance's:
-    a hint that some distribution writes legacy iptables, and any legacy write
-    from another distribution rebinds this instance's `--path /` rules to it
-    (decision 37). Counts only; never a reason to refuse."""
-    total = sum(len(table["rules"]) for tables in dumps if tables for table in tables.values())
-    mine = sum(len(rules) for found in owned if found for rules in found.values())
-    return max(total - mine, 0)
+def displaced(tables, found, backend="nft"):
+    """(guard, gate): whether another rule now sits ahead of this instance's
+    rules on the filter OUTPUT chain (the local guard) or on the FORWARD
+    chain of the gate's table (decision 37). Another tool's accept there
+    would let traffic past them. The nat chains are not checked: what they
+    fail to redirect meets the guard or the gate, so a rule ahead of them can
+    only make traffic fail, and Docker puts its MASQUERADE back on top of nat
+    POSTROUTING whenever it restarts."""
+    def behind(table, chain):
+        mine = {id(rule) for rule in found.get(table, []) if rule[1] == chain}
+        other = False
+        for rule in tables.get(table, {}).get("rules", []):
+            if rule[1] != chain:
+                continue
+            if id(rule) not in mine:
+                other = True
+            elif other:
+                return True
+        return False
+    return behind("filter", "OUTPUT"), behind(gate_table(backend), "FORWARD")
+
+
+def legacy_leftovers(p):
+    """This instance's rules an older version left in the legacy tables, per
+    family as (ipv6, tables, found); removed by a stop, never complete."""
+    families = [False]
+    if p.get("system_dns") is not None or p.get("ipv6") is not None:
+        families.append(True)
+    result = []
+    for ipv6 in families:
+        tables = legacy_firewall(ipv6=ipv6)
+        _, found = inspect_firewall(p, tables, True, ipv6=ipv6, backend="legacy")
+        result.append((ipv6, tables, found))
+    return result
 
 
 def rules_complete(p, present, rules, ipv6_rules):
     # Per-network rules come and go with the target's Docker networks and are
     # compared separately (`network_changes`).
     tags = (network_tag(p), network_tag(p, ipv6=True))
-    same = lambda left, right: sorted(rule_key(rule) for rule in left if not any(tag in rule for tag in tags)) == sorted(rule_key(rule) for rule in right)
-    if p.get("ipv6") is not None:
-        _, _, hooks, body, guards = artifacts(p)
-        _, _, _, v6_hooks, v6_body, v6_guards = ipv6_artifacts(p)
-        return (
-            present
-            and ipv6_rules is not None
-            and same(rules["nat"], hooks + body)
-            and same(rules["filter"], guards)
-            and same(ipv6_rules["nat"], v6_hooks + v6_body)
-            and same(ipv6_rules["filter"], v6_guards)
+
+    def same(found, ipv6):
+        want = base_tables(p, ipv6)
+        return all(
+            sorted(rule_key(rule) for rule in found.get(table, []) if not any(tag in rule for tag in tags))
+            == sorted(rule_key(rule) for rule in want.get(table, []))
+            for table in ("nat", "filter", "mangle")
         )
-    _, _, hooks, body, guards = artifacts(p)
-    return present and same(rules["nat"], hooks + body) and same(rules["filter"], guards) and (p.get("system_dns") is None or same(ipv6_rules["filter"], ipv6_guards(p)))
+
+    if not present or not same(rules, False):
+        return False
+    if p.get("system_dns") is None and p.get("ipv6") is None:
+        return True
+    return ipv6_rules is not None and same(ipv6_rules, True)
 
 
-def transaction(table, lines, test=False, ipv6=False):
-    arguments = ["ip6tables-legacy-restore" if ipv6 else "iptables-legacy-restore", "--wait", "2", "--noflush"]
+def transaction(table, lines, test=False, ipv6=False, backend="nft"):
+    tool = ("ip6tables-" if ipv6 else "iptables-") + backend + "-restore"
+    arguments = [tool, "--wait", "2", "--noflush"]
     if test:
         arguments.append("--test")
     # This is xtables-restore input, not shell syntax: it treats shlex's single
@@ -1134,29 +1214,29 @@ def install_rules(p, test=False, networks=None):
             *(insert(rule) for rule in reversed([rule for rule in rules if rule[1] in builtin])),
         ]
 
-    def with_networks(base, table, ipv6=False):
-        # As in sync_networks: each -I ... 1 lands on top, so they go in
-        # backwards to keep the subnet RETURNs ahead of their jump or drop.
-        if not networks:
-            return base
-        nat, filtered = network_rules(p, networks, ipv6)
-        return base + [insert(rule) for rule in reversed(nat if table == "nat" else filtered)]
+    def commit(ipv6, tables):
+        # Per-network rules go in as sync_networks puts them: each -I ... 1
+        # lands on top, so backwards to keep the subnet RETURNs ahead of
+        # their jump or drop.
+        owned, base = instance_chains(p, ipv6), base_tables(p, ipv6)
+        extra = {}
+        if networks:
+            nat, filtered = network_rules(p, networks, ipv6)
+            extra = split_guards(filtered)
+            extra["nat"] = nat
+        for table in tables:
+            document = lines(owned, table, base.get(table, [])) + [insert(rule) for rule in reversed(extra.get(table, []))]
+            if document:
+                transaction(table, document, test, ipv6=ipv6)
 
-    # Guards commit before redirection. An interrupted installation denies only
-    # target workload traffic; the journal can recover either partial phase.
+    # Guards and the gate commit before redirection. An interrupted
+    # installation denies only target workload traffic; the journal can
+    # recover either partial phase. -N fails on a concurrent name collision;
+    # never flush an existing chain.
     if p.get("system_dns") is not None:
-        transaction("filter", with_networks(lines(instance_chains(p), "filter", guards), "filter"), test)
-        v6_owned = instance_chains(p, ipv6=True)
-        if p.get("ipv6") is not None:
-            _, _, _, v6_hooks, v6_body, v6_guards = ipv6_artifacts(p)
-            # Like IPv4: the OUTPUT jumps go ahead of pre-existing accepts, or
-            # ICMPv6 and other non-TCP/UDP packets could leave before the drop.
-            transaction("filter", with_networks(lines(v6_owned, "filter", v6_guards), "filter", ipv6=True), test, ipv6=True)
-            transaction("nat", with_networks(lines(v6_owned, "nat", v6_body + v6_hooks), "nat", ipv6=True), test, ipv6=True)
-        else:
-            transaction("filter", with_networks(lines(v6_owned, "filter", ipv6_guards(p)), "filter", ipv6=True), test, ipv6=True)
-        # -N fails on a concurrent name collision; never flush an existing chain.
-        transaction("nat", with_networks(lines(instance_chains(p), "nat", body + hooks), "nat"), test)
+        commit(False, ("filter", "mangle"))
+        commit(True, ("filter", "mangle", "nat"))
+        commit(False, ("nat",))
     else:
         transaction("filter", [insert(rule) for rule in guards], test)
         transaction("nat", lines(instance_chains(p), "nat", body + hooks), test)
@@ -1735,11 +1815,11 @@ def execute(request):
         ct, cached_conntrack = acquire_conntrack()
         try:
             if operation in ("precheck", "install"):
-                dumps = [firewall()]
-                inspect_firewall(p, dumps[0], False)
+                inspect_firewall(p, firewall(), False)
                 if p.get("system_dns") is not None or p.get("ipv6") is not None:
-                    dumps.append(firewall(ipv6=True))
-                    inspect_firewall(p, dumps[1], False, ipv6=True)
+                    inspect_firewall(p, firewall(ipv6=True), False, ipv6=True)
+                for ipv6 in (False, True):
+                    inspect_firewall(p, legacy_firewall(ipv6=ipv6), False, ipv6=ipv6, backend="legacy")
                 require(not inspect_mappings(p, ct), "instance_connmark_collision")
                 require(not inspect_ipv6_mappings(p, ct), "instance_ipv6_connmark_collision")
                 # Read before anything commits, so the retries never sit
@@ -1752,7 +1832,7 @@ def execute(request):
                 else:
                     # Windows and the WSL VM need not agree on wall-clock seconds.
                     # Issue and validate in the guest; RPC transit can only shorten the window.
-                    return {"ok": True, "operation": operation, "grant_deadline": int(time.time()) + 30, "legacy_foreign_rules": foreign_legacy_rules(dumps, [])}
+                    return {"ok": True, "operation": operation, "grant_deadline": int(time.time()) + 30}
             elif operation in ("remove", "inspect"):
                 tables = firewall()
                 present, rules = inspect_firewall(p, tables, True)
@@ -1760,41 +1840,56 @@ def execute(request):
                 if p.get("system_dns") is not None or p.get("ipv6") is not None:
                     ipv6_tables = firewall(ipv6=True)
                     _, ipv6_rules = inspect_firewall(p, ipv6_tables, True, ipv6=True)
+                leftovers = legacy_leftovers(p)
+                old = any(any(found.values()) for _, _, found in leftovers)
                 # Complete both families and every owned tuple before any delete.
                 # Marked entries that cannot be proven are counted, never deleted,
                 # and do not stop the exact-tagged rules from going (decision 20);
                 # the periodic check still treats any of them as a protection loss.
                 entries, ipv6_entries, unproven = mapping_partition(p, ct)
                 if operation == "inspect":
+                    guard_behind, gate_behind = displaced(tables, rules)
+                    if ipv6_rules is not None:
+                        behind6 = displaced(ipv6_tables, ipv6_rules)
+                        guard_behind, gate_behind = guard_behind or behind6[0], gate_behind or behind6[1]
+                    complete = rules_complete(p, present, rules, ipv6_rules) and not old and not guard_behind
                     ownership = {
                         "identity_matches": identity_matches,
-                        "rules_present": present or any(rules.values()) or bool(ipv6_rules and any(ipv6_rules.values())),
-                        "rules_complete": rules_complete(p, present, rules, ipv6_rules),
+                        "rules_present": present or any(rules.values()) or bool(ipv6_rules and any(ipv6_rules.values())) or old,
+                        # A rule another tool put ahead of the local guard is
+                        # as good as a missing guard (decision 37).
+                        "rules_complete": complete,
                         "mappings_present": bool(entries or ipv6_entries),
                         "unproven_mappings": unproven,
+                        # Ahead of the FORWARD gate: the target's own
+                        # processes are still guarded, its containers may not be.
+                        "forward_displaced": complete and gate_behind,
                     }
                     require(identity_matches or not (ownership["rules_present"] or ownership["mappings_present"]), "stale_identity_has_owned_artifacts: " + str(drift))
                     if not ownership["rules_present"] and not ownership["mappings_present"]:
                         require(not grant_pending(p), "install_grant_pending")
-                    result = {"ok": True, "operation": operation, "ownership": ownership, "legacy_foreign_rules": foreign_legacy_rules([tables, ipv6_tables], [rules, ipv6_rules])}
+                    result = {"ok": True, "operation": operation, "ownership": ownership}
                     if drift is not None:
                         result["identity_error"] = drift
                     if p.get("system_dns") is not None and identity_matches and ownership["rules_complete"]:
                         result["networks"] = network_report(p, rules, ipv6_rules)
                     return result
-                def withdraw(table, found, observed, ipv6=False):
-                    # Every owned rule, then every owned chain that exists
-                    # (an older version may have created fewer chains).
-                    names = [name for name, kind in instance_chains(p, ipv6).items() if kind == table and name in observed.get(table, {}).get("chains", {})]
-                    lines = [["-D", *rule[1:]] for rule in found] + [["-X", name] for name in names]
-                    if lines:
-                        transaction(table, lines, ipv6=ipv6)
+                def withdraw(found, observed, ipv6=False, backend="nft"):
+                    # Redirection first, then the guards and the gate: every
+                    # owned rule, then every owned chain that exists (an older
+                    # version may have created fewer chains).
+                    for table in ("nat", "filter", "mangle"):
+                        names = [name for name, kind in instance_chains(p, ipv6, backend).items() if kind == table and name in observed.get(table, {}).get("chains", {})]
+                        lines = [["-D", *rule[1:]] for rule in found.get(table, [])] + [["-X", name] for name in names]
+                        if lines:
+                            transaction(table, lines, ipv6=ipv6, backend=backend)
 
-                withdraw("nat", rules["nat"], tables)
-                withdraw("filter", rules["filter"], tables)
+                withdraw(rules, tables)
                 if ipv6_rules is not None:
-                    withdraw("nat", ipv6_rules["nat"], ipv6_tables, ipv6=True)
-                    withdraw("filter", ipv6_rules["filter"], ipv6_tables, ipv6=True)
+                    withdraw(ipv6_rules, ipv6_tables, ipv6=True)
+                # What an older version left in the legacy tables (decision 37).
+                for ipv6, old_tables, found in leftovers:
+                    withdraw(found, old_tables, ipv6=ipv6, backend="legacy")
                 # Table commits synchronize old readers before exact tuple cleanup.
                 for _ in range(4):
                     entries, ipv6_entries, unproven = mapping_partition(p, ct)
@@ -1809,6 +1904,8 @@ def execute(request):
                 inspect_firewall(p, firewall(), False)
                 if p.get("system_dns") is not None or p.get("ipv6") is not None:
                     inspect_firewall(p, firewall(ipv6=True), False, ipv6=True)
+                for ipv6, _, _ in leftovers:
+                    inspect_firewall(p, legacy_firewall(ipv6=ipv6), False, ipv6=ipv6, backend="legacy")
                 entries, ipv6_entries, unproven = mapping_partition(p, ct)
                 require(not entries and not ipv6_entries, "owned_conntrack_residual")
                 unproven_left = unproven
@@ -1845,12 +1942,12 @@ def execute(request):
                 changes = [(False, *network_changes(p, rules, wanted)), (True, *network_changes(p, ipv6_rules, wanted, ipv6=True))]
                 # Redirection goes before the drops it relies on when removing,
                 # and after them when adding, as for the base rules.
-                for table in ("nat", "filter"):
+                for table in ("nat", "filter", "mangle"):
                     for ipv6, removals, _ in changes:
                         lines = [["-D", *rule[1:]] for kind, rule in removals if kind == table]
                         if lines:
                             transaction(table, lines, ipv6=ipv6)
-                for table in ("filter", "nat"):
+                for table in ("filter", "mangle", "nat"):
                     for ipv6, _, additions in changes:
                         rules_here = [rule for kind, rule in additions if kind == table]
                         # Each -I ... 1 lands on top, so insert backwards to

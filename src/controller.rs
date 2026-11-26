@@ -39,9 +39,6 @@ struct Watch {
     /// After a loss that leaves the target direct, the drop-only rules
     /// (decision 33): where they stand as of the last round.
     block: Option<BlockState>,
-    /// Rules in the shared legacy tables that are not this instance's, as
-    /// the precheck or the last inspect saw them (decision 37). A hint only.
-    legacy_foreign_rules: Option<u32>,
 }
 
 /// The drop-only rules of a lost takeover (decision 33), as last seen.
@@ -129,32 +126,6 @@ fn recovery_due(observed: &Observed) -> bool {
     matches!(observed, Observed::Lost(reason) if blockable(reason))
 }
 
-/// The log line for rules in the shared legacy tables that are not this
-/// instance's (decision 37).
-pub(crate) fn legacy_rules_warning(count: u32) -> String {
-    format!(
-        "共享网络里的 legacy iptables 表有 {count} 条不属于本次接管的规则，说明有发行版在用 legacy iptables（也可能是目标自己）。别的发行版再写一次 legacy 表，本次接管的规则就会改去匹配那个发行版：目标直连，而且核对看不出来。接管期间请不要在别的发行版使用 legacy iptables。"
-    )
-}
-
-/// Two log lines of one round as one.
-fn joined(
-    first: Option<(&'static str, String)>,
-    second: Option<(&'static str, String)>,
-) -> Option<(&'static str, String)> {
-    match (first, second) {
-        (Some((a, x)), Some((b, y))) => {
-            let level = if a == "warning" || b == "warning" {
-                "warning"
-            } else {
-                a
-            };
-            Some((level, format!("{x}{y}")))
-        }
-        (one, None) | (None, one) => one,
-    }
-}
-
 /// Losses after which the target's own new connections leave directly: its
 /// rules are gone or no longer apply (decision 33). Not a changed
 /// environment or unprovable mappings, where the rules still stand.
@@ -221,6 +192,15 @@ fn classify(result: Result<(kernel::Ownership, Option<String>), String>) -> Obse
                 own.unproven_mappings
             ))
         }
+        // Not blocked: the decision 33 block covers the target's own
+        // processes, which the local guard still covers; the containers are
+        // what the gate no longer may (decision 37).
+        Ok((own, _)) if own.identity_matches && own.rules_complete && own.forward_displaced => {
+            Observed::Lost(
+                "protection_lost: forward_gate_displaced: another rule now precedes this takeover's forward gate; the target's containers may bypass it"
+                    .into(),
+            )
+        }
         Ok((own, _)) if own.identity_matches && own.rules_complete => Observed::Protected,
         Ok((own, _)) if own.identity_matches => Observed::Lost(
             "protection_lost: rules_incomplete: this takeover's rules are missing or incomplete in the target".into(),
@@ -273,9 +253,7 @@ enum Finding {
     Unregistered,
     RunningListFailed(String),
     NotRunning,
-    /// What the inspect concluded, the network sync it led to, and the
-    /// foreign rule count in the shared legacy tables (decision 37).
-    Inspected(Observed, Option<NetworkUpdate>, Option<u32>),
+    Inspected(Observed, Option<NetworkUpdate>),
     /// A blocking round found the target registered and running.
     BlockDue,
 }
@@ -308,15 +286,15 @@ impl WatchRound {
     /// rules. This is the only change a round ever makes (decision 24).
     fn inspect(&self) -> Finding {
         match kernel::inspect_networks(&self.plan) {
-            Ok(inspection) => {
-                let observed = classify(Ok((inspection.ownership, inspection.drift)));
-                let update = match (&observed, inspection.networks) {
+            Ok((ownership, drift, networks)) => {
+                let observed = classify(Ok((ownership, drift)));
+                let update = match (&observed, networks) {
                     (Observed::Protected, Some(networks)) => Some(self.update_networks(networks)),
                     _ => None,
                 };
-                Finding::Inspected(observed, update, Some(inspection.legacy_foreign_rules))
+                Finding::Inspected(observed, update)
             }
-            Err(error) => Finding::Inspected(classify(Err(error)), None, None),
+            Err(error) => Finding::Inspected(classify(Err(error)), None),
         }
     }
 
@@ -555,13 +533,10 @@ impl Controller {
             }
             // Only blocking rounds, handled above, report this.
             Finding::BlockDue => None,
-            Finding::Inspected(observed, update, legacy) => {
+            Finding::Inspected(observed, update) => {
                 self.watch.target_running = Some(true);
                 if let Some(update) = update {
                     *note = self.record_networks(update);
-                }
-                if let Some(count) = legacy {
-                    *note = joined(note.take(), self.record_legacy(count));
                 }
                 match observed {
                     Observed::Protected => {
@@ -622,22 +597,6 @@ impl Controller {
         note
     }
 
-    /// Keeps the foreign rule count of the shared legacy tables and says
-    /// when it is worth a log line: when such rules appear after none, and
-    /// when they are gone again (decision 37). The precheck's count counts as
-    /// seen, so a count present from the start is reported once, at start.
-    fn record_legacy(&mut self, count: u32) -> Option<(&'static str, String)> {
-        let before = self.watch.legacy_foreign_rules.replace(count);
-        match (before, count) {
-            (Some(0) | None, 1..) => Some(("warning", legacy_rules_warning(count))),
-            (Some(1..), 0) => Some((
-                "info",
-                "共享网络里的 legacy iptables 表已经没有不属于本次接管的规则。".into(),
-            )),
-            _ => None,
-        }
-    }
-
     fn lose(&mut self, reason: String) -> Option<String> {
         self.watch.lost = Some(reason.clone());
         Some(reason)
@@ -668,7 +627,6 @@ impl Controller {
             "container_networks": self.watch.networks,
             "container_network_error": self.watch.network_error,
             "fallback_block": self.watch.block.as_ref().map(BlockState::view),
-            "legacy_foreign_rules": self.watch.legacy_foreign_rules,
         })
     }
 
@@ -761,7 +719,6 @@ impl Controller {
         if self.live.is_some() || journal::load()?.is_some() {
             return Err("recover_or_stop_existing_target_first".into());
         }
-        let legacy_foreign_rules = window.legacy_foreign_rules();
         journal::persist(&p)?;
         let mut sockets = match Ingress::bind(&p, runtime.clone()) {
             Ok(s) => s,
@@ -810,7 +767,6 @@ impl Controller {
         self.watch = Watch {
             cookie: p.cookie,
             networks,
-            legacy_foreign_rules: Some(legacy_foreign_rules),
             ..Watch::default()
         };
         if let Some(runtime) = &runtime {
@@ -946,7 +902,26 @@ mod tests {
             mappings_present: false,
             rules_complete,
             unproven_mappings: 0,
+            forward_displaced: false,
         }
+    }
+
+    #[test]
+    fn a_displaced_forward_gate_is_a_loss_that_is_not_blocked() {
+        let displaced = kernel::Ownership {
+            forward_displaced: true,
+            ..ownership(true, true)
+        };
+        let Observed::Lost(reason) = classify(Ok((displaced, None))) else {
+            panic!("a displaced gate must be a loss");
+        };
+        assert!(
+            reason.starts_with("protection_lost: forward_gate_displaced:"),
+            "{reason}"
+        );
+        // The block covers the target's own processes, which the guard still
+        // does; it would cut working traffic and leave the containers as they are.
+        assert!(!blockable(&reason));
     }
 
     #[test]
@@ -1029,6 +1004,9 @@ mod tests {
 
     #[test]
     fn only_losses_that_leave_the_target_direct_are_blocked() {
+        assert!(!blockable(
+            "protection_lost: forward_gate_displaced: another rule now precedes this takeover's forward gate"
+        ));
         assert!(blockable(RESTARTED));
         assert!(blockable(
             "protection_lost: rules_missing: this takeover's rules are gone from the target"
@@ -1087,36 +1065,6 @@ mod tests {
         assert_eq!(
             controller.watch.block.as_ref().map(BlockState::view),
             Some(serde_json::json!({"state": "installed", "error": null}))
-        );
-    }
-
-    #[test]
-    fn foreign_legacy_rules_are_logged_when_they_appear_or_go() {
-        let mut controller = Controller::default();
-        // Seen by the precheck: reported at start, not again by the rounds.
-        controller.watch.legacy_foreign_rules = Some(2);
-        assert_eq!(controller.record_legacy(2), None);
-        assert_eq!(controller.record_legacy(5), None);
-        let (level, message) = controller.record_legacy(0).unwrap();
-        assert_eq!(level, "info");
-        assert!(message.contains("已经没有"), "{message}");
-        assert_eq!(controller.record_legacy(0), None);
-        let (level, message) = controller.record_legacy(1).unwrap();
-        assert_eq!(level, "warning");
-        assert!(message.contains("有 1 条不属于本次接管的规则"), "{message}");
-        // Without a precheck count, the first round that sees some reports.
-        controller.watch.legacy_foreign_rules = None;
-        assert!(controller.record_legacy(3).is_some());
-        assert_eq!(
-            joined(Some(("info", "甲。".into())), controller.record_legacy(0)).map(|n| n.0),
-            Some("info")
-        );
-        assert_eq!(
-            joined(
-                Some(("info", "甲。".into())),
-                Some(("warning", "乙。".into()))
-            ),
-            Some(("warning", "甲。乙。".into()))
         );
     }
 

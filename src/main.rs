@@ -256,6 +256,9 @@ fn protection_lost_message(reason: &str) -> String {
         "target_unregistered" => {
             return "目标发行版已被注销，无法再停止或清理它。请在概览页点「放弃本次记录」，并在下次启动接管前执行一次 wsl --shutdown。".into();
         }
+        "forward_gate_displaced" => {
+            return "目标发行版里有别的规则排到了本次接管的转发闸门前面，目标的 Docker 容器的新连接可能绕过它直连；目标本机进程仍受保护。请停止接管并恢复，再重新启动接管。".into();
+        }
         "environment_changed" => format!(
             "目标发行版的环境变了（{}），无法再确认本次接管覆盖它的全部流量",
             detail.split(':').next().unwrap_or(detail)

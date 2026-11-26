@@ -19,6 +19,11 @@ import kernel
 if os.name == "nt":
     WindowsPosixOS().install(kernel)
 
+# The legacy tables hold nothing of this instance unless a test says so:
+# only an older version wrote there (decision 37).
+REAL_LEGACY_FIREWALL = kernel.legacy_firewall
+kernel.legacy_firewall = lambda ipv6=False: {}
+
 
 def plan():
     return {
@@ -91,28 +96,35 @@ def declare_chains(tables, p, ipv6=False):
     return tables
 
 
+def tables_of(p, ipv6=False, backend="nft"):
+    """A parsed dump holding exactly this instance's base rules, laid out as
+    the given backend keeps them."""
+    if not ipv6:
+        _, _, hooks, body, guards = kernel.artifacts(p)
+    else:
+        hooks, body, guards = [], [], kernel.ipv6_guards(p)
+        if p.get("ipv6") is not None:
+            _, _, _, hooks, body, guards = kernel.ipv6_artifacts(p)
+    tables = {}
+    if hooks + body:
+        tables["nat"] = {"chains": {"OUTPUT": "ACCEPT"}, "rules": copy.deepcopy(hooks + body)}
+    for table, rules in kernel.split_guards(guards, backend).items():
+        tables[table] = {"chains": {"OUTPUT": "ACCEPT"}, "rules": copy.deepcopy(rules)}
+    for name, table in kernel.instance_chains(p, ipv6, backend).items():
+        tables.setdefault(table, {"chains": {"OUTPUT": "ACCEPT"}, "rules": []})["chains"][name] = "-"
+    return tables
+
+
 def snapshot(p=None):
-    p = p or plan()
-    chain, _, hooks, body, guards = kernel.artifacts(p)
-    tables = {
-        "nat": {"chains": {"OUTPUT": "ACCEPT"}, "rules": copy.deepcopy(hooks + body)},
-        "filter": {"chains": {"OUTPUT": "ACCEPT"}, "rules": copy.deepcopy(guards)},
-    }
-    return declare_chains(tables, p)
+    return tables_of(p or plan())
 
 
 def ipv6_snapshot(p):
-    tables = {"filter": {"chains": {"OUTPUT": "ACCEPT"}, "rules": copy.deepcopy(kernel.ipv6_guards(p))}}
-    return declare_chains(tables, p, ipv6=True)
+    return tables_of(p, ipv6=True)
 
 
 def ipv6_full_snapshot(p):
-    chain, guard, _, hooks, body, guards = kernel.ipv6_artifacts(p)
-    tables = {
-        "nat": {"chains": {"OUTPUT": "ACCEPT"}, "rules": copy.deepcopy(hooks + body)},
-        "filter": {"chains": {"OUTPUT": "ACCEPT"}, "rules": copy.deepcopy(guards)},
-    }
-    return declare_chains(tables, p, ipv6=True)
+    return tables_of(p, ipv6=True)
 
 
 LEGACY_RULES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "legacy_rules.json")
@@ -125,7 +137,7 @@ def legacy_plan(name):
     return p
 
 
-def apply_removal(state, table, lines, test=False, ipv6=False):
+def apply_removal(state, table, lines, test=False, ipv6=False, backend="nft"):
     """A removal as iptables would apply it to a parsed dump: -D must hit an
     existing rule, -X an empty chain nothing jumps to; nothing else allowed."""
     if test:
@@ -710,19 +722,25 @@ class FirewallTests(unittest.TestCase):
             p = legacy_plan(name)
             with self.subTest(name=name):
                 old, old6 = copy.deepcopy(installed["v4"]), copy.deepcopy(installed["v6"])
-                present, rules = kernel.inspect_firewall(p, old, True)
-                _, ipv6_rules = kernel.inspect_firewall(p, old6, True, ipv6=True)
+                # An older version wrote the legacy tables (decision 37).
+                present, rules = kernel.inspect_firewall(p, old, True, backend="legacy")
+                _, ipv6_rules = kernel.inspect_firewall(p, old6, True, ipv6=True, backend="legacy")
                 self.assertTrue(present)
                 instance = sum(len(table["rules"]) for family in ("v4", "v6") for table in installed[family].values()) - sum(len(table["rules"]) for family in ("v4", "v6") for table in foreign[family].values())
                 self.assertEqual(sum(len(found) for both in (rules, ipv6_rules) for found in both.values()), instance)
                 self.assertFalse(kernel.rules_complete(p, present, rules, ipv6_rules))
                 # Not an install target either: nothing of this instance may exist.
                 with self.assertRaises(kernel.Failure):
-                    kernel.inspect_firewall(p, old, False)
+                    kernel.inspect_firewall(p, old, False, backend="legacy")
                 state = copy.deepcopy(installed)
+
+                def legacy_only(table, lines, test=False, ipv6=False, backend="nft"):
+                    self.assertEqual(backend, "legacy")
+                    apply_removal(state, table, lines, test, ipv6)
+
                 operation = request(p)
                 operation["operation"] = "remove"
-                with patch.object(kernel, "guest_lock"), patch.object(kernel, "grant"), patch.object(kernel, "guard"), patch.object(kernel, "Conntrack") as conntrack, patch.object(kernel, "firewall", side_effect=lambda ipv6=False: copy.deepcopy(state["v6" if ipv6 else "v4"])), patch.object(kernel, "transaction", side_effect=lambda table, lines, test=False, ipv6=False: apply_removal(state, table, lines, test, ipv6)):
+                with patch.object(kernel, "guest_lock"), patch.object(kernel, "grant"), patch.object(kernel, "guard"), patch.object(kernel, "Conntrack") as conntrack, patch.object(kernel, "firewall", return_value={}), patch.object(kernel, "legacy_firewall", side_effect=lambda ipv6=False: copy.deepcopy(state["v6" if ipv6 else "v4"])), patch.object(kernel, "transaction", side_effect=legacy_only):
                     conntrack.return_value.dump.return_value = []
                     self.assertTrue(kernel.execute(operation)["ok"])
                 self.assertEqual(state, foreign)
@@ -814,7 +832,7 @@ class FirewallTests(unittest.TestCase):
             kernel.inspect_firewall(plan(), tables, True)
             with self.assertRaises(kernel.Failure):
                 kernel.inspect_firewall(plan(), tables, False)
-        self.assertEqual(kernel.inspect_firewall(plan(), {}, True), (False, {"nat": [], "filter": []}))
+        self.assertEqual(kernel.inspect_firewall(plan(), {}, True), (False, {"nat": [], "filter": [], "mangle": []}))
 
     def test_semantically_canonical_save_order_is_accepted_not_broader_rules(self):
         tables = self.snapshot()
@@ -871,7 +889,7 @@ class FirewallTests(unittest.TestCase):
                     if "--path" in rule:
                         rule[rule.index("--path") + 1] = "../../unreachable/from/another/namespace"
                     rule.extend(["--foreign-extension", "shape-not-owned"])
-            self.assertEqual(kernel.inspect_firewall(p, tables, False), (False, {"nat": [], "filter": []}))
+            self.assertEqual(kernel.inspect_firewall(p, tables, False), (False, {"nat": [], "filter": [], "mangle": []}))
             if p.get("system_dns") is not None:
                 v6 = ipv6_snapshot(other)
                 v6["filter"]["rules"][0].extend(["--foreign-extension", "not-owned"])
@@ -965,10 +983,11 @@ class FirewallTests(unittest.TestCase):
             self.assertIn("connmark", rule)
         with patch.object(kernel, "transaction") as transact:
             kernel.install_rules(p, test=True)
-        ipv4_guard, ipv6_guard, nat = transact.call_args_list
-        self.assertEqual(ipv4_guard.args[0], "filter")
-        self.assertTrue(ipv6_guard.kwargs["ipv6"])
-        self.assertEqual(nat.args[0], "nat")
+        # Guards and the FORWARD gate (in mangle, decision 37) before redirection.
+        self.assertEqual(
+            [(call.args[0], call.kwargs.get("ipv6", False)) for call in transact.call_args_list],
+            [("filter", False), ("mangle", False), ("filter", True), ("mangle", True), ("nat", False)],
+        )
 
     def test_managed_ipv6_guards_go_ahead_of_existing_output_accepts(self):
         # A pre-existing ACCEPT ahead of an appended jump would let ICMPv6 and
@@ -991,7 +1010,9 @@ class FirewallTests(unittest.TestCase):
         )
         self.assertEqual(v6_filter[0], ["-N", v6_guard])
         self.assertTrue(any(line[:2] == ["-A", v6_guard] for line in v6_filter))
-        self.assertTrue(all(line[:3] == ["-I", "FORWARD", "1"] for line in v6_filter if "FORWARD" in line[:2]))
+        self.assertFalse(any("FORWARD" in line[:2] for line in v6_filter))
+        v6_gate = next(call.args[1] for call in transact.call_args_list if call.args[0] == "mangle" and call.kwargs.get("ipv6"))
+        self.assertTrue(all(line[:3] == ["-I", "FORWARD", "1"] for line in v6_gate if "FORWARD" in line[:2]))
 
     def test_comprehensive_partial_recovery_requires_exact_ipv4_and_ipv6_shapes(self):
         p = comprehensive_plan()
@@ -1006,7 +1027,7 @@ class FirewallTests(unittest.TestCase):
         reordered[index + 1] = "RELATED,ESTABLISHED"
         kernel.inspect_firewall(p, tables, True)
         guards = kernel.ipv6_guards(p)
-        ipv6 = {"filter": {"chains": {"OUTPUT": "ACCEPT"}, "rules": copy.deepcopy(guards)}}
+        ipv6 = {table: {"chains": {"OUTPUT": "ACCEPT"}, "rules": copy.deepcopy(rules)} for table, rules in kernel.split_guards(guards).items()}
         kernel.inspect_firewall(p, ipv6, True, ipv6=True)
         output_guards = [rule for rule in guards if rule[1] == "OUTPUT"]
         self.assertTrue(all("::1/128" in rule and "cgroup" in rule for rule in output_guards))
@@ -1019,16 +1040,18 @@ class FirewallTests(unittest.TestCase):
         p = comprehensive_plan()
         partial = self.snapshot(p)
         del partial["nat"]
-        v6 = {"filter": {"chains": {"OUTPUT": "ACCEPT"}, "rules": kernel.ipv6_guards(p)}}
+        v6 = {table: {"chains": {"OUTPUT": "ACCEPT"}, "rules": rules} for table, rules in kernel.split_guards(kernel.ipv6_guards(p)).items()}
         operation = request(p)
         operation["operation"] = "remove"
         with patch.object(kernel, "guest_lock"), patch.object(kernel, "grant"), patch.object(kernel, "guard") as guard, patch.object(kernel, "Conntrack") as conntrack, patch.object(kernel, "firewall", side_effect=[partial, v6, {}, {}]), patch.object(kernel, "transaction") as transact:
             conntrack.return_value.dump.return_value = []
             kernel.execute(operation)
         guard.assert_called_once_with(p, check_resolver=False, write_tools=True)
-        ipv4, ipv6 = transact.call_args_list
-        self.assertEqual({line[1] for line in ipv4.args[1] if line[0] == "-X"}, {"WPM2G_12345678", "WPM2F_12345678", "WPM2FB_12345678"})
-        self.assertTrue(ipv6.kwargs["ipv6"])
+        ipv4 = [call for call in transact.call_args_list if not call.kwargs.get("ipv6")]
+        self.assertEqual([call.args[0] for call in ipv4], ["filter", "mangle"])
+        self.assertEqual({line[1] for line in ipv4[0].args[1] if line[0] == "-X"}, {"WPM2G_12345678"})
+        self.assertEqual({line[1] for line in ipv4[1].args[1] if line[0] == "-X"}, {"WPM2F_12345678", "WPM2FB_12345678"})
+        self.assertTrue(any(call.kwargs.get("ipv6") for call in transact.call_args_list))
         self.assertTrue(all(rule[0] in ("-D", "-X") for call in transact.call_args_list for rule in call.args[1]))
 
     def test_stale_remove_recovers_after_any_identity_or_environment_drift_with_exact_rules(self):
@@ -1148,16 +1171,21 @@ class FakeTables:
     """Both address families of a guest's legacy tables, applying restore
     documents as iptables would: -N, -A, -I <chain> 1, -D, -X."""
 
-    def __init__(self, v4=None, v6=None):
+    def __init__(self, v4=None, v6=None, legacy_v4=None, legacy_v6=None):
         self.state = {"v4": copy.deepcopy(v4 or {}), "v6": copy.deepcopy(v6 or {})}
+        self.legacy_state = {"v4": copy.deepcopy(legacy_v4 or {}), "v6": copy.deepcopy(legacy_v6 or {})}
 
     def firewall(self, ipv6=False):
         return copy.deepcopy(self.state["v6" if ipv6 else "v4"])
 
-    def transaction(self, table, lines, test=False, ipv6=False):
+    def legacy(self, ipv6=False):
+        return copy.deepcopy(self.legacy_state["v6" if ipv6 else "v4"])
+
+    def transaction(self, table, lines, test=False, ipv6=False, backend="nft"):
         if test:
             return
-        current = self.state["v6" if ipv6 else "v4"].setdefault(table, {"chains": {"OUTPUT": "ACCEPT"}, "rules": []})
+        family = (self.state if backend == "nft" else self.legacy_state)["v6" if ipv6 else "v4"]
+        current = family.setdefault(table, {"chains": {"OUTPUT": "ACCEPT"}, "rules": []})
         rules = current["rules"]
         for line in lines:
             if line[0] == "-N":
@@ -1177,7 +1205,7 @@ class FakeTables:
                 raise AssertionError(line)
 
     def rules(self, tag):
-        return [rule for family in self.state.values() for table in family.values() for rule in table["rules"] if tag in rule]
+        return [rule for state in (self.state, self.legacy_state) for family in state.values() for table in family.values() for rule in table["rules"] if tag in rule]
 
 
 class BlockTests(unittest.TestCase):
@@ -1195,6 +1223,7 @@ class BlockTests(unittest.TestCase):
             patch.object(kernel, "Conntrack") as conntrack,
             patch.object(kernel, "docker_networks", return_value=None),
             patch.object(kernel, "firewall", side_effect=fake.firewall),
+            patch.object(kernel, "legacy_firewall", side_effect=fake.legacy),
             patch.object(kernel, "transaction", side_effect=fake.transaction),
         ):
             conntrack.return_value.dump.return_value = []
@@ -1268,42 +1297,80 @@ class BlockTests(unittest.TestCase):
 
 
 
-class ForeignLegacyRuleTests(unittest.TestCase):
-    """Decision 37, until the nft backend: count the rules in the shared
-    legacy tables that are not this instance's, never refuse over them."""
+
+class NftBackendTests(unittest.TestCase):
+    """Decision 37: rules go in through iptables-nft, the FORWARD gate lives
+    in the mangle table, and an older version's legacy rules are removed."""
 
     execute = BlockTests.execute
+    foreign = ["-m", "comment", "--comment", "another tool", "-j", "ACCEPT"]
 
-    foreign = [
-        ["-A", "OUTPUT", "-m", "comment", "--comment", "other distro", "-j", "RETURN"],
-        ["-A", "FORWARD", "-o", "br-1", "-j", "ACCEPT"],
-    ]
+    def ahead(self, tables, table, chain):
+        tables.setdefault(table, {"chains": {}, "rules": []})["rules"].insert(0, ["-A", chain, *self.foreign])
+        return tables
 
-    def test_precheck_counts_foreign_legacy_rules_without_refusing(self):
+    def ownership(self, p, v4, v6=None):
+        return self.execute(p, "inspect", FakeTables(v4, v6 if v6 is not None else ipv6_snapshot(p)), drift=None)["ownership"]
+
+    def test_a_rule_ahead_of_the_guard_is_incomplete_ahead_of_the_gate_displaced_and_nat_ignored(self):
         p = comprehensive_plan()
-        for name, v4, v6, count in (
-            ("empty", {}, {}, 0),
-            ("foreign", {"filter": {"chains": {"OUTPUT": "ACCEPT", "FORWARD": "DROP"}, "rules": copy.deepcopy(self.foreign)}}, {"filter": {"chains": {"OUTPUT": "ACCEPT"}, "rules": [copy.deepcopy(self.foreign[0])]}}, 3),
-        ):
-            with self.subTest(name):
-                result = self.execute(p, "precheck", FakeTables(v4, v6), drift=None)
-                self.assertEqual(result["legacy_foreign_rules"], count)
-                self.assertIn("grant_deadline", result)
+        clean = self.ownership(p, snapshot(p))
+        self.assertTrue(clean["rules_complete"])
+        self.assertFalse(clean["forward_displaced"])
+        # Another tool's accept ahead of the OUTPUT guard: as good as no guard.
+        guard = self.ownership(p, self.ahead(snapshot(p), "filter", "OUTPUT"))
+        self.assertFalse(guard["rules_complete"])
+        self.assertTrue(guard["rules_present"])
+        # Ahead of the FORWARD gate: the target is still guarded, not its containers.
+        gate = self.ownership(p, self.ahead(snapshot(p), "mangle", "FORWARD"))
+        self.assertTrue(gate["rules_complete"])
+        self.assertTrue(gate["forward_displaced"])
+        gate6 = self.ownership(p, snapshot(p), self.ahead(ipv6_snapshot(p), "mangle", "FORWARD"))
+        self.assertTrue(gate6["forward_displaced"])
+        # Docker's MASQUERADE on top of nat POSTROUTING, Docker's own FORWARD
+        # jumps in the filter table, or another tool's rule after ours: fine.
+        for table, chain in (("nat", "POSTROUTING"), ("nat", "PREROUTING"), ("filter", "FORWARD")):
+            with self.subTest(table=table, chain=chain):
+                value = self.ownership(p, self.ahead(snapshot(p), table, chain))
+                self.assertTrue(value["rules_complete"])
+                self.assertFalse(value["forward_displaced"])
+        after = snapshot(p)
+        after["filter"]["rules"].append(["-A", "OUTPUT", *self.foreign])
+        self.assertTrue(self.ownership(p, after)["rules_complete"])
 
-    def test_inspect_counts_only_rules_that_are_not_this_instances(self):
+    def test_the_gate_is_in_mangle_and_install_writes_only_through_nft(self):
         p = comprehensive_plan()
-        v4 = snapshot(p)
-        complete = self.execute(p, "inspect", FakeTables(v4, ipv6_snapshot(p)), drift=None)
-        self.assertEqual(complete["legacy_foreign_rules"], 0)
-        self.assertTrue(complete["ownership"]["rules_complete"])
-        v4["filter"]["rules"].extend(copy.deepcopy(self.foreign))
-        mixed = self.execute(p, "inspect", FakeTables(v4, ipv6_snapshot(p)), drift=None)
-        self.assertEqual(mixed["legacy_foreign_rules"], 2)
-        self.assertTrue(mixed["ownership"]["rules_complete"])
-        # A drop-only block (decision 33) is this instance's too.
+        for ipv6 in (False, True):
+            tables = kernel.base_tables(p, ipv6)
+            self.assertTrue(tables["mangle"])
+            self.assertTrue(all(kernel.gate_rule(rule) for rule in tables["mangle"]))
+            self.assertFalse(any(kernel.gate_rule(rule) for rule in tables["filter"]))
+        self.assertEqual(kernel.base_tables(p, backend="legacy").keys(), {"nat", "filter"})
         fake = FakeTables()
-        self.execute(p, "block", fake)
-        self.assertEqual(self.execute(p, "inspect", fake, drift=None)["legacy_foreign_rules"], 0)
+        with (
+            patch.object(kernel, "transaction", side_effect=fake.transaction) as transact,
+        ):
+            kernel.install_rules(p)
+        self.assertTrue(all(call.kwargs.get("backend", "nft") == "nft" for call in transact.call_args_list))
+        self.assertEqual(fake.legacy_state, {"v4": {}, "v6": {}})
+        self.assertTrue(self.execute(p, "inspect", fake, drift=None)["ownership"]["rules_complete"])
+
+    def test_an_older_versions_legacy_rules_next_to_nft_ones_are_never_complete_and_a_stop_clears_both(self):
+        p = comprehensive_plan()
+        fake = FakeTables(snapshot(p), ipv6_snapshot(p), tables_of(p, backend="legacy"), tables_of(p, ipv6=True, backend="legacy"))
+        value = self.execute(p, "inspect", fake, drift=None)["ownership"]
+        self.assertTrue(value["rules_present"])
+        self.assertFalse(value["rules_complete"])
+        # Only legacy ones left (an older version's stop never ran): present.
+        only_old = FakeTables(legacy_v4=tables_of(p, backend="legacy"), legacy_v6=tables_of(p, ipv6=True, backend="legacy"))
+        self.assertTrue(self.execute(p, "inspect", only_old, drift=None)["ownership"]["rules_present"])
+        for tables in (fake, only_old):
+            self.assertEqual(self.execute(p, "remove", tables, drift=None)["unproven_mappings"], 0)
+            for state in (tables.state, tables.legacy_state):
+                for family in state.values():
+                    for table in family.values():
+                        self.assertEqual(table["rules"], [])
+                        self.assertEqual(set(table["chains"]), {"OUTPUT"})
 
 class InspectionTests(unittest.TestCase):
     def observe(self, p, tables, entries=None, ipv6_entries=None, identity_error=None, pending=False):
@@ -1329,7 +1396,7 @@ class InspectionTests(unittest.TestCase):
             if p.get("system_dns") is not None:
                 tables.append(ipv6_snapshot(p))
             value = self.observe(p, tables)
-            self.assertEqual(value, {"identity_matches": True, "rules_present": True, "rules_complete": True, "mappings_present": False, "unproven_mappings": 0})
+            self.assertEqual(value, {"identity_matches": True, "rules_present": True, "rules_complete": True, "mappings_present": False, "unproven_mappings": 0, "forward_displaced": False})
             partial = snapshot(p)
             del partial["nat"]
             tables = [partial] + ([ipv6_snapshot(p)] if p.get("system_dns") is not None else [])
@@ -1394,12 +1461,12 @@ class InspectionTests(unittest.TestCase):
             foreign = snapshot(other)
             foreign["filter"]["rules"][0].extend(["--unrelated-shape", "unreachable"])
             value = self.observe(p, [foreign, ipv6_snapshot(other)], identity_error=reason)
-            self.assertEqual(value, {"identity_matches": False, "rules_present": False, "rules_complete": False, "mappings_present": False, "unproven_mappings": 0})
+            self.assertEqual(value, {"identity_matches": False, "rules_present": False, "rules_complete": False, "mappings_present": False, "unproven_mappings": 0, "forward_displaced": False})
             with self.subTest(reason=reason), self.assertRaises(kernel.Failure):
                 self.observe(p, [snapshot(p), ipv6_snapshot(p)], identity_error=reason)
         # Any other drift is handled the same way: it can attest absence only.
         value = self.observe(plan(), [{}], identity_error="workload_outside_distro_cgroup")
-        self.assertEqual(value, {"identity_matches": False, "rules_present": False, "rules_complete": False, "mappings_present": False, "unproven_mappings": 0})
+        self.assertEqual(value, {"identity_matches": False, "rules_present": False, "rules_complete": False, "mappings_present": False, "unproven_mappings": 0, "forward_displaced": False})
         with self.assertRaisesRegex(kernel.Failure, "stale_identity_has_owned_artifacts: workload_outside_distro_cgroup"):
             self.observe(plan(), [snapshot(plan())], identity_error="workload_outside_distro_cgroup")
 
@@ -1487,7 +1554,7 @@ def with_networks(tables, p, networks, ipv6=False):
     """`tables` with the per-network rules for `networks` in their chains,
     ahead of each chain's final RETURN, as a sync would leave them."""
     nat, filtered = kernel.network_rules(p, networks, ipv6)
-    for table, rules in (("nat", nat), ("filter", filtered)):
+    for table, rules in (("nat", nat), *kernel.split_guards(filtered).items()):
         if not rules:
             continue
         existing = tables[table]["rules"]
@@ -1669,7 +1736,7 @@ class ContainerNetworkTests(unittest.TestCase):
         result, calls = self.sync(p, tables, tables6, new)
         self.assertEqual(result["synced"], {"current": ["br-acc14c99a879"], "added": ["br-acc14c99a879"], "removed": ["docker0"]})
         # Removals: redirection (nat) before the drops; additions: drops first.
-        self.assertEqual([(table, ipv6, lines[0][0]) for table, ipv6, lines in calls], [("nat", False, "-D"), ("filter", False, "-D"), ("filter", True, "-D"), ("filter", False, "-I"), ("filter", True, "-I"), ("nat", False, "-I")])
+        self.assertEqual([(table, ipv6, lines[0][0]) for table, ipv6, lines in calls], [("nat", False, "-D"), ("filter", False, "-D"), ("mangle", False, "-D"), ("mangle", True, "-D"), ("filter", False, "-I"), ("mangle", False, "-I"), ("mangle", True, "-I"), ("nat", False, "-I")])
         removed = [line for _, _, lines in calls for line in lines if line[0] == "-D"]
         self.assertTrue(all("docker0" in line for line in removed))
         for table, ipv6, lines in calls:
@@ -1677,7 +1744,8 @@ class ContainerNetworkTests(unittest.TestCase):
                 continue
             # Inserted at the top in reverse, so they end up in rule order.
             final = [["-A", line[1], *line[3:]] for line in reversed(lines)]
-            expected = kernel.network_rules(p, new, ipv6)[0 if table == "nat" else 1]
+            nat, filtered = kernel.network_rules(p, new, ipv6)
+            expected = nat if table == "nat" else kernel.split_guards(filtered)[table]
             self.assertEqual(final, expected)
         # Nothing to do when the rules already match.
         result, calls = self.sync(p, tables, tables6, old)
@@ -1688,7 +1756,7 @@ class ContainerNetworkTests(unittest.TestCase):
         would apply each restore document in order."""
         state = {"v4": {}, "v6": {}}
 
-        def apply(table, lines, test=False, ipv6=False):
+        def apply(table, lines, test=False, ipv6=False, backend="nft"):
             if test:
                 return
             current = state["v6" if ipv6 else "v4"].setdefault(table, {"chains": {"OUTPUT": "ACCEPT"}, "rules": []})
