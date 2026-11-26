@@ -1714,6 +1714,119 @@ mod tests {
         outer.join().unwrap();
     }
 
+    /// A residential handshake that waits for each reply: method selection,
+    /// credentials, then the CONNECT only after the authentication reply.
+    fn sequential_handshake(stream: &mut TcpStream, accepted: bool, origin: SocketAddrV4) {
+        assert_eq!(read::<3>(stream), [5, 1, 2]);
+        stream.write_all(&[5, 2]).unwrap();
+        read_credentials(stream);
+        stream
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let mut early = [0];
+        assert!(
+            stream.read(&mut early).is_err(),
+            "CONNECT was sent before the authentication reply"
+        );
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        if !accepted {
+            stream.write_all(&[1, 1]).unwrap();
+            return;
+        }
+        stream.write_all(&[1, 0]).unwrap();
+        request(stream, origin);
+        success(stream);
+    }
+
+    /// Refuses credentials that arrive together with the CONNECT. The
+    /// CONNECT is read before the refusal goes out, so closing afterwards
+    /// leaves nothing unread and the refusal is not lost to a reset.
+    fn refuse_pipelined(stream: &mut TcpStream, origin: SocketAddrV4) {
+        assert_eq!(read::<3>(stream), [5, 1, 2]);
+        stream.write_all(&[5, 2]).unwrap();
+        read_credentials(stream);
+        request(stream, origin);
+        stream.write_all(&[1, 1]).unwrap();
+    }
+
+    #[test]
+    fn refused_pipelined_credentials_are_sent_step_by_step_then_pipelining_stops() {
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let residential = TcpListener::bind("127.0.0.1:0").unwrap();
+        let residential_endpoint = endpoint(&residential);
+        let origin: SocketAddrV4 = "192.0.2.1:443".parse().unwrap();
+        let policy = policy(endpoint(&first), residential_endpoint);
+        let outer = first_hop_tunnels(first, residential_endpoint, 3);
+        let inner = thread::spawn(move || {
+            refuse_pipelined(&mut accept(&residential), origin);
+            // The retry and every later chain wait for each reply.
+            for _ in 0..2 {
+                sequential_handshake(&mut accept(&residential), true, origin);
+            }
+        });
+        drop(policy.chain(origin).unwrap());
+        assert!(!policy.dialer.pipeline.load(Ordering::Relaxed));
+        assert_eq!(policy.dialer.report()["rejected_retries"], 1);
+        drop(policy.chain(origin).unwrap());
+        assert_eq!(policy.dialer.report()["rejected_retries"], 1);
+        inner.join().unwrap();
+        outer.join().unwrap();
+    }
+
+    #[test]
+    fn credentials_refused_both_ways_fail_once_retried_and_keep_pipelining() {
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let residential = TcpListener::bind("127.0.0.1:0").unwrap();
+        let residential_endpoint = endpoint(&residential);
+        let origin: SocketAddrV4 = "192.0.2.1:443".parse().unwrap();
+        let policy = policy(endpoint(&first), residential_endpoint);
+        let outer = first_hop_tunnels(first, residential_endpoint, 2);
+        let inner = thread::spawn(move || {
+            refuse_pipelined(&mut accept(&residential), origin);
+            sequential_handshake(&mut accept(&residential), false, origin);
+        });
+        // The first hop takes only two tunnels: a third attempt would wait
+        // there until the deadline and fail with a timeout instead.
+        assert_eq!(
+            policy.chain(origin).unwrap_err(),
+            "residential SOCKS5 authentication rejected"
+        );
+        inner.join().unwrap();
+        outer.join().unwrap();
+        assert!(policy.dialer.pipeline.load(Ordering::Relaxed));
+        assert_eq!(policy.dialer.report()["rejected_retries"], 1);
+    }
+
+    #[test]
+    fn a_refusal_after_pipelining_has_worked_is_still_asked_again_step_by_step() {
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let residential = TcpListener::bind("127.0.0.1:0").unwrap();
+        let residential_endpoint = endpoint(&residential);
+        let origin: SocketAddrV4 = "192.0.2.1:443".parse().unwrap();
+        let policy = policy(endpoint(&first), residential_endpoint);
+        let outer = first_hop_tunnels(first, residential_endpoint, 3);
+        let inner = thread::spawn(move || {
+            let mut stream = accept(&residential);
+            assert_eq!(read::<3>(&mut stream), [5, 1, 2]);
+            stream.write_all(&[5, 2]).unwrap();
+            read_credentials(&mut stream);
+            request(&mut stream, origin);
+            stream.write_all(&[1, 0]).unwrap();
+            success(&mut stream);
+            refuse_pipelined(&mut accept(&residential), origin);
+            sequential_handshake(&mut accept(&residential), true, origin);
+        });
+        drop(policy.chain(origin).unwrap());
+        assert!(policy.dialer.pipeline.load(Ordering::Relaxed));
+        drop(policy.chain(origin).unwrap());
+        inner.join().unwrap();
+        outer.join().unwrap();
+        assert!(!policy.dialer.pipeline.load(Ordering::Relaxed));
+        assert_eq!(policy.dialer.report()["rejected_retries"], 1);
+    }
+
     #[test]
     fn a_proxy_that_drops_the_connect_behind_accepted_credentials_stops_pipelining() {
         let first = TcpListener::bind("127.0.0.1:0").unwrap();

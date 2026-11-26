@@ -89,14 +89,19 @@ pub(super) enum Setup {
     /// for the CONNECT sent behind it. Either the target cannot be reached,
     /// or the proxy dropped the CONNECT it read together with the credentials.
     Unanswered(String),
+    /// Pipelined: the authentication reply refused the credentials. Either
+    /// they are wrong, or the proxy cannot parse credentials that arrive
+    /// together with the CONNECT behind them.
+    Rejected(String),
 }
 
 impl Setup {
     fn into_message(self) -> String {
         match self {
-            Self::Failed(message) | Self::Incompatible(message) | Self::Unanswered(message) => {
-                message
-            }
+            Self::Failed(message)
+            | Self::Incompatible(message)
+            | Self::Unanswered(message)
+            | Self::Rejected(message) => message,
         }
     }
 }
@@ -183,6 +188,9 @@ struct Stats {
     /// Fresh chains asked again step by step because a pipelined CONNECT
     /// went unanswered before pipelining had ever worked.
     unanswered_retries: AtomicU64,
+    /// Fresh chains asked again step by step because the proxy refused the
+    /// credentials sent together with their CONNECT.
+    rejected_retries: AtomicU64,
     prepared: AtomicU64,
     prepare_failures: AtomicU64,
     last_prepare_error: Mutex<Option<String>>,
@@ -259,6 +267,7 @@ impl Dialer {
             "stale_on_connect": count(&self.stats.stale_on_connect),
             "unanswered_on_connect": count(&self.stats.unanswered_on_connect),
             "unanswered_retries": count(&self.stats.unanswered_retries),
+            "rejected_retries": count(&self.stats.rejected_retries),
             "prepared": count(&self.stats.prepared),
             "prepare_failures": count(&self.stats.prepare_failures),
             "last_prepare_error": *self.stats.last_prepare_error.lock().unwrap_or_else(|e| e.into_inner()),
@@ -345,6 +354,22 @@ impl Dialer {
                     .map_err(|_| message.clone())?;
                 self.residential_connect(&mut stream, target, deadline, false)
                     .map_err(|_| message)?;
+                self.pipeline.store(false, Ordering::Relaxed);
+                Ok(stream)
+            }
+            // Some proxies refuse credentials that arrive in the same read as
+            // the CONNECT behind them, and accept the same ones step by step.
+            // Whether both land in one read depends on how the first hop
+            // relays them, so this is asked again even after pipelining has
+            // worked. The refusal comes back within one round trip, so the
+            // same deadline covers the retry. Pipelining stops only if the
+            // retry is accepted: wrong credentials fail both ways and change
+            // nothing.
+            Err(Setup::Rejected(_)) if pipelined => {
+                self.stats.rejected_retries.fetch_add(1, Ordering::Relaxed);
+                let mut stream = self.open_residential(deadline)?;
+                self.residential_connect(&mut stream, target, deadline, false)
+                    .map_err(Setup::into_message)?;
                 self.pipeline.store(false, Ordering::Relaxed);
                 Ok(stream)
             }
@@ -597,7 +622,8 @@ impl Dialer {
     /// Residential method selection, username/password authentication and
     /// CONNECT. Pipelined, authentication and CONNECT go out in one write
     /// once the proxy has selected authentication, saving one residential
-    /// round trip.
+    /// round trip. A pipelined refusal is `Setup::Rejected`, for the caller
+    /// to ask again step by step.
     fn residential_connect(
         &self,
         stream: &mut TcpStream,
@@ -624,7 +650,7 @@ impl Dialer {
         let mut status = [0; 2];
         receive(stream, &mut status, deadline).map_err(Setup::Incompatible)?;
         if status != [1, 0] {
-            return Err(Setup::Failed(
+            return Err(Setup::Rejected(
                 "residential SOCKS5 authentication rejected".into(),
             ));
         }
