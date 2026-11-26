@@ -116,6 +116,8 @@ The residential server, username and password are kept in `desktop.sqlite` next 
 **6. Process exit does not mean the network is restored.**
 Closing the window, killing a process or a controller crash does not restore direct routing; the rules keep blocking. You must stop explicitly; see [Stopping and recovery](#stopping-and-recovery).
 
+The exception is a restart of the target or of WSL: after the target restarts on its own, shuts down when idle, or after `wsl --shutdown`, this takeover's rules no longer apply and the target's new connections go direct. The check that runs about every 30 seconds then puts drop-only rules in the target (every new connection its own processes start, except to loopback, is dropped), and the overview says the target is blocked. Until that check, up to about 30 seconds, connections go direct; the block also does not cover the target's Docker containers, which may connect directly. Without a running backend, the process holding the ingress ports does the same.
+
 **7. Isolation has been measured on one kernel only.**
 "Other distributions are unaffected" was measured only on WSL kernel 6.18.58.1. A target whose kernel is older or cannot be read is refused by the preflight until WSL is updated. Whether an update gets past this floor has not been tested.
 

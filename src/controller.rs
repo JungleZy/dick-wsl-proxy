@@ -363,11 +363,10 @@ impl Controller {
                 ..Watch::default()
             };
         }
-        let block = match &self.watch.lost {
-            None => false,
-            Some(reason) if blockable(reason) => true,
-            Some(_) => return None,
-        };
+        // After a loss whose rules still stand (a changed environment,
+        // unprovable mappings), rounds keep observing read-only, so a restart
+        // after it is still found and blocked (decision 33).
+        let block = self.watch.lost.as_deref().is_some_and(blockable);
         let record = transition::load()
             .ok()
             .filter(|record| record.pending.is_none())?;
@@ -479,7 +478,7 @@ impl Controller {
             && (if round.block {
                 self.watch.lost.as_deref().is_some_and(blockable)
             } else {
-                self.watch.lost.is_none()
+                !self.watch.lost.as_deref().is_some_and(blockable)
             })
             && transition::load().is_ok_and(|record| {
                 record.pending.is_none() && record.generation == round.generation
@@ -534,6 +533,11 @@ impl Controller {
                     Observed::Protected => {
                         self.watch.consecutive_failures = 0;
                         self.watch.last_error = None;
+                        None
+                    }
+                    // Already lost, its rules still standing: only a loss
+                    // that leaves the target direct changes anything now.
+                    Observed::Lost(reason) if self.watch.lost.is_some() && !blockable(&reason) => {
                         None
                     }
                     Observed::Lost(reason) => {

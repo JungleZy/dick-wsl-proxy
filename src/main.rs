@@ -187,6 +187,10 @@ impl ProtectionWatch {
     }
 }
 
+/// How long a daemon being started waits for a busy controller lock; well
+/// inside the desktop's 15-second start deadline.
+const DAEMON_LOCK_WAIT: Duration = Duration::from_secs(10);
+
 /// Decision 33 with no controller left: while no process holds this user's
 /// controller lock, the port custodian blocks the recorded target whose
 /// rules are gone. The read-only check runs without the lock; the recheck and
@@ -324,7 +328,24 @@ fn run(command: Command) -> Result<u8, Failure> {
             .map_err(|e| Failure::new("lease_worker", e))?;
         return Ok(0);
     }
-    let _lock = host::acquire().map_err(|e| match e {
+    // The port custodian of a lost takeover may hold the lock for the few
+    // seconds it blocks the target (decision 33): a daemon being started
+    // waits that out rather than fail as busy.
+    let acquire = || {
+        let deadline = Instant::now() + DAEMON_LOCK_WAIT;
+        loop {
+            match host::acquire() {
+                #[cfg(windows)]
+                Err(host::LockError::Busy)
+                    if matches!(command, Command::Daemon) && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                result => return result,
+            }
+        }
+    };
+    let _lock = acquire().map_err(|e| match e {
         #[cfg(windows)]
         host::LockError::Busy => Failure::new(
             "controller_busy",

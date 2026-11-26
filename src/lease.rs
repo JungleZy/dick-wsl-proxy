@@ -1,12 +1,17 @@
 //! A non-forwarding Windows process keeps exclusive sockets reserved if the controller dies.
 //! It receives Winsock duplication tickets on an anonymous pipe, never accepts a connection,
 //! and releases them only after an explicit, journal-backed stop has removed the guest rules.
+/// How long a stop waits for the custodian to let the ports go: longer than
+/// an idle round can take (registry, running list, an inspect and a block).
+#[cfg_attr(not(windows), allow(dead_code))]
+const RELEASE_WAIT_MILLIS: u32 = 100_000;
+
 /// How often a waiting custodian runs its idle round.
 pub const IDLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[cfg(windows)]
 mod windows {
-    use super::IDLE_INTERVAL;
+    use super::{IDLE_INTERVAL, RELEASE_WAIT_MILLIS};
     use crate::plan::Plan;
     use socket2::Socket;
     use std::io::{Read, Write};
@@ -235,7 +240,9 @@ mod windows {
         let done = Event::open(&name(plan, "done"), SYNCHRONIZATION_SYNCHRONIZE)?
             .ok_or("lease_missing_done_event")?;
         stop.signal()?;
-        done.wait(10000)
+        // The custodian sees the stop between idle rounds; one round is a few
+        // guest calls, each bounded by its own deadline (decision 33).
+        done.wait(RELEASE_WAIT_MILLIS)
     }
 }
 #[cfg(windows)]

@@ -984,7 +984,9 @@ fn recovery_reason(issue: &str, block: Option<&str>, target: &str) -> String {
             format!("{target}：{cause}，在目标里断网没有成功，新连接可能直连。{then}")
         }
         Some("target_stopped") => {
-            format!("{target}：{cause}。目标现在没有运行；它再启动时会先在里面断网。{then}")
+            format!(
+                "{target}：{cause}。目标现在没有运行；它再启动后，要等下一轮核对（最长约 30 秒）才会在里面断网，此前新连接可能直连。{then}"
+            )
         }
         _ => format!("{target}：{cause}，新连接可能已不经代理。{then}"),
     }
