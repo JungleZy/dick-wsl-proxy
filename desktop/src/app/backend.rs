@@ -227,6 +227,12 @@ fn humanize_code(code: &str, message: &str) -> String {
         "ipc_unavailable" if message.trim() == "Windows error 5" => {
             "后台正以管理员身份运行，当前界面权限较低，连不上它。请同样以管理员身份打开界面；或者在任务管理器里结束 wsl-proxyctl.exe 后台进程，再正常打开。".into()
         }
+        // 后台一次只服务一个管道连接。它在处理长操作（例如命令行发起的启动，要一两分钟）时
+        // 管道一直忙，`open_pipe` 等满期限：`WaitNamedPipeW` 超时报 ERROR_SEM_TIMEOUT（121），
+        // 等待途中被别的客户端抢先、期限用尽时报 `ipc_timeout`。两种都是连不上，请求没有发出。
+        "ipc_unavailable" if matches!(message.trim(), "Windows error 121" | "ipc_timeout") => {
+            PIPE_BUSY.into()
+        }
         "desktop_request_failed" | "controller_error" => humanize_error(message),
         "not_registered" => "找不到指定的 WSL 环境，请刷新列表后重试。".into(),
         "ambiguous_target" => "目标 WSL 名称不唯一，请刷新列表后重试。".into(),
@@ -361,6 +367,9 @@ fn humanize_code(code: &str, message: &str) -> String {
     }
 }
 
+/// 这句话也会接在「启动接管失败：」「连接后台失败：」后面，所以只说处处成立的：
+/// 请求没有发出，状态轮询会自己恢复，用户发起的操作要自己重试。
+const PIPE_BUSY: &str = "后台正在处理另一个操作（例如命令行发起的启动），暂时连不上，这次请求没有发出。等它处理完，状态会自动刷新；需要时再重试刚才的操作。";
 const UDP_CHAIN_UNAVAILABLE: &str = "住宅出口没有通过 UDP 探测，UDP（含 QUIC，直连例外也一样）已阻断，不会直连；下次启动或切换目标时重新探测。";
 /// 上限来自这次接管的策略，所以从后台的消息里取，不写死。
 fn tcp_capacity_reached(message: &str) -> String {
@@ -754,7 +763,7 @@ pub(crate) fn worker() -> (Sender<Job>, Receiver<Reply>) {
 mod tests {
     use super::Kind;
     use super::{
-        KERNEL_RELEASE_UNVERIFIED, humanize_error, kernel_gap, kernel_prepare_notice,
+        KERNEL_RELEASE_UNVERIFIED, PIPE_BUSY, humanize_error, kernel_gap, kernel_prepare_notice,
         kernel_release_notice, offer_kernel_prepare, residential_probe_badge,
         residential_stage_text, wsl_check_text, wsl_platform_badge, wsl_update_notice,
     };
@@ -1056,6 +1065,27 @@ mod tests {
         );
         // A missing controller is still told apart (`DAEMON_ABSENT`).
         assert!(!humanize_error("ipc_unavailable: Windows error 2").contains("管理员"));
+    }
+
+    #[test]
+    fn explains_a_controller_busy_with_another_request() {
+        // `report()` formats `WaitNamedPipeW`'s ERROR_SEM_TIMEOUT and `open_pipe`'s own
+        // deadline error like this.
+        for error in [
+            "ipc_unavailable: Windows error 121",
+            "ipc_unavailable: ipc_timeout",
+        ] {
+            assert_eq!(humanize_error(error), PIPE_BUSY, "{error}");
+        }
+        assert!(PIPE_BUSY.starts_with("后台正在处理另一个操作"));
+        // The other pipe errors keep their own explanations.
+        for error in [
+            "ipc_unavailable: Windows error 2",
+            "ipc_unavailable: Windows error 5",
+            "ipc_untrusted_server: Windows error 121",
+        ] {
+            assert_ne!(humanize_error(error), PIPE_BUSY, "{error}");
+        }
     }
 
     #[test]

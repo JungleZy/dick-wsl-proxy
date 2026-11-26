@@ -71,6 +71,30 @@ fn push_reminder(reminder: Reminder, window: &mut Window, cx: &mut App) {
     window.push_notification(notification, cx);
 }
 
+/// 状态查询失败通知的编号：和保存结果、提醒分开，互不顶替。
+struct StatusNotice;
+
+/// 状态查询失败时通知里的话：说明是刷新状态失败，再接后台错误的中文说明。
+fn status_failure_message(error: &str) -> String {
+    format!(
+        "{}失败：{}",
+        Kind::Status.label(),
+        super::backend::humanize_error(error)
+    )
+}
+
+/// 弹出状态查询失败的通知，顶替上一条。不自动消失，状态重新读到时撤掉。
+/// 同保存结果通知一样不设通知类型，图标颜色自己给。
+fn push_status_notice(message: String, window: &mut Window, cx: &mut App) {
+    let notification = Notification::new()
+        .message(message)
+        .icon(design_icon("info", 16., RUST))
+        .autohide(false)
+        .id::<StatusNotice>();
+    window.remove_notification::<StatusNotice>(cx);
+    window.push_notification(notification, cx);
+}
+
 fn input(window: &mut Window, cx: &mut App, hint: &'static str, multiline: bool) -> Field {
     if multiline {
         Field::Multi(cx.new(|cx| TextareaState::new(window, cx).placeholder(hint)))
@@ -311,6 +335,7 @@ impl Desktop {
             residential_probe_checking: false,
             save_notice: None,
             reminder: None,
+            status_notice: None,
             island_enabled: super::island::enabled_preference(),
             updater: super::update::Updater::new(),
         };
@@ -869,7 +894,7 @@ impl Desktop {
             _ => false,
         };
         match reply.result {
-            Err(error) => self.on_reply_error(reply.kind, error, cx),
+            Err(error) => self.on_reply_error(reply.kind, error, window, cx),
             Ok(value) => self.on_reply_value(reply.kind, value, window, cx),
         }
         if let Some(error) = status_error {
@@ -920,9 +945,23 @@ impl Desktop {
     }
 
     /// 后台拒绝或执行失败：标记失败的保存页，按操作类型写失败提示。
-    fn on_reply_error(&mut self, kind: Kind, error: String, cx: &mut Context<Self>) {
+    fn on_reply_error(
+        &mut self,
+        kind: Kind,
+        error: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if matches!(kind, Kind::Status | Kind::Bootstrap) {
             self.status_valid = false;
+        }
+        // 查状态（主要是 2 秒一次的轮询）失败不写全局错误条：错误条是用户操作的结果，
+        // 例如后台被命令行发起的启动占着时，它会盖掉预检未通过这类原因，状态恢复后还挂着。
+        // 改弹一条不自动消失的通知，状态重新读到时撤掉。
+        if kind == Kind::Status {
+            self.show_status_failure(&error, window, cx);
+            cx.notify();
+            return;
         }
         if kind == Kind::Preflight {
             self.pending_prepare = None;
@@ -970,6 +1009,24 @@ impl Desktop {
         }
     }
 
+    /// 查状态失败：弹出右上角通知；和正在显示的原因一样时不动它，免得反复重播入场动画。
+    /// 用户关掉之后同样的原因不再弹，原因变了或者恢复后再失败才弹。
+    fn show_status_failure(&mut self, error: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let message = status_failure_message(error);
+        if self.status_notice.as_deref() == Some(message.as_str()) {
+            return;
+        }
+        push_status_notice(message.clone(), window, cx);
+        self.status_notice = Some(message);
+    }
+
+    /// 状态又读到了：撤掉状态查询失败的通知。
+    fn clear_status_failure(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.status_notice.take().is_some() {
+            window.remove_notification::<StatusNotice>(cx);
+        }
+    }
+
     /// 后台成功返回：按操作类型更新页面。
     fn on_reply_value(
         &mut self,
@@ -988,6 +1045,9 @@ impl Desktop {
                 // 后台最新的，之后的保存不会因为版本号过期被拒。
                 self.accept_profile_keeping_edits(&value["profile"], window, cx);
                 self.accept_status(value["status"].clone());
+                if self.status_valid {
+                    self.clear_status_failure(window, cx);
+                }
                 self.accept_logs(&value["logs"], false);
                 // 连接时读到的就是未筛选的最新日志，首页时间线直接用它。
                 // 读日志失败时两处都显示读取失败，不能当成「暂无记录」。
@@ -1036,6 +1096,9 @@ impl Desktop {
             }
             Kind::Status => {
                 self.accept_status(value);
+                if self.status_valid {
+                    self.clear_status_failure(window, cx);
+                }
                 if self.page == Page::Connection {
                     self.refresh_connection_history(cx);
                 }
@@ -1613,5 +1676,20 @@ impl Desktop {
             }
         }
         self.loading_fields = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::status_failure_message;
+
+    #[test]
+    fn status_failure_notice_names_the_refresh_and_explains_a_busy_controller() {
+        let message = status_failure_message("ipc_unavailable: Windows error 121");
+        assert!(message.starts_with("刷新状态失败："), "{message}");
+        assert!(message.contains("后台正在处理另一个操作"), "{message}");
+        // 没有专门说明的错误码也说清是刷新状态失败，不只剩一句「操作失败」。
+        let message = status_failure_message("ipc_unavailable: Windows error 2");
+        assert!(message.starts_with("刷新状态失败："), "{message}");
     }
 }

@@ -145,6 +145,9 @@ pub(crate) struct Desktop {
     /// 不是错误、但用户需要看到的结果（UDP 已阻断、目标已自动清除等），由 tick 弹成通知。
     /// 全局错误条只显示错误，没有它这些话只写进 `notice`，哪里都看不到。
     pub(crate) reminder: Option<Reminder>,
+    /// 右上角「刷新状态失败」通知里正在显示的那句话；没有这条通知时为 `None`。
+    /// 连续失败、原因不变时不重推：重推会重播入场动画，后台不在时每 2 秒闪一次。
+    pub(crate) status_notice: Option<String>,
     /// 屏幕顶部状态岛是否打开，见 [`super::island`]。
     pub(crate) island_enabled: bool,
     /// 检查更新与一键升级，见 [`super::update`]。
