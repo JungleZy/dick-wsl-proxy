@@ -2,6 +2,10 @@
 # a GitHub release with detailed notes. Run it by hand (workflow_dispatch) for a
 # dry run: everything but the publish step, with the package kept as an
 # artifact. See docs/plans/m5/README.md, "发布流水线".
+#
+# The checks (check) and the release build (package) run side by side on two
+# Windows runners; notes waits for both, writes the release notes from their
+# results and uploads the same artifact the single job used to.
 name: Release
 
 on:
@@ -17,62 +21,33 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  package:
-    name: Build, check and package (Windows, MSVC)
+  check:
+    name: Format, lint and test (Windows, MSVC)
     runs-on: windows-latest
-    timeout-minutes: 150
+    timeout-minutes: 90
     env:
       CARGO_TERM_COLOR: never
-    outputs:
-      version: ${{ steps.version.outputs.version }}
     steps:
-      # Package the repository's own bytes: no CRLF conversion of scripts,
+      # Test the repository's own bytes: no CRLF conversion of scripts,
       # Cargo.lock or the guest scripts embedded in the backend.
       - name: Keep line endings as committed
         run: git config --global core.autocrlf false
 
       - uses: actions/checkout@v4
-        with:
-          # The notes list every commit since the previous v* tag.
-          fetch-depth: 0
-
-      # Fetch the tags again so an annotated tag keeps its message (the notes
-      # start with it) whatever the checkout made of the triggering tag.
-      - name: Fetch annotated tags
-        run: git fetch --force --tags origin
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Resolve and check the version
-        id: version
-        shell: pwsh
-        env:
-          REF_TYPE: ${{ github.ref_type }}
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          # A RUSTFLAGS variable, even an empty one, replaces the +crt-static
-          # setting in .cargo/config.toml and would link the C runtime dynamically.
-          if (Test-Path Env:RUSTFLAGS) { throw 'RUSTFLAGS is set; unset it for release builds' }
-          $line = Select-String -Path Cargo.toml -Pattern '^version = "(\d+\.\d+\.\d+)"$' | Select-Object -First 1
-          if (-not $line) { throw 'No workspace version in Cargo.toml' }
-          $version = $line.Matches[0].Groups[1].Value
-          if ($env:REF_TYPE -eq 'tag' -and $env:REF_NAME -cne "v$version") {
-            throw "Tag $env:REF_NAME does not match the workspace version $version"
-          }
-          "version=$version" >> $env:GITHUB_OUTPUT
-          New-Item -ItemType Directory ci-logs, work, dist | Out-Null
-
       - name: Install the Rust toolchain
         shell: pwsh
         run: |
+          # A RUSTFLAGS variable, even an empty one, replaces the +crt-static
+          # setting in .cargo/config.toml.
+          if (Test-Path Env:RUSTFLAGS) { throw 'RUSTFLAGS is set; unset it for release builds' }
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
-          rustc -vV | Out-File -Encoding utf8 work/toolchain.txt
-          cargo -V | Out-File -Encoding utf8 -Append work/toolchain.txt
-          python --version | Out-File -Encoding utf8 -Append work/toolchain.txt
-          Get-Content work/toolchain.txt
+          New-Item -ItemType Directory ci-logs | Out-Null
 
       - name: Format and lint
         shell: pwsh
@@ -101,6 +76,62 @@ jobs:
         run: |
           python scripts/test_package_windows.py 2>&1 | Tee-Object -FilePath ci-logs/python-packaging.txt
           if ($LASTEXITCODE) { exit 1 }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: check-logs
+          path: ci-logs/*
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    name: Build and package (Windows, MSVC)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: never
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      # Package the repository's own bytes: no CRLF conversion of scripts,
+      # Cargo.lock or the guest scripts embedded in the backend.
+      - name: Keep line endings as committed
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve and check the version
+        id: version
+        shell: pwsh
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          # A RUSTFLAGS variable, even an empty one, replaces the +crt-static
+          # setting in .cargo/config.toml and would link the C runtime dynamically.
+          if (Test-Path Env:RUSTFLAGS) { throw 'RUSTFLAGS is set; unset it for release builds' }
+          $line = Select-String -Path Cargo.toml -Pattern '^version = "(\d+\.\d+\.\d+)"$' | Select-Object -First 1
+          if (-not $line) { throw 'No workspace version in Cargo.toml' }
+          $version = $line.Matches[0].Groups[1].Value
+          if ($env:REF_TYPE -eq 'tag' -and $env:REF_NAME -cne "v$version") {
+            throw "Tag $env:REF_NAME does not match the workspace version $version"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          New-Item -ItemType Directory work, dist | Out-Null
+
+      - name: Install the Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc -vV | Out-File -Encoding utf8 work/toolchain.txt
+          cargo -V | Out-File -Encoding utf8 -Append work/toolchain.txt
+          python --version | Out-File -Encoding utf8 -Append work/toolchain.txt
+          Get-Content work/toolchain.txt
 
       - name: Build the release executables
         shell: pwsh
@@ -136,13 +167,59 @@ jobs:
           & powershell.exe -NoProfile -File scripts/smoke-install-windows.ps1 -Zip "dist/wsl-proxy-$version-windows-x64.zip" -Version $version -WorkDir "$env:RUNNER_TEMP\wsl-proxy-smoke" -Output work/smoke.json
           if ($LASTEXITCODE) { exit 1 }
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-build
+          path: |
+            dist/*
+            work/build-record.json
+            work/imports.json
+            work/smoke.json
+            work/toolchain.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  notes:
+    name: Release notes
+    needs: [check, package]
+    # Windows like the build: the run summary names this runner's image.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Keep line endings as committed
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+        with:
+          # The notes list every commit since the previous v* tag.
+          fetch-depth: 0
+
+      # Fetch the tags again so an annotated tag keeps its message (the notes
+      # start with it) whatever the checkout made of the triggering tag.
+      - name: Fetch annotated tags
+        run: git fetch --force --tags origin
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: package-build
+          path: .
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: check-logs
+          path: ci-logs
+
       - name: Release notes
         shell: pwsh
         env:
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          $version = '${{ steps.version.outputs.version }}'
+          $version = '${{ needs.package.outputs.version }}'
           $tag = if ($env:REF_TYPE -eq 'tag') { $env:REF_NAME } else { 'HEAD' }
           python scripts/release-notes.py --version $version --tag $tag --zip "dist/wsl-proxy-$version-windows-x64.zip" --imports work/imports.json --smoke work/smoke.json --logs ci-logs --toolchain work/toolchain.txt --output work/release-notes.md --summary work/run-summary.md
           if ($LASTEXITCODE) { exit 1 }
@@ -151,7 +228,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wsl-proxy-${{ steps.version.outputs.version }}-windows-x64
+          name: wsl-proxy-${{ needs.package.outputs.version }}-windows-x64
           path: |
             dist/*
             work/build-record.json
@@ -178,7 +255,7 @@ jobs:
 
   publish:
     name: Publish the GitHub release
-    needs: [package, licenses]
+    needs: [package, notes, licenses]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
