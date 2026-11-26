@@ -121,6 +121,8 @@ The exception is a restart of the target or of WSL: after the target restarts on
 **7. Isolation has been measured on one kernel only.**
 "Other distributions are unaffected" was measured only on WSL kernel 6.18.58.1. A target whose kernel is older or cannot be read is refused by the preflight until WSL is updated. Whether an update gets past this floor has not been tested.
 
+Also, do not use legacy iptables in another distribution during a takeover: `iptables-legacy`, `ip6tables-legacy`, or Docker or ufw with `iptables` switched to legacy. The rules currently live in the legacy tables, and a single legacy write from another distribution (even adding a rule and deleting it again) rebinds this takeover's rules to that distribution: the target's new connections go direct, that distribution's connections go out through the residential exit instead, the status still shows the takeover running, and the periodic check cannot see it. While the target is blocked, the next check (within about 30 seconds) puts the block back on the target. Docker and ufw on the nft backend (the Ubuntu 24.04 default) are not affected. The preflight and the periodic check warn, without refusing, when the shared legacy tables hold rules that do not belong to this takeover. A later version will write the rules through the nft backend; see decision 37.
+
 **8. Release packages are unsigned.**
 The SHA-256 checksum shows the file is intact; it does not identify the publisher. Packages released after v0.1.11 also carry a GitHub build provenance attestation, which shows the release pipeline of this repository built them; that is not a code signature either, and Windows still warns about an unknown publisher.
 

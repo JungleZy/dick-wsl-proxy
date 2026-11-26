@@ -1267,6 +1267,44 @@ class BlockTests(unittest.TestCase):
             self.execute(plan(), "block", FakeTables())
 
 
+
+class ForeignLegacyRuleTests(unittest.TestCase):
+    """Decision 37, until the nft backend: count the rules in the shared
+    legacy tables that are not this instance's, never refuse over them."""
+
+    execute = BlockTests.execute
+
+    foreign = [
+        ["-A", "OUTPUT", "-m", "comment", "--comment", "other distro", "-j", "RETURN"],
+        ["-A", "FORWARD", "-o", "br-1", "-j", "ACCEPT"],
+    ]
+
+    def test_precheck_counts_foreign_legacy_rules_without_refusing(self):
+        p = comprehensive_plan()
+        for name, v4, v6, count in (
+            ("empty", {}, {}, 0),
+            ("foreign", {"filter": {"chains": {"OUTPUT": "ACCEPT", "FORWARD": "DROP"}, "rules": copy.deepcopy(self.foreign)}}, {"filter": {"chains": {"OUTPUT": "ACCEPT"}, "rules": [copy.deepcopy(self.foreign[0])]}}, 3),
+        ):
+            with self.subTest(name):
+                result = self.execute(p, "precheck", FakeTables(v4, v6), drift=None)
+                self.assertEqual(result["legacy_foreign_rules"], count)
+                self.assertIn("grant_deadline", result)
+
+    def test_inspect_counts_only_rules_that_are_not_this_instances(self):
+        p = comprehensive_plan()
+        v4 = snapshot(p)
+        complete = self.execute(p, "inspect", FakeTables(v4, ipv6_snapshot(p)), drift=None)
+        self.assertEqual(complete["legacy_foreign_rules"], 0)
+        self.assertTrue(complete["ownership"]["rules_complete"])
+        v4["filter"]["rules"].extend(copy.deepcopy(self.foreign))
+        mixed = self.execute(p, "inspect", FakeTables(v4, ipv6_snapshot(p)), drift=None)
+        self.assertEqual(mixed["legacy_foreign_rules"], 2)
+        self.assertTrue(mixed["ownership"]["rules_complete"])
+        # A drop-only block (decision 33) is this instance's too.
+        fake = FakeTables()
+        self.execute(p, "block", fake)
+        self.assertEqual(self.execute(p, "inspect", fake, drift=None)["legacy_foreign_rules"], 0)
+
 class InspectionTests(unittest.TestCase):
     def observe(self, p, tables, entries=None, ipv6_entries=None, identity_error=None, pending=False):
         operation = request(p)

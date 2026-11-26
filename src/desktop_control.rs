@@ -454,6 +454,32 @@ fn command_log(command: &str, response: &Value) -> (&'static str, String, String
                 ),
             )
         }
+        "start" | "switch"
+            if response["protection_check"]["legacy_foreign_rules"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
+                && response["unproven_mappings_left"].as_u64().unwrap_or(0) == 0 =>
+        {
+            let count = response["protection_check"]["legacy_foreign_rules"]
+                .as_u64()
+                .unwrap_or(0);
+            (
+                "warning",
+                "lifecycle".into(),
+                format!(
+                    "{}。{}",
+                    if command == "start" {
+                        "已开始接管"
+                    } else {
+                        "已切换接管目标"
+                    },
+                    crate::controller::legacy_rules_warning(
+                        u32::try_from(count).unwrap_or(u32::MAX)
+                    )
+                ),
+            )
+        }
         "start" => ("info", "lifecycle".into(), "已开始接管".into()),
         "switch" | "stop" if response["unproven_mappings_left"].as_u64().unwrap_or(0) > 0 => (
             "warning",
@@ -916,6 +942,25 @@ mod tests {
         let (level, _, message) = command_log("switch", &json!({"unproven_mappings_left":1}));
         assert_eq!(level, "warning");
         assert!(message.starts_with("已切换接管目标；"), "{message}");
+    }
+
+    #[test]
+    fn a_start_next_to_foreign_legacy_rules_is_logged_as_a_warning() {
+        let started =
+            json!({"phase":"forwarding_managed","protection_check":{"legacy_foreign_rules":3}});
+        let (level, source, message) = command_log("start", &started);
+        assert_eq!((level, source.as_str()), ("warning", "lifecycle"));
+        assert!(
+            message.starts_with("已开始接管。共享网络里的 legacy iptables 表有 3 条"),
+            "{message}"
+        );
+        let (level, _, message) = command_log("switch", &started);
+        assert_eq!(level, "warning");
+        assert!(message.starts_with("已切换接管目标。"), "{message}");
+        let clean =
+            json!({"phase":"forwarding_managed","protection_check":{"legacy_foreign_rules":0}});
+        assert_eq!(command_log("start", &clean).2, "已开始接管");
+        assert_eq!(command_log("start", &json!({})).2, "已开始接管");
     }
 
     #[test]

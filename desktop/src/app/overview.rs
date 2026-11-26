@@ -147,11 +147,20 @@ impl Desktop {
             .map(|generation| format!(" · 代次 {generation}"))
             .unwrap_or_default();
         match self.phase() {
-            "forwarding_managed" => (
-                StatusTone::Ok,
-                "接管中",
-                format!("{target} 的 TCP 和系统 DNS 正经双跳代理出网{generation}"),
-            ),
+            "forwarding_managed" => {
+                let legacy = self.status["protection_check"]["legacy_foreign_rules"]
+                    .as_u64()
+                    .unwrap_or(0);
+                (
+                    if legacy > 0 {
+                        StatusTone::Warn
+                    } else {
+                        StatusTone::Ok
+                    },
+                    "接管中",
+                    managed_summary(&target, &generation, legacy),
+                )
+            }
             "forwarding_scoped" => (
                 StatusTone::Warn,
                 "诊断转发中",
@@ -958,6 +967,18 @@ fn empty_note(message: impl Into<SharedString>) -> Div {
 ///
 /// `block` 是后台在目标里断网的结果（决策 33）：`installed`、`failed`、
 /// `target_stopped`，还没断过时为 `None`。断网只拦目标本机进程，容器不在其内。
+/// 接管中的一句说明。共享网络的 legacy iptables 表里有别人的规则时，
+/// 别的发行版一次 legacy 写入就会让目标直连且看不出来（决策 37），要说出来。
+fn managed_summary(target: &str, generation: &str, legacy_foreign_rules: u64) -> String {
+    let base = format!("{target} 的 TCP 和系统 DNS 正经双跳代理出网{generation}");
+    if legacy_foreign_rules == 0 {
+        return base;
+    }
+    format!(
+        "{base}。共享网络里有 {legacy_foreign_rules} 条别人的 legacy iptables 规则：别的发行版再写一次 legacy 表，{target} 就会直连而且看不出来，接管期间别在其他发行版用 legacy iptables。"
+    )
+}
+
 fn recovery_reason(issue: &str, block: Option<&str>, target: &str) -> String {
     if issue.starts_with("managed_install_unverified:container_networks_unavailable") {
         return format!(
@@ -1028,7 +1049,21 @@ fn residential_address(saved: String, running: Option<&str>) -> (String, Option<
 
 #[cfg(test)]
 mod tests {
-    use super::{ago, event_time, recovery_reason, residential_address};
+    use super::{ago, event_time, managed_summary, recovery_reason, residential_address};
+
+    #[test]
+    fn the_managed_summary_warns_about_foreign_legacy_rules() {
+        assert_eq!(
+            managed_summary("Dev", " · 代次 7", 0),
+            "Dev 的 TCP 和系统 DNS 正经双跳代理出网 · 代次 7"
+        );
+        let warned = managed_summary("Dev", "", 2);
+        assert!(
+            warned.contains("有 2 条别人的 legacy iptables 规则"),
+            "{warned}"
+        );
+        assert!(warned.contains("Dev 就会直连"), "{warned}");
+    }
 
     #[test]
     fn a_takeover_shows_the_residential_address_it_runs_with() {

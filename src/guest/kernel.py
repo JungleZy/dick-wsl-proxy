@@ -1050,6 +1050,16 @@ def inspect_firewall(p, tables, existing, ipv6=False):
     return present, found
 
 
+def foreign_legacy_rules(dumps, owned):
+    """How many rules in the shared legacy tables are not this instance's:
+    a hint that some distribution writes legacy iptables, and any legacy write
+    from another distribution rebinds this instance's `--path /` rules to it
+    (decision 37). Counts only; never a reason to refuse."""
+    total = sum(len(table["rules"]) for tables in dumps if tables for table in tables.values())
+    mine = sum(len(rules) for found in owned if found for rules in found.values())
+    return max(total - mine, 0)
+
+
 def rules_complete(p, present, rules, ipv6_rules):
     # Per-network rules come and go with the target's Docker networks and are
     # compared separately (`network_changes`).
@@ -1725,9 +1735,11 @@ def execute(request):
         ct, cached_conntrack = acquire_conntrack()
         try:
             if operation in ("precheck", "install"):
-                inspect_firewall(p, firewall(), False)
+                dumps = [firewall()]
+                inspect_firewall(p, dumps[0], False)
                 if p.get("system_dns") is not None or p.get("ipv6") is not None:
-                    inspect_firewall(p, firewall(ipv6=True), False, ipv6=True)
+                    dumps.append(firewall(ipv6=True))
+                    inspect_firewall(p, dumps[1], False, ipv6=True)
                 require(not inspect_mappings(p, ct), "instance_connmark_collision")
                 require(not inspect_ipv6_mappings(p, ct), "instance_ipv6_connmark_collision")
                 # Read before anything commits, so the retries never sit
@@ -1740,7 +1752,7 @@ def execute(request):
                 else:
                     # Windows and the WSL VM need not agree on wall-clock seconds.
                     # Issue and validate in the guest; RPC transit can only shorten the window.
-                    return {"ok": True, "operation": operation, "grant_deadline": int(time.time()) + 30}
+                    return {"ok": True, "operation": operation, "grant_deadline": int(time.time()) + 30, "legacy_foreign_rules": foreign_legacy_rules(dumps, [])}
             elif operation in ("remove", "inspect"):
                 tables = firewall()
                 present, rules = inspect_firewall(p, tables, True)
@@ -1764,7 +1776,7 @@ def execute(request):
                     require(identity_matches or not (ownership["rules_present"] or ownership["mappings_present"]), "stale_identity_has_owned_artifacts: " + str(drift))
                     if not ownership["rules_present"] and not ownership["mappings_present"]:
                         require(not grant_pending(p), "install_grant_pending")
-                    result = {"ok": True, "operation": operation, "ownership": ownership}
+                    result = {"ok": True, "operation": operation, "ownership": ownership, "legacy_foreign_rules": foreign_legacy_rules([tables, ipv6_tables], [rules, ipv6_rules])}
                     if drift is not None:
                         result["identity_error"] = drift
                     if p.get("system_dns") is not None and identity_matches and ownership["rules_complete"]:
