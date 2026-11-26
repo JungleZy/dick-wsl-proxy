@@ -144,10 +144,10 @@ jobs:
         run: |
           $version = '${{ steps.version.outputs.version }}'
           $tag = if ($env:REF_TYPE -eq 'tag') { $env:REF_NAME } else { 'HEAD' }
-          python scripts/release-notes.py --version $version --tag $tag --zip "dist/wsl-proxy-$version-windows-x64.zip" --imports work/imports.json --smoke work/smoke.json --logs ci-logs --toolchain work/toolchain.txt --output work/release-notes.md
+          python scripts/release-notes.py --version $version --tag $tag --zip "dist/wsl-proxy-$version-windows-x64.zip" --imports work/imports.json --smoke work/smoke.json --logs ci-logs --toolchain work/toolchain.txt --output work/release-notes.md --summary work/run-summary.md
           if ($LASTEXITCODE) { exit 1 }
           Copy-Item work/release-notes.md dist/
-          Get-Content work/release-notes.md >> $env:GITHUB_STEP_SUMMARY
+          Get-Content work/run-summary.md >> $env:GITHUB_STEP_SUMMARY
 
       - uses: actions/upload-artifact@v4
         with:

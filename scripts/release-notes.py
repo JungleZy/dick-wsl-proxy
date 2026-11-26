@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Write the GitHub release notes for one tagged Windows package.
 
-The notes say what was released and how it was checked: the tag message (the
-maintainer's own summary), the download with its SHA-256, the source commit,
-toolchain and runner, the C runtime import check, the test counts read from
-the CI logs, the install smoke test, every commit since the previous v* tag
-grouped by type, install guidance and the known limitations.
+The release notes (--output) carry the tag message (the maintainer's own
+summary), the download with its SHA-256, every commit since the previous v*
+tag grouped by type, install guidance and the known limitations. The run
+summary (--summary) is the same document plus how the package was built and
+checked: the source commit, toolchain and runner, the C runtime import check,
+the test counts read from the CI logs and the install smoke test. Those two
+sections stay off the release page; every check still has to pass for the
+notes to be written at all.
 
 Usage: release-notes.py --version X.Y.Z --tag REF --zip ZIP --imports JSON
                         --smoke JSON --logs DIR --toolchain TXT --output MD
-                        [--repository OWNER/NAME]
+                        [--summary MD] [--repository OWNER/NAME]
 
 REF is the release tag, or any commit (HEAD) for a dry run.
 """
@@ -107,6 +110,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     for name in ("version", "tag", "zip", "imports", "smoke", "logs", "toolchain", "output"):
         parser.add_argument("--" + name, required=True)
+    parser.add_argument("--summary", help="also write the notes with the build and check sections here")
     parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY", ""))
     args = parser.parse_args()
 
@@ -146,9 +150,10 @@ def main():
     if args.repository:
         out += [
             f"来源：发布流水线为这个 ZIP 生成了 GitHub 构建来源证明。装了 GitHub CLI 的话，运行 `gh attestation verify .\\{archive.name} -R {args.repository}`，"
-            "通过就说明它是本仓库的发布流水线从下面的提交构建出来的。这证明的是构建来源，不是代码签名。",
+            f"通过就说明它是本仓库的发布流水线从 `{args.tag}` 对应的提交构建出来的。这证明的是构建来源，不是代码签名。",
             "",
         ]
+    build_start = len(out)
     out += [
         "## 构建",
         "",
@@ -187,6 +192,9 @@ def main():
         "没有在构建机上做的：真实 WSL 发行版上的接管（构建机没有 WSL）、从旧版本升级、`-Recover` 中断恢复。"
         "这些按 [M5 发布说明]" + (f"({repo}/blob/{args.tag}/docs/plans/m5/README.md)" if repo else "(docs/plans/m5/README.md)") + " 在本机验收。",
         "",
+    ]
+    build_end = len(out)
+    out += [
         f"## 变更（自 {previous or '首个提交'} 以来 {total} 个提交）",
         "",
     ]
@@ -216,9 +224,13 @@ def main():
         "- 其余已知问题和未验证范围见 M5 发布说明与 `docs/decisions.md`。",
         "",
     ]
-    Path(args.output).write_text("\n".join(out), encoding="utf-8")
+    # The release page leaves out how the package was built and checked; the
+    # run summary keeps the whole record.
+    Path(args.output).write_text("\n".join(out[:build_start] + out[build_end:]), encoding="utf-8")
+    if args.summary:
+        Path(args.summary).write_text("\n".join(out), encoding="utf-8")
     # Only the path: a CI console may not encode the Chinese text (cp1252).
-    print(f"release notes written to {args.output}")
+    print(f"release notes written to {args.output}" + (f", run summary to {args.summary}" if args.summary else ""))
     return 0
 
 
