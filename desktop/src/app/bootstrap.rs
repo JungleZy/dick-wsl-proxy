@@ -319,6 +319,8 @@ impl Desktop {
             confirmation: None,
             confirmation_pending: false,
             kernel_prepare_offered: false,
+            nftables_install_offered: false,
+            create_residential: None,
             exiting: false,
             exit_confirm_pending: false,
             exit_anyway_pending: false,
@@ -1054,7 +1056,7 @@ impl Desktop {
             cx.notify();
             return;
         }
-        if kind == Kind::Preflight {
+        if matches!(kind, Kind::Preflight | Kind::InstallNftables) {
             self.pending_prepare = None;
         }
         let failed_save = if kind == Kind::Save {
@@ -1068,6 +1070,7 @@ impl Desktop {
         let readable_error = super::backend::humanize_error(&error);
         let message = match kind {
             Kind::EnvironmentCreate => {
+                self.create_residential = None;
                 format!("环境创建失败，组件安装未完成：{readable_error}")
             }
             Kind::EnvironmentEdit if self.environment_timezone_only => {
@@ -1261,9 +1264,8 @@ impl Desktop {
                     self.error = false;
                     if let Some(pending) = self.pending_prepare.take() {
                         let selection_matches = matches!(
-                            self.selection(),
-                            Ok((target, port))
-                                if target == pending.target && port == pending.port
+                            self.start_selection(&pending.target),
+                            Ok((_, port)) if port == pending.port
                         );
                         if self.generation_for(&pending.target) == Some(pending.generation)
                             && selection_matches
@@ -1279,8 +1281,21 @@ impl Desktop {
                 } else {
                     self.error = true;
                     let pending_kind = self.pending_prepare.as_ref().map(|pending| pending.kind);
-                    // 只有从空闲启动才询问加载模块。
-                    if super::backend::offer_kernel_prepare(
+                    // 没有 nft 时先装它（决策 41），每次启动只问一次；装好后重新预检，
+                    // 还缺内核能力的话接着问加载模块。
+                    if pending_kind == Some(Kind::Start)
+                        && !self.nftables_install_offered
+                        && blockers
+                            .iter()
+                            .any(|blocker| blocker == "tooling.nft_missing")
+                    {
+                        self.nftables_install_offered = true;
+                        let pending = self
+                            .pending_prepare
+                            .take()
+                            .expect("pending was checked above");
+                        self.prompt_nftables_install(pending, cx);
+                    } else if super::backend::offer_kernel_prepare(
                         pending_kind,
                         self.kernel_prepare_offered,
                         &blockers,
@@ -1337,15 +1352,53 @@ impl Desktop {
                     self.pending_prepare = None;
                 }
             }
+            Kind::InstallNftables => {
+                self.preflight = None;
+                self.error = false;
+                self.notice = if value["nftables"] == "installed" {
+                    format!(
+                        "已在 {} 里装好 nftables。",
+                        value["target"].as_str().unwrap_or("目标")
+                    )
+                } else {
+                    format!(
+                        "{} 里已有 nftables。",
+                        value["target"].as_str().unwrap_or("目标")
+                    )
+                };
+                // 预检因为缺 nft 停在这里：装好后自动重跑，通过就接着弹启动确认。
+                if let Some((target, port)) = self
+                    .pending_prepare
+                    .as_ref()
+                    .map(|pending| (pending.target.clone(), pending.port))
+                {
+                    self.send(
+                        Kind::Preflight,
+                        json!({"command":"preflight","target":target,"port":port}),
+                        cx,
+                    );
+                    if self.reading {
+                        self.notice = format!("{}正在重新预检…", self.notice);
+                    }
+                }
+            }
             Kind::Export => {
                 self.export_path = value["path"].as_str().map(str::to_owned);
                 self.notice = "诊断已导出；请按内部资料处理。".into();
             }
             Kind::Abandon => {
+                // 还有别的环境在接管时，后台已在那个环境里删掉被放弃环境的规则表（决策 41）。
+                let next = value["abandoned"]["next"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
                 self.accept_status(value);
-                self.notice =
-                    "已放弃本次接管记录。下次启动接管前，请先执行一次 wsl --shutdown。".into();
-                self.error = false;
+                self.notice = match next.as_str() {
+                    "tables_removed" => "已放弃这个环境的接管记录，它的规则表也已在另一个接管中的环境里删掉。".into(),
+                    "tables_left" => "已放弃这个环境的接管记录，但没能删掉它的规则表；所有接管都停止后，请执行一次 wsl --shutdown。".into(),
+                    _ => "已放弃这个环境的接管记录。下次启动接管前，请先执行一次 wsl --shutdown。".into(),
+                };
+                self.error = next == "tables_left";
             }
             Kind::ResetDnsAliases => {
                 self.notice = "DNS 别名记录已清空，下次启动接管时重新分配。".into();
@@ -1395,6 +1448,23 @@ impl Desktop {
                 self.select_environment(selected.as_deref(), window, cx);
                 self.error = false;
                 self.notice = "环境创建成功，组件安装已完成。".into();
+                // 新建表单里填的住宅代理，现在有了 ID，保存给它。
+                if let (Some(residential), Some(id)) = (
+                    self.create_residential.take(),
+                    value["environment"]["id"].as_str(),
+                ) {
+                    let request = super::drafts::environment_save_request(
+                        id,
+                        residential,
+                        None,
+                        &Value::Null,
+                    );
+                    if !self.send_save(SaveScope::Environment, request, cx) {
+                        self.notice =
+                            "环境创建成功，但住宅代理没能保存，请在环境详情里重新填写并保存。"
+                                .into();
+                    }
+                }
             }
             Kind::EnvironmentEdit => {
                 if let Some(environment) = value.get("environment").cloned() {

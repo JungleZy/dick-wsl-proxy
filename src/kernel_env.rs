@@ -440,6 +440,69 @@ pub fn record(distro: &Distro, preparation: &Preparation) -> Result<PathBuf, Str
     result.map(|()| path)
 }
 
+/// What installing `nftables` in a target found (decision 41: the takeover
+/// writes its rules with `nft`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NftablesInstall {
+    /// `nft` was there already; nothing changed.
+    Present,
+    /// apt installed the package.
+    Installed,
+}
+
+/// The apt run, as root in the target. Every outcome exits 0 and says which
+/// it was on the last line, so the host never mistakes a failure for output.
+const NFTABLES_SCRIPT: &str = r#"
+if command -v nft >/dev/null 2>&1; then echo wpl-nft:present; exit 0; fi
+if ! command -v apt-get >/dev/null 2>&1; then echo wpl-nft:no_apt; exit 0; fi
+export DEBIAN_FRONTEND=noninteractive
+log=/tmp/wpl-nftables-install.log
+if apt-get update >"$log" 2>&1 && apt-get install -y --no-install-recommends nftables >>"$log" 2>&1 && command -v nft >/dev/null 2>&1; then
+    echo wpl-nft:installed
+else
+    tail -n 5 "$log" | tr -cd '[:print:]\n' | cut -c1-200
+    echo wpl-nft:failed
+fi
+"#;
+
+/// Installs the `nftables` package in `distro` with apt. Only for a target
+/// that is not taken over; it downloads from the target's own network.
+pub fn install_nftables(distro: &Distro) -> Result<NftablesInstall, String> {
+    let run = || {
+        crate::host::guest_script_with_timeout(
+            distro,
+            NFTABLES_SCRIPT,
+            std::time::Duration::from_secs(600),
+        )
+    };
+    // `wsl.exe` itself sometimes fails to reach the WSL service and gives up
+    // before the script runs (seen: Wsl/Service/WSAETIMEDOUT). The script is
+    // safe to run twice, so that is retried once.
+    let output = match run() {
+        Err(error) if error.contains("Wsl/Service") => run()?,
+        other => other?,
+    };
+    parse_nftables_install(&output)
+}
+
+fn parse_nftables_install(output: &str) -> Result<NftablesInstall, String> {
+    let lines: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    match lines.last().copied() {
+        Some("wpl-nft:present") => Ok(NftablesInstall::Present),
+        Some("wpl-nft:installed") => Ok(NftablesInstall::Installed),
+        Some("wpl-nft:no_apt") => Err("nftables_install_requires_apt".into()),
+        Some("wpl-nft:failed") => Err(format!(
+            "nftables_install_failed: {}",
+            lines[..lines.len() - 1].join(" / ")
+        )),
+        _ => Err("nftables_install_unverified".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,5 +706,30 @@ mod tests {
         let mut value = sample();
         value.as_object_mut().unwrap().remove("tables");
         assert!(interpret(&value.to_string()).is_err());
+    }
+
+    #[test]
+    fn an_nftables_install_reports_only_what_its_last_line_says() {
+        assert_eq!(
+            parse_nftables_install("wpl-nft:present\n"),
+            Ok(NftablesInstall::Present)
+        );
+        assert_eq!(
+            parse_nftables_install("Reading package lists...\nwpl-nft:installed\n"),
+            Ok(NftablesInstall::Installed)
+        );
+        assert_eq!(
+            parse_nftables_install("wpl-nft:no_apt").unwrap_err(),
+            "nftables_install_requires_apt"
+        );
+        assert_eq!(
+            parse_nftables_install("E: Unable to locate package nftables\nwpl-nft:failed")
+                .unwrap_err(),
+            "nftables_install_failed: E: Unable to locate package nftables"
+        );
+        assert_eq!(
+            parse_nftables_install("").unwrap_err(),
+            "nftables_install_unverified"
+        );
     }
 }

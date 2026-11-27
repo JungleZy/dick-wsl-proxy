@@ -439,6 +439,8 @@ pub(crate) enum UiAction {
     PrepareFor(Kind, String),
     /// 停止全部接管。
     StopAll,
+    /// 启动某一个环境的接管（注册表 GUID）。
+    StartFor(String),
     Reveal,
     EnvironmentCreate,
     EnvironmentSubmit,

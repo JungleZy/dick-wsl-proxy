@@ -42,6 +42,16 @@ const EDIT_RESTART_WARNING: &str =
 /// selected it resets the system language. Changing only the timezone does not.
 const EDIT_LANGUAGE_NOTE: &str = "勾了 Chrome 或中文输入法时，保存会把系统语言设为 en_US（LANG=en_US.UTF-8、LANGUAGE=en_US:en）。";
 
+/// 说明文字不占版面：一个「ⓘ」图标，鼠标移上去才显示。
+pub(crate) fn info_tip(id: &'static str, text: &'static str) -> Button {
+    Button::new(id)
+        .icon(design_icon("info", 14., MUTED))
+        .accessibility_label(text)
+        .tooltip(text)
+        .ghost()
+        .compact()
+}
+
 pub(crate) fn card_header(title: &'static str, caption: &'static str) -> Div {
     let mut title_view = div()
         .flex()
@@ -1118,7 +1128,8 @@ impl Desktop {
                             .flex_1()
                             .min_w_0(),
                         ),
-                );
+                )
+                .child(self.create_residential_section(locked, cx));
         }
         body = body.child(
             div()
@@ -1213,7 +1224,8 @@ impl Desktop {
                         "保存设置"
                     },
                     UiAction::EnvironmentSubmit,
-                    locked,
+                    // 新建时默认用户、密码和住宅代理都填了才能创建。
+                    locked || (creating && self.create_missing(cx).is_some()),
                     cx,
                 )
                 .icon(design_icon(
@@ -1543,6 +1555,129 @@ impl Desktop {
             )
     }
 
+    /// 环境列表一行的按钮：按这个环境自己的状态启动、停止、恢复或放弃。点它不打开详情。
+    fn environment_row_action(
+        &self,
+        index: usize,
+        id: &str,
+        locked: bool,
+        cx: &Context<Self>,
+    ) -> Button {
+        let phase = self.phase_for(id);
+        let gone = self
+            .session_for(id)
+            .is_some_and(|session| session["target_registered"] == false);
+        let (label, action) = match phase {
+            _ if gone => (
+                "放弃记录",
+                UiAction::PrepareFor(Kind::Abandon, id.to_owned()),
+            ),
+            "recovery_required" => ("恢复直连", UiAction::PrepareFor(Kind::Stop, id.to_owned())),
+            "idle" | "unknown" => ("启动接管", UiAction::StartFor(id.to_owned())),
+            _ => ("停止接管", UiAction::PrepareFor(Kind::Stop, id.to_owned())),
+        };
+        let running = phase.starts_with("forwarding");
+        let button = Button::new(("environment-row-action", index))
+            .label(label)
+            .small()
+            .disabled(locked)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                match action.clone() {
+                    UiAction::StartFor(target) => this.start_environment(target, cx),
+                    UiAction::PrepareFor(kind, target) => {
+                        this.prepare_for(kind, target, window, cx)
+                    }
+                    _ => {}
+                }
+            }));
+        if running {
+            button.outline()
+        } else {
+            button.primary()
+        }
+    }
+
+    /// 环境列表名字下面的一行小字：这个环境的接管状态。
+    fn environment_state_line(&self, id: &str) -> Div {
+        let phase = self.phase_for(id);
+        let (text, color) = if phase == "recovery_required" {
+            ("需要恢复", RUST)
+        } else if phase.starts_with("forwarding") {
+            ("接管中", ACCENT)
+        } else if super::drafts::residential_configured(super::drafts::environment_row(
+            &self.environments,
+            id,
+        )) {
+            ("未接管", MUTED)
+        } else {
+            ("未配置住宅代理", MUTED)
+        };
+        div().text_xs().text_color(rgb(color)).child(text)
+    }
+
+    /// 新建环境表单里的住宅代理：和环境详情里的是同一组输入框，创建成功后保存给新环境。
+    fn create_residential_section(&self, locked: bool, cx: &Context<Self>) -> Div {
+        let view = cx.entity().clone();
+        let selected = RESIDENTIAL_PROTOCOLS
+            .iter()
+            .position(|(value, _)| *value == self.residential_protocol_draft);
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(div().text_sm().child("住宅代理"))
+                    .child(info_tip(
+                        "environment-create-residential-tip",
+                        "这个环境接管时用的住宅代理，创建成功后保存给它。协议按服务商给这个端口的类型选；HTTP 代理只能转发 TCP。Windows 入口端口由程序分配，之后可在环境详情里改。",
+                    )),
+            )
+            .child(
+                RadioGroup::horizontal("environment-create-protocol")
+                    .children(
+                        RESIDENTIAL_PROTOCOLS
+                            .iter()
+                            .map(|(value, label)| Radio::new(*value).label(*label)),
+                    )
+                    .selected_index(selected)
+                    .disabled(locked)
+                    .on_click(move |index: &usize, _, cx: &mut App| {
+                        let protocol = RESIDENTIAL_PROTOCOLS[*index].0;
+                        view.update(cx, |this, cx| {
+                            this.set_residential_protocol_draft(protocol, cx)
+                        });
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(self.field("服务器 IPv4", "", &self.fields.residential_ip, false).flex_1())
+                    .child(
+                        self.field("服务器端口", "", &self.fields.residential_port, false)
+                            .w(px(128.)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(
+                        self.field("用户名", "", &self.fields.residential_username, false)
+                            .flex_1(),
+                    )
+                    .child(
+                        self.field("密码", "", &self.fields.residential_password, false)
+                            .flex_1(),
+                    ),
+            )
+    }
+
     /// 这个环境此刻的接管状态：接管中、需要恢复、配好了住宅代理或还没配。
     fn environment_role_badge(&self, id: &str) -> Div {
         let phase = self.phase_for(id);
@@ -1610,17 +1745,13 @@ impl Desktop {
             self.button(
                 "environment-takeover-start",
                 "启动接管",
-                UiAction::Prepare(Kind::Start),
-                locked || self.start_blocker().is_some(),
+                UiAction::StartFor(id.to_owned()),
+                locked,
                 cx,
             )
             .icon(design_icon("play", 15., SURFACE))
         }
         .primary();
-        let blocker = (!active)
-            .then(|| self.start_blocker())
-            .flatten()
-            .map(|reason| div().text_sm().text_color(rgb(MUTED)).child(reason));
         let view = cx.entity().clone();
         let protocol_selected = RESIDENTIAL_PROTOCOLS
             .iter()
@@ -1632,9 +1763,14 @@ impl Desktop {
             .child(
                 div()
                     .w(px(112.))
-                    .text_sm()
-                    .text_color(rgb(MUTED))
-                    .child("协议"),
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(div().text_sm().text_color(rgb(MUTED)).child("协议"))
+                    .child(info_tip(
+                        "environment-protocol-tip",
+                        "按服务商给这个端口的类型选。HTTP 代理只能转发 TCP：选它时接管期间的 UDP（含 QUIC、WebRTC、游戏和语音）一律拒绝，不会直连。两种协议的用户名和密码都是明文发送，接管时经宿主 SOCKS5 发出。",
+                    )),
             )
             .child(
                 RadioGroup::horizontal("environment-residential-protocol")
@@ -1666,13 +1802,19 @@ impl Desktop {
                     .items_start()
                     .justify_between()
                     .gap_3()
-                    .child(card_header(
-                        "接管",
-                        "这个环境用自己的住宅代理和入口端口出网；可以和别的环境同时接管。",
-                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(div().text_sm().child("接管"))
+                            .child(info_tip(
+                                "environment-takeover-tip",
+                                "这个环境用自己的住宅代理和入口端口出网，可以和别的环境同时接管。启动前会把它的时区改成住宅出口所在时区并重启它。",
+                            )),
+                    )
                     .child(action),
             )
-            .children(blocker)
             .children(unassigned)
             .child(protocol)
             .child(
@@ -1701,15 +1843,17 @@ impl Desktop {
                             .flex_1(),
                     ),
             )
-            .child(self.field(
-                "Windows 入口端口",
-                "这个环境的流量从这个端口进入代理；每个环境一个，留空由程序从 43531 起分配。",
-                &self.fields.port,
-                false,
-            ))
-            .child(div().text_sm().text_color(rgb(MUTED)).child(
-                "协议按服务商给这个端口的类型选。HTTP 代理只能转发 TCP：选 HTTP 时接管期间的 UDP（含 QUIC、WebRTC、游戏和语音）一律拒绝，不会直连。用户名和密码在两种协议下都是明文发送，接管时经宿主 SOCKS5 发出。",
-            ))
+            .child(
+                div()
+                    .flex()
+                    .items_end()
+                    .gap_1()
+                    .child(self.field("Windows 入口端口", "", &self.fields.port, false))
+                    .child(div().pb_1().child(info_tip(
+                        "environment-port-tip",
+                        "这个环境的流量从这个端口进入代理，每个环境一个；留空保存时由程序从 43531 起分配一个别的环境没用的端口。",
+                    ))),
+            )
             .child(
                 div()
                     .flex()
@@ -1815,11 +1959,14 @@ impl Desktop {
                 RULE
             };
             // 每行只显示状态；启动、停止和住宅代理都在这个环境的详情里。
+            // 每行右边直接是这个环境的启停按钮；按钮不置灰，不能启动时点了说明原因。
             let target_control = if version != 2 {
                 badge("WSL 1 不支持", RUST, super::theme::DANGER_BG).into_any_element()
             } else {
-                self.environment_role_badge(&id).into_any_element()
+                self.environment_row_action(index, &id, controls_locked, cx)
+                    .into_any_element()
             };
+            let state_line = (version == 2).then(|| self.environment_state_line(&id));
             rows = rows.child(
                 div()
                     .id(("environment-row", index))
@@ -1857,13 +2004,20 @@ impl Desktop {
                             .gap_2()
                             .child(div().flex_shrink_0().child(icon("icons/folder.svg")))
                             .child(
-                                div().flex().flex_col().gap_1().flex_1().min_w_0().child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(rgb(if active { PRIMARY } else { INK }))
-                                        .truncate()
-                                        .child(name),
-                                ),
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(if active { PRIMARY } else { INK }))
+                                            .truncate()
+                                            .child(name),
+                                    )
+                                    .children(state_line),
                             )
                             .child(div().flex_shrink_0().child(target_control)),
                     ),
@@ -2431,6 +2585,10 @@ impl Desktop {
                     .items_center()
                     .gap_2()
                     .child(badge(label, color, background))
+                    .child(info_tip(
+                        "environment-probe-tip",
+                        "只用已保存的配置，看住宅代理能否从 Windows 直接连上、能否经宿主 SOCKS5 连上。直接连接会把账号密码不经前置代理发出去，点了先确认；Windows 上开着 TUN 或全局代理时，直接连接也可能被它接管。接管始终经宿主 SOCKS5，检测不改变接管方式。",
+                    ))
                     .when_some(checked, |row, checked| {
                         row.child(div().text_sm().text_color(rgb(MUTED)).child(checked))
                     }),
@@ -2479,9 +2637,6 @@ impl Desktop {
                     )),
             );
         }
-        rows.push(div().text_sm().text_color(rgb(MUTED)).child(
-            "检测只用已保存的配置，看住宅代理能否从 Windows 直接连上、能否经宿主 SOCKS5 连上；直接连接会把账号密码不经前置代理发出去，点「检测」后先确认。Windows 上开着 TUN 或全局模式的代理时，「直接连接」也可能被它接管。接管始终经宿主 SOCKS5，检测结果不改变接管方式。",
-        ));
         rows
     }
 

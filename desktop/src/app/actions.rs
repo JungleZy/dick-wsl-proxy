@@ -363,34 +363,20 @@ impl Desktop {
     }
 
     /// 要启动的环境和它已保存的入口端口：环境页正在看的那个，住宅代理要已经保存好。
-    pub(crate) fn selection(&self) -> Result<(String, u16), String> {
-        let target = self.selected.clone().ok_or("请先在环境页选一个环境。")?;
-        let row = self.selected_row();
+    /// 启动某个环境要用的 ID 和它已保存的入口端口；住宅代理没保存时说明原因。
+    pub(crate) fn start_selection(&self, distro_id: &str) -> Result<(String, u16), String> {
+        let name = self.environment_display_name(distro_id);
+        let row = environment_row(&self.environments, distro_id);
         if !residential_configured(row) {
-            return Err("这个环境还没有保存住宅代理：先在环境页填写并保存。".into());
+            return Err(format!(
+                "{name} 还没有配置住宅代理：打开它的详情，填写住宅代理并保存后再启动。"
+            ));
         }
         let port = row
             .and_then(|row| row["ingress_port"].as_u64())
             .and_then(|port| u16::try_from(port).ok())
-            .ok_or("这个环境保存的 Windows 入口端口无效，请改正后保存。")?;
-        Ok((target, port))
-    }
-
-    /// 环境页「启动接管」按钮为什么不能点；能点时为 `None`。
-    pub(crate) fn start_blocker(&self) -> Option<String> {
-        if !self.status_valid {
-            return Some("后台状态未确认".into());
-        }
-        // Other environments may be taken over (decision 40); this one may not.
-        if let Some(selected) = self.selected.as_deref()
-            && self.phase_for(selected) != "idle"
-        {
-            return Some("这个环境正在接管或需要恢复".into());
-        }
-        if let Some(message) = self.unsaved_message() {
-            return Some(message);
-        }
-        self.selection().err()
+            .ok_or_else(|| format!("{name} 保存的 Windows 入口端口无效，请改正后保存。"))?;
+        Ok((distro_id.to_owned(), port))
     }
 
     /// 托盘「去恢复接管」：打开（第一个）需要恢复的那个环境的页面。
@@ -477,8 +463,11 @@ impl Desktop {
         };
         let message = confirmation.message.clone();
         let kernel_prompt = confirmation.kind == Kind::PrepareKernel;
+        let nft_prompt = confirmation.kind == Kind::InstallNftables;
         let (title, ok_text) = if kernel_prompt {
             ("准备内核环境", "加载并继续")
+        } else if nft_prompt {
+            ("安装 nftables", "安装并继续")
         } else if confirmation.exit {
             ("退出 WSL Proxy", "停止接管并退出")
         } else {
@@ -507,6 +496,12 @@ impl Desktop {
                         if kernel_prompt {
                             this.pending_prepare = None;
                             this.notice = "已取消加载内核能力；缺少这些能力时无法启动接管。".into();
+                            this.error = true;
+                        }
+                        if nft_prompt {
+                            this.pending_prepare = None;
+                            this.notice =
+                                "已取消安装 nftables；目标没有 nft 命令时无法启动接管。".into();
                             this.error = true;
                         }
                         cx.notify();
@@ -747,13 +742,40 @@ impl Desktop {
             cx.notify();
             return;
         }
+        let Some(target) = self.selected.clone() else {
+            self.fail("请先在环境页选一个环境。", cx);
+            return;
+        };
+        self.start_environment(target, cx);
+    }
+
+    /// 启动某个环境的接管（环境列表的按钮、详情的按钮都走这里）：按钮不置灰，
+    /// 不能启动时直接说明原因。
+    pub(crate) fn start_environment(&mut self, distro_id: String, cx: &mut Context<Self>) {
+        if self.locked() {
+            return;
+        }
+        let name = self.environment_display_name(&distro_id);
+        match self.phase_for(&distro_id) {
+            "unknown" => {
+                self.fail("后台状态未确认，请先刷新。", cx);
+                return;
+            }
+            "idle" => {}
+            _ => {
+                self.fail(format!("{name} 已经在接管或需要恢复。"), cx);
+                return;
+            }
+        }
         if let Some(message) = self.unsaved_message() {
             self.fail(message, cx);
             return;
         }
+        let kind = Kind::Start;
         self.pending_prepare = None;
         self.kernel_prepare_offered = false;
-        let (target, port) = match self.selection() {
+        self.nftables_install_offered = false;
+        let (target, port) = match self.start_selection(&distro_id) {
             Ok(value) => value,
             Err(error) => {
                 self.fail(error, cx);
@@ -776,6 +798,35 @@ impl Desktop {
             json!({"command":"preflight","target":target,"port":port}),
             cx,
         );
+    }
+
+    /// 启动前预检发现目标没有 nft 命令时，询问是否用 apt 装上 nftables（决策 41）；
+    /// 确认后由 InstallNftables 的结果处理重新预检。
+    pub(crate) fn prompt_nftables_install(
+        &mut self,
+        pending: PendingPrepare,
+        cx: &mut Context<Self>,
+    ) {
+        let target_name = self.environment_display_name(&pending.target);
+        self.notice = format!("预检未通过：{target_name} 里没有 nft 命令。");
+        self.error = true;
+        self.confirmation = Some(Confirmation {
+            kind: Kind::InstallNftables,
+            generation: pending.generation,
+            request: json!({
+                "command":"install_nftables",
+                "target":pending.target.clone(),
+                "confirm":true
+            }),
+            message: format!(
+                "接管的规则要用 nft 命令写进 {target_name} 里，它还没装 nftables。是否现在以 root 在 {target_name} 里运行 apt-get install nftables？会从这个发行版自己的网络下载软件包，通常不到一分钟；只装这一个包，不改别的设置，也不启动接管。装好后自动重新预检。"
+            ),
+            exit: false,
+            queue: Vec::new(),
+        });
+        self.pending_prepare = Some(pending);
+        self.confirmation_pending = true;
+        cx.notify();
     }
 
     /// 启动前预检发现目标内核缺少所需能力时，把「加载目标已有模块」作为一次
@@ -1307,7 +1358,12 @@ impl Desktop {
     }
 
     /// 发出一页的保存。有别的操作在进行、请求没有发出时返回 `false`。
-    fn send_save(&mut self, scope: SaveScope, request: Value, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn send_save(
+        &mut self,
+        scope: SaveScope,
+        request: Value,
+        cx: &mut Context<Self>,
+    ) -> bool {
         // 发出的修改类请求都会让 `epoch` 加一；没加说明请求被丢弃了，
         // 这时可能还有一次保存在途，不能覆盖它记下的页面。
         let epoch = self.epoch;
@@ -1318,6 +1374,23 @@ impl Desktop {
             self.saving = previous;
         }
         sent
+    }
+
+    /// 新建环境还缺什么必填项；都填了时为 `None`。
+    pub(crate) fn create_missing(&self, cx: &App) -> Option<&'static str> {
+        let filled = |field: &Field| !Self::field_value(field, cx).trim().is_empty();
+        if !filled(&self.fields.environment_username) || !filled(&self.fields.environment_password)
+        {
+            return Some("新增环境需要默认用户名和密码。");
+        }
+        if !self
+            .residential_inputs()
+            .into_iter()
+            .all(|(field, _)| filled(field))
+        {
+            return Some("新增环境需要填写住宅代理：服务器、端口、用户名和密码。");
+        }
+        None
     }
 
     pub(crate) fn environment_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1667,9 +1740,17 @@ impl Desktop {
                     self.fail("新增环境需要发行版和安装目录。", cx);
                     return;
                 }
-                if username.is_empty() || password.is_empty() {
-                    self.fail("新增环境需要默认用户名和密码。", cx);
+                if let Some(missing) = self.create_missing(cx) {
+                    self.fail(missing, cx);
                     return;
+                }
+                // 创建成功后保存给新环境（见 EnvironmentCreate 的回复处理）。
+                match self.residential_draft(cx) {
+                    Ok(residential) => self.create_residential = Some(residential),
+                    Err(error) => {
+                        self.fail(error, cx);
+                        return;
+                    }
                 }
                 (
                     Kind::EnvironmentCreate,

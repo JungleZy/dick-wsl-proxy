@@ -30,6 +30,14 @@ pub(crate) enum Command {
         #[arg(long)]
         confirm: bool,
     },
+    /// Install the `nftables` package in a target with apt: the takeover
+    /// writes its rules with `nft` (decision 41). Only while this target is
+    /// not taken over; needs `--confirm`.
+    InstallNftables {
+        target: String,
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Read-only report of the WSL platform: `wsl.exe`, its kernel and the
     /// registered distributions. Starts no distribution and changes nothing.
     WslPlatform,
@@ -345,6 +353,37 @@ pub(crate) fn dispatch_result(
                 "record_error": record_error,
                 "blockers": blockers,
                 "inspection_error": inspection_error,
+            })
+        }
+        Command::InstallNftables { target, confirm } => {
+            if !confirm {
+                return Err(Failure::new(
+                    "confirmation_required",
+                    "Pass --confirm: apt installs nftables in the target from its own network",
+                ));
+            }
+            let all = registry()?;
+            let distro = find(&all, &target)?;
+            if controller.owned(&distro.id).map_err(error)? {
+                return Err(Failure::new(
+                    "nftables_install_requires_idle",
+                    "Stop this target's takeover first",
+                ));
+            }
+            let outcome = kernel_env::install_nftables(distro).map_err(|e| {
+                let code = if e.starts_with("nftables_install_requires_apt") {
+                    "nftables_install_requires_apt"
+                } else {
+                    "nftables_install_failed"
+                };
+                Failure::new(code, e)
+            })?;
+            serde_json::json!({
+                "target": distro.name,
+                "nftables": match outcome {
+                    kernel_env::NftablesInstall::Present => "present",
+                    kernel_env::NftablesInstall::Installed => "installed",
+                },
             })
         }
         Command::WslPlatform => {

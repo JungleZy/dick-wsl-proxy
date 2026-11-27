@@ -15,6 +15,8 @@ pub(crate) enum Kind {
     Events,
     Preflight,
     PrepareKernel,
+    /// 在目标里用 apt 装 nftables（决策 41：接管的规则用 nft 写）。
+    InstallNftables,
     Save,
     Start,
     Stop,
@@ -51,6 +53,7 @@ impl Kind {
             self,
             Self::Save
                 | Self::PrepareKernel
+                | Self::InstallNftables
                 | Self::Start
                 | Self::Stop
                 | Self::Probe
@@ -85,6 +88,7 @@ impl Kind {
             Self::Events => "读取运行事件",
             Self::Preflight => "启动前检查",
             Self::PrepareKernel => "准备内核环境",
+            Self::InstallNftables => "安装 nftables",
             Self::Save => "保存修改",
             Self::Start => "启动接管",
             Self::Stop => "停止并恢复",
@@ -251,6 +255,23 @@ fn humanize_code(code: &str, message: &str) -> String {
         "target_already_owned" => "当前已有接管任务，请先停止接管并恢复直连。".into(),
         "timezone_sync_failed" => timezone_sync_failure(message),
         "kernel_prepare_requires_idle" => "请先停止接管并恢复直连，再准备内核环境。".into(),
+        "nftables_install_requires_idle" => "请先停止这个环境的接管，再安装 nftables。".into(),
+        "nftables_install_requires_apt" => {
+            "这个发行版没有 apt，程序装不了 nftables。请在发行版里用它自己的包管理器装上 nftables（提供 nft 命令），再启动接管。".into()
+        }
+        "nftables_install_failed" => format!(
+            "在目标里安装 nftables 失败：{}。请检查发行版的网络和软件源后重试，或在发行版里运行 sudo apt install nftables。",
+            // The backend's message repeats the code before the apt output.
+            Some(
+                message
+                    .trim()
+                    .strip_prefix("nftables_install_failed:")
+                    .unwrap_or(message)
+                    .trim()
+            )
+            .filter(|detail| !detail.is_empty())
+            .unwrap_or("apt 没有装上")
+        ),
         "kernel_prepare_failed" => {
             "内核环境准备失败，请确认目标发行版能启动，并且带有内核模块。".into()
         }
@@ -965,6 +986,19 @@ mod tests {
             humanize_error("kernel_prepare_failed: Target"),
             "内核环境准备失败，请确认目标发行版能启动，并且带有内核模块。"
         );
+    }
+
+    #[test]
+    fn translates_nftables_install_errors_for_the_ui() {
+        assert!(humanize_error("nftables_install_requires_apt").contains("没有 apt"));
+        let failed =
+            humanize_error("nftables_install_failed: E: Unable to locate package nftables");
+        assert!(
+            failed.contains("E: Unable to locate package nftables"),
+            "{failed}"
+        );
+        assert!(failed.contains("sudo apt install nftables"), "{failed}");
+        assert!(humanize_error("nftables_install_requires_idle").contains("先停止这个环境的接管"));
     }
 
     #[test]

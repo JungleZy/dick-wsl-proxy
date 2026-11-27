@@ -107,6 +107,10 @@ pub(crate) struct Desktop {
     pub(crate) confirmation_pending: bool,
     /// 本次启动尝试已经就缺少的内核能力问过一次；避免预检失败后反复弹框。
     pub(crate) kernel_prepare_offered: bool,
+    /// 本次启动尝试已经就缺 nftables 问过一次。
+    pub(crate) nftables_install_offered: bool,
+    /// 新建环境时填的住宅代理，创建成功、有了发行版 ID 后保存给它。
+    pub(crate) create_residential: Option<Value>,
     /// 托盘「退出」进行中：停止接管成功后接着关闭后台，后台关闭后退出程序。
     pub(crate) exiting: bool,
     /// 托盘「退出」时没有接管：等加载框关掉后弹退出确认框。

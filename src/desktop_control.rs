@@ -68,6 +68,7 @@ fn blocked_by_environment_job(command: &str, request: &Value, job: &EnvironmentJ
         "start"
             | "preflight"
             | "prepare_kernel"
+            | "install_nftables"
             | "probe_exit"
             | "shutdown_daemon"
             | "environment_create"
@@ -390,6 +391,7 @@ fn log_command(command: &str) -> bool {
         "profile_save"
             | "preflight"
             | "prepare_kernel"
+            | "install_nftables"
             | "start"
             | "stop"
             | "probe_exit"
@@ -459,6 +461,7 @@ fn failed_action(command: &str) -> &'static str {
         "stop" => "停止接管",
         "preflight" => "预检",
         "prepare_kernel" => "准备内核环境",
+        "install_nftables" => "安装 nftables",
         "profile_save" => "保存配置",
         _ => "操作",
     }
@@ -534,6 +537,21 @@ fn command_log(command: &str, response: &Value) -> (&'static str, String, String
             )
         }
         "start" => ("info", "lifecycle".into(), "已开始接管".into()),
+        "install_nftables" => (
+            "info",
+            "kernel".into(),
+            if response["nftables"] == "installed" {
+                format!(
+                    "已在 {} 里安装 nftables",
+                    response["target"].as_str().unwrap_or("目标")
+                )
+            } else {
+                format!(
+                    "{} 里已有 nftables",
+                    response["target"].as_str().unwrap_or("目标")
+                )
+            },
+        ),
         "stop" if response["unproven_mappings_left"].as_u64().unwrap_or(0) > 0 => (
             "warning",
             "lifecycle".into(),
@@ -917,9 +935,9 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                 }
                 return Ok((json!({"shutdown":true}), true));
             }
-            "list" | "status" | "preflight" | "prepare_kernel" | "import_credential"
-            | "forget_credential" | "start" | "stop" | "abandon" | "reset_dns_aliases"
-            | "wsl_platform" => {
+            "list" | "status" | "preflight" | "prepare_kernel" | "install_nftables"
+            | "import_credential" | "forget_credential" | "start" | "stop" | "abandon"
+            | "reset_dns_aliases" | "wsl_platform" => {
                 if matches!(&*cmd, "start" | "stop" | "abandon")
                     && request["expected_generation"].as_u64().is_none()
                 {

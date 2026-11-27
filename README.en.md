@@ -205,12 +205,15 @@ Keep `wsl-proxy-desktop.exe` and the matching version of `wsl-proxyctl.exe` in t
    - leave **Windows ingress port** empty to let the app pick, on save, the first port from 43531 up that no other environment uses, or enter one;
    - click **Save residential proxy**. Each environment's residential proxy and ingress port are saved separately.
    - To check the residential proxy first, click **Test residential proxy**. It asks for confirmation, because the direct path sends the username and password in plain text without the first hop.
-4. In the same card, click **Start takeover**.
+4. Click **Start takeover**: every row of the environment list has it on the right, and so does the **Takeover** card. Without a saved residential proxy, or with unsaved changes on a page, it says why instead of starting.
    - The preflight runs automatically.
+   - If the distribution has no `nftables`, the app asks whether to install it with apt; once installed it runs the preflight again.
    - If kernel modules are missing, the app asks whether to load the ones already in the distribution.
    - A confirmation dialog then states that the timezone will change and the target will restart. The takeover starts once you confirm.
    - Several environments can be taken over at once, each started and stopped on its own. At most one of them may run Docker: starting an environment whose Docker is running is refused while another takeover already covers container networks.
 5. **Stop**: click **Stop takeover** in that environment's **Takeover** card, **Stop takeover** on Home, or **Stop all takeovers** in the tray menu.
+
+When **creating an environment**, the default user name and password and the environment's residential proxy (protocol, server, port, username, password) are all required before **Create and set up** can be clicked; the proxy is saved to the new environment once it exists, and the app assigns its ingress port.
 
 When upgrading from 0.1.17 or earlier, the single saved residential proxy and ingress port move to the distribution that was set as the target. If that distribution is gone, the environment details show a residential proxy that is "not assigned to any environment"; assign it to the environment you are viewing, or discard it.
 

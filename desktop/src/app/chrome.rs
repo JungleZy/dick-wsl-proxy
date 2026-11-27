@@ -95,6 +95,7 @@ impl Desktop {
                         this.prepare_for(kind, target, window, cx)
                     }
                     UiAction::StopAll => this.prompt_stop_all(window, cx),
+                    UiAction::StartFor(target) => this.start_environment(target, cx),
                     UiAction::Reveal => {
                         if let Some(path) = &this.export_path {
                             cx.reveal_path(std::path::Path::new(path));
