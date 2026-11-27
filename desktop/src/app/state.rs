@@ -69,6 +69,10 @@ pub(crate) struct Desktop {
     /// 环境页正在看的环境的 ID。住宅代理和入口端口输入框装的是它的配置，
     /// 详情页上的「启动接管」也是启动它。
     pub(crate) selected: Option<String>,
+    /// Every environment the backend has records for (decision 40), each
+    /// with its `scope`, `phase` and `operation_generation`. `status` is the
+    /// one the pages show.
+    pub(crate) sessions: Vec<Value>,
     pub(crate) profile: Value,
     /// 配置库里各环境的住宅代理和入口端口（决策 40），每项带 `distro_id`、`revision`、
     /// `residential`、`ingress_port`。

@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use super::{ALIAS_BLOCK, ALIAS_SPACE, ALIAS_START};
-/// Serialized by the controller's existing current-user exclusive lock. The
+/// Serialized across processes by the controller's current-user exclusive
+/// lock, and across the takeovers of one backend (decision 40) by
+/// [`exclusive`]: each takeover's resolver has its own view and reloads the
+/// map whenever another one appended to it. The
 /// ledger contains a version marker and an allocated-address count. The
 /// digest map contains no domain names or real IP addresses, only stable
 /// name/IP digests and their reserved aliases. A leftover pending file is an
@@ -29,8 +32,28 @@ pub(super) struct AliasLedger {
     assignments: HashMap<[u8; 32], u32>,
     used: HashMap<u32, [u8; 32]>,
     loaded: bool,
+    /// The mapping file's length when this view read it.
+    loaded_len: u64,
     #[cfg(test)]
     pub(super) cleanup: Option<PathBuf>,
+}
+
+/// Held from a lookup through the allocation to the record of new aliases,
+/// so two takeovers never record the same name and address twice (a
+/// duplicate makes every later load refuse the map).
+pub(super) fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+    static LEDGER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LEDGER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn file_len(path: &Path) -> Result<u64, String> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(format!("inspect DNS alias mapping: {error}")),
+    }
 }
 
 #[cfg(test)]
@@ -52,6 +75,7 @@ impl Default for AliasLedger {
             assignments: HashMap::new(),
             used: HashMap::new(),
             loaded: false,
+            loaded_len: 0,
             cleanup: Some(root),
         }
     }
@@ -69,12 +93,21 @@ impl AliasLedger {
             assignments: HashMap::new(),
             used: HashMap::new(),
             loaded: false,
+            loaded_len: 0,
             cleanup: None,
         }
     }
 
     fn ensure_loaded(&mut self) -> Result<(), String> {
-        if self.loaded {
+        // The map only grows, by appends: a longer file means another
+        // takeover recorded aliases since this view read it.
+        if self.loaded
+            && file_len(
+                self.mapping_path
+                    .as_deref()
+                    .ok_or("DNS alias mapping path unavailable")?,
+            )? == self.loaded_len
+        {
             return Ok(());
         }
         if self.path.is_none() {
@@ -88,15 +121,16 @@ impl AliasLedger {
                 .as_deref()
                 .ok_or("DNS alias ledger path unavailable")?,
         )?;
-        let (assignments, used) = read_alias_map(
-            self.mapping_path
-                .as_deref()
-                .ok_or("DNS alias mapping path unavailable")?,
-            high,
-        )?;
+        let mapping = self
+            .mapping_path
+            .as_deref()
+            .ok_or("DNS alias mapping path unavailable")?;
+        let length = file_len(mapping)?;
+        let (assignments, used) = read_alias_map(mapping, high)?;
         self.assignments = assignments;
         self.used = used;
         self.loaded = true;
+        self.loaded_len = length;
         Ok(())
     }
 
@@ -179,6 +213,7 @@ impl AliasLedger {
             self.assignments.insert(key, offset);
             self.used.insert(offset, key);
         }
+        self.loaded_len = file_len(path)?;
         Ok(())
     }
 

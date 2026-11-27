@@ -838,6 +838,8 @@ impl Aliases {
             })
             .copied()
             .collect();
+        // Another takeover's resolver shares the durable ledger (decision 40).
+        let _ledger = ledger::exclusive();
         let mut new_pairs = Vec::new();
         for ip in &missing {
             if self.history.contains_key(&(name.clone(), *ip)) {

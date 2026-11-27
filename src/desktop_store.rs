@@ -39,9 +39,10 @@ const STATE_KEYS: [&str; 5] = [
     "dns_managed",
 ];
 
-/// Last state recorded per store. The desktop polls status every two seconds;
-/// polls that only move traffic counters return here without opening SQLite.
-static LAST_RUNTIME_STATE: Mutex<Option<(PathBuf, Value)>> = Mutex::new(None);
+/// Last state recorded per store and environment scope. The desktop polls
+/// status every two seconds; polls that only move traffic counters return
+/// here without opening SQLite.
+static LAST_RUNTIME_STATE: Mutex<Vec<(PathBuf, String, Value)>> = Mutex::new(Vec::new());
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RuntimeLogEntry {
@@ -195,6 +196,11 @@ fn open(path: &Path) -> Result<Connection, String> {
             );
             CREATE TABLE IF NOT EXISTS runtime_state (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                updated_at INTEGER NOT NULL,
+                snapshot_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS runtime_session_state (
+                scope TEXT PRIMARY KEY,
                 updated_at INTEGER NOT NULL,
                 snapshot_json TEXT NOT NULL
             );
@@ -421,6 +427,9 @@ fn runtime_snapshot(status: &Value) -> Value {
         "active_target": status["active_target"]
             .as_str()
             .or_else(|| status["recorded_target"].as_str()),
+        // An idle session names the environment it last ran (decision 40);
+        // not part of the state key, so it never logs a transition itself.
+        "last_target": status["last_target"].as_str(),
         "operation_generation": status["operation_generation"].as_u64(),
         "config_generation": status["config_generation"].as_u64(),
         "dns_managed": status["dns_managed"].as_bool(),
@@ -452,23 +461,39 @@ fn state_key(snapshot: &Value) -> Value {
 /// Persist the snapshot of the last state transition and log the transition.
 /// The stored row is compared across daemon restarts; metrics-only changes
 /// neither touch the database nor log anything.
+/// Records each environment's state from a status reply: the backend's
+/// `{"sessions": [...]}`, or one session's status (a start or stop reply).
+/// A state change is logged once per environment (decision 40).
 pub(crate) fn record_runtime_snapshot(path: &Path, status: &Value) -> Result<(), String> {
+    match status["sessions"].as_array() {
+        Some(sessions) => {
+            for session in sessions {
+                record_session_snapshot(path, session)?;
+            }
+            Ok(())
+        }
+        None => record_session_snapshot(path, status),
+    }
+}
+
+fn record_session_snapshot(path: &Path, status: &Value) -> Result<(), String> {
+    let scope = status["scope"].as_str().unwrap_or_default().to_owned();
     let snapshot = runtime_snapshot(status);
     let key = state_key(&snapshot);
     let mut last = LAST_RUNTIME_STATE
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    if last
-        .as_ref()
-        .is_some_and(|(cached_path, cached_key)| cached_path == path && *cached_key == key)
-    {
+    let cached = last
+        .iter()
+        .position(|(cached_path, cached_scope, _)| cached_path == path && *cached_scope == scope);
+    if cached.is_some_and(|index| last[index].2 == key) {
         return Ok(());
     }
     let connection = open(path)?;
     let previous = connection
         .query_row(
-            "SELECT snapshot_json FROM runtime_state WHERE id = 1",
-            [],
+            "SELECT snapshot_json FROM runtime_session_state WHERE scope = ?1",
+            [&scope],
             |row| row.get::<_, String>(0),
         )
         .optional()
@@ -483,11 +508,11 @@ pub(crate) fn record_runtime_snapshot(path: &Path, status: &Value) -> Result<(),
         let now = now_unix_seconds()?;
         connection
             .execute(
-                "INSERT INTO runtime_state (id, updated_at, snapshot_json)
-                 VALUES (1, ?1, ?2)
-                 ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at,
+                "INSERT INTO runtime_session_state (scope, updated_at, snapshot_json)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(scope) DO UPDATE SET updated_at=excluded.updated_at,
                      snapshot_json=excluded.snapshot_json",
-                params![now, snapshot_json],
+                params![scope, now, snapshot_json],
             )
             .map_err(|error| format!("desktop_store_snapshot_write:{error}"))?;
         let (level, message) = snapshot_event(&snapshot);
@@ -499,12 +524,17 @@ pub(crate) fn record_runtime_snapshot(path: &Path, status: &Value) -> Result<(),
                 source: "runtime",
                 message: &message,
                 phase: snapshot["phase"].as_str(),
-                target: snapshot["active_target"].as_str(),
+                target: snapshot["active_target"]
+                    .as_str()
+                    .or_else(|| snapshot["last_target"].as_str()),
                 generation: snapshot["operation_generation"].as_u64(),
             },
         )?;
     }
-    *last = Some((path.to_path_buf(), key));
+    match cached {
+        Some(index) => last[index].2 = key,
+        None => last.push((path.to_path_buf(), scope, key)),
+    }
     Ok(())
 }
 
@@ -1371,7 +1401,7 @@ mod tests {
         let stored: String = open(&path)
             .unwrap()
             .query_row(
-                "SELECT snapshot_json FROM runtime_state WHERE id = 1",
+                "SELECT snapshot_json FROM runtime_session_state WHERE scope = ''",
                 [],
                 |row| row.get(0),
             )

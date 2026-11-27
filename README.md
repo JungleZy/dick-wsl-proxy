@@ -349,20 +349,20 @@ password=change-me
 | --- | --- |
 | `list` | 列出发行版，只读，不唤醒任何发行版 |
 | `preflight <目标> [--port 43531]` | 只读预检，可能唤醒目标 |
-| `prepare-kernel <目标> --confirm` | 加载已有模块、注册空表、写开机配置；要求空闲 |
+| `prepare-kernel <目标> --confirm` | 加载已有模块、注册空表、写开机配置；要求这个目标没在接管 |
 | `wsl-platform` | 只读报告 WSL 平台信息 |
 | `wsl-platform-update --confirm` | 运行 `wsl --update`；要求空闲，会终止所有发行版 |
 | `start <目标> --profile <策略> [--port <端口>]` | 用目标自己的住宅代理启动接管（会改时区并重启目标），之后留在前台，标准输入关闭时停止；已有接管时拒绝 |
-| `status` | 输出当前状态 JSON |
-| `stop [--expected-generation <N>]` | 停止接管或执行恢复；空闲时重复执行仍成功 |
-| `abandon --confirm` | 目标已被注销、`stop` 无法完成时，放弃本次记录 |
+| `status` | 输出各环境的状态 JSON：`{"sessions":[...]}`，每项带 `scope`（发行版 GUID）和这个环境的阶段、操作代次 |
+| `stop [--target <目标>] [--expected-generation <N>]` | 停止一个环境的接管或执行恢复；只有一个环境在接管时可以不写 `--target`；空闲时重复执行仍成功 |
+| `abandon --confirm [--target <GUID>]` | 目标已被注销、`stop` 无法完成时，放弃它的记录；还有别的环境在接管时，顺带在那个环境里删掉它的规则表 |
 | `import-credential --name <标签> --target <目标> --env-file <路径>` | 导入一个环境的住宅代理设置 |
 | `forget-credential --name <标签> [--target <目标>]` | 清空一个环境的住宅代理；不带 `--target` 时丢弃未分配的那一份 |
 | `reset-dns-aliases --confirm` | 白名单域名的别名地址用尽时清空账本；要求空闲 |
 | `session` | 会话模式：逐行读 JSON 命令，标准输入关闭时停止接管 |
 | `rpc` | 从标准输入读一条 JSON 请求，交给正在运行的桌面后台 |
 
-`status` 里的 `phase` 有四种取值：`idle`（空闲）、`forwarding_managed`（接管中）、`forwarding_scoped`（诊断模式）、`recovery_required`（需要恢复）。更多细节见 [M2](docs/plans/m2/README.md)、[M3](docs/plans/m3/README.md)。
+`status` 里每个会话的 `phase` 有四种取值：`idle`（空闲）、`forwarding_managed`（接管中）、`forwarding_scoped`（诊断模式）、`recovery_required`（需要恢复）。更多细节见 [M2](docs/plans/m2/README.md)、[M3](docs/plans/m3/README.md)。
 
 ## 策略配置参考
 
@@ -434,7 +434,7 @@ $state = '{"command":"status"}' | & $ctl rpc | ConvertFrom-Json
 
 **目标在接管中被注销**
 
-`stop` 会报 `journal_distribution_no_longer_matches_registration`。这时运行 `& $ctl abandon --confirm`（桌面端是首页的「放弃本次记录」），然后执行一次 `wsl --shutdown`，清掉 WSL 里可能残留的规则。
+`stop` 会报 `journal_distribution_no_longer_matches_registration`。这时运行 `& $ctl abandon --confirm --target <GUID>`（桌面端是首页的「放弃本次记录」）。还有别的环境在接管时，后台会在那个环境里按表名删掉被放弃环境的规则表；没有别的环境在接管时，再执行一次 `wsl --shutdown`，清掉 WSL 里可能残留的规则。
 
 > [!IMPORTANT]
 > 不要手动删除 `%LOCALAPPDATA%\WSLProxyLab` 里的 `m1-active.json`、`m3-operation.json`，也不要清空共享的防火墙规则或连接跟踪表。删掉恢复记录不会恢复网络，只会让程序失去恢复所需的信息。

@@ -92,7 +92,7 @@ def endpoint6(value):
 
 def validate(request):
     fields = {"operation", "plan", "protocol", "peer"}
-    require(isinstance(request, dict) and set(request) in (fields, fields | {"deadline"}, fields | {"bridges"}), "invalid_request")
+    require(isinstance(request, dict) and set(request) in (fields, fields | {"deadline"}, fields | {"bridges"}, fields | {"sibling"}), "invalid_request")
     operation = request["operation"]
     if "bridges" in request:
         # The target's Docker bridges Windows saw during the takeover, for
@@ -100,7 +100,12 @@ def validate(request):
         bridges = request["bridges"]
         require(operation == "block" and isinstance(bridges, list) and len(bridges) <= 64, "invalid_block_bridges")
         require(all(isinstance(name, str) and BRIDGE_NAME.fullmatch(name) and name not in ("eth0", "lo") for name in bridges), "invalid_block_bridges")
-    require(operation in ("precheck", "arm", "install", "remove", "inspect", "lookup", "sync_networks", "block"), "invalid_operation")
+    require(operation in ("precheck", "arm", "install", "remove", "inspect", "lookup", "sync_networks", "block", "drop_instance"), "invalid_operation")
+    # The cookie of another takeover whose distribution was unregistered:
+    # its private tables are deleted from this live one (decision 41).
+    require((operation == "drop_instance") == ("sibling" in request), "unexpected_or_missing_sibling")
+    if operation == "drop_instance":
+        require(integer(request["sibling"], 1, 0xffffffff) and request["sibling"] != request["plan"]["cookie"], "invalid_sibling")
     require((operation == "arm") == ("deadline" in request), "unexpected_or_missing_grant_deadline")
     if operation == "arm":
         require(integer(request["deadline"], 1, 0xffffffffffffffff), "invalid_grant_deadline")
@@ -2348,6 +2353,17 @@ def execute(request):
         if operation == "arm":
             grant(p, "arm", request["deadline"])
             return {"ok": True, "operation": operation}
+        if operation == "drop_instance":
+            # The nft tables are shared by every distribution, so deleting a
+            # gone takeover's private tables from here is the same as from
+            # its own. Nothing of this instance is touched.
+            sibling = dict(p, cookie=request["sibling"])
+            dropped = 0
+            for ipv6 in (False, True):
+                if nft_json(private_family(ipv6), private_name(sibling)) is not None:
+                    run(["nft", "delete", "table", private_family(ipv6), private_name(sibling)])
+                    dropped += 1
+            return {"ok": True, "operation": operation, "dropped": dropped}
         if operation == "install":
             grant(p, "consume")
         elif operation == "remove":

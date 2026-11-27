@@ -1,5 +1,7 @@
-//! A single owner and recovery journal for scoped M1 and policy-managed M2 sessions.
-//! The journal is immutable while active: persist intent BEFORE any guest mutation.
+//! The takeovers this backend runs, one `Session` per environment (decision
+//! 40), each with its own owner journal and operation record (scoped by the
+//! distribution's GUID, see `transition::scope`). A journal is immutable
+//! while active: persist intent BEFORE any guest mutation.
 use crate::managed::{Readiness, Runtime};
 use crate::{host, ingress::Ingress, kernel, lease, plan::Plan, transition};
 use serde::Deserialize;
@@ -8,9 +10,15 @@ use std::sync::Arc;
 
 pub(crate) mod journal;
 pub(crate) mod lifecycle;
+mod sessions;
+pub use sessions::Controller;
 
+/// One environment's takeover: its scope, the live ingress and plan, and
+/// what the periodic check found.
 #[derive(Default)]
-pub struct Controller {
+pub struct Session {
+    /// The environment's record scope (`transition::scope`).
+    pub(crate) scope: String,
     pub(crate) live: Option<(Plan, Ingress)>,
     pub(crate) readiness: Option<Result<Readiness, String>>,
     pub(crate) runtime: Option<Arc<Runtime>>,
@@ -19,6 +27,9 @@ pub struct Controller {
     /// Marked entries the last stop or switch left because they could not
     /// be proven this takeover's (decision 20); reported once, then cleared.
     unproven_left: u32,
+    /// The target of the takeover this session last ended, so an idle
+    /// status still says which environment it is (decision 40).
+    last_target: Option<String>,
 }
 
 /// Periodic, read-only evidence that the live target still carries this
@@ -72,21 +83,36 @@ impl BlockState {
 /// only after [`Self::current`] rechecks the record under the lock that a stop
 /// needs too, so it never follows the stop that would remove it.
 pub(crate) struct RecoveryRound {
+    scope: String,
     plan: Plan,
     generation: u64,
 }
 
 impl RecoveryRound {
     /// The recorded managed takeover, when no operation is in flight.
-    pub(crate) fn recorded() -> Option<Self> {
-        let record = transition::load()
+    pub(crate) fn recorded(scope: &str) -> Option<Self> {
+        let record = transition::load(scope)
             .ok()
             .filter(|record| record.pending.is_none())?;
-        let plan = journal::load().ok().flatten()?;
+        let plan = journal::load(scope).ok().flatten()?;
         plan.system_dns.is_some().then_some(Self {
+            scope: scope.to_owned(),
             plan,
             generation: record.generation,
         })
+    }
+
+    /// The recorded managed takeover of each environment that has one.
+    pub(crate) fn all_recorded() -> Vec<Self> {
+        transition::scopes()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|scope| Self::recorded(scope))
+            .collect()
+    }
+
+    pub(crate) fn scope(&self) -> &str {
+        &self.scope
     }
 
     pub(crate) fn plan(&self) -> &Plan {
@@ -117,8 +143,8 @@ impl RecoveryRound {
 
     /// Still the same recorded takeover with nothing in flight.
     pub(crate) fn current(&self) -> bool {
-        journal::load().ok().flatten().as_ref() == Some(&self.plan)
-            && transition::load().is_ok_and(|record| {
+        journal::load(&self.scope).ok().flatten().as_ref() == Some(&self.plan)
+            && transition::load(&self.scope).is_ok_and(|record| {
                 record.pending.is_none() && record.generation == self.generation
             })
     }
@@ -242,8 +268,9 @@ fn unix_seconds() -> Option<u64> {
 }
 
 /// One protection check, started under the controller lock by
-/// [`Controller::watch_round`] so that its slow part can run without it.
+/// [`Session::watch_round`] so that its slow part can run without it.
 pub(crate) struct WatchRound {
+    scope: String,
     plan: Plan,
     generation: u64,
     /// The loss is already recorded and leaves the target direct: this round
@@ -251,7 +278,7 @@ pub(crate) struct WatchRound {
     block: bool,
 }
 
-/// What [`WatchRound::observe`] found, for [`Controller::finish_watch`].
+/// What [`WatchRound::observe`] found, for [`Session::finish_watch`].
 pub(crate) struct WatchFinding(Finding);
 
 enum Finding {
@@ -273,17 +300,21 @@ struct NetworkUpdate {
     error: Option<String>,
 }
 
-/// What [`Controller::finish_watch`] reports back: a first protection loss,
+/// What [`Session::finish_watch`] reports back: a first protection loss,
 /// and a runtime log line about the target's container networks.
 pub(crate) struct WatchOutcome {
     pub(crate) lost: Option<String>,
     pub(crate) note: Option<(&'static str, String)>,
     /// Block this plan's target now, still under the controller lock that
-    /// rechecked the takeover, then report through [`Controller::record_block`].
+    /// rechecked the takeover, then report through [`Session::record_block`].
     pub(crate) block: Option<Plan>,
 }
 
 impl WatchRound {
+    pub(crate) fn scope(&self) -> &str {
+        &self.scope
+    }
+
     pub(crate) fn target(&self) -> &str {
         &self.plan.target.name
     }
@@ -364,7 +395,7 @@ impl WatchRound {
     }
 }
 
-impl Controller {
+impl Session {
     /// Starts one protection check of the forwarding target, or returns `None`
     /// when there is nothing to check: no verified takeover, protection already
     /// lost, or an operation in flight.
@@ -383,10 +414,11 @@ impl Controller {
         // unprovable mappings), rounds keep observing read-only, so a restart
         // after it is still found and blocked (decision 33).
         let block = self.watch.lost.as_deref().is_some_and(blockable);
-        let record = transition::load()
+        let record = transition::load(&self.scope)
             .ok()
             .filter(|record| record.pending.is_none())?;
         Some(WatchRound {
+            scope: self.scope.clone(),
             plan,
             generation: record.generation,
             block,
@@ -410,15 +442,6 @@ impl Controller {
         let mut block = None;
         let lost = self.record_watch(round, finding, &mut note, &mut block);
         WatchOutcome { lost, note, block }
-    }
-
-    /// A recovery round for the takeover this controller only knows from the
-    /// journal (it started after the one that ran it ended).
-    pub(crate) fn recovery_round(&self) -> Option<RecoveryRound> {
-        if self.live.is_some() {
-            return None;
-        }
-        RecoveryRound::recorded()
     }
 
     /// Blocks the recorded target after a due recovery round, if nothing
@@ -511,7 +534,7 @@ impl Controller {
             } else {
                 !self.watch.lost.as_deref().is_some_and(blockable)
             })
-            && transition::load().is_ok_and(|record| {
+            && transition::load(&self.scope).is_ok_and(|record| {
                 record.pending.is_none() && record.generation == round.generation
             });
         if !unchanged {
@@ -694,9 +717,11 @@ impl Controller {
 
     pub(crate) fn settled_status(&self) -> Result<serde_json::Value, String> {
         use serde_json::json;
-        let disk = journal::load()?;
+        let disk = journal::load(&self.scope)?;
         match (&self.live, disk) {
-            (None, None) => Ok(json!({"phase":"idle","active_target":null,"config_generation":0})),
+            (None, None) => Ok(
+                json!({"phase":"idle","active_target":null,"config_generation":0,"last_target":self.last_target}),
+            ),
             (Some((p, ingress)), Some(d)) if *p == d => {
                 let issue = self
                     .readiness
@@ -738,7 +763,7 @@ impl Controller {
         {
             return Err("ipv6_domain_allowlist_unsupported".into());
         }
-        if self.live.is_some() || journal::load()?.is_some() {
+        if self.live.is_some() || journal::load(&self.scope)?.is_some() {
             return Err("recover_or_stop_existing_target_first".into());
         }
         journal::persist(&p)?;
@@ -824,7 +849,7 @@ impl Controller {
         Ok(())
     }
     pub(crate) fn retire(&mut self, expected: &Plan) -> Result<(), String> {
-        let Some(p) = journal::load()? else {
+        let Some(p) = journal::load(&self.scope)? else {
             if self.live.is_some() {
                 return Err("missing_active_journal".into());
             }
@@ -867,7 +892,15 @@ impl Controller {
         self.recent_exit = None;
         self.watch = Watch::default();
         self.unproven_left = unproven;
+        self.last_target = Some(p.target.name.clone());
         Ok(())
+    }
+
+    /// The live target's name when its takeover covers Docker networks.
+    pub(crate) fn container_target(&self) -> Option<String> {
+        let (plan, _) = self.live.as_ref()?;
+        (self.watch.cookie == plan.cookie && !self.watch.networks.is_empty())
+            .then(|| plan.target.name.clone())
     }
 
     /// How many unprovable marked entries the last stop or switch left in
@@ -889,7 +922,7 @@ mod tests {
             removed: removed.iter().map(|name| (*name).to_owned()).collect(),
             error: error.map(str::to_owned),
         };
-        let mut controller = Controller::default();
+        let mut controller = Session::new("01234567-89ab-cdef-0123-456789abcdef");
         assert_eq!(controller.record_networks(update(&[], &[], None)), None);
         let (level, message) = controller
             .record_networks(update(&["br-0123456789ab"], &["docker0"], None))
@@ -1047,7 +1080,7 @@ mod tests {
 
     #[test]
     fn a_block_is_logged_when_it_changes_not_every_round() {
-        let mut controller = Controller::default();
+        let mut controller = Session::new("01234567-89ab-cdef-0123-456789abcdef");
         let installed = || {
             Ok(kernel::Blocked {
                 rules: 14,
@@ -1082,7 +1115,7 @@ mod tests {
 
     #[test]
     fn an_idle_controller_never_checks_the_guest() {
-        let mut controller = Controller::default();
+        let mut controller = Session::new("01234567-89ab-cdef-0123-456789abcdef");
         assert!(controller.watch_round().is_none());
         assert_eq!(controller.watch.checked_unix_seconds, None);
     }

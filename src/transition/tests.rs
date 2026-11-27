@@ -18,7 +18,9 @@ impl TempDir {
     }
 
     fn journal(&self) -> PathBuf {
-        self.0.join(FILE_NAME)
+        self.0.join(format!(
+            "{FILE_PREFIX}00000000-0000-0000-0000-000000000001.json"
+        ))
     }
 }
 
@@ -62,7 +64,9 @@ fn start(path: &Path) -> Record {
 #[test]
 fn legacy_absence_and_bootstrap_are_durable_idle_then_pending() {
     let dir = TempDir::new();
-    let path = dir.0.join("new-state-directory").join(FILE_NAME);
+    let path = dir.0.join("new-state-directory").join(format!(
+        "{FILE_PREFIX}00000000-0000-0000-0000-000000000001.json"
+    ));
     assert_eq!(load_at(&path).unwrap(), Record::default());
     assert_eq!(
         finish_at(&path, &Record::default()).unwrap(),
@@ -389,7 +393,12 @@ fn directory_or_journal_non_regular_state_is_refused() {
     assert!(begin_at(&path, &Record::default(), Kind::Start, None, Some(&plan(1))).is_err());
     let file_parent = dir.0.join("file-parent");
     fs::write(&file_parent, b"not a directory").unwrap();
-    assert!(load_at(&file_parent.join(FILE_NAME)).is_err());
+    assert!(
+        load_at(&file_parent.join(format!(
+            "{FILE_PREFIX}00000000-0000-0000-0000-000000000001.json"
+        )))
+        .is_err()
+    );
 }
 
 #[cfg(unix)]
@@ -409,7 +418,12 @@ fn symlink_journal_and_directory_are_refused_without_following() {
     );
     let directory_link = dir.0.join("directory-link");
     symlink(&dir.0, &directory_link).unwrap();
-    assert!(load_at(&directory_link.join(FILE_NAME)).is_err());
+    assert!(
+        load_at(&directory_link.join(format!(
+            "{FILE_PREFIX}00000000-0000-0000-0000-000000000001.json"
+        )))
+        .is_err()
+    );
 }
 
 #[test]
@@ -436,4 +450,93 @@ fn abandon_clears_an_intent_at_any_stage_but_never_a_stale_one() {
         "transition_stale_record"
     );
     assert_eq!(load_at(&path).unwrap(), next);
+}
+
+#[test]
+fn a_scope_is_a_lower_case_guid_without_braces() {
+    assert_eq!(
+        scope("{05312BC5-8849-43BC-83BD-A7FEDA8D165F}").unwrap(),
+        "05312bc5-8849-43bc-83bd-a7feda8d165f"
+    );
+    assert_eq!(
+        scope("05312bc5-8849-43bc-83bd-a7feda8d165f").unwrap(),
+        "05312bc5-8849-43bc-83bd-a7feda8d165f"
+    );
+    for bad in [
+        "",
+        "..",
+        "Target",
+        "{05312bc5-8849-43bc-83bd-a7feda8d165}",
+        "05312bc5_8849_43bc_83bd_a7feda8d165f",
+        "../../05312bc5-8849-43bc-83bd-a7feda8d",
+    ] {
+        assert!(scope(bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn legacy_records_move_to_the_environment_they_name() {
+    let scope_of = |plan: &Plan| scope(&plan.target.id).unwrap();
+    // A pending start: the record goes to the new plan's environment.
+    let dir = TempDir::new();
+    let legacy = dir.0.join(LEGACY_FILE_NAME);
+    let pending = begin_at(
+        &legacy,
+        &Record::default(),
+        Kind::Start,
+        None,
+        Some(&plan(7)),
+    )
+    .unwrap();
+    migrate_legacy_in(&dir.0).unwrap();
+    assert!(!legacy.exists());
+    let moved = dir
+        .0
+        .join(format!("{FILE_PREFIX}{}.json", scope_of(&plan(7))));
+    assert_eq!(load_at(&moved).unwrap(), pending);
+    // Running it again changes nothing.
+    migrate_legacy_in(&dir.0).unwrap();
+    assert_eq!(load_at(&moved).unwrap(), pending);
+
+    // A live takeover: the owner journal and the settled record follow its target.
+    let dir = TempDir::new();
+    let legacy = dir.0.join(LEGACY_FILE_NAME);
+    let started = begin_at(
+        &legacy,
+        &Record::default(),
+        Kind::Start,
+        None,
+        Some(&plan(9)),
+    )
+    .unwrap();
+    let settled = finish_at(&legacy, &started).unwrap();
+    fs::write(
+        dir.0.join("m1-active.json"),
+        serde_json::to_vec(&plan(9)).unwrap(),
+    )
+    .unwrap();
+    migrate_legacy_in(&dir.0).unwrap();
+    let scope = scope_of(&plan(9));
+    assert_eq!(
+        load_at(&dir.0.join(format!("{FILE_PREFIX}{scope}.json"))).unwrap(),
+        settled
+    );
+    assert!(dir.0.join(format!("m1-active-{scope}.json")).exists());
+    assert!(!dir.0.join("m1-active.json").exists());
+
+    // Nothing in flight and no journal: the record belongs to nobody.
+    let dir = TempDir::new();
+    let legacy = dir.0.join(LEGACY_FILE_NAME);
+    let started = begin_at(
+        &legacy,
+        &Record::default(),
+        Kind::Start,
+        None,
+        Some(&plan(3)),
+    )
+    .unwrap();
+    finish_at(&legacy, &started).unwrap();
+    migrate_legacy_in(&dir.0).unwrap();
+    assert!(!legacy.exists());
+    assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 0);
 }

@@ -291,17 +291,21 @@ fn environment_options(
     }
 }
 
-fn require_idle(controller: &mut controller::Controller) -> Result<(), crate::command::Failure> {
-    let phase = controller
-        .status()
-        .map_err(|error| crate::command::Failure::new("controller_error", error))?["phase"]
-        .as_str()
-        .unwrap_or("unknown")
-        .to_owned();
-    if phase != "idle" {
+/// Editing, backing up or deleting an environment needs only that one to be
+/// idle (decision 40): the others keep their takeovers.
+fn require_idle(
+    controller: &controller::Controller,
+    name: &str,
+) -> Result<(), crate::command::Failure> {
+    let failure = |error: String| crate::command::Failure::new("controller_error", error);
+    let distributions = host::distributions().map_err(failure)?;
+    let Some(distro) = distributions.iter().find(|d| d.name == name) else {
+        return Ok(());
+    };
+    if controller.owned(&distro.id).map_err(failure)? {
         return Err(crate::command::Failure::new(
             "environment_requires_idle",
-            "先停止接管并恢复直连，再管理 WSL 环境",
+            "先停止这个环境的接管并恢复直连，再管理它",
         ));
     }
     Ok(())
@@ -630,7 +634,12 @@ fn record_runtime_result(command: &str, response: &Value, controller: &controlle
         &source,
         &message,
         status.and_then(|value| value["phase"].as_str()),
-        status.and_then(|value| value["active_target"].as_str()),
+        status.and_then(|value| {
+            value["active_target"]
+                .as_str()
+                .or_else(|| value["recorded_target"].as_str())
+                .or_else(|| value["last_target"].as_str())
+        }),
         status.and_then(|value| value["operation_generation"].as_u64()),
     );
 }
@@ -670,8 +679,18 @@ fn sanitized(s: &Value) -> Value {
     }
     json!({"schema":1,"phase":phase,"operation_generation":s["operation_generation"].as_u64(),"dns_managed":s["dns_managed"].as_bool(),"fresh_udp_dns":s["startup_verified"]["fresh_udp_dns"].as_bool(),"fresh_tcp_dns":s["startup_verified"]["fresh_tcp_dns"].as_bool(),"udp_supported":s["startup_verified"]["udp_supported"].as_bool(),"https_status":s["startup_verified"]["https_status"].as_u64(),"tx_bytes":s["forwarding"]["traffic"]["tx_bytes"].as_u64(),"rx_bytes":s["forwarding"]["traffic"]["rx_bytes"].as_u64(),"counters":counters})
 }
+/// One sanitized entry per environment with records (decision 40); the
+/// scope (a registry GUID) is left out like every other identifier.
+fn sanitized_sessions(status: &Value) -> Value {
+    let sessions: Vec<Value> = status["sessions"]
+        .as_array()
+        .map(|sessions| sessions.iter().map(sanitized).collect())
+        .unwrap_or_default();
+    json!({"schema":2,"sessions":sessions})
+}
+
 fn export(controller: &controller::Controller) -> Result<Value, String> {
-    let doc = sanitized(&controller.status()?);
+    let doc = sanitized_sessions(&controller.status()?);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| "invalid_clock")?
@@ -784,8 +803,9 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                 let req: EnvironmentLaunch = fields(&mut request, "invalid_environment_fields")?;
                 environment::apps::launch(&req.name, &req.app).map_err(bad)?
             }
+            // A new distribution touches no takeover: its setup's legacy
+            // iptables writes cannot reach the private tables (decision 41).
             "environment_create" => {
-                require_idle(controller)?;
                 let req: EnvironmentCreate = fields(&mut request, "invalid_environment_fields")?;
                 let target = req.name.clone();
                 start_environment_job("environment_create", target, move || {
@@ -810,8 +830,8 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                 })?
             }
             "environment_edit" => {
-                require_idle(controller)?;
                 let req: EnvironmentEdit = fields(&mut request, "invalid_environment_fields")?;
+                require_idle(controller, &req.name)?;
                 let target = req.name.clone();
                 start_environment_job("environment_edit", target, move || {
                     let environment = environment::edit(
@@ -829,8 +849,8 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                 })?
             }
             "environment_backup" => {
-                require_idle(controller)?;
                 let req: EnvironmentBackup = fields(&mut request, "invalid_environment_fields")?;
+                require_idle(controller, &req.name)?;
                 let target = req.name.clone();
                 start_environment_job("environment_backup", target, move || {
                     let backup = environment::backup(&req.name, &req.backup_path)?;
@@ -838,8 +858,8 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                 })?
             }
             "environment_delete" => {
-                require_idle(controller)?;
                 let req: EnvironmentDelete = fields(&mut request, "invalid_environment_fields")?;
+                require_idle(controller, &req.name)?;
                 let target = req.name.clone();
                 // Read before the job: the registry entry is gone afterwards.
                 let distro_id = host::distributions()
@@ -882,11 +902,17 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                 let generation = request["expected_generation"]
                     .as_u64()
                     .ok_or_else(|| bad("expected_generation_required".into()))?;
-                controller.probe_exit(generation).map_err(bad)?;
-                controller.status().map_err(bad)?
+                let scope = controller
+                    .resolve(request["target"].as_str())
+                    .map_err(bad)?;
+                controller
+                    .session(&scope)
+                    .probe_exit(generation)
+                    .map_err(bad)?;
+                controller.session_status(&scope).map_err(bad)?
             }
             "shutdown_daemon" => {
-                if controller.status().map_err(bad)?["phase"] != "idle" {
+                if controller.any_owned().map_err(bad)? {
                     return Err(bad("stop_and_restore_before_daemon_shutdown".into()));
                 }
                 return Ok((json!({"shutdown":true}), true));
@@ -1197,5 +1223,12 @@ mod tests {
         assert!(!v.to_string().contains("secret"));
         assert_eq!(v["tx_bytes"], 12);
         assert_eq!(v["counters"]["chain_tcp"], 4);
+        let all = sanitized_sessions(&json!({"sessions":[
+            {"scope":"05312bc5-8849-43bc-83bd-a7feda8d165f","phase":"idle","active_target":"secret"},
+            {"scope":"63536b91-140f-4b7a-8118-a69fcd568827","phase":"forwarding_managed","active_target":"secret"}
+        ]}));
+        assert_eq!(all["sessions"].as_array().unwrap().len(), 2);
+        assert!(!all.to_string().contains("secret"));
+        assert!(!all.to_string().contains("05312bc5"));
     }
 }

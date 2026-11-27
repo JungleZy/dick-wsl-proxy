@@ -1,6 +1,6 @@
 //! Serialize changes under the Windows controller lock. The operation log records
 //! ordering; only authenticated kernel evidence and the owner journal authorize cleanup.
-use super::{Controller, journal};
+use super::{Session, journal};
 use crate::{
     host, kernel, lease,
     managed::Runtime,
@@ -62,8 +62,10 @@ fn stage_owner(intent: &Intent) -> Option<&Plan> {
         Stage::StartingNew => intent.new.as_ref(),
     }
 }
-pub fn checked(expected: Option<u64>) -> Result<Record, String> {
-    let current = transition::load()?;
+/// The scope's operation record, refused when `expected` names another
+/// generation: each environment has its own (decision 40).
+pub fn checked(scope: &str, expected: Option<u64>) -> Result<Record, String> {
+    let current = transition::load(scope)?;
     if let Some(old) = expected
         && old != current.generation
     {
@@ -75,10 +77,10 @@ pub fn checked(expected: Option<u64>) -> Result<Record, String> {
     Ok(current)
 }
 
-impl Controller {
+impl Session {
     pub fn status(&self) -> Result<Value, String> {
-        let op = transition::load()?;
-        let owner = journal::load()?;
+        let op = transition::load(&self.scope)?;
+        let owner = journal::load(&self.scope)?;
         if self
             .live
             .as_ref()
@@ -121,7 +123,7 @@ impl Controller {
         )
     }
     pub fn switch_source(&self, expected: u64) -> Result<(&Plan, &Runtime), String> {
-        let current = checked(Some(expected))?;
+        let current = checked(&self.scope, Some(expected))?;
         if current.pending.is_some() {
             return Err("operation_pending: explicit recovery required".into());
         }
@@ -130,7 +132,7 @@ impl Controller {
             .runtime
             .as_deref()
             .ok_or("requires_live_managed_owner")?;
-        if journal::load()?.as_ref() != Some(p)
+        if journal::load(&self.scope)?.as_ref() != Some(p)
             || !self.readiness.as_ref().is_some_and(Result::is_ok)
         {
             return Err("active_owner_unverified".into());
@@ -147,12 +149,13 @@ impl Controller {
         runtime: Option<Arc<Runtime>>,
         expected: Option<u64>,
     ) -> Result<(), String> {
-        let current = checked(expected)?;
-        if current.pending.is_some() || self.live.is_some() || journal::load()?.is_some() {
+        let current = checked(&self.scope, expected)?;
+        if current.pending.is_some() || self.live.is_some() || journal::load(&self.scope)?.is_some()
+        {
             return Err("recover_or_stop_existing_target_first".into());
         }
         let window = kernel::precheck(&p)?;
-        let record = transition::begin(&current, Kind::Start, None, Some(&p))?;
+        let record = transition::begin(&self.scope, &current, Kind::Start, None, Some(&p))?;
         self.activate_and_commit(p, runtime, &record, window)
     }
     fn activate_and_commit(
@@ -164,8 +167,8 @@ impl Controller {
     ) -> Result<(), String> {
         let result = self.activate(p, runtime, window);
         // If any guest mutation is still possible, activate has kept its owner journal.
-        if result.is_ok() || (journal::load()?.is_none() && self.live.is_none()) {
-            transition::finish(record)?;
+        if result.is_ok() || (journal::load(&self.scope)?.is_none() && self.live.is_none()) {
+            transition::finish(&self.scope, record)?;
         }
         result
     }
@@ -174,8 +177,8 @@ impl Controller {
     /// instance's Windows ports and recovery records only. Rules it installed
     /// may remain inside a still-running WSL VM until the next `wsl --shutdown`.
     pub fn abandon(&mut self, expected: Option<u64>) -> Result<Value, String> {
-        let record = checked(expected)?;
-        let owner = journal::load()?;
+        let record = checked(&self.scope, expected)?;
+        let owner = journal::load(&self.scope)?;
         let Some(plan) = owner
             .clone()
             .or_else(|| record.pending.as_ref().and_then(stage_owner).cloned())
@@ -199,7 +202,7 @@ impl Controller {
             journal::forget(&plan)?;
         }
         if record.pending.is_some() {
-            transition::abandon(&record)?;
+            transition::abandon(&self.scope, &record)?;
         }
         self.live = None;
         self.readiness = None;
@@ -209,26 +212,34 @@ impl Controller {
         Ok(json!({"abandoned":plan.target.name,"next":"run wsl --shutdown before the next start"}))
     }
 
+    /// The cookie of the takeover this environment's records name, if any.
+    pub(crate) fn recorded_cookie(&self) -> Result<Option<u32>, String> {
+        let record = transition::load(&self.scope)?;
+        Ok(journal::load(&self.scope)?
+            .or_else(|| record.pending.as_ref().and_then(stage_owner).cloned())
+            .map(|plan| plan.cookie))
+    }
+
     pub fn stop(&mut self) -> Result<(), String> {
-        let mut record = checked(None)?;
+        let mut record = checked(&self.scope, None)?;
         if record.pending.is_none() {
-            let Some(p) = journal::load()? else {
+            let Some(p) = journal::load(&self.scope)? else {
                 return if self.live.is_none() {
                     Ok(())
                 } else {
                     Err("missing_active_journal".into())
                 };
             };
-            record = transition::begin(&record, Kind::Stop, Some(&p), None)?;
+            record = transition::begin(&self.scope, &record, Kind::Stop, Some(&p), None)?;
         }
         let pending = record.pending.as_ref().ok_or("missing_operation")?;
         match pending.stage {
             Stage::ReleasingOld => {
                 self.retire(pending.old.as_ref().ok_or("missing_old_owner")?)?;
-                record = transition::advance(&record, Stage::OldRestored)?;
+                record = transition::advance(&self.scope, &record, Stage::OldRestored)?;
             }
             Stage::OldRestored => {
-                if self.live.is_some() || journal::load()?.is_some() {
+                if self.live.is_some() || journal::load(&self.scope)?.is_some() {
                     return Err("unexpected_owner_in_restored_gap".into());
                 }
                 verify_restored(pending.old.as_ref().ok_or("missing_old_owner")?)?;
@@ -240,7 +251,7 @@ impl Controller {
                 self.retire(pending.new.as_ref().ok_or("missing_new_owner")?)?;
             }
         }
-        transition::finish(&record)?;
+        transition::finish(&self.scope, &record)?;
         Ok(())
     }
 }

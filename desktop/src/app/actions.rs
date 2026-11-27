@@ -130,6 +130,31 @@ impl Desktop {
             .then(|| self.status["operation_generation"].as_u64())
             .flatten()
     }
+
+    /// The operation generation of one environment (decision 40: each has
+    /// its own). An environment the backend has no records for is at 0.
+    pub(crate) fn generation_for(&self, distro_id: &str) -> Option<u64> {
+        if !self.status_valid {
+            return None;
+        }
+        let scope = record_scope(distro_id);
+        Some(
+            self.sessions
+                .iter()
+                .find(|session| session["scope"].as_str() == Some(scope.as_str()))
+                .and_then(|session| session["operation_generation"].as_u64())
+                .unwrap_or(0),
+        )
+    }
+
+    /// The generation a confirmation was made against: its target
+    /// environment's, or for requests that name none the current takeover's.
+    fn confirmation_generation(&self, request: &Value) -> Option<u64> {
+        match request["target"].as_str() {
+            Some(target) => self.generation_for(target),
+            None => self.generation(),
+        }
+    }
     pub(crate) fn locked(&self) -> bool {
         self.busy.is_some() || self.reading || self.confirmation.is_some()
     }
@@ -490,11 +515,14 @@ impl Desktop {
             self.fail("后台状态未确认，请先刷新。", cx);
             return;
         };
+        // Stop and abandon act on the takeover the status shows; each
+        // environment has its own records (decision 40).
+        let scope = self.status["scope"].clone();
         if kind == Kind::Abandon {
             self.confirmation = Some(Confirmation {
                 kind,
                 generation,
-                request: json!({"command":"abandon","confirm":true,"expected_generation":generation}),
+                request: json!({"command":"abandon","confirm":true,"expected_generation":generation,"target":scope}),
                 message: "目标发行版已不在 WSL 注册表里，无法清理它的规则。将释放本次接管占用的端口并清掉恢复记录。WSL 里可能还残留本次接管的规则：下次启动接管前，请先在终端执行一次 wsl --shutdown（会关闭所有发行版）。".into(),
                 exit: false,
             });
@@ -506,7 +534,7 @@ impl Desktop {
             self.confirmation = Some(Confirmation {
                 kind,
                 generation,
-                request: json!({"command":"stop","expected_generation":generation}),
+                request: json!({"command":"stop","expected_generation":generation,"target":scope}),
                 message:
                     "将停止接管并恢复直连。现有 TCP 连接会中断，需要重连；只清理本控制器的规则。"
                         .into(),
@@ -528,6 +556,10 @@ impl Desktop {
                 self.fail(error, cx);
                 return;
             }
+        };
+        let Some(generation) = self.generation_for(&target) else {
+            self.fail("后台状态未确认，请先刷新。", cx);
+            return;
         };
         self.preflight = None;
         self.pending_prepare = Some(PendingPrepare {
@@ -615,7 +647,7 @@ impl Desktop {
             return;
         };
         self.confirmation_pending = false;
-        if self.generation() != Some(confirmation.generation) {
+        if self.confirmation_generation(&confirmation.request) != Some(confirmation.generation) {
             self.fail("确认期间后台状态已变化，请刷新后重试。", cx);
             return;
         }
@@ -862,7 +894,7 @@ impl Desktop {
         self.confirmation = Some(Confirmation {
             kind: Kind::Stop,
             generation,
-            request: json!({"command":"stop","expected_generation":generation}),
+            request: json!({"command":"stop","expected_generation":generation,"target":self.status["scope"]}),
             message: "退出程序会先停止接管并恢复直连，再关闭后台。现有 TCP 连接会中断，需要重连；只清理本控制器的规则。停止没有完成时程序不会退出。".into(),
             exit: true,
         });
@@ -990,7 +1022,7 @@ impl Desktop {
         };
         self.send(
             Kind::Probe,
-            json!({"command":"probe_exit","expected_generation":generation}),
+            json!({"command":"probe_exit","expected_generation":generation,"target":self.status["scope"]}),
             cx,
         );
     }
@@ -1667,4 +1699,14 @@ impl Desktop {
         })
         .detach();
     }
+}
+
+/// The backend's record scope of a distribution: its registry GUID in lower
+/// case without braces (`transition::scope` on the backend side).
+pub(crate) fn record_scope(distro_id: &str) -> String {
+    distro_id
+        .trim()
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .to_ascii_lowercase()
 }

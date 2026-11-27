@@ -1475,6 +1475,14 @@ class PrivateTableTests(unittest.TestCase):
         with self.assertRaisesRegex(kernel.Failure, "private_unknown_option"):
             statement(["-A", "WPM2_12345678", "--sport", "53", "-j", "RETURN"])
 
+    def test_only_drop_instance_names_a_sibling_and_never_its_own_cookie(self):
+        p = comprehensive_plan()
+        request = lambda operation, **extra: {"operation": operation, "plan": p, "protocol": None, "peer": None, **extra}
+        self.assertEqual(kernel.validate(request("drop_instance", sibling=0xA0A0A0A1)), p)
+        for bad in (request("drop_instance"), request("inspect", sibling=0xA0A0A0A1), request("drop_instance", sibling=p["cookie"]), request("drop_instance", sibling=0)):
+            with self.subTest(bad=bad), self.assertRaises(kernel.Failure):
+                kernel.validate(bad)
+
     def test_a_stop_deletes_both_private_tables_before_the_shared_cleanup(self):
         p = comprehensive_plan()
         order = []

@@ -109,7 +109,7 @@ pub fn sync_networks(p: &Plan) -> Result<Synced, String> {
 /// guest adds those its per-network rules, an earlier block and the target's
 /// dockerd show, and drops what they forward too.
 pub fn block(p: &Plan, bridges: &[String]) -> Result<Blocked, String> {
-    invoke_with(p, "block", None, Some(bridges))?
+    invoke_with(p, "block", None, Some(bridges), None)?
         .blocked
         .ok_or_else(|| "kernel_missing_block_result".into())
 }
@@ -146,6 +146,8 @@ struct Request<'a> {
     deadline: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bridges: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sibling: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -166,6 +168,8 @@ struct Response {
     synced: Option<Synced>,
     #[serde(default)]
     blocked: Option<Blocked>,
+    #[serde(default)]
+    dropped: Option<u32>,
 }
 
 /// What a block left: how many drop-only rules are in place, and the
@@ -179,7 +183,16 @@ pub struct Blocked {
 }
 
 fn invoke(p: &Plan, operation: &str, deadline: Option<u64>) -> Result<Response, String> {
-    invoke_with(p, operation, deadline, None)
+    invoke_with(p, operation, deadline, None, None)
+}
+
+/// Deletes the private tables (decision 41) of another takeover, `sibling`,
+/// whose distribution was unregistered, from the live takeover `p`: the nft
+/// tables are shared by all distributions. Returns how many tables it found.
+pub fn drop_instance(p: &Plan, sibling: u32) -> Result<u32, String> {
+    invoke_with(p, "drop_instance", None, None, Some(sibling))?
+        .dropped
+        .ok_or_else(|| "kernel_missing_drop_result".into())
 }
 
 fn invoke_with(
@@ -187,6 +200,7 @@ fn invoke_with(
     operation: &str,
     deadline: Option<u64>,
     bridges: Option<&[String]>,
+    sibling: Option<u32>,
 ) -> Result<Response, String> {
     validate(p)?;
     let request = Request {
@@ -196,6 +210,7 @@ fn invoke_with(
         peer: None,
         deadline,
         bridges,
+        sibling,
     };
     let bytes = serde_json::to_vec(&request)
         .map_err(|error| format!("kernel_request_encoding_failed: {error}"))?;
@@ -243,6 +258,9 @@ fn parse_response(output: &str, operation: &str) -> Result<Response, String> {
     }
     if response.blocked.is_some() != (operation == "block") {
         return Err("kernel_unexpected_or_missing_block_result".into());
+    }
+    if response.dropped.is_some() != (operation == "drop_instance") {
+        return Err("kernel_unexpected_or_missing_drop_result".into());
     }
     if let Some(ownership) = &response.ownership
         && ((ownership.rules_complete && !ownership.rules_present)

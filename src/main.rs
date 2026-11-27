@@ -107,47 +107,14 @@ impl ProtectionWatch {
                     let Some(mut guard) = try_owned(&controller) else {
                         continue;
                     };
-                    let round = guard.watch_round();
-                    let recovery = round.is_none().then(|| guard.recovery_round()).flatten();
+                    // One round per verified takeover, and one recovery round
+                    // per environment this controller only knows from its
+                    // journal (decision 40).
+                    let rounds = guard.watch_rounds();
+                    let recoveries = guard.recovery_rounds();
                     drop(guard);
-                    let Some(round) = round else {
-                        next = Instant::now() + PROTECTION_CHECK_INTERVAL;
-                        // Decision 33: a takeover this controller only knows
-                        // from the journal is blocked when its rules are gone.
-                        if let Some(recovery) = recovery
-                            && recovery.due()
-                            && !stopping.load(Ordering::Acquire)
-                            && let Some(mut guard) = try_owned(&controller)
-                        {
-                            let target = recovery.plan().target.name.clone();
-                            let note = guard.finish_recovery(recovery);
-                            drop(guard);
-                            if let (Some((level, message)), Some(path)) = (note, &store) {
-                                let _ = desktop_store::append_runtime_log(
-                                    path,
-                                    level,
-                                    "protection",
-                                    &message,
-                                    None,
-                                    Some(&target),
-                                    None,
-                                );
-                            }
-                        }
-                        continue;
-                    };
-                    let finding = round.observe();
-                    if stopping.load(Ordering::Acquire) {
-                        break;
-                    }
-                    // `ProtectionWatch::drop` joins this thread: never block on
-                    // the lock, so a dropper holding it cannot deadlock.
-                    let Some(mut guard) = try_owned(&controller) else {
-                        continue;
-                    };
-                    let target = round.target().to_owned();
-                    let outcome = guard.finish_watch(round, finding);
-                    let log = |level: &str, message: &str, outcome: Option<&str>| {
+                    next = Instant::now() + PROTECTION_CHECK_INTERVAL;
+                    let log = |level: &str, message: &str, outcome: Option<&str>, target: &str| {
                         if let Some(path) = &store {
                             let _ = desktop_store::append_runtime_log(
                                 path,
@@ -155,33 +122,66 @@ impl ProtectionWatch {
                                 "protection",
                                 message,
                                 outcome,
-                                Some(&target),
+                                Some(target),
                                 None,
                             );
                         }
                     };
-                    if let Some(reason) = &outcome.lost {
-                        log(
-                            "error",
-                            &protection_lost_message(reason),
-                            Some("recovery_required"),
-                        );
+                    // Decision 33: a takeover this controller only knows from
+                    // the journal is blocked when its rules are gone.
+                    for recovery in recoveries {
+                        if stopping.load(Ordering::Acquire) {
+                            break;
+                        }
+                        if !recovery.due() {
+                            continue;
+                        }
+                        let Some(mut guard) = try_owned(&controller) else {
+                            continue;
+                        };
+                        let target = recovery.plan().target.name.clone();
+                        let note = guard.finish_recovery(recovery);
+                        drop(guard);
+                        if let Some((level, message)) = note {
+                            log(level, &message, None, &target);
+                        }
                     }
-                    if let Some((level, message)) = &outcome.note {
-                        log(level, message, None);
+                    for round in rounds {
+                        let finding = round.observe();
+                        if stopping.load(Ordering::Acquire) {
+                            break;
+                        }
+                        // `ProtectionWatch::drop` joins this thread: never block on
+                        // the lock, so a dropper holding it cannot deadlock.
+                        let Some(mut guard) = try_owned(&controller) else {
+                            continue;
+                        };
+                        let target = round.target().to_owned();
+                        let scope = round.scope().to_owned();
+                        let outcome = guard.finish_watch(round, finding);
+                        if let Some(reason) = &outcome.lost {
+                            log(
+                                "error",
+                                &protection_lost_message(reason),
+                                Some("recovery_required"),
+                                &target,
+                            );
+                        }
+                        if let Some((level, message)) = &outcome.note {
+                            log(level, message, None, &target);
+                        }
+                        // Decision 33: block while still holding the lock that
+                        // rechecked this takeover, so a stop, which removes the
+                        // block with the rest, can never have run in between.
+                        if let Some(plan) = &outcome.block
+                            && let bridges = guard.block_bridges(&scope, plan)
+                            && let Some((level, message)) =
+                                guard.record_block(&scope, kernel::block(plan, &bridges))
+                        {
+                            log(level, &message, None, &target);
+                        }
+                        drop(guard);
                     }
-                    // Decision 33: block while still holding the lock that
-                    // rechecked this takeover, so a stop, which removes the
-                    // block with the rest, can never have run in between.
-                    if let Some(plan) = &outcome.block
-                        && let bridges = guard.block_bridges(plan)
-                        && let Some((level, message)) =
-                            guard.record_block(kernel::block(plan, &bridges))
-                    {
-                        log(level, &message, None);
-                    }
-                    drop(guard);
-                    next = Instant::now() + PROTECTION_CHECK_INTERVAL;
                 }
             })
             .ok();
@@ -208,10 +208,13 @@ fn custodian_round(
     if host::acquire().is_err() {
         return;
     }
-    let Some(round) = controller::RecoveryRound::recorded() else {
+    let Some(round) = controller::RecoveryRound::all_recorded()
+        .into_iter()
+        .find(|round| round.plan().cookie == cookie)
+    else {
         return;
     };
-    if round.plan().cookie != cookie || !round.due() {
+    if !round.due() {
         return;
     }
     let Ok(_lock) = host::acquire() else {
@@ -329,10 +332,20 @@ fn run(command: Command) -> Result<u8, Failure> {
         return Ok(rc);
     }
     if let Command::LeaseWorker { cookie } = command {
-        let plan = controller::journal::load()
-            .map_err(|e| Failure::new("lease_journal", e))?
-            .filter(|p| p.cookie == cookie)
-            .ok_or_else(|| Failure::new("lease_journal", "Instance no longer present"))?;
+        // The takeover whose ports this worker holds: the environment whose
+        // journal names this cookie (decision 40).
+        let mut plan = None;
+        for scope in transition::scopes().map_err(|e| Failure::new("lease_journal", e))? {
+            if let Some(found) = controller::journal::load(&scope)
+                .map_err(|e| Failure::new("lease_journal", e))?
+                .filter(|p| p.cookie == cookie)
+            {
+                plan = Some(found);
+                break;
+            }
+        }
+        let plan =
+            plan.ok_or_else(|| Failure::new("lease_journal", "Instance no longer present"))?;
         let store = desktop_store::path().ok();
         let mut last = None;
         lease::worker(&plan, || custodian_round(cookie, &store, &mut last))
@@ -368,18 +381,19 @@ fn run(command: Command) -> Result<u8, Failure> {
     if matches!(command, Command::Maintenance) {
         // Do not start WSL, try recovery or even consult a live guest. A journal or pending
         // transition is sufficient reason to refuse. _lock stays alive across the handshake.
-        let record =
-            transition::load().map_err(|e| Failure::new("maintenance_state_unknown", e))?;
-        let active = controller::journal::load()
-            .map_err(|e| Failure::new("maintenance_state_unknown", e))?;
-        if active.is_some() || record.pending.is_some() {
+        let unknown = |e: String| Failure::new("maintenance_state_unknown", e);
+        let legacy_left = controller::journal::load_legacy()
+            .map_err(unknown)?
+            .is_some()
+            || transition::legacy_pending().map_err(unknown)?;
+        if legacy_left || owned(&controller).any_owned().map_err(unknown)? {
             return Err(Failure::new(
                 "maintenance_requires_restore",
                 "Restore the existing target before updating or uninstalling",
             ));
         }
         command::emit(
-            &serde_json::json!({"maintenance":true,"protocol":1,"phase":"idle","operation_generation":record.generation,"version":env!("CARGO_PKG_VERSION"),"pid":std::process::id()}),
+            &serde_json::json!({"maintenance":true,"protocol":1,"phase":"idle","version":env!("CARGO_PKG_VERSION"),"pid":std::process::id()}),
         )?;
         use std::io::Read;
         let mut release = Vec::new();
@@ -396,6 +410,9 @@ fn run(command: Command) -> Result<u8, Failure> {
         }
         return Ok(0);
     }
+    // Records of a release before decision 40 move to their environment
+    // before anything reads them.
+    transition::migrate_legacy().map_err(|e| Failure::new("controller_error", e))?;
     if matches!(command, Command::Daemon) {
         let store = desktop_store::path().ok();
         if let Some(path) = &store {
@@ -471,8 +488,10 @@ fn run(command: Command) -> Result<u8, Failure> {
     }
     drop(watch);
     let mut controller = owned(&controller);
-    if controller.live.is_some() {
+    // End of input stops every takeover this session runs.
+    for scope in controller.live_scopes() {
         controller
+            .session(&scope)
             .stop()
             .map_err(|e| Failure::new("restore_failed", e))?;
     }

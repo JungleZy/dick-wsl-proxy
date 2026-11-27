@@ -351,20 +351,20 @@ Prepare a policy JSON file (fields under [Policy reference](#policy-reference)),
 | --- | --- |
 | `list` | List distributions; read-only, wakes none |
 | `preflight <target> [--port 43531]` | Read-only preflight; may wake the target |
-| `prepare-kernel <target> --confirm` | Load existing modules, register empty tables, write boot configuration; requires idle |
+| `prepare-kernel <target> --confirm` | Load existing modules, register empty tables, write boot configuration; requires that this target is not taken over |
 | `wsl-platform` | Read-only report on the WSL platform |
 | `wsl-platform-update --confirm` | Run `wsl --update`; requires idle and stops every distribution |
 | `start <target> --profile <policy> [--port <port>]` | Start a takeover with the target's own residential proxy (changes the timezone and restarts the target), then stay in the foreground and stop when stdin closes; refused while another takeover exists |
-| `status` | Print the current state as JSON |
-| `stop [--expected-generation <N>]` | Stop a takeover or run recovery; repeating it when idle still succeeds |
-| `abandon --confirm` | Drop the record when the target was unregistered and `stop` cannot finish |
+| `status` | Print each environment's state as JSON: `{"sessions":[...]}`, each with its `scope` (the distribution GUID), phase and operation generation |
+| `stop [--target <target>] [--expected-generation <N>]` | Stop one environment's takeover or run recovery; `--target` may be left out while only one environment is taken over; repeating it when idle still succeeds |
+| `abandon --confirm [--target <GUID>]` | Drop the record of a target that was unregistered when `stop` cannot finish; while another environment is taken over, also deletes its rule tables from that one |
 | `import-credential --name <label> --target <target> --env-file <path>` | Import one environment's residential proxy settings |
 | `forget-credential --name <label> [--target <target>]` | Clear one environment's residential proxy; without `--target`, discard the unassigned one |
 | `reset-dns-aliases --confirm` | Clear the alias ledger when allowlisted-name aliases run out; requires idle |
 | `session` | Session mode: read JSON commands line by line, stop the takeover when stdin closes |
 | `rpc` | Read one JSON request from stdin and hand it to the running desktop backend |
 
-The `phase` field of `status` takes four values: `idle`, `forwarding_managed` (takeover running), `forwarding_scoped` (diagnostic mode) and `recovery_required`. See [M2](docs/plans/m2/README.md) and [M3](docs/plans/m3/README.md) for details.
+In `status`, each session's `phase` takes four values: `idle`, `forwarding_managed` (takeover running), `forwarding_scoped` (diagnostic mode) and `recovery_required`. See [M2](docs/plans/m2/README.md) and [M3](docs/plans/m3/README.md) for details.
 
 ## Policy reference
 
@@ -436,7 +436,7 @@ The expected result is `phase` `idle` and `active_target` `null`. `controller_bu
 
 **Target unregistered during a takeover**
 
-`stop` reports `journal_distribution_no_longer_matches_registration`. Run `& $ctl abandon --confirm` (on the desktop, **Abandon this record** on Home), then run `wsl --shutdown` once to clear any rules left inside WSL.
+`stop` reports `journal_distribution_no_longer_matches_registration`. Run `& $ctl abandon --confirm --target <GUID>` (on the desktop, **Abandon this record** on Home). While another environment is taken over, the backend deletes the abandoned one's rule tables from it by name; otherwise run `wsl --shutdown` once to clear any rules left inside WSL.
 
 > [!IMPORTANT]
 > Do not delete `m1-active.json` or `m3-operation.json` under `%LOCALAPPDATA%\WSLProxyLab`, and do not flush shared firewall rules or the connection-tracking table. Deleting recovery records does not restore the network; it only removes what recovery needs.

@@ -1,5 +1,9 @@
 //! Durable transition intent, independent of the immutable active-session journal.
 //! Callers hold the current-user controller lock and mutate guests only after a write succeeds.
+//!
+//! One record per environment (decision 40): `m3-operation-<scope>.json`, where
+//! the scope is the distribution's registry GUID in lower case without braces.
+//! Each environment has its own generation.
 use crate::{host, plan::Plan};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fs::{self, OpenOptions};
@@ -8,7 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAX_BYTES: usize = 64 * 1024;
-const FILE_NAME: &str = "m3-operation.json";
+/// The single record of releases before decision 40; `migrate_legacy` moves
+/// it to the environment it belongs to.
+const LEGACY_FILE_NAME: &str = "m3-operation.json";
+const FILE_PREFIX: &str = "m3-operation-";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -81,8 +88,110 @@ fn validate(record: &Record) -> Result<(), String> {
     Ok(())
 }
 
-fn journal() -> Result<PathBuf, String> {
-    Ok(host::state_dir()?.join(FILE_NAME))
+/// The scope of a distribution's records: its registry GUID, lower case,
+/// without braces. Anything else is refused, so a scope is always a safe
+/// file-name part.
+pub fn scope(distro_id: &str) -> Result<String, String> {
+    let id = distro_id
+        .trim()
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .to_ascii_lowercase();
+    let valid = id.len() == 36
+        && id.char_indices().all(|(index, c)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                c == '-'
+            } else {
+                c.is_ascii_hexdigit()
+            }
+        });
+    if valid {
+        Ok(id)
+    } else {
+        Err("invalid_record_scope".into())
+    }
+}
+
+fn journal(scope: &str) -> Result<PathBuf, String> {
+    Ok(host::state_dir()?.join(format!("{FILE_PREFIX}{scope}.json")))
+}
+
+/// Every scope that has an operation record or an owner journal on disk.
+pub fn scopes() -> Result<Vec<String>, String> {
+    let directory = host::state_dir()?;
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("transition_scopes:{error}")),
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let name = entry
+            .map_err(|error| format!("transition_scopes:{error}"))?
+            .file_name();
+        let Some(name) = name.to_str() else { continue };
+        let middle = name
+            .strip_prefix(FILE_PREFIX)
+            .or_else(|| name.strip_prefix(crate::controller::journal::FILE_PREFIX))
+            .and_then(|rest| rest.strip_suffix(".json"));
+        if let Some(scope) = middle.and_then(|middle| self::scope(middle).ok())
+            && !found.contains(&scope)
+        {
+            found.push(scope);
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// Whether the single record of a release before decision 40 still holds an
+/// operation in flight; read without moving it.
+pub fn legacy_pending() -> Result<bool, String> {
+    Ok(load_at(&host::state_dir()?.join(LEGACY_FILE_NAME))?
+        .pending
+        .is_some())
+}
+
+/// Moves the records of a release before decision 40 to the environment they
+/// belong to: the owner journal's target, or the pending intent's. A record
+/// with neither belongs to nobody and is dropped. Run once at controller
+/// start, under the controller lock; an interrupted move is simply redone.
+pub fn migrate_legacy() -> Result<(), String> {
+    migrate_legacy_in(&host::state_dir()?)
+}
+
+fn migrate_legacy_in(directory: &Path) -> Result<(), String> {
+    let legacy = directory.join(LEGACY_FILE_NAME);
+    let record = load_at(&legacy)?;
+    let owner = crate::controller::journal::load_legacy_in(directory)?;
+    let scope = match (&record.pending, &owner) {
+        (Some(intent), _) => intent
+            .old
+            .as_ref()
+            .or(intent.new.as_ref())
+            .map(|plan| scope(&plan.target.id))
+            .transpose()?,
+        (None, Some(plan)) => Some(scope(&plan.target.id)?),
+        (None, None) => None,
+    };
+    if let Some(scope) = &scope {
+        let path = directory.join(format!("{FILE_PREFIX}{scope}.json"));
+        let current = load_at(&path)?;
+        if record != Record::default() && current != record {
+            if current != Record::default() {
+                return Err("transition_legacy_record_conflict".into());
+            }
+            persist(&path, &current, &record)?;
+        }
+        if owner.is_some() {
+            crate::controller::journal::adopt_legacy_in(directory, scope)?;
+        }
+    }
+    match fs::remove_file(&legacy) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("transition_legacy_remove:{error}")),
+    }
 }
 
 fn is_reparse(metadata: &fs::Metadata) -> bool {
@@ -160,9 +269,9 @@ fn load_at(path: &Path) -> Result<Record, String> {
     Ok(record)
 }
 
-/// Absence is the legacy, generation-zero idle state; malformed state is never ignored.
-pub fn load() -> Result<Record, String> {
-    load_at(&journal()?)
+/// Absence is the generation-zero idle state; malformed state is never ignored.
+pub fn load(scope: &str) -> Result<Record, String> {
+    load_at(&journal(scope)?)
 }
 
 struct BoundedBytes(Vec<u8>);
@@ -312,12 +421,13 @@ fn begin_at(
 
 /// Persist the next generation before any release, install, or activation of ownership.
 pub fn begin(
+    scope: &str,
     expected: &Record,
     kind: Kind,
     old: Option<&Plan>,
     new: Option<&Plan>,
 ) -> Result<Record, String> {
-    begin_at(&journal()?, expected, kind, old, new)
+    begin_at(&journal(scope)?, expected, kind, old, new)
 }
 
 fn advance_at(path: &Path, expected: &Record, stage: Stage) -> Result<Record, String> {
@@ -339,8 +449,8 @@ fn advance_at(path: &Path, expected: &Record, stage: Stage) -> Result<Record, St
 }
 
 /// Record old ownership restored before opening the gap or starting the next owner.
-pub fn advance(expected: &Record, stage: Stage) -> Result<Record, String> {
-    advance_at(&journal()?, expected, stage)
+pub fn advance(scope: &str, expected: &Record, stage: Stage) -> Result<Record, String> {
+    advance_at(&journal(scope)?, expected, stage)
 }
 
 fn finish_at(path: &Path, expected: &Record) -> Result<Record, String> {
@@ -388,14 +498,14 @@ fn abandon_at(path: &Path, expected: &Record) -> Result<Record, String> {
 /// operator abandon of a target that is no longer registered may call this:
 /// there is no guest left to restore. A normal stop uses `finish`, which never
 /// skips the release of an old owner.
-pub fn abandon(expected: &Record) -> Result<Record, String> {
-    abandon_at(&journal()?, expected)
+pub fn abandon(scope: &str, expected: &Record) -> Result<Record, String> {
+    abandon_at(&journal(scope)?, expected)
 }
 
 /// Clear completed or safely rolled-back intent, retaining its generation for stale callers.
 /// Retrying a successful finish is harmless; an old-owner release cannot be finished early.
-pub fn finish(expected: &Record) -> Result<Record, String> {
-    finish_at(&journal()?, expected)
+pub fn finish(scope: &str, expected: &Record) -> Result<Record, String> {
+    finish_at(&journal(scope)?, expected)
 }
 #[cfg(test)]
 mod tests;

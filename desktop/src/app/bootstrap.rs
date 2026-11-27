@@ -296,6 +296,7 @@ impl Desktop {
             dns_checked_at: None,
             distributions: Vec::new(),
             selected: None,
+            sessions: Vec::new(),
             profile: Value::Null,
             environments: Vec::new(),
             unassigned_residential: Value::Null,
@@ -1255,7 +1256,9 @@ impl Desktop {
                             Ok((target, port))
                                 if target == pending.target && port == pending.port
                         );
-                        if self.generation() == Some(pending.generation) && selection_matches {
+                        if self.generation_for(&pending.target) == Some(pending.generation)
+                            && selection_matches
+                        {
                             self.notice = "预检通过，请确认后启动接管。".into();
                             self.open_prepare_confirmation(pending, cx);
                         } else {
@@ -1584,7 +1587,54 @@ impl Desktop {
         self.logs_before_id = value["next_before_id"].as_i64();
     }
 
+    /// The backend reports every environment (decision 40): `{"sessions":
+    /// [...]}` from a status request, one session from a start or a stop.
+    /// The pages still show one takeover: the one that is not idle (a
+    /// forwarding one first), or an idle placeholder.
     fn accept_status(&mut self, status: Value) {
+        let well_formed = |session: &Value| {
+            session["phase"].is_string()
+                && session["operation_generation"].is_u64()
+                && session["scope"].is_string()
+        };
+        if let Some(sessions) = status["sessions"].as_array() {
+            if sessions.iter().all(well_formed) {
+                self.sessions = sessions.clone();
+            } else {
+                self.status_valid = false;
+                self.error = true;
+                self.notice = "后台返回的状态缺少阶段或操作代数，已禁用接管操作。".into();
+                return;
+            }
+        } else if well_formed(&status) {
+            match self
+                .sessions
+                .iter_mut()
+                .find(|session| session["scope"] == status["scope"])
+            {
+                Some(session) => *session = status,
+                None => self.sessions.push(status),
+            }
+        } else {
+            self.status_valid = false;
+            self.error = true;
+            self.notice = "后台返回的状态缺少阶段或操作代数，已禁用接管操作。".into();
+            return;
+        }
+        let rank = |session: &Value| match session["phase"].as_str() {
+            Some("forwarding_managed" | "forwarding_scoped") => 0,
+            Some("idle") => 2,
+            _ => 1,
+        };
+        let status = self
+            .sessions
+            .iter()
+            .filter(|session| rank(session) < 2)
+            .min_by_key(|session| rank(session))
+            .cloned()
+            .unwrap_or_else(|| {
+                serde_json::json!({"phase":"idle","active_target":null,"operation_generation":0,"scope":null})
+            });
         if status["phase"].is_string() && status["operation_generation"].is_u64() {
             let traffic = &status["forwarding"]["traffic"];
             if traffic.is_object() {

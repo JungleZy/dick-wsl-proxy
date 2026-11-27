@@ -100,19 +100,30 @@ pub(crate) enum Command {
         #[arg(long)]
         target: Option<String>,
     },
-    /// Restore this session's target, or recover a journal left by an exited process.
+    /// Restore one environment's target, or recover a journal left by an
+    /// exited process. Without `--target`, the only environment taken over.
     Stop {
         #[arg(long)]
         expected_generation: Option<u64>,
+        /// The environment, by name or registry GUID.
+        #[arg(long)]
+        #[serde(default)]
+        target: Option<String>,
     },
     /// Release a takeover whose target distribution is no longer registered:
-    /// frees its Windows ports and recovery records. Run `wsl --shutdown`
-    /// before the next start; rules may remain in a running WSL VM.
+    /// frees its Windows ports and recovery records, and deletes its rules
+    /// from another environment still taken over (decision 41). With none,
+    /// run `wsl --shutdown` before the next start.
     Abandon {
         #[arg(long)]
         confirm: bool,
         #[arg(long)]
         expected_generation: Option<u64>,
+        /// The environment, by its registry GUID (it is no longer
+        /// registered, so its name cannot be looked up).
+        #[arg(long)]
+        #[serde(default)]
+        target: Option<String>,
     },
     /// Reset the durable DNS alias ledger after an explicit idle-state confirmation.
     ResetDnsAliases {
@@ -259,26 +270,14 @@ pub(crate) fn wsl_update_ready(
             "Pass --confirm: wsl --update restarts WSL and stops every distribution",
         ));
     }
-    let state = controller
-        .status()
-        .map_err(|error| Failure::new("controller_error", error))?;
-    if state["phase"] != "idle" {
-        return Err(Failure::new(
-            "wsl_update_requires_idle",
-            "Stop the target and restore direct networking first",
-        ));
-    }
-    if controller::journal::load()
+    // `wsl --update` may restart WSL: every takeover must be stopped.
+    if controller
+        .any_owned()
         .map_err(|error| Failure::new("controller_error", error))?
-        .is_some()
-        || transition::load()
-            .map_err(|error| Failure::new("controller_error", error))?
-            .pending
-            .is_some()
     {
         return Err(Failure::new(
-            "target_already_owned",
-            "Restore the recorded target before updating WSL",
+            "wsl_update_requires_idle",
+            "Stop every takeover and restore direct networking first",
         ));
     }
     Ok(())
@@ -296,28 +295,15 @@ pub(crate) fn dispatch_result(
         Command::Preflight { target, port } => {
             let all = registry()?;
             let state = controller.status().map_err(error)?;
-            // Checking another target must not test-bind over the daemon's own exclusive
-            // sockets. The active controller target is the only owner that can reserve them.
-            let reserved = if state["phase"] == "forwarding_managed" {
-                let active = state["active_target"].as_str();
-                let candidate = find(&all, &target)?;
-                if active.is_some_and(|name| name != candidate.name) {
-                    let generation = state["operation_generation"]
-                        .as_u64()
-                        .ok_or_else(|| error("missing_operation_generation".into()))?;
-                    Some(
-                        controller
-                            .switch_source(generation)
-                            .map_err(error)?
-                            .0
-                            .ingress,
-                    )
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+            // Checking a target that is taken over must not test-bind over
+            // its own exclusive sockets; every other environment has a port
+            // of its own (decision 40).
+            let candidate = find(&all, &target)?.id.clone();
+            let reserved = controller
+                .live_ingresses()
+                .into_iter()
+                .find(|(id, _)| id.eq_ignore_ascii_case(&candidate))
+                .map(|(_, ingress)| ingress);
             let result = preflight(&all, &target, port, state, reserved)?;
             return Ok((if result.passed { 0 } else { 2 }, serde_json::json!(result)));
         }
@@ -325,26 +311,21 @@ pub(crate) fn dispatch_result(
             if !confirm {
                 return Err(Failure::new(
                     "confirmation_required",
-                    "Pass --confirm after stopping any takeover: loading modules changes the shared WSL kernel",
+                    "Pass --confirm after stopping this target's takeover: loading modules changes the shared WSL kernel",
                 ));
             }
-            let state = controller.status().map_err(error)?;
-            if state["phase"] != "idle" {
-                return Err(Failure::new(
-                    "kernel_prepare_requires_idle",
-                    "Stop the target and restore direct networking first",
-                ));
-            }
-            if controller::journal::load().map_err(error)?.is_some()
-                || transition::load().map_err(error)?.pending.is_some()
-            {
-                return Err(Failure::new(
-                    "target_already_owned",
-                    "Restore the recorded target before preparing the kernel",
-                ));
-            }
+            // Only this environment must be idle (decision 40): loading a
+            // module adds to the shared kernel, and the legacy tables it
+            // registers cannot touch another takeover's private tables
+            // (decision 41).
             let all = registry()?;
             let distro = find(&all, &target)?;
+            if controller.owned(&distro.id).map_err(error)? {
+                return Err(Failure::new(
+                    "kernel_prepare_requires_idle",
+                    "Stop this target's takeover and restore direct networking first",
+                ));
+            }
             let preparation = kernel_env::prepare(distro).map_err(|e| {
                 Failure::new("kernel_prepare_failed", format!("{}: {e}", distro.name))
             })?;
@@ -443,11 +424,11 @@ pub(crate) fn dispatch_result(
                     "Pass --confirm after stopping the target and allowing cached DNS aliases to expire",
                 ));
             }
-            let state = controller.status().map_err(error)?;
-            if state["phase"] != "idle" {
+            // One alias ledger serves every environment (decision 40).
+            if controller.any_owned().map_err(error)? {
                 return Err(Failure::new(
                     "target_already_owned",
-                    "Stop the target and confirm idle state before resetting DNS aliases",
+                    "Stop every takeover and confirm idle state before resetting DNS aliases",
                 ));
             }
             managed_dns::reset_aliases().map_err(error)?;
@@ -485,14 +466,18 @@ pub(crate) fn dispatch_result(
         }
         Command::Stop {
             expected_generation,
+            target,
         } => {
-            controller::lifecycle::checked(expected_generation).map_err(error)?;
-            controller.stop().map_err(error)?;
-            with_unproven_left(controller, controller.status().map_err(error)?)
+            let scope = scope_of(controller, target.as_deref())?;
+            controller::lifecycle::checked(&scope, expected_generation).map_err(error)?;
+            controller.session(&scope).stop().map_err(error)?;
+            let status = controller.session_status(&scope).map_err(error)?;
+            with_unproven_left(controller, &scope, status)
         }
         Command::Abandon {
             confirm,
             expected_generation,
+            target,
         } => {
             if !confirm {
                 return Err(Failure::new(
@@ -500,8 +485,11 @@ pub(crate) fn dispatch_result(
                     "Pass --confirm after verifying the target distribution was unregistered; run wsl --shutdown before the next start",
                 ));
             }
-            let abandoned = controller.abandon(expected_generation).map_err(error)?;
-            let mut status = controller.status().map_err(error)?;
+            let scope = scope_of(controller, target.as_deref())?;
+            let abandoned = controller
+                .abandon(&scope, expected_generation)
+                .map_err(error)?;
+            let mut status = controller.session_status(&scope).map_err(error)?;
             status["abandoned"] = abandoned;
             status
         }
@@ -530,19 +518,18 @@ fn start(
     expected_generation: Option<u64>,
 ) -> Result<(u8, serde_json::Value), Failure> {
     let error = |e: String| Failure::new("controller_error", e);
-    if controller::lifecycle::checked(expected_generation)
-        .map_err(error)?
-        .pending
-        .is_some()
-        || controller::journal::load().map_err(error)?.is_some()
-    {
-        return Err(Failure::new(
-            "target_already_owned",
-            "Explicitly stop the previous target before starting",
-        ));
-    }
     let all = host::distributions().map_err(|e| Failure::new("enumeration_failed", e))?;
     let distro_id = find(&all, target)?.id.clone();
+    // Other environments may be taken over (decision 40); this one may not.
+    let scope = transition::scope(&distro_id).map_err(error)?;
+    controller::lifecycle::checked(&scope, expected_generation).map_err(error)?;
+    if controller.owned(&distro_id).map_err(error)? {
+        return Err(Failure::new(
+            "target_already_owned",
+            "Explicitly stop this target's takeover before starting it again",
+        ));
+    }
+    docker_limit(controller, find(&all, target)?)?;
     let port = match (port, profile.as_deref()) {
         (Some(port), _) => port,
         (None, Some(path)) if managed::is_store(path) => {
@@ -618,7 +605,10 @@ fn start(
         .map_err(error)?;
     Ok((
         0,
-        with_timezone(controller.status().map_err(error)?, synced_timezone),
+        with_timezone(
+            controller.session_status(&scope).map_err(error)?,
+            synced_timezone,
+        ),
     ))
 }
 
@@ -639,18 +629,50 @@ pub(crate) fn dispatch(
     Ok(rc)
 }
 
-/// Whether a live or recorded takeover names this environment.
+/// At most one environment taken over at a time runs Docker (decision 40):
+/// two would share the `docker0` bridge name and its address range in the
+/// one network stack. Refused before anything changes in the target.
+fn docker_limit(controller: &controller::Controller, distro: &host::Distro) -> Result<(), Failure> {
+    let Some(other) = controller.other_with_containers(&distro.id) else {
+        return Ok(());
+    };
+    let active = host::guest_script(
+        distro,
+        "systemctl is-active --quiet docker.service && echo active || echo inactive",
+    )
+    .map_err(|e| Failure::new("probe_failed", format!("{}: {e}", distro.name)))?;
+    if active.trim() == "active" {
+        return Err(Failure::new(
+            "docker_in_two_takeovers",
+            format!(
+                "{other} is taken over and runs Docker; stop Docker in {} or that takeover first",
+                distro.name
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a live or recorded takeover names this environment. Reads only
+/// its records: a live takeover always has a journal.
 pub(crate) fn owned_by(distro_id: &str) -> Result<bool, String> {
-    let owner = controller::journal::load()?;
-    let pending = transition::load()?.pending;
-    let plans = owner.iter().chain(
-        pending
-            .iter()
-            .flat_map(|intent| intent.old.iter().chain(intent.new.iter())),
-    );
-    Ok(plans
-        .into_iter()
-        .any(|plan| plan.target.id.eq_ignore_ascii_case(distro_id)))
+    let scope = transition::scope(distro_id)?;
+    Ok(controller::journal::load(&scope)?.is_some() || transition::load(&scope)?.pending.is_some())
+}
+
+/// The record scope of a command's target: a registered distribution by
+/// name or GUID, a GUID alone (an unregistered one, for abandon), or with
+/// none named the only environment taken over.
+fn scope_of(controller: &controller::Controller, target: Option<&str>) -> Result<String, Failure> {
+    let error = |e: String| Failure::new("controller_error", e);
+    let Some(target) = target else {
+        return controller.resolve(None).map_err(error);
+    };
+    if let Ok(scope) = transition::scope(target) {
+        return Ok(scope);
+    }
+    let all = host::distributions().map_err(|e| Failure::new("enumeration_failed", e))?;
+    transition::scope(&find(&all, target)?.id).map_err(error)
 }
 
 /// Replaces one environment's residential proxy, keeping its ingress port.
@@ -747,9 +769,10 @@ fn chain_probe(
 /// (decision 20); omitted when there were none.
 fn with_unproven_left(
     controller: &mut controller::Controller,
+    scope: &str,
     mut status: serde_json::Value,
 ) -> serde_json::Value {
-    let left = controller.take_unproven_left();
+    let left = controller.session(scope).take_unproven_left();
     if left > 0 {
         status["unproven_mappings_left"] = left.into();
     }
