@@ -878,7 +878,7 @@ fn shoulder(edge: f32, right: bool, color: u32) -> Div {
 /// 肩的描边：贴着肩的凹弧内侧的一条细圆环，和主体两侧的竖直描边接上。
 fn shoulder_outline(edge: f32, right: bool, color: Rgba) -> Div {
     // 方框多伸进主体 2px，细环靠近主体那头不被裁掉半个像素，和竖直描边接得上。
-    quarter_ring(edge, right, 1.5, 2., color)
+    quarter_ring(edge, right, model::OUTLINE, 2., color)
 }
 
 /// 肩的方框里，一个内圈半径等于肩宽、宽 `band` 的圆环被裁出的四分之一。
@@ -1011,15 +1011,13 @@ impl Render for Island {
                 // 静止描边单独一层压在主体上，从肩的圆弧收拢处（往下一个肩高）才开始：
                 // 再往上外沿是肩的圆弧（由上面两段肩的描边画），主体那段竖直边在形状里面，
                 // 描上色会多出一截直线。
-                let width: AbsoluteLength = px(1.5).into();
+                let width: AbsoluteLength = px(model::OUTLINE).into();
                 let mut outline = div()
                     .absolute()
                     .left(px(left))
-                    // 往上多 1px 和肩的描边重叠，接缝处不留暗点；这 1px 里圆弧离竖直边
-                    // 不到 0.1px，看不出直线。
-                    .top(px(model::FILLET - 1.))
+                    .top(px(model::FILLET))
                     .w(px(self.shape.width))
-                    .h(px((self.shape.height - model::FILLET + 1.).max(0.)))
+                    .h(px((self.shape.height - model::FILLET).max(0.)))
                     .rounded_b(px(self.shape.radius))
                     .border_color(color);
                 let borders = &mut outline.style().border_widths;
@@ -1220,13 +1218,13 @@ fn flowing_light(shape: Shape, left: f32, phase: f32, palette: Palette) -> Canva
     canvas(
         |_, _, _| (),
         move |bounds, (), window, _| {
-            let points = model::outline(shape, left, -0.75);
+            let points = model::light_path(shape, left);
             for (piece, brightness) in model::flow(&points, phase) {
                 let color = Rgba {
                     a: brightness,
                     ..rgb(head)
                 };
-                stroke(window, bounds.origin, &piece, 2., color);
+                stroke(window, bounds.origin, &piece, model::OUTLINE + 0.5, color);
             }
         },
     )

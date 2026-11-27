@@ -384,6 +384,47 @@ pub(crate) fn outline(shape: Shape, left: f32, grow: f32) -> Vec<(f32, f32)> {
         .collect()
 }
 
+/// 接管中的静止描边宽度。取整像素：边框会被对齐到像素，肩的细圆环不会，
+/// 宽度带小数时两者对不齐，接缝处出一个折角。
+pub(crate) const OUTLINE: f32 = 1.;
+
+/// 流动光走的线：静止描边的中线。和描边用同一套几何：两侧是主体的竖直边往里
+/// 半个描边宽，底部圆角半径少半个描边宽，肩是同一个圆心、半径多半个描边宽的凹弧。
+/// 从右肩在顶边上的那一点开始，沿右侧、底边绕到左肩在顶边上的那一点。
+pub(crate) fn light_path(shape: Shape, left: f32) -> Vec<(f32, f32)> {
+    use std::f32::consts::FRAC_PI_2;
+    const STEPS: usize = 16;
+    let d = OUTLINE / 2.;
+    let (xl, xr) = (left, left + shape.width);
+    let f = FILLET;
+    let shoulder = f + d;
+    // 肩的圆和顶边（y = 0）相交处的角度：从水平方向往上量。
+    let top = (f / shoulder).clamp(-1., 1.).asin();
+    let r = shape.radius.max(d);
+    let corner_y = (shape.height - r).max(f);
+    let mut points = Vec::with_capacity(4 * STEPS + 4);
+    // 右肩：圆心 (xr + f, f)，从顶边那一点转到侧边那一点 (xr - d, f)。
+    for i in 0..=STEPS {
+        let a = top * (1. - i as f32 / STEPS as f32);
+        points.push((xr + f - shoulder * a.cos(), f - shoulder * a.sin()));
+    }
+    // 右下角、底边、左下角：圆心 (xr - r, corner_y) 和 (xl + r, corner_y)，半径 r - d。
+    for i in 0..=STEPS {
+        let a = FRAC_PI_2 * i as f32 / STEPS as f32;
+        points.push((xr - r + (r - d) * a.cos(), corner_y + (r - d) * a.sin()));
+    }
+    for i in 0..=STEPS {
+        let a = FRAC_PI_2 * (1. + i as f32 / STEPS as f32);
+        points.push((xl + r + (r - d) * a.cos(), corner_y + (r - d) * a.sin()));
+    }
+    // 左肩：圆心 (xl - f, f)，从侧边那一点 (xl + d, f) 转到顶边那一点。
+    for i in 0..=STEPS {
+        let a = top * i as f32 / STEPS as f32;
+        points.push((xl - f + shoulder * a.cos(), f - shoulder * a.sin()));
+    }
+    points
+}
+
 /// 接管中沿岛边缘流动的光：一圈多长时间。
 pub(crate) const FLOW_PERIOD: Duration = Duration::from_millis(3200);
 /// 一道光（含渐隐的尾巴）占轮廓全长的比例。
@@ -961,7 +1002,14 @@ mod tests {
     fn the_flowing_light_stays_on_the_outline_and_brightens_toward_its_head() {
         let shape = shape(1., CARD_DETAILED);
         let left = (WINDOW.0 - shape.width) / 2.;
-        let points = outline(shape, left, -1.);
+        let points = light_path(shape, left);
+        // 两端在顶边上，左右对称，侧边在主体里半个描边宽。
+        let (first, last) = (points[0], points[points.len() - 1]);
+        assert!(first.1.abs() < 1e-3 && last.1.abs() < 1e-3);
+        assert!(((first.0 - left - shape.width) - (left - last.0)).abs() < 1e-3);
+        assert!(points.iter().any(|&(x, y)| {
+            (x - (left + shape.width - OUTLINE / 2.)).abs() < 1e-3 && (y - FILLET).abs() < 1e-3
+        }));
         for i in 0..=40 {
             let pieces = flow(&points, i as f32 / 40.);
             assert!(!pieces.is_empty(), "phase {i}/40 时边上没有光");
