@@ -393,7 +393,9 @@ fn run(command: Command) -> Result<u8, Failure> {
             ));
         }
         command::emit(
-            &serde_json::json!({"maintenance":true,"protocol":1,"phase":"idle","version":env!("CARGO_PKG_VERSION"),"pid":std::process::id()}),
+            // Protocol 2: no single operation generation since decision 40;
+            // the refusal above already covers every environment.
+            &serde_json::json!({"maintenance":true,"protocol":2,"phase":"idle","version":env!("CARGO_PKG_VERSION"),"pid":std::process::id()}),
         )?;
         use std::io::Read;
         let mut release = Vec::new();

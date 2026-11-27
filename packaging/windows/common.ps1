@@ -336,7 +336,14 @@ function Invoke-Control([string] $Backend, [string] $Digest, [string] $Argument,
 }
 
 function Assert-Idle($Value, [switch] $Legacy) {
-    if ($Value.phase -cne 'idle' -or $null -ne $Value.active_target -or $Value.config_generation -ne 0 -or $Value.PSObject.Properties.Name -contains 'code') { throw 'Controller is active, recovery-required, or unknown. Use the controller to inspect/recover explicitly; installer never stops a session.' }
+    if ($Value.PSObject.Properties.Name -contains 'code') { throw 'Controller is active, recovery-required, or unknown. Use the controller to inspect/recover explicitly; installer never stops a session.' }
+    # From 0.2.0 the backend reports one session per environment (decision 40):
+    # every one of them must be idle. Earlier backends report a single takeover.
+    if ($Value.PSObject.Properties.Name -contains 'sessions') {
+        foreach ($session in @($Value.sessions)) { Assert-Idle $session }
+        return
+    }
+    if ($Value.phase -cne 'idle' -or $null -ne $Value.active_target -or $Value.config_generation -ne 0) { throw 'Controller is active, recovery-required, or unknown. Use the controller to inspect/recover explicitly; installer never stops a session.' }
     if (-not $Legacy -and ($Value.PSObject.Properties.Name -notcontains 'operation_generation' -or $Value.operation_generation -isnot [ValueType] -or $Value.operation_generation -lt 0)) { throw 'Controller has no verified operation generation.' }
 }
 
@@ -385,8 +392,15 @@ function Start-Maintenance($Package, [string] $Parent) {
             if ($value.PSObject.Properties.Name -contains 'code') { throw "Maintenance refused: $($line.Result). No status-only fallback or session cleanup was attempted." }
             if ($legacy) { Assert-Idle $value -Legacy
             } else {
-                Assert-Fields $value @('maintenance', 'protocol', 'phase', 'operation_generation', 'version', 'pid')
-                if ($value.maintenance -cne $true -or $value.protocol -ne 1 -or $value.phase -cne 'idle' -or $value.version -cne $Package.Manifest.version -or $value.pid -ne $process.Id -or $value.operation_generation -isnot [ValueType] -or $value.operation_generation -lt 0) { throw 'Maintenance lock handshake was not exact; no status-only fallback is permitted.' }
+                # Protocol 2 (0.2.0 on) has no single operation generation: each
+                # environment has its own and the helper refuses unless all are idle.
+                if ($value.protocol -eq 2) {
+                    Assert-Fields $value @('maintenance', 'protocol', 'phase', 'version', 'pid')
+                    if ($value.maintenance -cne $true -or $value.phase -cne 'idle' -or $value.version -cne $Package.Manifest.version -or $value.pid -ne $process.Id) { throw 'Maintenance lock handshake was not exact; no status-only fallback is permitted.' }
+                } else {
+                    Assert-Fields $value @('maintenance', 'protocol', 'phase', 'operation_generation', 'version', 'pid')
+                    if ($value.maintenance -cne $true -or $value.protocol -ne 1 -or $value.phase -cne 'idle' -or $value.version -cne $Package.Manifest.version -or $value.pid -ne $process.Id -or $value.operation_generation -isnot [ValueType] -or $value.operation_generation -lt 0) { throw 'Maintenance lock handshake was not exact; no status-only fallback is permitted.' }
+                }
             }
             if ($process.HasExited) { throw 'Maintenance helper exited without holding the lock.' }
             return [pscustomobject]@{ Process = $process; Pin = $pin; Directory = $helper; Exe = $exe; Digest = $Package.Files['wsl-proxyctl.exe'].sha256; Legacy = $legacy }
