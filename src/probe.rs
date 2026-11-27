@@ -301,6 +301,11 @@ fn snapshot(
             blockers.push(reason.into());
         }
     }
+    // Decision 41: the takeover writes its rules into its own nft tables
+    // with the `nft` tool (package nftables).
+    if !get("tooling.nft").starts_with("nftables ") {
+        blockers.push("tooling.nft_missing".into());
+    }
     if get("kernel.conntrack_readable").is_empty() {
         blockers.push("capability.kernel.conntrack_readable.unverified".into());
     }

@@ -43,7 +43,7 @@ It is not a general-purpose VPN: it handles one WSL2 distribution, and the backe
 
 ## Features
 
-- **Per-distribution takeover**: installs iptables rules tagged with this instance into the target, matched by cgroup so that only this distribution's processes are redirected to the Windows ingress.
+- **Per-distribution takeover**: creates this instance's own nft tables in the target, matched by cgroup so that only this distribution's processes are redirected to the Windows ingress. Other distributions writing firewall rules cannot change these tables.
 - **Direct allowlist**: IPs, CIDRs, exact domains and domain suffixes. Matching TCP is connected directly by Windows. A new configuration store comes pre-filled with suffixes of common services in mainland China.
 - **Two-hop chain**: other traffic first goes through the SOCKS5 proxy already running on the host (first hop), then through a residential proxy with username/password authentication (SOCKS5, or an HTTP proxy that only carries TCP, so UDP is refused with it) (second hop).
 - **Fail closed**: if either hop fails, the connection fails; faults keep traffic blocked rather than degrading to direct.
@@ -138,7 +138,8 @@ The SHA-256 checksum shows the file is intact; it does not identify the publishe
 - WSL2 in NAT networking mode. WSL1, mirrored, bridged and other modes are not supported.
 - WSL kernel 6.18.58.1 or newer.
 - systemd as PID 1.
-- `iptables-nft` and `ip6tables-nft`: the rules go into the nft tables through them (decision 37). The preflight still checks for `iptables-legacy` and `ip6tables-legacy`; the Ubuntu `iptables` package ships both.
+- `nft` (the `nftables` package): the rules go into this instance's own nft tables (decision 41), and the preflight reports `tooling.nft_missing` without it. Environments the app creates get it installed; for an existing distribution run `apt install nftables` yourself.
+- `iptables-nft` and `ip6tables-nft`: used to find and remove rules an older version wrote into the shared tables. The preflight still checks for `iptables-legacy` and `ip6tables-legacy`; the Ubuntu `iptables` package ships both.
 - Kernel capabilities: `xt_cgroup`, `nf_conntrack`, `nf_nat`, `iptable_nat`, `ip6table_nat`, and IPv4/IPv6 REJECT; the nft writes also need `nft_compat` (a module in the WSL kernel), which the preflight does not check yet. After a cold start, missing modules can be loaded from the distribution; see below.
 - `/usr/bin/python3`. Note that the preflight does not check this yet; a target without it fails only after the timezone change and restart.
 - Timezone data under `/usr/share/zoneinfo`, and basic tools such as `awk`, `od`, `sha256sum` and `ip`.

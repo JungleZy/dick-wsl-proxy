@@ -264,14 +264,8 @@ fn protection_lost_message(reason: &str) -> String {
         "rules_incomplete" | "rules_missing" => {
             "目标发行版里本次接管的规则已缺失或不完整".to_owned()
         }
-        "rules_rebound" => {
-            "目标发行版里本次接管的规则已不再匹配目标（别的发行版整表导回了含这些规则的 nft 表），重新锚定也没有恢复".to_owned()
-        }
         "target_unregistered" => {
             return "目标发行版已被注销，无法再停止或清理它。请在概览页点「放弃本次记录」，并在下次启动接管前执行一次 wsl --shutdown。".into();
-        }
-        "forward_gate_displaced" => {
-            return "目标发行版里有别的规则排到了本次接管的转发闸门前面，目标的 Docker 容器的新连接可能绕过它直连；目标本机进程仍受保护。请停止接管并恢复，再重新启动接管。".into();
         }
         "environment_changed" => format!(
             "目标发行版的环境变了（{}），无法再确认本次接管覆盖它的全部流量",
@@ -279,10 +273,7 @@ fn protection_lost_message(reason: &str) -> String {
         ),
         _ => "无法再确认本次接管仍然有效".to_owned(),
     };
-    if matches!(
-        kind,
-        "restarted" | "rules_incomplete" | "rules_missing" | "rules_rebound"
-    ) {
+    if matches!(kind, "restarted" | "rules_incomplete" | "rules_missing") {
         // Decision 33: the block follows at once; its own line says how it went.
         return format!(
             "{cause}，它的新连接可能已不经代理，正在目标里断网。请停止接管并恢复，再重新启动接管。"

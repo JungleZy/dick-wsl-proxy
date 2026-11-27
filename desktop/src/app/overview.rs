@@ -954,11 +954,7 @@ fn recovery_reason(issue: &str, block: Option<&str>, target: &str) -> String {
         Some(lost) => match lost.split(':').next().unwrap_or("") {
             "restarted" => "目标发行版或 WSL 重启过，本次接管的规则已不再生效",
             "rules_incomplete" | "rules_missing" => "目标里本次接管的规则已缺失或不完整",
-            "rules_rebound" => "目标里本次接管的规则已不再匹配目标，重新锚定也没有恢复",
             "environment_changed" => "目标的环境变了，无法再确认本次接管覆盖它的全部流量",
-            "forward_gate_displaced" => {
-                "有别的规则排到了本次接管的转发闸门前面，目标的 Docker 容器可能绕过它直连（目标本机进程仍受保护）"
-            }
             _ => "无法再确认本次接管仍然有效",
         },
         // A controller that started again only blocks once the rules are gone.
@@ -1067,23 +1063,6 @@ mod tests {
             recovery_reason("protection_lost: mapping_integrity: x: y", None, "Dev")
                 .starts_with("Dev：无法再确认本次接管仍然有效，")
         );
-        let displaced = recovery_reason(
-            "protection_lost: forward_gate_displaced: another rule now precedes this takeover's forward gate",
-            None,
-            "Dev",
-        );
-        assert!(
-            displaced.contains("Docker 容器可能绕过它直连"),
-            "{displaced}"
-        );
-        assert!(displaced.contains("目标本机进程仍受保护"), "{displaced}");
-        let rebound = recovery_reason(
-            "protection_lost: rules_rebound: this takeover's rules no longer match the target and re-anchoring did not fix it (x)",
-            Some("installed"),
-            "Dev",
-        );
-        assert!(rebound.contains("重新锚定也没有恢复"), "{rebound}");
-        assert!(rebound.contains("已在目标里断网"), "{rebound}");
         assert_eq!(
             recovery_reason("", None, "Dev"),
             "Dev 的上次接管没有正常结束，请停止接管并恢复直连。"

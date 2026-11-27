@@ -14,7 +14,10 @@ const REQUEST_LIMIT: usize = 2048;
 const GUEST_TIMING_LIMIT_US: u64 = 12_000_000;
 pub(crate) const MAX_LOOKUPS: usize = 16;
 #[cfg(windows)]
-const BOOTSTRAP_LIMIT: usize = 128 * 1024;
+// The guest script plus a plan, sent once at start. 192 KiB since the
+// private nft tables of decision 41 made the script larger; the bootstrap in
+// `bootstrap.rs` receives the same amount.
+const BOOTSTRAP_LIMIT: usize = 192 * 1024;
 
 // Only this fixed program is an argument to wsl.exe. The embedded kernel source
 // and all plan/query values travel as JSON over stdin, never through a shell.

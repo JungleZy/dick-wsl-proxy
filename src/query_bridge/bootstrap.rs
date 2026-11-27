@@ -29,7 +29,7 @@ def reason(error):
     return ''.join(c if 32 <= ord(c) < 127 else '?' for c in str(error))[:512] or 'query_failed'
 try:
     signal.alarm(65)
-    initial = receive(131072)
+    initial = receive(196608)
     if initial is None:
         sys.exit(0)
     if not isinstance(initial, dict) or set(initial) != {'kernel', 'plan'} or not isinstance(initial['kernel'], str):

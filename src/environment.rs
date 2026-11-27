@@ -272,7 +272,8 @@ if [ "$install_components" = 1 ] && ! command -v apt-get >/dev/null 2>&1; then
     echo 'environment_setup_requires_apt' >&2
     exit 20
 fi
-# A new environment always gets systemd and iptables (the takeover needs both),
+# A new environment always gets systemd, iptables and nftables (the takeover
+# needs all three: decision 41 writes its rules with nft),
 # even when no optional component was selected.
 run_apt=$install_components
 if [ "$new_environment" = 1 ] && command -v apt-get >/dev/null 2>&1; then
@@ -296,7 +297,7 @@ if [ "$run_apt" = 1 ]; then
         done
     fi
     # locales provides locale-gen and update-locale for the en_US default below.
-    for package in systemd systemd-sysv iptables locales; do
+    for package in systemd systemd-sysv iptables nftables locales; do
         if apt-cache show "$package" >/dev/null 2>&1; then
             packages="$packages $package"
         fi
@@ -1057,7 +1058,7 @@ mod tests {
         assert!(script.contains("wsl_conf_set boot systemd true"));
         assert!(script.contains("wsl_conf_set user default \"$environment_user\""));
         assert!(script.contains("wsl_conf_set time useWindowsTimezone false"));
-        assert!(script.contains("for package in systemd systemd-sysv iptables locales"));
+        assert!(script.contains("for package in systemd systemd-sysv iptables nftables locales"));
         assert!(!script.contains("> /etc/wsl.conf"));
     }
 

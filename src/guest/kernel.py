@@ -100,7 +100,7 @@ def validate(request):
         bridges = request["bridges"]
         require(operation == "block" and isinstance(bridges, list) and len(bridges) <= 64, "invalid_block_bridges")
         require(all(isinstance(name, str) and BRIDGE_NAME.fullmatch(name) and name not in ("eth0", "lo") for name in bridges), "invalid_block_bridges")
-    require(operation in ("precheck", "arm", "install", "remove", "inspect", "lookup", "sync_networks", "block", "anchor"), "invalid_operation")
+    require(operation in ("precheck", "arm", "install", "remove", "inspect", "lookup", "sync_networks", "block"), "invalid_operation")
     require((operation == "arm") == ("deadline" in request), "unexpected_or_missing_grant_deadline")
     if operation == "arm":
         require(integer(request["deadline"], 1, 0xffffffffffffffff), "invalid_grant_deadline")
@@ -195,7 +195,7 @@ def guard(p, check_resolver=True, write_tools=True):
                 require((executable.st_dev, executable.st_ino) == (init.st_dev, init.st_ino), "workload_outside_distro_cgroup")
         except (FileNotFoundError, ProcessLookupError):
             require(not os.path.exists(entry.path), "unverifiable_workload")
-    for command in (("ip", "iptables-nft-save", "iptables-nft-restore") if write_tools else ("ip", "iptables-nft-save")):
+    for command in (("ip", "iptables-nft-save", "iptables-nft-restore", "nft") if write_tools else ("ip", "iptables-nft-save", "nft")):
         require(shutil.which(command, path="/usr/sbin:/usr/bin:/sbin:/bin") is not None, "missing_prerequisite: " + command)
     addresses = json.loads(run(["ip", "-j", "-4", "address", "show", "dev", "eth0"]))
     require(isinstance(addresses, list) and len(addresses) == 1, "guest_interface_ambiguous")
@@ -404,8 +404,11 @@ def artifacts(p):
 
 
 # Reserved (240.0.0.0/4): never redirected (the redirect chain returns it
-# before marking) and dropped by the local guard, so a probe never leaves
-# while the rules hold; if they no longer match the target it goes nowhere.
+# before marking) and dropped by the local guard. Decision 37 sent a probe
+# here to find rules re-bound to another distribution; a private table
+# (decision 41) cannot be re-bound, so nothing probes any more. The counting
+# rules stay in the rule set so that a takeover an older version wrote into
+# the shared tables still reads back complete and is removed whole.
 PROBE = ("240.0.0.1", 9)
 
 
@@ -420,9 +423,7 @@ def m2_artifacts(p):
     ingress, ingress_port = endpoint(p["ingress"])
     local = ["-m", "cgroup", "--path", "/"]
     fresh = ["-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL"]
-    # Counting only, no target (decision 37): the probe the periodic check
-    # sends from the target to PROBE must bump both, one per table, or another
-    # distribution re-added the rules under its own cgroup namespace.
+    # Counting only, no target: see PROBE.
     probe = ["-d", PROBE[0] + "/32", "-p", "tcp", "-m", "tcp", "--dport", str(PROBE[1]), *local, *comment]
     hooks, body = [["-A", "OUTPUT", *probe]], []
     # These exclusions precede marking: a direct forged ingress packet can
@@ -646,7 +647,7 @@ def gate_table(backend="nft"):
     which Docker never writes: on a restart Docker puts its own jumps back on
     top of the filter FORWARD chain, ahead of anything there (decision 37).
     An older version kept it in the legacy filter table."""
-    return "mangle" if backend == "nft" else "filter"
+    return "mangle" if backend in ("nft", "shared") else "filter"
 
 
 def gate_rule(rule):
@@ -989,7 +990,15 @@ def network_report(p, rules, ipv6_rules):
     return {"installed": installed, "wanted": sorted(wanted), "in_sync": in_sync, "error": None}
 
 def firewall(ipv6=False):
-    """The tables this instance writes, through iptables-nft (decision 37)."""
+    """This instance's rules as iptables-save would show them: its private
+    nft table (decision 41) read back in that shape and put in front of the
+    shared nft tables, where an older version wrote them (decision 37)."""
+    return merge_private(shared_firewall(ipv6), private_view(PLAN, ipv6))
+
+
+def shared_firewall(ipv6=False):
+    """The shared nft tables through iptables-nft: rules an older version
+    wrote there are only found and removed."""
     return parse_firewall(run(["ip6tables-nft-save" if ipv6 else "iptables-nft-save"]))
 
 
@@ -1156,78 +1165,6 @@ def inspect_firewall(p, tables, existing, ipv6=False, backend="nft"):
     return present, found
 
 
-def displaced(tables, found, backend="nft"):
-    """(guard, gate): whether another rule now sits ahead of this instance's
-    rules on the filter OUTPUT chain (the local guard) or on the FORWARD
-    chain of the gate's table (decision 37). Another tool's accept there
-    would let traffic past them. The nat chains are not checked: what they
-    fail to redirect meets the guard or the gate, so a rule ahead of them can
-    only make traffic fail, and Docker puts its MASQUERADE back on top of nat
-    POSTROUTING whenever it restarts."""
-    def behind(table, chain):
-        mine = {id(rule) for rule in found.get(table, []) if rule[1] == chain}
-        other = False
-        for rule in tables.get(table, {}).get("rules", []):
-            if rule[1] != chain:
-                continue
-            if id(rule) not in mine:
-                other = True
-            elif other:
-                return True
-        return False
-    return behind("filter", "OUTPUT"), behind(gate_table(backend), "FORWARD")
-
-
-def probe_rules(p):
-    """{table: the counting rule the probe must bump} (decision 37)."""
-    _, _, hooks, _, guards = artifacts(p)
-    pick = lambda rules: next(rule for rule in rules if rule[1] == "OUTPUT" and PROBE[0] + "/32" in rule and "-j" not in rule)
-    return {"nat": pick(hooks), "filter": pick(guards)}
-
-
-def probe_counts(p):
-    """Packets counted so far by the probe rules, per table."""
-    wanted = {table: rule_key(rule) for table, rule in probe_rules(p).items()}
-    counts = {}
-    for table, key in wanted.items():
-        for line in run(["iptables-nft-save", "-c", "-t", table]).splitlines():
-            match = re.match(r"\[(\d+):\d+\] (-A OUTPUT .*)", line)
-            if match:
-                try:
-                    found = rule_key(shlex.split(match.group(2)))
-                except (Failure, ValueError):
-                    continue
-                if found == key:
-                    counts[table] = counts.get(table, 0) + int(match.group(1))
-    return counts
-
-
-def probe_bound(p):
-    """Whether this instance's cgroup rules still match the target: one TCP
-    SYN to PROBE from here, which both probe rules must count. A restore of a
-    whole nft table from another distribution re-adds them under that
-    distribution's cgroup namespace, and the text stays the same (decision 37)."""
-    before = probe_counts(p)
-    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        probe.setblocking(False)
-        try:
-            probe.connect(PROBE)
-        except OSError:
-            pass  # In progress, or refused by the guard's DROP: either way sent.
-    finally:
-        probe.close()
-    after = probe_counts(p)
-    return all(after.get(table, 0) > before.get(table, 0) for table in ("nat", "filter"))
-
-
-def anchored_rules(p, ipv6=False):
-    """{table: this instance's cgroup-matched OUTPUT rules} in install order:
-    the ones a restore from another distribution rebinds."""
-    tables = base_tables(p, ipv6)
-    return {table: [rule for rule in tables.get(table, []) if rule[1] == "OUTPUT" and "cgroup" in rule] for table in ("nat", "filter")}
-
-
 def legacy_leftovers(p):
     """This instance's rules an older version left in the legacy tables, per
     family as (ipv6, tables, found); removed by a stop, never complete."""
@@ -1263,7 +1200,12 @@ def rules_complete(p, present, rules, ipv6_rules):
 
 
 def transaction(table, lines, test=False, ipv6=False, backend="nft"):
-    tool = ("ip6tables-" if ipv6 else "iptables-") + backend + "-restore"
+    """Applies iptables-restore lines: "nft" to this instance's private table
+    (decision 41); "shared" to the shared nft tables and "legacy" to the
+    legacy ones, only to remove what an older version wrote there."""
+    if backend == "nft":
+        return private_commit(PLAN, table, lines, test, ipv6)
+    tool = ("ip6tables-" if ipv6 else "iptables-") + ("nft" if backend == "shared" else backend) + "-restore"
     arguments = [tool, "--wait", "2", "--noflush"]
     if test:
         arguments.append("--test")
@@ -1272,6 +1214,499 @@ def transaction(table, lines, test=False, ipv6=False, backend="nft"):
     require(all(re.fullmatch(r"[A-Za-z0-9_:\[\]./%!,=+-]+", token) for line in lines for token in line), "unsafe_restore_token")
     document = "*" + table + "\n" + "\n".join(" ".join(line) for line in lines) + "\nCOMMIT\n"
     run(arguments, document)
+
+
+# ---------------------------------------------------------------------------
+# Decision 41: this instance's rules in its own nft tables (one per family,
+# named after the cookie) instead of the shared filter/nat/mangle tables.
+# The rest of this script keeps working on iptables-style rules:
+# `private_view` reads the private table back in that shape and
+# `private_commit` applies iptables-restore lines to it.
+# Each hook gets one fixed base chain. Hooks whose rules match the target by
+# cgroup get a single rule written over netlink, "xt cgroup --path / -> jump
+# <chain>" (nft cannot write xt matches), everything else goes in through
+# `nft -f` in native syntax, one atomic transaction per commit.
+# ---------------------------------------------------------------------------
+
+PLAN = None
+# What each rule of the private tables read back as right after this script
+# wrote it, so the periodic check compares without writing (decision 06).
+# In the target's /run: a target restart clears it together with the cgroup
+# namespace the table's jumps were bound to.
+FINGERPRINT_DIRECTORY = "/run/wsl-proxyctl-nft"
+# private chain -> (base chain, chain type, hook, priority, matched by cgroup)
+PRIVATE_BASES = {
+    "cg_filter": ("out_filter", "filter", "output", 0, True),
+    "cg_block": ("out_block", "filter", "output", -1, True),
+    "cg_nat": ("out_nat", "nat", "output", -199, True),
+    "pre": ("pre_nat", "nat", "prerouting", -199, False),
+    "post": ("post_nat", "nat", "postrouting", -199, False),
+    "fwd_main": ("fwd_gate", "filter", "forward", -150, False),
+    "fwd_block": ("fwd_block_hook", "filter", "forward", -151, False),
+}
+PRIVATE_VIRTUAL = {"cg_filter": ("filter", "OUTPUT"), "cg_block": ("filter", "OUTPUT"), "cg_nat": ("nat", "OUTPUT"),
+                   "pre": ("nat", "PREROUTING"), "post": ("nat", "POSTROUTING"),
+                   "fwd_main": ("mangle", "FORWARD"), "fwd_block": ("mangle", "FORWARD")}
+CGROUP_JUMP_COMMENT = "wpm:cgroup"
+HOOK_JUMP_COMMENT = "wpm:hook"
+
+
+def private_name(p):
+    return f"wpm2_{p['cookie']:08x}"
+
+
+def private_family(ipv6):
+    return "ip6" if ipv6 else "ip"
+
+
+def private_chain(p, table, rule, ipv6):
+    """The private chain a rule of iptables `table` goes to."""
+    chain = rule[1]
+    blocking = p.get("system_dns") is not None and block_tag(p, ipv6) in rule
+    if chain == "OUTPUT":
+        return "cg_block" if blocking else ("cg_nat" if table == "nat" else "cg_filter")
+    if chain == "PREROUTING":
+        return "pre"
+    if chain == "POSTROUTING":
+        return "post"
+    if chain == "FORWARD":
+        return "fwd_block" if blocking else "fwd_main"
+    require(chain.startswith(("WPM1_", "WPM2")), "private_unknown_chain")
+    return chain
+
+
+def private_chain_table(p, chain, ipv6):
+    if chain in PRIVATE_VIRTUAL:
+        return PRIVATE_VIRTUAL[chain][0]
+    owned = dict(instance_chains(p, ipv6))
+    require(chain in owned, "private_unknown_chain")
+    return owned[chain]
+
+
+def rule_digest(rule):
+    return hashlib.sha256(repr(rule_key(rule)).encode()).hexdigest()[:24]
+
+
+def private_tags(p, ipv6):
+    main = (ipv6_artifacts(p)[2] if ipv6 and p.get("ipv6") is not None else artifacts(p)[1])
+    return main, network_tag(p, ipv6), (block_tag(p, ipv6) if p.get("system_dns") is not None else None)
+
+
+def strip_comment(rule):
+    if "--comment" not in rule:
+        return list(rule), None
+    at = rule.index("--comment")
+    require(rule[at - 2:at] == ["-m", "comment"], "private_comment_shape")
+    return rule[:at - 2] + rule[at + 2:], rule[at + 1]
+
+
+def with_comment(rule, tag):
+    at = rule.index("-j") if "-j" in rule else len(rule)
+    return rule[:at] + ["-m", "comment", "--comment", tag] + rule[at:]
+
+
+def encode_rule(p, rule, ipv6):
+    """The comment that names a rule: a digest for the base and block rules,
+    which the plan regenerates, the rule itself for the per-network and
+    block-forward rules, which depend on bridge names."""
+    bare, tag = strip_comment(rule)
+    main, network, blocking = private_tags(p, ipv6)
+    if tag == network:
+        text = "n:" + " ".join(bare[1:])
+    elif tag == blocking and rule[1] == "FORWARD":
+        text = "b:" + " ".join(bare[1:])
+    else:
+        text = "h:" + rule_digest(rule)
+    require(len(text) <= 120 and '"' not in text and "\\" not in text, "private_comment_too_long")
+    return text
+
+
+def private_candidates(p, ipv6):
+    rules = [rule for rules in base_tables(p, ipv6).values() for rule in rules]
+    if p.get("system_dns") is not None:
+        rules += block_rules(p, ipv6)
+    return {rule_digest(rule): rule for rule in rules}
+
+
+def decode_rule(p, text, ipv6, candidates):
+    main, network, blocking = private_tags(p, ipv6)
+    if text.startswith("h:"):
+        return candidates.get(text[2:])
+    if text.startswith("n:"):
+        return with_comment(["-A", *text[2:].split()], network)
+    if text.startswith("b:") and blocking is not None:
+        return with_comment(["-A", *text[2:].split()], blocking)
+    return None
+
+
+def nft_statement(p, rule, ipv6, strip_cgroup):
+    """One iptables-style rule in native nft syntax (closed vocabulary)."""
+    family = private_family(ipv6)
+    tokens, index = rule[2:], 0
+    parts, verdict, module, protocol, negated = [], None, None, None, False
+    target, target_options = None, {}
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "!":
+            negated, index = True, index + 1
+            continue
+        value = tokens[index + 1] if index + 1 < len(tokens) else None
+        neq = "!= " if negated else ""
+        if token in ("-s", "-d"):
+            parts.append(f"{family} {'saddr' if token == '-s' else 'daddr'} {neq}{ipaddress.ip_network(value, strict=False)}")
+        elif token == "-p":
+            require(value in ("tcp", "udp"), "private_protocol")
+            protocol = value
+            parts.append(f"meta l4proto {value}")
+        elif token in ("-i", "-o"):
+            require(BRIDGE_NAME.fullmatch(value) is not None, "private_interface")
+            parts.append(f"{'iifname' if token == '-i' else 'oifname'} {neq}\"{value}\"")
+        elif token == "-m":
+            module = value
+            if value == "cgroup":
+                require(strip_cgroup and tokens[index + 2:index + 4] == ["--path", "/"], "private_cgroup_outside_output")
+                index += 4
+                negated = False
+                continue
+            require(value in ("tcp", "udp", "conntrack", "connmark", "mark", "comment"), "private_module")
+        elif token == "--dport":
+            require(protocol is not None, "private_port_without_protocol")
+            parts.append(f"{protocol} dport {int(value)}")
+        elif token == "--ctstate":
+            states = value.split(",")
+            if states == ["DNAT"]:
+                parts.append("ct status dnat")
+            else:
+                require(all(state in ("NEW", "ESTABLISHED", "RELATED", "INVALID", "UNTRACKED") for state in states), "private_ctstate")
+                parts.append("ct state " + ",".join(state.lower() for state in states))
+        elif token == "--ctdir":
+            require(value in ("ORIGINAL", "REPLY"), "private_ctdir")
+            parts.append("ct direction " + value.lower())
+        elif token in ("--ctorigsrc", "--ctorigdst"):
+            parts.append(f"ct original {family} {'saddr' if token == '--ctorigsrc' else 'daddr'} {neq}{ipaddress.ip_network(value, strict=False)}")
+        elif token == "--ctorigdstport":
+            parts.append(f"ct original proto-dst {int(value)}")
+        elif token == "--mark":
+            require(module in ("connmark", "mark"), "private_mark_module")
+            parts.append(f"{'ct mark' if module == 'connmark' else 'meta mark'} {int(value, 0):#x}")
+        elif token == "--comment":
+            pass
+        elif token == "-j":
+            target = value
+        elif token in ("--to-destination", "--to-source", "--set-xmark", "--reject-with"):
+            target_options[token] = value
+        else:
+            raise Failure("private_unknown_option: " + token)
+        negated = False
+        index += 2
+    if target is None:
+        verdict = None
+    elif target in ("RETURN", "DROP", "ACCEPT"):
+        verdict = target.lower()
+    elif target == "DNAT":
+        verdict = "dnat to " + target_options["--to-destination"]
+    elif target == "SNAT":
+        verdict = "snat to " + target_options["--to-source"]
+    elif target == "REJECT":
+        require(target_options.get("--reject-with") == "tcp-reset", "private_reject")
+        verdict = "reject with tcp reset"
+    elif target in ("CONNMARK", "MARK"):
+        value, _, mask = target_options["--set-xmark"].partition("/")
+        require(int(mask or "0xffffffff", 0) == 0xffffffff, "private_xmark_mask")
+        verdict = f"{'ct mark set' if target == 'CONNMARK' else 'meta mark set'} {int(value, 0):#x}"
+    else:
+        require(target.startswith(("WPM1_", "WPM2")), "private_unknown_target")
+        verdict = "jump " + target
+    return " ".join(parts + ["counter"] + ([verdict] if verdict else []))
+
+
+def nft_json(family, table):
+    listed = run(["nft", "list", "tables", family])
+    if f"table {family} {table}\n" not in listed + "\n":
+        return None
+    return json.loads(run(["nft", "-j", "list", "table", family, table]))["nftables"]
+
+
+def plain_expr(expr):
+    """A rule's expressions without counter values, for comparison."""
+    return [({"counter": None} if "counter" in item else item) for item in expr]
+
+
+def private_state(p, ipv6, verify=True):
+    """{chain: [rule]} of the private table in this family (iptables-style
+    rules, in order), the base chains present as {base: [(handle, target)]},
+    and whether everything reads back exactly as this script last wrote it."""
+    chains, bases, intact, raw = private_rules(p, ipv6)
+    if verify and intact and chains:
+        intact = fingerprint(raw) == read_fingerprint(p, ipv6)
+    return chains, bases, intact
+
+
+def private_rules(p, ipv6):
+    """private_state without the fingerprint comparison, plus each chain's
+    rules as read: {chain: [(comment, expressions)]}."""
+    family, name = private_family(ipv6), private_name(p)
+    items = nft_json(family, name)
+    chains, bases, intact = {}, {}, True
+    if items is None:
+        return chains, bases, True, {}
+    candidates = private_candidates(p, ipv6)
+    base_names = {spec[0]: chain for chain, spec in PRIVATE_BASES.items()}
+    raw = {}
+    for item in items:
+        if "chain" in item:
+            chain = item["chain"]["name"]
+            if chain in base_names:
+                bases.setdefault(chain, [])
+            else:
+                chains.setdefault(chain, [])
+        elif "rule" in item:
+            rule = item["rule"]
+            chain, comment = rule["chain"], rule.get("comment", "")
+            if chain in base_names:
+                jumps = [entry["jump"]["target"] for entry in rule["expr"] if "jump" in entry]
+                cgroup = any(entry.get("xt", {}).get("name") == "cgroup" for entry in rule["expr"])
+                spec = PRIVATE_BASES[base_names[chain]]
+                good = jumps == [base_names[chain]] and cgroup == spec[4] and comment == (CGROUP_JUMP_COMMENT if spec[4] else HOOK_JUMP_COMMENT)
+                intact &= good
+                bases[chain].append((rule["handle"], jumps[0] if good else None))
+                continue
+            decoded = decode_rule(p, comment, ipv6, candidates)
+            if decoded is None:
+                intact = False
+                continue
+            table = private_chain_table(p, chain, ipv6)
+            if chain in PRIVATE_VIRTUAL:
+                require(private_chain(p, table, decoded, ipv6) == chain, "private_rule_in_wrong_chain")
+            else:
+                require(decoded[1] == chain, "private_rule_in_wrong_chain")
+            chains.setdefault(chain, []).append(decoded)
+            raw.setdefault(chain, []).append((comment, plain_expr(rule["expr"])))
+    # Every hook with rules behind it needs its base chain holding exactly
+    # one good jump, and no base chain may lead nowhere: a missing cgroup
+    # jump would leave the rules in place but never reached.
+    for chain, spec in PRIVATE_BASES.items():
+        jumps = bases.get(spec[0])
+        if chain in chains:
+            intact &= jumps is not None and [target for _, target in jumps] == [chain]
+        elif jumps is not None:
+            intact = False
+    return chains, bases, intact, raw
+
+
+def fingerprint(raw):
+    """{chain: [[comment, digest of the expressions]]}: what each rule reads
+    back as, counters left out."""
+    return {chain: [[comment, hashlib.sha256(json.dumps(expr, sort_keys=True).encode()).hexdigest()] for comment, expr in rules] for chain, rules in sorted(raw.items())}
+
+
+def fingerprint_path(p, ipv6):
+    return os.path.join(FINGERPRINT_DIRECTORY, private_name(p) + "." + private_family(ipv6) + ".json")
+
+
+def read_fingerprint(p, ipv6):
+    """None when nothing was recorded: never equal to a table's fingerprint."""
+    try:
+        with open(fingerprint_path(p, ipv6), encoding="ascii") as handle:
+            return json.loads(handle.read(4 * 1024 * 1024))
+    except (FileNotFoundError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def record_fingerprint(p, ipv6):
+    """Records the private table as it reads back now. Called only right
+    after this script wrote it, under the guest lock."""
+    _, _, _, raw = private_rules(p, ipv6)
+    os.makedirs(FINGERPRINT_DIRECTORY, mode=0o700, exist_ok=True)
+    path = fingerprint_path(p, ipv6)
+    staging = path + ".tmp"
+    with open(staging, "w", encoding="ascii") as handle:
+        handle.write(json.dumps(fingerprint(raw)))
+    os.replace(staging, path)
+
+
+def forget_fingerprint(p, ipv6):
+    try:
+        os.unlink(fingerprint_path(p, ipv6))
+    except FileNotFoundError:
+        pass
+
+
+def private_view(p, ipv6):
+    """The private table as iptables-save would show it, per iptables table:
+    {"chains": {own chain: "-"}, "rules": [rule]}. A table that does not read
+    back exactly as written shows a rule no plan produces, which the caller
+    rejects as a foreign instance rule."""
+    chains, _, intact = private_state(p, ipv6)
+    view = {"nat": {"chains": {}, "rules": []}, "filter": {"chains": {}, "rules": []}, "mangle": {"chains": {}, "rules": []}}
+    for chain, rules in chains.items():
+        table = private_chain_table(p, chain, ipv6)
+        if chain not in PRIVATE_VIRTUAL:
+            view[table]["chains"][chain] = "-"
+        view[table]["rules"].extend(rules)
+    if not intact:
+        view["filter"]["rules"].append(["-A", "OUTPUT", "-m", "comment", "--comment", private_tags(p, ipv6)[0], "-j", "ACCEPT"])
+    return view
+
+
+def merge_private(shared, view):
+    for table, content in view.items():
+        entry = shared.setdefault(table, {"chains": {}, "rules": []})
+        entry["chains"].update(content["chains"])
+        entry["rules"] = content["rules"] + entry["rules"]
+    return shared
+
+
+def private_commit(p, table, lines, test, ipv6):
+    """Applies iptables-restore lines for `table` to the private table and
+    commits the result in one `nft -f` transaction; then writes or renews
+    the netlink cgroup jumps the hooks need."""
+    family, name = private_family(ipv6), private_name(p)
+    chains, bases, intact = private_state(p, ipv6, verify=False)
+    before = {chain: list(rules) for chain, rules in chains.items()}
+    touched = set()
+    for line in lines:
+        op = line[0]
+        if op == "-N":
+            require(line[1] not in chains, "instance_chain_collision")
+            chains[line[1]] = []
+        elif op == "-X":
+            require(not chains.get(line[1]), "private_delete_nonempty_chain")
+            chains.pop(line[1], None)
+        elif op in ("-A", "-I"):
+            rule = ["-A", line[1], *(line[3:] if op == "-I" else line[2:])]
+            if op == "-I":
+                require(line[2] == "1", "private_insert_position")
+            chain = private_chain(p, table, rule, ipv6)
+            require(chain in PRIVATE_VIRTUAL or chain in chains, "private_missing_chain")
+            target = chains.setdefault(chain, [])
+            target.insert(0, rule) if op == "-I" else target.append(rule)
+            touched.add(chain)
+        elif op == "-D":
+            rule = ["-A", *line[1:]]
+            chain = private_chain(p, table, rule, ipv6)
+            keys = [rule_key(existing) for existing in chains.get(chain, [])]
+            require(rule_key(rule) in keys, "private_rule_not_found")
+            chains[chain].pop(keys.index(rule_key(rule)))
+            touched.add(chain)
+        else:
+            raise Failure("private_unknown_line: " + op)
+    for chain in [chain for chain in chains if chain in PRIVATE_VIRTUAL and not chains[chain]]:
+        del chains[chain]
+    script = []
+    if not chains:
+        if before or bases:
+            script = [f"delete table {family} {name}"]
+    else:
+        script = [f"add table {family} {name}"]
+        wanted_bases = {PRIVATE_BASES[chain][0]: chain for chain in chains if chain in PRIVATE_BASES}
+        for base in bases:
+            if base not in wanted_bases:
+                script += [f"flush chain {family} {name} {base}", f"delete chain {family} {name} {base}"]
+        for chain, rules in chains.items():
+            script.append(f"add chain {family} {name} {chain}")
+            script.append(f"flush chain {family} {name} {chain}")
+        for chain, rules in chains.items():
+            for rule in rules:
+                statement = nft_statement(p, rule, ipv6, chain in ("cg_filter", "cg_block", "cg_nat"))
+                script.append(f"add rule {family} {name} {chain} {statement} comment \"{encode_rule(p, rule, ipv6)}\"")
+        for chain in before:
+            if chain not in chains and chain not in PRIVATE_VIRTUAL:
+                script.append(f"delete chain {family} {name} {chain}")
+        new_bases = []
+        for base, chain in wanted_bases.items():
+            _, kind, hook, priority, cgroup = PRIVATE_BASES[chain]
+            if base not in bases:
+                script.append(f"add chain {family} {name} {base} {{ type {kind} hook {hook} priority {priority}; policy accept; }}")
+                if not cgroup:
+                    script.append(f"add rule {family} {name} {base} counter jump {chain} comment \"{HOOK_JUMP_COMMENT}\"")
+                else:
+                    new_bases.append((base, chain))
+    if test:
+        if script:
+            run(["nft", "-c", "-f", "-"], "\n".join(script) + "\n")
+        return
+    if script:
+        run(["nft", "-f", "-"], "\n".join(script) + "\n")
+    if not chains:
+        forget_fingerprint(p, ipv6)
+        return
+    for base, chain in new_bases:
+        private_cgroup_jump(family, name, base, chain)
+    # The block chain's jump is written anew on every change: `--path /`
+    # resolves only when a rule goes in, so after a target-only restart only
+    # a fresh one matches the target again (decision 33).
+    if "cg_block" in chains and "out_block" in bases and "cg_block" in touched:
+        old = [handle for handle, _ in bases["out_block"]]
+        private_cgroup_jump(family, name, "out_block", "cg_block")
+        for handle in old:
+            run(["nft", "delete", "rule", family, name, "out_block", "handle", str(handle)])
+    record_fingerprint(p, ipv6)
+
+
+def private_delete(p, ipv6):
+    family, name = private_family(ipv6), private_name(p)
+    if nft_json(family, name) is not None:
+        run(["nft", "delete", "table", family, name])
+    forget_fingerprint(p, ipv6)
+
+
+# nf_tables netlink, only for the cgroup jumps.
+NFT_SUBSYS = 10
+NFT_MSG_NEWRULE = 6
+NFNL_BATCH_BEGIN, NFNL_BATCH_END = 0x10, 0x11
+NFT_JUMP = 0xFFFFFFFD
+# struct xt_cgroup_info_v2 with has_path = 1, path = "/" (528 bytes).
+XT_CGROUP_ROOT = b"\x01\x00\x00\x00/" + b"\x00" * 523
+
+
+def private_cgroup_jump(family, table, base, chain):
+    """Appends "xt cgroup --path / counter jump <chain>" to `base`. The path
+    resolves in this process's cgroup namespace, the target's."""
+    def string(kind, value):
+        return attribute(kind, value.encode() + b"\0")
+
+    def u32(kind, value):
+        return attribute(kind, struct.pack(">I", value))
+
+    def expr(name, data):
+        return attribute(1, string(1, name) + attribute(2, data, nested=True), nested=True)
+
+    match = expr("match", string(1, "cgroup") + u32(2, 2) + attribute(3, XT_CGROUP_ROOT))
+    counter = expr("counter", attribute(1, b"\0" * 8) + attribute(2, b"\0" * 8))
+    verdict = attribute(2, u32(1, NFT_JUMP) + string(2, chain), nested=True)
+    jump = expr("immediate", u32(1, 0) + attribute(2, verdict, nested=True))
+    comment = CGROUP_JUMP_COMMENT.encode() + b"\0"
+    userdata = bytes([0, len(comment)]) + comment
+    body = string(1, table) + string(2, base) + attribute(4, match + counter + jump, nested=True) + attribute(7, userdata)
+    family_number = socket.AF_INET6 if family == "ip6" else socket.AF_INET
+
+    def message(kind, flags, seq, nfamily, payload, subsystem=True):
+        kind = (NFT_SUBSYS << 8 | kind) if subsystem else kind
+        payload = struct.pack("=BBH", nfamily, 0, socket.htons(NFT_SUBSYS if not subsystem else 0)) + payload
+        return struct.pack("=IHHII", 16 + len(payload), kind, flags, seq, 0) + payload
+
+    blob = message(NFNL_BATCH_BEGIN, 1, 1, socket.AF_UNSPEC, b"", subsystem=False)
+    blob += message(NFT_MSG_NEWRULE, 1 | 4 | 0x400 | 0x800, 2, family_number, body)
+    blob += message(NFNL_BATCH_END, 1, 3, socket.AF_UNSPEC, b"", subsystem=False)
+    sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 12)
+    try:
+        sock.settimeout(4)
+        sock.bind((0, 0))
+        sock.send(blob)
+        while True:
+            data = sock.recv(65536)
+            offset = 0
+            while offset < len(data):
+                length, kind, _, seq, _ = struct.unpack_from("=IHHII", data, offset)
+                if kind == 2:
+                    error = struct.unpack_from("=i", data, offset + 16)[0]
+                    require(error == 0, f"private_cgroup_jump_failed: {os.strerror(-error) if error else ''}")
+                    if seq == 2:
+                        return
+                offset += (length + 3) & ~3
+    finally:
+        sock.close()
 
 
 # Reading the target's Docker networks at install: a few tries, so a dockerd
@@ -1890,6 +2325,8 @@ def resolve(p, entries, protocol, peer):
 
 def execute(request):
     p = validate(request)
+    global PLAN
+    PLAN = p
     operation = request["operation"]
     with guest_lock():
         identity_matches = True
@@ -1937,6 +2374,13 @@ def execute(request):
                     # Issue and validate in the guest; RPC transit can only shorten the window.
                     return {"ok": True, "operation": operation, "grant_deadline": int(time.time()) + 30}
             elif operation in ("remove", "inspect"):
+                if operation == "remove":
+                    # One table per family holds redirection and guards
+                    # together, so deleting it withdraws both at once. What
+                    # is left below is what an older version wrote into the
+                    # shared tables.
+                    for ipv6 in (False, True):
+                        private_delete(p, ipv6)
                 tables = firewall()
                 present, rules = inspect_firewall(p, tables, True)
                 ipv6_tables, ipv6_rules = None, None
@@ -1951,24 +2395,16 @@ def execute(request):
                 # the periodic check still treats any of them as a protection loss.
                 entries, ipv6_entries, unproven = mapping_partition(p, ct)
                 if operation == "inspect":
-                    guard_behind, gate_behind = displaced(tables, rules)
-                    if ipv6_rules is not None:
-                        behind6 = displaced(ipv6_tables, ipv6_rules)
-                        guard_behind, gate_behind = guard_behind or behind6[0], gate_behind or behind6[1]
-                    complete = rules_complete(p, present, rules, ipv6_rules) and not old and not guard_behind
+                    # Base chains of their own run whatever else hooks the
+                    # same place: nobody's accept ahead of them lets traffic
+                    # past (decision 41), so there is no position to check.
+                    complete = rules_complete(p, present, rules, ipv6_rules) and not old
                     ownership = {
                         "identity_matches": identity_matches,
                         "rules_present": present or any(rules.values()) or bool(ipv6_rules and any(ipv6_rules.values())) or old,
-                        # A rule another tool put ahead of the local guard is
-                        # as good as a missing guard (decision 37).
                         "rules_complete": complete,
                         "mappings_present": bool(entries or ipv6_entries),
                         "unproven_mappings": unproven,
-                        # Ahead of the FORWARD gate: the target's own
-                        # processes are still guarded, its containers may not be.
-                        "forward_displaced": complete and gate_behind,
-                        # Only asked of complete managed rules of this identity.
-                        "rules_bound": probe_bound(p) if complete and identity_matches and p.get("system_dns") is not None else True,
                     }
                     require(identity_matches or not (ownership["rules_present"] or ownership["mappings_present"]), "stale_identity_has_owned_artifacts: " + str(drift))
                     if not ownership["rules_present"] and not ownership["mappings_present"]:
@@ -1989,9 +2425,9 @@ def execute(request):
                         if lines:
                             transaction(table, lines, ipv6=ipv6, backend=backend)
 
-                withdraw(rules, tables)
+                withdraw(rules, tables, backend="shared")
                 if ipv6_rules is not None:
-                    withdraw(ipv6_rules, ipv6_tables, ipv6=True)
+                    withdraw(ipv6_rules, ipv6_tables, ipv6=True, backend="shared")
                 # What an older version left in the legacy tables (decision 37).
                 for ipv6, old_tables, found in leftovers:
                     withdraw(found, old_tables, ipv6=ipv6, backend="legacy")
@@ -2050,25 +2486,6 @@ def execute(request):
                         require(have == sorted(rule_key(rule) for rule in wanted), "block_not_in_place")
                         in_place += len(have)
                 return {"ok": True, "operation": operation, "blocked": {"rules": in_place, "bridges": sorted(bridges)}}
-            elif operation == "anchor":
-                # Decision 37: the probe found the rules no longer matching
-                # the target. Re-insert this instance's cgroup-matched OUTPUT
-                # rules from here, one transaction per table, delete and insert
-                # together, text unchanged; then probe again. Only for a
-                # complete managed takeover of this exact identity (the guard
-                # above refused any drift).
-                require(p.get("system_dns") is not None, "anchor_needs_managed_mode")
-                tables, ipv6_tables = firewall(), firewall(ipv6=True)
-                present, rules = inspect_firewall(p, tables, True)
-                _, ipv6_rules = inspect_firewall(p, ipv6_tables, True, ipv6=True)
-                require(rules_complete(p, present, rules, ipv6_rules), "anchor_without_complete_rules")
-                insert = lambda rule: ["-I", rule[1], "1", *rule[2:]]
-                for ipv6, found in ((False, rules), (True, ipv6_rules)):
-                    for table, wanted in anchored_rules(p, ipv6).items():
-                        old = [rule for rule in found[table] if rule[1] == "OUTPUT" and "cgroup" in rule]
-                        if old or wanted:
-                            transaction(table, [["-D", *rule[1:]] for rule in old] + [insert(rule) for rule in reversed(wanted)], ipv6=ipv6)
-                return {"ok": True, "operation": operation, "anchored": {"bound": probe_bound(p)}}
             elif operation == "sync_networks":
                 # Only an active, complete takeover of this exact identity is
                 # extended (the guard above refused any drift); after a stop

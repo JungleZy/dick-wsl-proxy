@@ -128,6 +128,7 @@ else
 fi
 observe tooling.iptables_legacy iptables-legacy --version
 observe tooling.ip6tables_legacy ip6tables-legacy --version
+observe tooling.nft nft --version
 firewall_save() {
     # No table argument: do not ask xtables to load any missing table/module.
     saved=$("$1" 2>&1) || { printf '%s' "$saved"; return 1; }

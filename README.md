@@ -43,7 +43,7 @@ dick-wsl-proxy 在 Windows 侧只接管你指定的那一个发行版：
 
 ## 功能
 
-- **按发行版接管**：在目标里装一组带本实例标记的 iptables 规则，按 cgroup 只匹配这个发行版的进程，把新连接引到 Windows 上的入口。
+- **按发行版接管**：在目标里建本实例自己的 nft 表，按 cgroup 只匹配这个发行版的进程，把新连接引到 Windows 上的入口。别的发行版写防火墙规则改不动这张表。
 - **白名单直连**：支持 IP、CIDR、精确域名、域名后缀四种写法，命中的 TCP 由 Windows 直接连。新建的配置库会预填一批国内常用服务的域名后缀。
 - **双跳代理**：其余流量先经宿主机上已有的 SOCKS5 代理（第一跳），再经住宅代理（第二跳，用户名密码认证）出去。住宅代理可以是 SOCKS5，也可以是 HTTP 代理；HTTP 代理只能转发 TCP，选它时 UDP 全部拒绝。
 - **失败不放行**：任何一跳失败，连接就失败；故障时保持阻断，不会降级成直连。
@@ -138,7 +138,8 @@ SHA-256 校验值只能证明文件完整，不能证明是谁发布的。v0.1.1
 - WSL2，网络模式是 NAT。WSL1、mirrored、bridged 等模式不支持。
 - WSL 内核不低于 6.18.58.1。
 - systemd 是 PID 1。
-- 有 `iptables-nft` 和 `ip6tables-nft`：规则经它们写入 nft 表（决策 37）。预检目前仍检查 `iptables-legacy` 和 `ip6tables-legacy`；Ubuntu 的 `iptables` 包两套都带。
+- 有 `nft`（`nftables` 包）：规则写进本实例自己的 nft 表（决策 41），预检缺它时报 `tooling.nft_missing`；程序新建的环境会自动装上，已有的发行版要自己 `apt install nftables`。
+- 有 `iptables-nft` 和 `ip6tables-nft`：用来找出并删除旧版本写在共用表里的规则。预检目前仍检查 `iptables-legacy` 和 `ip6tables-legacy`；Ubuntu 的 `iptables` 包两套都带。
 - 内核能力：`xt_cgroup`、`nf_conntrack`、`nf_nat`、`iptable_nat`、`ip6table_nat`，以及 IPv4、IPv6 的 REJECT；nft 写入还要 `nft_compat`（WSL 内核以模块提供），这一项预检还没有检查。冷启动后缺这些模块时，可以让程序加载发行版里已有的模块，见下文。
 - 有 `/usr/bin/python3`。注意：预检目前不检查这一项，缺了要到改完时区、重启目标之后才会失败。
 - 有 `/usr/share/zoneinfo` 时区数据，以及 `awk`、`od`、`sha256sum`、`ip` 等基础命令。

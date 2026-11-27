@@ -23,10 +23,10 @@ if os.name == "nt":
 # only an older version wrote there (decision 37).
 REAL_LEGACY_FIREWALL = kernel.legacy_firewall
 kernel.legacy_firewall = lambda ipv6=False: {}
-# The probe sends a packet and reads live counters; tests that need it patch
-# `probe_counts` and `socket` themselves.
-REAL_PROBE_BOUND = kernel.probe_bound
-kernel.probe_bound = lambda p: True
+# The private nft tables (decision 41) are faked one level up, at
+# `firewall` and `transaction`; a stop's delete of them needs the real `nft`.
+REAL_PRIVATE_DELETE = kernel.private_delete
+kernel.private_delete = lambda p, ipv6: None
 
 
 def plan():
@@ -686,7 +686,8 @@ class ExactLookupTests(unittest.TestCase):
 class FirewallTests(unittest.TestCase):
     def test_restore_preserves_xtables_negation_token(self):
         with patch.object(kernel, "run") as run:
-            kernel.transaction("filter", [["-I", "OUTPUT", "!", "-d", "127.0.0.0/8", "-j", "DROP"]], test=True)
+            kernel.transaction("filter", [["-I", "OUTPUT", "!", "-d", "127.0.0.0/8", "-j", "DROP"]], test=True, backend="shared")
+        self.assertEqual(run.call_args.args[0][0], "iptables-nft-restore")
         self.assertEqual(run.call_args.args[1], "*filter\n-I OUTPUT ! -d 127.0.0.0/8 -j DROP\nCOMMIT\n")
 
     def test_other_bridges_pass_untouched_in_every_mode(self):
@@ -1192,7 +1193,9 @@ class FakeTables:
     def transaction(self, table, lines, test=False, ipv6=False, backend="nft"):
         if test:
             return
-        family = (self.state if backend == "nft" else self.legacy_state)["v6" if ipv6 else "v4"]
+        # "nft" is the private table, "shared" what an older version wrote
+        # into the shared nft tables: both read back through `firewall`.
+        family = (self.state if backend in ("nft", "shared") else self.legacy_state)["v6" if ipv6 else "v4"]
         current = family.setdefault(table, {"chains": {"OUTPUT": "ACCEPT"}, "rules": []})
         rules = current["rules"]
         for line in lines:
@@ -1370,31 +1373,18 @@ class NftBackendTests(unittest.TestCase):
     def ownership(self, p, v4, v6=None):
         return self.execute(p, "inspect", FakeTables(v4, v6 if v6 is not None else ipv6_snapshot(p)), drift=None)["ownership"]
 
-    def test_a_rule_ahead_of_the_guard_is_incomplete_ahead_of_the_gate_displaced_and_nat_ignored(self):
+    def test_another_tools_rule_ahead_of_this_instances_rules_does_not_matter(self):
+        # Decision 41: the rules sit in base chains of their own, which run
+        # whatever else hooks the same place, so there is no position to check.
         p = comprehensive_plan()
-        clean = self.ownership(p, snapshot(p))
-        self.assertTrue(clean["rules_complete"])
-        self.assertFalse(clean["forward_displaced"])
-        # Another tool's accept ahead of the OUTPUT guard: as good as no guard.
-        guard = self.ownership(p, self.ahead(snapshot(p), "filter", "OUTPUT"))
-        self.assertFalse(guard["rules_complete"])
-        self.assertTrue(guard["rules_present"])
-        # Ahead of the FORWARD gate: the target is still guarded, not its containers.
-        gate = self.ownership(p, self.ahead(snapshot(p), "mangle", "FORWARD"))
-        self.assertTrue(gate["rules_complete"])
-        self.assertTrue(gate["forward_displaced"])
-        gate6 = self.ownership(p, snapshot(p), self.ahead(ipv6_snapshot(p), "mangle", "FORWARD"))
-        self.assertTrue(gate6["forward_displaced"])
-        # Docker's MASQUERADE on top of nat POSTROUTING, Docker's own FORWARD
-        # jumps in the filter table, or another tool's rule after ours: fine.
-        for table, chain in (("nat", "POSTROUTING"), ("nat", "PREROUTING"), ("filter", "FORWARD")):
+        self.assertTrue(self.ownership(p, snapshot(p))["rules_complete"])
+        for table, chain in (("filter", "OUTPUT"), ("mangle", "FORWARD"), ("nat", "POSTROUTING"), ("nat", "PREROUTING"), ("filter", "FORWARD")):
             with self.subTest(table=table, chain=chain):
                 value = self.ownership(p, self.ahead(snapshot(p), table, chain))
                 self.assertTrue(value["rules_complete"])
-                self.assertFalse(value["forward_displaced"])
-        after = snapshot(p)
-        after["filter"]["rules"].append(["-A", "OUTPUT", *self.foreign])
-        self.assertTrue(self.ownership(p, after)["rules_complete"])
+                self.assertEqual(set(value), {"identity_matches", "rules_present", "rules_complete", "mappings_present", "unproven_mappings"})
+        value = self.ownership(p, snapshot(p), self.ahead(ipv6_snapshot(p), "mangle", "FORWARD"))
+        self.assertTrue(value["rules_complete"])
 
     def test_the_gate_is_in_mangle_and_install_writes_only_through_nft(self):
         p = comprehensive_plan()
@@ -1431,99 +1421,70 @@ class NftBackendTests(unittest.TestCase):
                         self.assertEqual(set(table["chains"]), {"OUTPUT"})
 
 
-class ProbeTests(unittest.TestCase):
-    """Decision 37: a probe from the target catches rules another
-    distribution re-added under its own cgroup namespace; re-anchoring puts
-    them back."""
+class PrivateTableTests(unittest.TestCase):
+    """Decision 41: this instance's rules live in its own nft tables."""
 
-    execute = BlockTests.execute
+    def test_nft_writes_go_to_the_private_table_and_cleanup_to_the_shared_ones(self):
+        with patch.object(kernel, "private_commit") as private, patch.object(kernel, "run") as run:
+            kernel.transaction("nat", [["-N", "WPM2_12345678"]])
+            self.assertTrue(private.called)
+            self.assertFalse(run.called)
+            kernel.transaction("nat", [["-X", "WPM2_12345678"]], backend="shared")
+            self.assertEqual(run.call_args.args[0][0], "iptables-nft-restore")
+            kernel.transaction("nat", [["-X", "WPM2_12345678"]], ipv6=True, backend="legacy")
+            self.assertEqual(run.call_args.args[0][0], "ip6tables-legacy-restore")
 
-    def test_the_probe_rules_count_only_and_sit_ahead_of_the_guard(self):
+    def test_the_periodic_check_only_reads_and_trusts_what_this_script_recorded(self):
         p = comprehensive_plan()
-        probes = kernel.probe_rules(p)
-        for table, rule in probes.items():
-            self.assertNotIn("-j", rule)
-            self.assertEqual(rule[rule.index("-d") + 1], "240.0.0.1/32")
-            self.assertEqual(rule[rule.index("--path") + 1], "/")
-        output = [rule for rule in kernel.artifacts(p)[4] if rule[1] == "OUTPUT"]
-        self.assertEqual(output[0], probes["filter"])
-        # The redirect chain returns 240.0.0.0/4 before marking anything.
-        body = kernel.artifacts(p)[3]
-        returned = next(index for index, rule in enumerate(body) if "240.0.0.0/4" in rule)
-        marked = next(index for index, rule in enumerate(body) if "CONNMARK" in rule)
-        self.assertLess(returned, marked)
-        self.assertEqual(body[returned][-1], "RETURN")
+        rule = ["-A", "WPM2_12345678", "-j", "RETURN"]
+        raw = {"WPM2_12345678": [("h:1", [{"counter": None}, {"return": None}])]}
+        parsed = ({"WPM2_12345678": [rule]}, {}, True, raw)
+        with patch.object(kernel, "private_rules", return_value=parsed), patch.object(kernel, "run") as run:
+            with patch.object(kernel, "read_fingerprint", return_value=kernel.fingerprint(raw)):
+                self.assertTrue(kernel.private_state(p, False)[2])
+            # Same comment, other expressions: someone rewrote the rule.
+            other = {"WPM2_12345678": [("h:1", [{"counter": None}, {"accept": None}])]}
+            with patch.object(kernel, "read_fingerprint", return_value=kernel.fingerprint(other)):
+                self.assertFalse(kernel.private_state(p, False)[2])
+            # Nothing recorded (for example after a target restart).
+            with patch.object(kernel, "read_fingerprint", return_value=None):
+                self.assertFalse(kernel.private_state(p, False)[2])
+            self.assertFalse(run.called)
 
-    def test_probe_counts_read_only_the_probe_rules(self):
+    def test_counters_do_not_change_a_fingerprint(self):
+        before = {"c": [("h:1", kernel.plain_expr([{"counter": {"packets": 0, "bytes": 0}}, {"return": None}]))]}
+        after = {"c": [("h:1", kernel.plain_expr([{"counter": {"packets": 9, "bytes": 540}}, {"return": None}]))]}
+        self.assertEqual(kernel.fingerprint(before), kernel.fingerprint(after))
+
+    def test_rules_translate_to_native_nft(self):
         p = comprehensive_plan()
-        probes = kernel.probe_rules(p)
-        other = ["-A", "OUTPUT", "-d", "240.0.0.1/32", "-p", "tcp", "-m", "tcp", "--dport", "9", "-m", "comment", "--comment", "someone-else"]
-        dumps = {
-            "nat": "# comment\n*nat\n:OUTPUT ACCEPT [0:0]\n[7:420] " + " ".join(probes["nat"]) + "\n[99:1] " + " ".join(other) + "\nCOMMIT\n",
-            "filter": "*filter\n[3:180] " + " ".join(probes["filter"]).replace("--path /", '--path "/"') + "\nCOMMIT\n",
-        }
-        with patch.object(kernel, "run", side_effect=lambda argv, data=None, timeout=4: dumps[argv[-1]]):
-            self.assertEqual(kernel.probe_counts(p), {"nat": 7, "filter": 3})
+        statement = lambda rule, cgroup=False, ipv6=False: kernel.nft_statement(p, rule, ipv6, cgroup)
+        self.assertEqual(
+            statement(["-A", "WPM2_12345678", "-p", "tcp", "-m", "connmark", "--mark", "0x12345678", "-j", "DNAT", "--to-destination", "172.28.80.1:43531"]),
+            "meta l4proto tcp ct mark 0x12345678 counter dnat to 172.28.80.1:43531",
+        )
+        self.assertEqual(
+            statement(["-A", "OUTPUT", "-p", "udp", "-m", "cgroup", "--path", "/", "-m", "conntrack", "--ctstate", "NEW", "--ctdir", "ORIGINAL", "-j", "WPM2_12345678"], cgroup=True),
+            "meta l4proto udp ct state new ct direction original counter jump WPM2_12345678",
+        )
+        self.assertEqual(statement(["-A", "WPM2G_12345678", "-p", "tcp", "-j", "REJECT", "--reject-with", "tcp-reset"]), "meta l4proto tcp counter reject with tcp reset")
+        self.assertEqual(statement(["-A", "WPM2V_12345678", "-d", "fe80::/10", "-j", "RETURN"], ipv6=True), "ip6 daddr fe80::/10 counter return")
+        # The cgroup match goes on the netlink jump; never inside a chain.
+        with self.assertRaisesRegex(kernel.Failure, "private_cgroup_outside_output"):
+            statement(["-A", "WPM2_12345678", "-m", "cgroup", "--path", "/", "-j", "RETURN"])
+        with self.assertRaisesRegex(kernel.Failure, "private_unknown_option"):
+            statement(["-A", "WPM2_12345678", "--sport", "53", "-j", "RETURN"])
 
-    def test_the_probe_is_bound_only_when_both_tables_count_it(self):
+    def test_a_stop_deletes_both_private_tables_before_the_shared_cleanup(self):
         p = comprehensive_plan()
-        for after, bound in (({"nat": 8, "filter": 4}, True), ({"nat": 8, "filter": 3}, False), ({"nat": 7, "filter": 3}, False), ({}, False)):
-            with self.subTest(after=after), patch.object(kernel, "probe_counts", side_effect=[{"nat": 7, "filter": 3}, after]), patch.object(kernel.socket, "socket") as make:
-                make.return_value.connect.side_effect = BlockingIOError()
-                self.assertEqual(REAL_PROBE_BOUND(p), bound)
-                make.return_value.connect.assert_called_once_with(("240.0.0.1", 9))
-                make.return_value.close.assert_called_once()
+        order = []
+        fake = FakeTables(snapshot(p), ipv6_snapshot(p))
+        with patch.object(kernel, "private_delete", side_effect=lambda plan, ipv6: order.append(("delete", ipv6))), patch.object(fake, "transaction", wraps=fake.transaction) as transact:
+            transact.side_effect = lambda *a, **k: (order.append(("shared", k.get("backend"))), FakeTables.transaction(fake, *a, **k))[1]
+            BlockTests.execute(self, p, "remove", fake, drift=None)
+        self.assertEqual(order[:2], [("delete", False), ("delete", True)])
+        self.assertTrue(all(backend == "shared" for kind, backend in order[2:] if kind == "shared"))
 
-    def test_inspect_reports_unbound_rules_only_when_complete(self):
-        p = comprehensive_plan()
-        with patch.object(kernel, "probe_bound", return_value=False) as probe:
-            value = self.execute(p, "inspect", FakeTables(snapshot(p), ipv6_snapshot(p)), drift=None)["ownership"]
-            self.assertTrue(value["rules_complete"])
-            self.assertFalse(value["rules_bound"])
-            partial = snapshot(p)
-            del partial["nat"]
-            value = self.execute(p, "inspect", FakeTables(partial, ipv6_snapshot(p)), drift=None)["ownership"]
-        self.assertTrue(value["rules_bound"])
-        self.assertEqual(probe.call_count, 1)
-
-    def test_anchor_reinserts_the_cgroup_rules_in_place_and_probes_again(self):
-        for ipv6 in (None, {"guest": "2001:db8:1::2", "ingress": "[fe80::1%2]:43771"}):
-            with self.subTest(managed_ipv6=ipv6 is not None):
-                p = comprehensive_plan()
-                if ipv6 is not None:
-                    p["ipv6"] = ipv6
-                fake = FakeTables(snapshot(p), ipv6_snapshot(p))
-                fake.state["v4"]["filter"]["rules"].append(["-A", "OUTPUT", "-m", "comment", "--comment", "after", "-j", "ACCEPT"])
-                before = copy.deepcopy(fake.state)
-                calls = []
-                original = fake.transaction
-                with patch.object(fake, "transaction", side_effect=lambda *a, **k: (calls.append((a, k)), original(*a, **k))), patch.object(kernel, "probe_bound", return_value=True):
-                    self.assertEqual(self.execute(p, "anchor", fake, drift=None), {"ok": True, "operation": "anchor", "anchored": {"bound": True}})
-                # One transaction per table that has such rules, deletes then inserts.
-                for (table, lines), kwargs in calls:
-                    self.assertIn(table, ("nat", "filter"))
-                    kinds = [line[0] for line in lines]
-                    self.assertEqual(kinds, sorted(kinds, key=lambda kind: kind != "-D"))
-                    self.assertTrue(all(line[1] == "OUTPUT" and "cgroup" in line for line in lines))
-                self.assertEqual(len(calls), 4 if ipv6 is not None else 3)
-                for family in ("v4", "v6"):
-                    for table in fake.state[family]:
-                        self.assertEqual(sorted(map(kernel.rule_key, fake.state[family][table]["rules"])), sorted(map(kernel.rule_key, before[family][table]["rules"])), (family, table))
-                        output = [rule for rule in fake.state[family][table]["rules"] if rule[1] == "OUTPUT"]
-                        mine = [rule for rule in output if "cgroup" in rule]
-                        self.assertEqual(output[:len(mine)], mine)
-                self.assertTrue(self.execute(p, "inspect", fake, drift=None)["ownership"]["rules_complete"])
-
-    def test_anchor_refuses_incomplete_rules_drift_and_scoped_mode(self):
-        p = comprehensive_plan()
-        partial = snapshot(p)
-        del partial["nat"]
-        with self.assertRaisesRegex(kernel.Failure, "anchor_without_complete_rules"):
-            self.execute(p, "anchor", FakeTables(partial, ipv6_snapshot(p)), drift=None)
-        with self.assertRaisesRegex(kernel.Failure, "boot_changed"):
-            self.execute(p, "anchor", FakeTables(snapshot(p), ipv6_snapshot(p)), drift="boot_changed")
-        with self.assertRaisesRegex(kernel.Failure, "anchor_needs_managed_mode"):
-            self.execute(plan(), "anchor", FakeTables(snapshot(plan())), drift=None)
 
 class InspectionTests(unittest.TestCase):
     def observe(self, p, tables, entries=None, ipv6_entries=None, identity_error=None, pending=False):
@@ -1549,7 +1510,7 @@ class InspectionTests(unittest.TestCase):
             if p.get("system_dns") is not None:
                 tables.append(ipv6_snapshot(p))
             value = self.observe(p, tables)
-            self.assertEqual(value, {"identity_matches": True, "rules_present": True, "rules_complete": True, "mappings_present": False, "unproven_mappings": 0, "forward_displaced": False, "rules_bound": True})
+            self.assertEqual(value, {"identity_matches": True, "rules_present": True, "rules_complete": True, "mappings_present": False, "unproven_mappings": 0})
             partial = snapshot(p)
             del partial["nat"]
             tables = [partial] + ([ipv6_snapshot(p)] if p.get("system_dns") is not None else [])
@@ -1614,12 +1575,12 @@ class InspectionTests(unittest.TestCase):
             foreign = snapshot(other)
             foreign["filter"]["rules"][0].extend(["--unrelated-shape", "unreachable"])
             value = self.observe(p, [foreign, ipv6_snapshot(other)], identity_error=reason)
-            self.assertEqual(value, {"identity_matches": False, "rules_present": False, "rules_complete": False, "mappings_present": False, "unproven_mappings": 0, "forward_displaced": False, "rules_bound": True})
+            self.assertEqual(value, {"identity_matches": False, "rules_present": False, "rules_complete": False, "mappings_present": False, "unproven_mappings": 0})
             with self.subTest(reason=reason), self.assertRaises(kernel.Failure):
                 self.observe(p, [snapshot(p), ipv6_snapshot(p)], identity_error=reason)
         # Any other drift is handled the same way: it can attest absence only.
         value = self.observe(plan(), [{}], identity_error="workload_outside_distro_cgroup")
-        self.assertEqual(value, {"identity_matches": False, "rules_present": False, "rules_complete": False, "mappings_present": False, "unproven_mappings": 0, "forward_displaced": False, "rules_bound": True})
+        self.assertEqual(value, {"identity_matches": False, "rules_present": False, "rules_complete": False, "mappings_present": False, "unproven_mappings": 0})
         with self.assertRaisesRegex(kernel.Failure, "stale_identity_has_owned_artifacts: workload_outside_distro_cgroup"):
             self.observe(plan(), [snapshot(plan())], identity_error="workload_outside_distro_cgroup")
 

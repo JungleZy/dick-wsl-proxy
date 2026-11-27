@@ -133,14 +133,9 @@ fn recovery_due(observed: &Observed) -> bool {
 /// rules are gone or no longer apply (decision 33). Not a changed
 /// environment or unprovable mappings, where the rules still stand.
 fn blockable(reason: &str) -> bool {
-    [
-        "restarted",
-        "rules_missing",
-        "rules_incomplete",
-        "rules_rebound",
-    ]
-    .iter()
-    .any(|kind| reason.starts_with(&format!("protection_lost: {kind}:")))
+    ["restarted", "rules_missing", "rules_incomplete"]
+        .iter()
+        .any(|kind| reason.starts_with(&format!("protection_lost: {kind}:")))
 }
 
 /// The outcome of one guest observation, judged only by its evidence.
@@ -193,17 +188,6 @@ pub(crate) fn containers_blocked(bridges: &[String]) -> String {
     }
 }
 
-/// The log line after a probe that was not counted led to a successful
-/// re-anchoring (decision 37).
-const REANCHORED: &str = "目标发行版里本次接管的规则一度不再匹配目标（别的发行版整表导回了含这些规则的 nft 表），目标的新连接可能短暂直连、那个发行版的连接可能被送进了住宅出口；已在目标里重新锚定，探测确认恢复。";
-
-/// A probe still not counted after re-anchoring, or a re-anchoring that failed.
-fn rebound(detail: &str) -> String {
-    format!(
-        "protection_lost: rules_rebound: this takeover's rules no longer match the target and re-anchoring did not fix it ({detail})"
-    )
-}
-
 const RESTARTED: &str = "protection_lost: restarted: the target or the WSL VM restarted; this takeover's rules no longer apply";
 
 fn changed(reason: &str) -> String {
@@ -222,15 +206,6 @@ fn classify(result: Result<(kernel::Ownership, Option<String>), String>) -> Obse
                 "protection_lost: mapping_integrity: {} connection-tracking entries carry this takeover's mark without a provable mapping",
                 own.unproven_mappings
             ))
-        }
-        // Not blocked: the decision 33 block covers the target's own
-        // processes, which the local guard still covers; the containers are
-        // what the gate no longer may (decision 37).
-        Ok((own, _)) if own.identity_matches && own.rules_complete && own.forward_displaced => {
-            Observed::Lost(
-                "protection_lost: forward_gate_displaced: another rule now precedes this takeover's forward gate; the target's containers may bypass it"
-                    .into(),
-            )
         }
         Ok((own, _)) if own.identity_matches && own.rules_complete => Observed::Protected,
         Ok((own, _)) if own.identity_matches => Observed::Lost(
@@ -284,9 +259,8 @@ enum Finding {
     Unregistered,
     RunningListFailed(String),
     NotRunning,
-    /// What the inspect concluded, the network sync it led to, and a log
-    /// line when the rules had to be re-anchored (decision 37).
-    Inspected(Observed, Option<NetworkUpdate>, Option<String>),
+    /// What the inspect concluded and the network sync it led to.
+    Inspected(Observed, Option<NetworkUpdate>),
     /// A blocking round found the target registered and running.
     BlockDue,
 }
@@ -314,32 +288,20 @@ impl WatchRound {
         &self.plan.target.name
     }
 
-    /// One guest inspect; when the rules are complete but the probe from the
-    /// target was not counted, one re-anchoring (decision 37); when the
-    /// target's Docker networks no longer match the rules, one sync to add or
-    /// remove per-network rules (decision 24). These are the only changes a
-    /// round ever makes.
+    /// One guest inspect, read-only; when the target's Docker networks no
+    /// longer match the rules, one sync to add or remove per-network rules
+    /// (decision 24). That is the only change a round ever makes.
     fn inspect(&self) -> Finding {
         match kernel::inspect_networks(&self.plan) {
             Ok((ownership, drift, networks)) => {
-                let mut observed = classify(Ok((ownership, drift)));
-                let mut anchored = None;
-                if observed == Observed::Protected && !ownership.rules_bound {
-                    match kernel::anchor(&self.plan) {
-                        Ok(true) => anchored = Some(REANCHORED.to_owned()),
-                        Ok(false) => {
-                            observed = Observed::Lost(rebound("still_unbound_after_anchor"))
-                        }
-                        Err(error) => observed = Observed::Lost(rebound(&error)),
-                    }
-                }
+                let observed = classify(Ok((ownership, drift)));
                 let update = match (&observed, networks) {
                     (Observed::Protected, Some(networks)) => Some(self.update_networks(networks)),
                     _ => None,
                 };
-                Finding::Inspected(observed, update, anchored)
+                Finding::Inspected(observed, update)
             }
-            Err(error) => Finding::Inspected(classify(Err(error)), None, None),
+            Err(error) => Finding::Inspected(classify(Err(error)), None),
         }
     }
 
@@ -593,16 +555,10 @@ impl Controller {
             }
             // Only blocking rounds, handled above, report this.
             Finding::BlockDue => None,
-            Finding::Inspected(observed, update, anchored) => {
+            Finding::Inspected(observed, update) => {
                 self.watch.target_running = Some(true);
                 if let Some(update) = update {
                     *note = self.record_networks(update);
-                }
-                if let Some(anchored) = anchored {
-                    *note = Some(match note.take() {
-                        Some((_, networks)) => ("warning", format!("{anchored}{networks}")),
-                        None => ("warning", anchored),
-                    });
                 }
                 match observed {
                     Observed::Protected => {
@@ -968,43 +924,7 @@ mod tests {
             mappings_present: false,
             rules_complete,
             unproven_mappings: 0,
-            forward_displaced: false,
-            rules_bound: true,
         }
-    }
-
-    #[test]
-    fn rules_that_stay_unbound_after_re_anchoring_are_a_loss_that_blocks() {
-        let reason = rebound("still_unbound_after_anchor");
-        assert!(
-            reason.starts_with("protection_lost: rules_rebound:"),
-            "{reason}"
-        );
-        assert!(blockable(&reason));
-        // Unbound alone is not judged by classify: the round re-anchors first.
-        let unbound = kernel::Ownership {
-            rules_bound: false,
-            ..ownership(true, true)
-        };
-        assert_eq!(classify(Ok((unbound, None))), Observed::Protected);
-    }
-
-    #[test]
-    fn a_displaced_forward_gate_is_a_loss_that_is_not_blocked() {
-        let displaced = kernel::Ownership {
-            forward_displaced: true,
-            ..ownership(true, true)
-        };
-        let Observed::Lost(reason) = classify(Ok((displaced, None))) else {
-            panic!("a displaced gate must be a loss");
-        };
-        assert!(
-            reason.starts_with("protection_lost: forward_gate_displaced:"),
-            "{reason}"
-        );
-        // The block covers the target's own processes, which the guard still
-        // does; it would cut working traffic and leave the containers as they are.
-        assert!(!blockable(&reason));
     }
 
     #[test]
@@ -1088,7 +1008,7 @@ mod tests {
     #[test]
     fn only_losses_that_leave_the_target_direct_are_blocked() {
         assert!(!blockable(
-            "protection_lost: forward_gate_displaced: another rule now precedes this takeover's forward gate"
+            "protection_lost: mapping_integrity: 1 connection-tracking entries carry this takeover's mark without a provable mapping"
         ));
         assert!(blockable(RESTARTED));
         assert!(blockable(

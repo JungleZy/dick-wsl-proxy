@@ -57,21 +57,6 @@ pub struct Ownership {
     /// mappings. Never deleted; the periodic check counts any as a loss.
     #[serde(default)]
     pub unproven_mappings: u32,
-    /// The rules are complete, but another tool's rule now sits ahead of
-    /// this takeover's FORWARD gate (decision 37): the target's own
-    /// processes are still guarded, its containers may not be.
-    #[serde(default)]
-    pub forward_displaced: bool,
-    /// The probe from the target was counted by this takeover's cgroup
-    /// rules. False after another distribution re-added them under its own
-    /// cgroup namespace by restoring a whole nft table (decision 37). Only
-    /// probed when the rules are complete; true otherwise.
-    #[serde(default = "bound_by_default")]
-    pub rules_bound: bool,
-}
-
-fn bound_by_default() -> bool {
-    true
 }
 
 impl Ownership {
@@ -119,17 +104,6 @@ pub fn sync_networks(p: &Plan) -> Result<Synced, String> {
 /// managed takeover, and only under the controller lock with the takeover
 /// rechecked, so it can never run after the stop that would remove it. A stop
 /// removes these rules with the rest. The target's containers are not covered.
-/// Re-inserts this takeover's cgroup-matched OUTPUT rules from the target,
-/// one transaction per table, text unchanged, then probes again; returns
-/// whether the rules match the target now (decision 37). Only extends a
-/// complete managed takeover of the same identity.
-pub fn anchor(p: &Plan) -> Result<bool, String> {
-    invoke(p, "anchor", None)?
-        .anchored
-        .map(|anchored| anchored.bound)
-        .ok_or_else(|| "kernel_missing_anchor_result".into())
-}
-
 ///
 /// `bridges` are the target's Docker bridges seen during the takeover; the
 /// guest adds those its per-network rules, an earlier block and the target's
@@ -192,15 +166,6 @@ struct Response {
     synced: Option<Synced>,
     #[serde(default)]
     blocked: Option<Blocked>,
-    #[serde(default)]
-    anchored: Option<Anchored>,
-}
-
-/// What a re-anchoring left: whether the probe now passes (decision 37).
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct Anchored {
-    bound: bool,
 }
 
 /// What a block left: how many drop-only rules are in place, and the
@@ -278,9 +243,6 @@ fn parse_response(output: &str, operation: &str) -> Result<Response, String> {
     }
     if response.blocked.is_some() != (operation == "block") {
         return Err("kernel_unexpected_or_missing_block_result".into());
-    }
-    if response.anchored.is_some() != (operation == "anchor") {
-        return Err("kernel_unexpected_or_missing_anchor_result".into());
     }
     if let Some(ownership) = &response.ownership
         && ((ownership.rules_complete && !ownership.rules_present)
@@ -538,8 +500,6 @@ mod tests {
                         mappings_present,
                         rules_complete: false,
                         unproven_mappings: 1,
-                        forward_displaced: false,
-                        rules_bound: true,
                     };
                     assert_eq!(ownership.clean(), !rules_present && !mappings_present);
                     assert!(serde_json::to_string(&ownership).is_ok());
@@ -588,31 +548,10 @@ mod tests {
             })
         );
         assert!(parse_response(r#"{"ok":true,"operation":"block"}"#, "block").is_err());
-        // The anchor result belongs to the anchor operation only, and an
-        // inspect without the probe field reads as bound (decision 37).
-        let anchored = parse_response(
-            r#"{"ok":true,"operation":"anchor","anchored":{"bound":false}}"#,
-            "anchor",
-        )
-        .unwrap();
-        assert_eq!(anchored.anchored, Some(Anchored { bound: false }));
-        assert!(parse_response(r#"{"ok":true,"operation":"anchor"}"#, "anchor").is_err());
-        assert!(parse_response(r#"{"ok":true,"operation":"block","blocked":{"rules":4},"anchored":{"bound":true}}"#, "block").is_err());
+        // Decision 41 dropped the probe and re-anchoring: those fields are
+        // no longer part of the protocol.
         let unbound = r#"{"ok":true,"operation":"inspect","ownership":{"identity_matches":true,"rules_present":true,"rules_complete":true,"mappings_present":false,"rules_bound":false}}"#;
-        assert!(
-            !parse_response(unbound, "inspect")
-                .unwrap()
-                .ownership
-                .unwrap()
-                .rules_bound
-        );
-        assert!(
-            parse_response(report, "inspect")
-                .unwrap()
-                .ownership
-                .unwrap()
-                .rules_bound
-        );
+        assert!(parse_response(unbound, "inspect").is_err());
         assert!(
             parse_response(
                 r#"{"ok":true,"operation":"remove","unproven_mappings":0,"blocked":{"rules":0}}"#,
