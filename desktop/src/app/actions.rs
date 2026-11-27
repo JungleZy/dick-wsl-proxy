@@ -1100,7 +1100,8 @@ impl Desktop {
         }
         self.environment_launch_result = None;
         self.refresh_environment_apps(cx);
-        super::launcher::open(cx.entity(), cx);
+        let snapshot = self.launcher_snapshot();
+        super::launcher::open(cx.entity(), snapshot, cx);
         cx.notify();
     }
 

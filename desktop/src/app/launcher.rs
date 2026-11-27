@@ -1,7 +1,10 @@
 //! 「已安装应用」独立窗口：列出环境里的图形应用，点一下以默认用户启动。
 //!
 //! 窗口不自己和后台通信：列表、读取中、失败原因和启动结果都在主界面 [`Desktop`] 里，
-//! 窗口观察主界面，主界面一刷新它就重画；「启动」「重新读取」也交给主界面发请求。
+//! 「启动」「重新读取」也交给主界面发请求。窗口画的是自己手里的一份 [`Snapshot`]，
+//! 从不在重画时读主界面：Windows 会在创建、激活窗口时同步要求它画一帧，那时主界面
+//! 往往正在处理点击（状态被占用），去读就会 panic、整个程序退出。快照由主界面打开
+//! 窗口时交进来，之后在主界面每次通知（那时它的状态已经放开）时重拍。
 //! 所以列表跟着环境页当前查看的环境走：在主窗口点另一个环境，这里换成那个环境的应用。
 //!
 //! 它是普通窗口（占任务栏、可以和主窗口并排、一直开着当启动器用）。主窗口藏进托盘时
@@ -14,7 +17,6 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
 };
 use gpui_kit::{prelude::*, *};
-use serde_json::Value;
 
 use super::components::{app_icon, design_icon};
 use super::state::Desktop;
@@ -37,8 +39,66 @@ pub(crate) fn is_open() -> bool {
     HANDLE.with(|slot| slot.borrow().is_some())
 }
 
+/// 窗口要画的全部内容，从主界面拍下来。
+#[derive(Clone, Default, PartialEq)]
+pub(crate) struct Snapshot {
+    /// 列表所属的环境；还没读到列表时是详情页正在看的环境。
+    pub(crate) environment: Option<String>,
+    /// `(桌面文件 ID, 显示名)`；`None` 是还没读到。
+    pub(crate) apps: Option<Vec<(String, String)>>,
+    pub(crate) loading: bool,
+    pub(crate) error: Option<String>,
+    /// 主界面有变更操作在执行（编辑、删除环境等）。
+    pub(crate) busy: bool,
+    pub(crate) graphics: bool,
+    pub(crate) launching: Option<String>,
+    pub(crate) result: Option<Result<String, String>>,
+    pub(crate) traffic: Option<&'static str>,
+    /// 主题会变：主界面切换主题后快照不同，窗口跟着重画。
+    pub(crate) dark: bool,
+}
+
+impl Desktop {
+    pub(crate) fn launcher_snapshot(&self) -> Snapshot {
+        let listed = self.environment_apps.as_ref();
+        let environment = listed
+            .and_then(|apps| apps["name"].as_str())
+            .or_else(|| {
+                self.environment_detail
+                    .as_ref()
+                    .and_then(|detail| detail["name"].as_str())
+            })
+            .map(str::to_owned);
+        let apps = listed.and_then(|apps| apps["apps"].as_array()).map(|apps| {
+            apps.iter()
+                .filter_map(|app| {
+                    let id = app["id"].as_str()?;
+                    let name = app["name"].as_str().unwrap_or(id);
+                    Some((id.to_owned(), name.to_owned()))
+                })
+                .collect()
+        });
+        let traffic = environment
+            .as_deref()
+            .and_then(|name| self.environment_traffic_hint(name));
+        Snapshot {
+            environment,
+            apps,
+            loading: self.environment_apps_loading,
+            error: self.environment_apps_error.clone(),
+            busy: self.busy.is_some(),
+            graphics: self.environment_apps_graphics(),
+            launching: self.environment_launching.clone(),
+            result: self.environment_launch_result.clone(),
+            traffic,
+            dark: super::theme::is_dark(),
+        }
+    }
+}
+
 /// 打开应用窗口；已经开着就叫到前面。开不出来不影响主窗口。
-pub(crate) fn open(desktop: Entity<Desktop>, cx: &mut App) {
+/// `snapshot` 由调用方（主界面）给：这时主界面的状态被占用，窗口不能自己去读。
+pub(crate) fn open(desktop: Entity<Desktop>, snapshot: Snapshot, cx: &mut App) {
     if let Some(handle) = HANDLE.with(|slot| *slot.borrow()) {
         if handle
             .update(cx, |_, window, _| window.activate_window())
@@ -58,7 +118,7 @@ pub(crate) fn open(desktop: Entity<Desktop>, cx: &mut App) {
             HANDLE.with(|slot| *slot.borrow_mut() = None);
             true
         });
-        cx.new(|cx| Launcher::new(desktop, cx))
+        cx.new(|cx| Launcher::new(desktop, snapshot, cx))
     });
     if let Ok((handle, _)) = opened {
         HANDLE.with(|slot| *slot.borrow_mut() = Some(handle));
@@ -74,14 +134,23 @@ pub(crate) fn close(cx: &mut App) {
 
 struct Launcher {
     desktop: WeakEntity<Desktop>,
+    snapshot: Snapshot,
     _observe: Subscription,
 }
 
 impl Launcher {
-    fn new(desktop: Entity<Desktop>, cx: &mut Context<Self>) -> Self {
-        let observe = cx.observe(&desktop, |_, _, cx| cx.notify());
+    fn new(desktop: Entity<Desktop>, snapshot: Snapshot, cx: &mut Context<Self>) -> Self {
+        // 观察回调在主界面更新结束、通知派发时才跑，这时读主界面是安全的。
+        let observe = cx.observe(&desktop, |launcher: &mut Self, desktop, cx| {
+            let snapshot = desktop.read(cx).launcher_snapshot();
+            if snapshot != launcher.snapshot {
+                launcher.snapshot = snapshot;
+                cx.notify();
+            }
+        });
         Self {
             desktop: desktop.downgrade(),
+            snapshot,
             _observe: observe,
         }
     }
@@ -147,13 +216,13 @@ fn note(message: impl Into<SharedString>, color: u32) -> Div {
 /// 一行一个应用：名称、桌面文件 ID，右边写「启动」或「启动中…」。整行可点。
 fn app_row(
     index: usize,
-    app: &Value,
+    (id, name): &(String, String),
     launching: Option<&str>,
     disabled: bool,
     desktop: WeakEntity<Desktop>,
 ) -> Stateful<Div> {
-    let id = app["id"].as_str().unwrap_or_default().to_owned();
-    let name = app["name"].as_str().unwrap_or(id.as_str()).to_owned();
+    let id = id.clone();
+    let name = name.clone();
     let starting = launching == Some(id.as_str());
     let action = if starting { "启动中…" } else { "启动" };
     let row = div()
@@ -204,41 +273,11 @@ fn app_row(
 }
 
 impl Render for Launcher {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let shell = div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .font_family(UI_FONT)
-            .text_sm()
-            .text_color(rgb(INK))
-            .bg(rgb(PAPER));
-        let Some(entity) = self.desktop.upgrade() else {
-            return shell
-                .child(title_bar(None))
-                .child(div().p_3().child(note("主窗口已关闭。", MUTED)));
-        };
-        let desktop = entity.read(cx);
-        let environment = desktop
-            .environment_apps
-            .as_ref()
-            .and_then(|apps| apps["name"].as_str())
-            .map(str::to_owned)
-            .or_else(|| {
-                desktop
-                    .environment_detail
-                    .as_ref()
-                    .and_then(|detail| detail["name"].as_str())
-                    .map(str::to_owned)
-            });
-        let apps = desktop
-            .environment_apps
-            .as_ref()
-            .and_then(|apps| apps["apps"].as_array());
-        let busy = desktop.busy.is_some();
-        let graphics = desktop.environment_apps_graphics();
-        let launching = desktop.environment_launching.as_deref();
-        let disabled = !graphics || busy || launching.is_some();
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let snapshot = &self.snapshot;
+        let environment = snapshot.environment.as_deref();
+        let launching = snapshot.launching.as_deref();
+        let disabled = !snapshot.graphics || snapshot.busy || launching.is_some();
         let weak = self.desktop.clone();
 
         let header = div()
@@ -256,9 +295,14 @@ impl Render for Launcher {
                         div()
                             .text_sm()
                             .truncate()
-                            .child(environment.clone().unwrap_or_else(|| "未选择环境".into())),
+                            .child(environment.unwrap_or("未选择环境").to_owned()),
                     )
-                    .children(apps.map(|apps| note(format!("{} 个应用", apps.len()), MUTED))),
+                    .children(
+                        snapshot
+                            .apps
+                            .as_ref()
+                            .map(|apps| note(format!("{} 个应用", apps.len()), MUTED)),
+                    ),
             )
             .child({
                 let weak = weak.clone();
@@ -268,15 +312,15 @@ impl Render for Launcher {
                     .tooltip("重新读取应用列表")
                     .ghost()
                     .compact()
-                    .disabled(desktop.environment_apps_loading || busy)
+                    .disabled(snapshot.loading || snapshot.busy || environment.is_none())
                     .on_click(move |_, _, cx| {
                         let _ = weak.update(cx, |desktop, cx| desktop.refresh_environment_apps(cx));
                     })
             });
 
-        let body = if let Some(error) = desktop.environment_apps_error.as_ref() {
+        let body = if let Some(error) = snapshot.error.as_ref() {
             note(format!("读取应用列表失败：{error}"), AMBER)
-        } else if let Some(apps) = apps {
+        } else if let Some(apps) = snapshot.apps.as_ref() {
             if apps.is_empty() {
                 note(
                     "没有找到图形应用。这里只列 .desktop 入口里登记、不在终端里运行的程序。",
@@ -289,7 +333,7 @@ impl Render for Launcher {
                 }
                 list
             }
-        } else if desktop.environment_apps_loading {
+        } else if snapshot.loading {
             note("正在读取环境里的应用…", MUTED)
         } else if environment.is_none() {
             note(
@@ -300,41 +344,47 @@ impl Render for Launcher {
             note("还没有读取应用列表，点右上角重新读取。", MUTED)
         };
 
-        let result = desktop
-            .environment_launch_result
-            .as_ref()
-            .map(|result| match result {
-                Ok(message) => note(message.clone(), TEAL),
-                Err(message) => note(message.clone(), RUST),
-            });
-        let traffic = environment
-            .as_deref()
-            .and_then(|name| desktop.environment_traffic_hint(name));
+        let result = snapshot.result.as_ref().map(|result| match result {
+            Ok(message) => note(message.clone(), TEAL),
+            Err(message) => note(message.clone(), RUST),
+        });
 
-        shell.child(title_bar(environment.as_deref())).child(
-            div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_h_0()
-                .gap_2()
-                .p_3()
-                .child(header)
-                .children((!graphics).then(|| note("WSLg 不可用，无法启动图形应用。", AMBER)))
-                .children(traffic.map(|message| note(message, AMBER)))
-                .children(result)
-                .child(
-                    div()
-                        .id("launcher-scroll")
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .child(body),
-                )
-                .child(note(
-                    "以环境的默认用户启动；环境没运行时会先启动它。",
-                    MUTED,
-                )),
-        )
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .font_family(UI_FONT)
+            .text_sm()
+            .text_color(rgb(INK))
+            .bg(rgb(PAPER))
+            .child(title_bar(environment))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .gap_2()
+                    .p_3()
+                    .child(header)
+                    .children(
+                        (!snapshot.graphics)
+                            .then(|| note("WSLg 不可用，无法启动图形应用。", AMBER)),
+                    )
+                    .children(snapshot.traffic.map(|message| note(message, AMBER)))
+                    .children(result)
+                    .child(
+                        div()
+                            .id("launcher-scroll")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .child(body),
+                    )
+                    .child(note(
+                        "以环境的默认用户启动；环境没运行时会先启动它。",
+                        MUTED,
+                    )),
+            )
     }
 }
