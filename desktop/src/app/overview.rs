@@ -11,7 +11,6 @@ use serde_json::Value;
 
 use super::backend::{self, Kind};
 use super::components::{StatusTone, Tip, bytes, design_icon, status_dot, text};
-use super::drafts::SaveScope;
 use super::model::{Page, TrafficSample, UiAction};
 use super::state::Desktop;
 use super::theme::{
@@ -190,18 +189,23 @@ impl Desktop {
         })
     }
 
-    /// 空闲时告诉用户离启动还差什么，顺序和启动前的检查一致。
+    /// 空闲时告诉用户怎么开始：接管在各环境的页面上启动（决策 40）。
     fn idle_hint(&self) -> String {
-        match &self.selected {
-            None => "还没有设定目标 WSL：到「环境」页把要保护的发行版设为目标。".to_owned(),
-            Some(_) if self.unsaved_message().is_some() => match self.unsaved.pages() {
-                Some(pages) => format!("{pages}有未保存的修改，在该页保存后才能启动接管。"),
-                None => "配置还没有保存过，到「环境」页设定接管目标后才能启动接管。".to_owned(),
-            },
-            Some(target) => format!(
-                "将接管 {}；启动前会自动预检，通过后再请你确认。",
-                self.environment_display_name(target)
-            ),
+        if let Some(pages) = self.unsaved.pages() {
+            return format!("{pages}有未保存的修改，保存后才会生效。");
+        }
+        let configured = self
+            .environments
+            .iter()
+            .filter(|row| super::drafts::residential_configured(Some(row)))
+            .count();
+        if configured == 0 {
+            "还没有环境配好住宅代理：到「环境」页选一个发行版，填写它的住宅代理后启动接管。"
+                .to_owned()
+        } else {
+            format!(
+                "{configured} 个环境已配好住宅代理；到「环境」页选一个启动接管，一次只能接管一个。"
+            )
         }
     }
 
@@ -241,40 +245,12 @@ impl Desktop {
                 .icon(design_icon("close", 15., SURFACE))
                 .primary();
         }
-        if self.selected.is_none() {
-            return Button::new("overview-choose-target")
-                .label("去选择目标")
-                .icon(design_icon("environment", 15., SURFACE))
-                .primary()
-                .on_click(cx.listener(|this, _, _, cx| this.open_page(Page::Environment, cx)));
-        }
-        // 首页不保存任何内容：带用户去有未保存修改的那一页，在那里看清改了什么再保存。
-        if self.unsaved_message().is_some() {
-            let page = self.unsaved_page();
-            return Button::new("overview-go-save")
-                .label("去保存修改")
-                .icon(design_icon("save", 15., SURFACE))
-                .primary()
-                .on_click(cx.listener(move |this, _, _, cx| this.open_page(page, cx)));
-        }
-        self.button(
-            "overview-session-action",
-            "启动接管",
-            UiAction::Prepare(Kind::Start),
-            locked,
-            cx,
-        )
-        .icon(design_icon("play", 15., SURFACE))
-        .primary()
-    }
-
-    /// 有未保存修改的那一页；规则页、设置页都没有时是环境页（配置还没保存过）。
-    pub(crate) fn unsaved_page(&self) -> Page {
-        match self.unsaved.first() {
-            Some(SaveScope::Settings) => Page::Settings,
-            Some(SaveScope::Policy) => Page::Policy,
-            Some(SaveScope::Environment) | None => Page::Environment,
-        }
+        // 首页不启动接管：启动在各环境的页面上，带用户过去。
+        Button::new("overview-environments")
+            .label("去环境页")
+            .icon(design_icon("environment", 15., SURFACE))
+            .primary()
+            .on_click(cx.listener(|this, _, _, cx| this.open_page(Page::Environment, cx)))
     }
 
     /// 托盘要显示的状态和菜单里的主操作。主操作和 [`Self::protection_action`] 的选择一致，
@@ -286,14 +262,12 @@ impl Desktop {
             Primary::Reconnect
         } else if self.target_gone() {
             Primary::Abandon
+        } else if self.phase() == "recovery_required" {
+            Primary::Recover
         } else if self.phase() != "idle" {
             Primary::Stop
-        } else if self.selected.is_none() {
-            Primary::ChooseTarget
-        } else if self.unsaved_message().is_some() {
-            Primary::GoSave
         } else {
-            Primary::Start
+            Primary::Environments
         };
         // 只在后台确认有接管记录时写目标名；状态没确认时那份状态已经过时。
         let target = matches!(look, Look::Managed | Look::Scoped | Look::Recovery)
@@ -390,24 +364,15 @@ impl Desktop {
         };
 
         let running = valid.then(|| self.status_target()).flatten();
-        let planned = self
-            .selected
-            .as_deref()
-            .map(|id| self.environment_display_name(id));
-        let (target_value, target_detail, target_tone) = match (running, &planned) {
-            (Some(name), _) if healthy => (name.to_owned(), "接管中", StatusTone::Ok),
-            (Some(name), _) => (name.to_owned(), "需要恢复", StatusTone::Error),
-            (None, Some(name)) => (name.clone(), "已设为目标", StatusTone::Off),
-            (None, None) => (
-                "未设定".to_owned(),
-                "到「环境」页设为目标",
-                StatusTone::Warn,
-            ),
+        let (target_value, target_detail, target_tone) = match running {
+            Some(name) if healthy => (name.to_owned(), "接管中", StatusTone::Ok),
+            Some(name) => (name.to_owned(), "需要恢复", StatusTone::Error),
+            None => ("未接管".to_owned(), "在「环境」页启动", StatusTone::Off),
         };
         let target_tip = Tip::new("目标 WSL")
             .row("接管中", running.unwrap_or("—"))
-            .row("已选择", planned.clone().unwrap_or_else(|| "未设定".into()))
-            .note("接管只作用于这一个发行版");
+            .note("接管在各环境的页面上启动和停止")
+            .note("一次只能接管一个环境");
 
         let ingress = valid.then(|| self.status["ingress"].as_str()).flatten();
         let (ingress_value, ingress_detail, ingress_tone) = if forwarding {
@@ -419,22 +384,15 @@ impl Desktop {
                 StatusTone::Warn,
             )
         } else if valid {
-            (
-                format!("端口 {}", self.saved_port),
-                "未监听",
-                StatusTone::Off,
-            )
+            ("—".to_owned(), "未监听", StatusTone::Off)
         } else {
             // 状态未确认时可能仍在转发，不能说「未监听」。
-            (
-                format!("端口 {}", self.saved_port),
-                "状态未知",
-                StatusTone::Off,
-            )
+            ("—".to_owned(), "状态未知", StatusTone::Off)
         };
         let ingress_tip = Tip::new("Windows 入口")
             .row("地址", ingress_value.clone())
             .note("目标发行版的流量从这里进入代理")
+            .note("每个环境有自己的端口，在「环境」页查看和修改")
             .note_if(!forwarding, "启动接管后才会监听");
 
         let (first_hop, hop_pending) = config("first_hop");
@@ -458,9 +416,15 @@ impl Desktop {
             .note("双跳代理的第一跳，在「设置」页修改")
             .note_if(running_policy, "接管中改的设置要下次启动接管才生效");
 
+        // 首页只显示正在接管（或需要恢复）的那个环境的住宅代理；各环境的在「环境」页看。
         // 后台解析住宅地址前会去掉首尾空格，库里存的是原样输入。
-        let residential_ip = text(&self.residential, "ip", "").trim().to_owned();
-        let residential_port = Self::profile_field_value(&self.residential, "port", false);
+        let active_residential = self
+            .active_distro_id()
+            .and_then(|id| super::drafts::environment_row(&self.environments, &id))
+            .map(|row| row["residential"].clone())
+            .unwrap_or(Value::Null);
+        let residential_ip = text(&active_residential, "ip", "").trim().to_owned();
+        let residential_port = Self::profile_field_value(&active_residential, "port", false);
         let saved_residential = if residential_ip.is_empty() || residential_port.is_empty() {
             residential_ip
         } else {
@@ -476,7 +440,13 @@ impl Desktop {
         let exit_verdict =
             (valid && exit.is_object()).then(|| exit["matches_residential"].as_bool());
         let udp = self.udp_state_label();
-        let (exit_value, exit_detail, exit_tone) = if residential.is_empty() {
+        let (exit_value, exit_detail, exit_tone) = if residential.is_empty() && self.idle() {
+            (
+                "按环境配置".to_owned(),
+                "第二跳".to_owned(),
+                StatusTone::Off,
+            )
+        } else if residential.is_empty() {
             ("未配置".to_owned(), "第二跳".to_owned(), StatusTone::Warn)
         } else {
             let value = residential;
@@ -525,6 +495,7 @@ impl Desktop {
             .row("公网出口", exit_summary)
             .row("UDP", udp)
             .note("双跳代理的第二跳，流量最终从这里出网")
+            .note("每个环境有自己的住宅代理，在「环境」页修改")
             .note("接管中可以在「连接」页复核公网出口")
             .note_if(
                 running_residential.is_some(),

@@ -1,15 +1,14 @@
-//! 处理用户发起的校验、策略保存、接管、切换、停止和凭据操作。
+//! 处理用户发起的校验、策略保存、接管、停止和凭据操作。
 
 use gpui_kit::component::{WindowExt, button::ButtonVariant, dialog::DialogButtonProps};
 use gpui_kit::{prelude::*, *};
 use serde_json::{Value, json};
 
 use super::backend::Kind;
-use super::components::text;
 use super::drafts::{
-    PageDraft, ProfileField, SaveScope, Saved, Unsaved, names_target, profile_changed,
-    residential_value, save_request, saved_fake_ip, saved_residential_protocol,
-    saved_residential_text, target_missing,
+    PageDraft, ProfileField, SaveScope, Saved, Unsaved, environment_row, environment_save_request,
+    ingress_port_value, names_target, profile_changed, residential_configured, residential_value,
+    save_request, saved_fake_ip, saved_residential_protocol, saved_residential_text,
 };
 use super::model::{Confirmation, EnvironmentEditor, Field, PendingPrepare};
 use super::state::Desktop;
@@ -184,15 +183,57 @@ impl Desktop {
         cx.notify();
     }
 
-    /// 选择设置页住宅代理的协议。
+    /// 选择环境页住宅代理的协议。
     pub(crate) fn set_residential_protocol_draft(
         &mut self,
         protocol: &'static str,
         cx: &mut Context<Self>,
     ) {
         self.residential_protocol_draft = protocol;
-        self.input_edited(Some(SaveScope::Settings), cx);
+        self.input_edited(Some(SaveScope::Environment), cx);
         cx.notify();
+    }
+
+    /// 配置库里环境页正在看的那个环境的一行；没保存过时为 `None`。
+    pub(crate) fn selected_row(&self) -> Option<&Value> {
+        self.selected
+            .as_deref()
+            .and_then(|id| environment_row(&self.environments, id))
+    }
+
+    /// 正在看的环境已保存的住宅代理；没保存过时为 `null`。
+    pub(crate) fn selected_residential(&self) -> Value {
+        self.selected_row()
+            .map(|row| row["residential"].clone())
+            .unwrap_or(Value::Null)
+    }
+
+    /// 正在看的环境已保存的 Windows 入口端口；没保存过时为空，保存时由后台分配。
+    pub(crate) fn selected_port_text(&self) -> String {
+        self.selected_row()
+            .and_then(|row| row["ingress_port"].as_u64())
+            .map(|port| port.to_string())
+            .unwrap_or_default()
+    }
+
+    /// 发行版名称对应的 ID；列表里没有时为 `None`。
+    pub(crate) fn distro_id(&self, name: &str) -> Option<String> {
+        self.distributions
+            .iter()
+            .find(|distro| names_target(distro, name))
+            .and_then(|distro| distro["id"].as_str())
+            .map(str::to_owned)
+    }
+
+    /// 后台记着的接管目标（接管中或需要恢复）的 ID；空闲或状态未确认时为 `None`。
+    pub(crate) fn active_distro_id(&self) -> Option<String> {
+        if !self.status_valid || self.phase() == "idle" {
+            return None;
+        }
+        let name = self.status["active_target"]
+            .as_str()
+            .or_else(|| self.status["recorded_target"].as_str())?;
+        self.distro_id(name)
     }
 
     pub(crate) fn residential_inputs(&self) -> [(&Field, &'static str); 4] {
@@ -204,17 +245,20 @@ impl Desktop {
         ]
     }
 
-    /// 规则页、设置页各自有没有改过还没保存的输入。
+    /// 环境页、规则页、设置页各自有没有改过还没保存的输入。环境页比的是正在看的那个环境。
     pub(crate) fn draft_unsaved(&self, cx: &App) -> Unsaved {
         let draft = |field| Self::field_value(self.profile_input(field), cx);
-        let settings = Self::field_value(&self.fields.port, cx) != self.saved_port
-            || self.fake_ip_draft != saved_fake_ip(&self.profile)
-            || self.residential_protocol_draft != saved_residential_protocol(&self.residential)
-            || profile_changed(&self.profile, SaveScope::Settings, draft)
-            || self.residential_inputs().into_iter().any(|(field, key)| {
-                Self::field_value(field, cx) != saved_residential_text(&self.residential, key)
-            });
+        let settings = self.fake_ip_draft != saved_fake_ip(&self.profile)
+            || profile_changed(&self.profile, SaveScope::Settings, draft);
+        let residential = self.selected_residential();
+        let environment = self.selected.is_some()
+            && (Self::field_value(&self.fields.port, cx) != self.selected_port_text()
+                || self.residential_protocol_draft != saved_residential_protocol(&residential)
+                || self.residential_inputs().into_iter().any(|(field, key)| {
+                    Self::field_value(field, cx) != saved_residential_text(&residential, key)
+                }));
         Unsaved {
+            environment,
             policy: profile_changed(&self.profile, SaveScope::Policy, draft),
             settings,
         }
@@ -238,22 +282,62 @@ impl Desktop {
                 "{pages}有未保存的修改，请先在该页保存。未保存的内容不会生效。"
             ))
         } else if !self.profile_exists || self.profile_path.is_none() {
-            Some("配置还没有保存过，请先到环境页设定接管目标。".into())
+            Some("代理链设置还没有保存过，请先到设置页确认第一跳等设置并保存。".into())
         } else {
             None
         }
     }
 
-    pub(crate) fn port(&self, cx: &App) -> Result<u16, &'static str> {
-        Self::field_value(&self.fields.port, cx)
-            .parse::<u16>()
-            .ok()
-            .filter(|port| *port >= 1024)
-            .ok_or("端口需为 1024–65535 的整数。")
+    /// 要启动的环境和它已保存的入口端口：环境页正在看的那个，住宅代理要已经保存好。
+    pub(crate) fn selection(&self) -> Result<(String, u16), String> {
+        let target = self.selected.clone().ok_or("请先在环境页选一个环境。")?;
+        let row = self.selected_row();
+        if !residential_configured(row) {
+            return Err("这个环境还没有保存住宅代理：先在环境页填写并保存。".into());
+        }
+        let port = row
+            .and_then(|row| row["ingress_port"].as_u64())
+            .and_then(|port| u16::try_from(port).ok())
+            .ok_or("这个环境保存的 Windows 入口端口无效，请改正后保存。")?;
+        Ok((target, port))
     }
-    pub(crate) fn selection(&self, cx: &App) -> Result<(String, u16), String> {
-        let target = self.selected.clone().ok_or("请选择目标 WSL。")?;
-        Ok((target, self.port(cx)?))
+
+    /// 环境页「启动接管」按钮为什么不能点；能点时为 `None`。
+    pub(crate) fn start_blocker(&self) -> Option<String> {
+        if !self.status_valid {
+            return Some("后台状态未确认".into());
+        }
+        if let Some(active) = self.active_distro_id() {
+            let name = self.environment_display_name(&active);
+            return Some(format!(
+                "{name} 正在接管或需要恢复；一次只能接管一个环境，请先停止它"
+            ));
+        }
+        if self.phase() != "idle" {
+            return Some("当前有接管任务，请先停止".into());
+        }
+        if let Some(message) = self.unsaved_message() {
+            return Some(message);
+        }
+        self.selection().err()
+    }
+
+    /// 托盘「去恢复接管」：打开需要恢复的那个环境的页面。
+    pub(crate) fn open_recovery_environment(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = self
+            .active_distro_id()
+            .map(|id| self.environment_display_name(&id));
+        match name {
+            Some(name) => {
+                self.open_page(super::model::Page::Environment, cx);
+                self.environment_view(name, window, cx);
+            }
+            None => self.open_page(super::model::Page::Overview, cx),
+        }
     }
 
     pub(crate) fn environment_display_name(&self, target: &str) -> String {
@@ -368,34 +452,25 @@ impl Desktop {
             kind,
             generation,
             target,
-            port,
+            port: _,
         } = pending;
-        let command = if kind == Kind::Start {
-            "start"
-        } else {
-            "switch"
-        };
+        // 不带端口：后台用这个环境保存的入口端口。两个版本号让后台确认启动的正是
+        // 界面上显示为已保存的共用配置和这个环境的住宅代理。
+        let residential_revision = environment_row(&self.environments, &target)
+            .map(|row| row["revision"].clone())
+            .unwrap_or(Value::Null);
         let request = json!({
-            "command":command,
+            "command":"start",
             "target":target,
-            "port":port,
             "profile":self.profile_path,
             "profile_revision":self.revision,
+            "residential_revision":residential_revision,
             "expected_generation":generation
         });
         let target_name = self.environment_display_name(&target);
-        let message = if kind == Kind::Switch {
-            let active_target = text(&self.status, "active_target", "当前目标");
-            let active_target_name = self.environment_display_name(&active_target);
-            format!(
-                "将从 {} 切换到 {target_name}。切换前会把 {target_name} 的时区改成住宅出口所在时区并重启它，其中正在运行的程序都会被结束；旧目标会先恢复直连；现有 TCP 连接需要重连。",
-                active_target_name
-            )
-        } else {
-            format!(
-                "将接管 {target_name} 的 TCP、UDP 和系统 DNS；只有直连例外的 TCP 连接直连，其余经代理链。接管前会把 {target_name} 的时区改成住宅出口所在时区并重启它，其中正在运行的程序都会被结束。"
-            )
-        };
+        let message = format!(
+            "将用 {target_name} 自己的住宅代理接管它的 TCP、UDP 和系统 DNS；只有直连例外的 TCP 连接直连，其余经代理链。接管前会把 {target_name} 的时区改成住宅出口所在时区并重启它，其中正在运行的程序都会被结束。"
+        );
         self.confirmation = Some(Confirmation {
             kind,
             generation,
@@ -447,7 +522,7 @@ impl Desktop {
         }
         self.pending_prepare = None;
         self.kernel_prepare_offered = false;
-        let (target, port) = match self.selection(cx) {
+        let (target, port) = match self.selection() {
             Ok(value) => value,
             Err(error) => {
                 self.fail(error, cx);
@@ -651,31 +726,38 @@ impl Desktop {
             return;
         }
         // 检测只读配置库，输入框里没保存的值不会被用上。
-        if self.unsaved.contains(SaveScope::Settings) {
+        if self.unsaved.contains(SaveScope::Environment)
+            || self.unsaved.contains(SaveScope::Settings)
+        {
             self.fail(
-                "设置有未保存的修改；检测只用已保存的配置，请先保存设置。",
+                "住宅代理或设置有未保存的修改；检测只用已保存的配置，请先保存。",
                 cx,
             );
             return;
         }
-        let saved = self.residential["ip"]
-            .as_str()
-            .is_some_and(|value| !value.is_empty());
-        if !self.profile_exists || !saved {
-            self.fail("还没有保存住宅代理，请先填写服务器和账号并保存设置。", cx);
+        let Some(distro_id) = self.selected.clone() else {
+            return;
+        };
+        if !self.profile_exists || !residential_configured(self.selected_row()) {
+            self.fail(
+                "这个环境还没有保存住宅代理，或者代理链设置还没保存过；请先保存。",
+                cx,
+            );
             return;
         }
-        let credentials = if saved_residential_protocol(&self.residential) == "http" {
+        let residential = self.selected_residential();
+        let credentials = if saved_residential_protocol(&residential) == "http" {
             "HTTP 代理的用户名和密码只做 Base64 编码，等于明文"
         } else {
             "SOCKS5 的用户名和密码是明文"
         };
         let message = format!(
-            "将用已保存的住宅代理配置检测两条路：一条从 Windows 直接连住宅服务器，一条经宿主 SOCKS5 连过去。两条都会登录，并让住宅代理连一次 DNS 上游，各自最多 8 秒。直连那一条不经前置代理：{credentials}，会经本地网络直接发出，住宅服务商也会看到你的真实 IP。检测不改变接管状态和规则。"
+            "将用这个环境已保存的住宅代理检测两条路：一条从 Windows 直接连住宅服务器，一条经宿主 SOCKS5 连过去。两条都会登录，并让住宅代理连一次 DNS 上游，各自最多 8 秒。直连那一条不经前置代理：{credentials}，会经本地网络直接发出，住宅服务商也会看到你的真实 IP。检测不改变接管状态和规则。"
         );
         let view = cx.entity().clone();
         window.open_alert_dialog(cx, move |dialog, _, _| {
             let ok_view = view.clone();
+            let distro_id = distro_id.clone();
             let cancel_view = view.clone();
             dialog
                 .confirm()
@@ -692,10 +774,11 @@ impl Desktop {
                 )
                 .description(div().text_sm().child(message.clone()))
                 .on_ok(move |_, _, cx| {
-                    ok_view.update(cx, |this, cx| {
+                    let distro_id = distro_id.clone();
+                    ok_view.update(cx, move |this, cx| {
                         this.send(
                             Kind::ResidentialProbe,
-                            json!({"command":"residential_probe","confirm":true}),
+                            json!({"command":"residential_probe","confirm":true,"distro_id":distro_id}),
                             cx,
                         );
                     });
@@ -912,110 +995,87 @@ impl Desktop {
         );
     }
 
-    /// 保存规则页或设置页：只发这一页的输入，其他页的字段用已保存的值。
+    /// 保存一页：规则页、设置页只发这一页的输入，其他页的字段用已保存的值；
+    /// 环境页只保存正在看的那个环境的住宅代理和入口端口。
     pub(crate) fn save(&mut self, scope: SaveScope, cx: &mut Context<Self>) {
-        let page = match scope {
-            SaveScope::Environment => return,
-            SaveScope::Policy => PageDraft::Policy,
-            SaveScope::Settings => {
-                let checked = self.limits_valid(cx).and_then(|()| {
-                    Ok(PageDraft::Settings {
-                        port: self.port(cx)?,
-                        residential: self.residential_draft(cx)?,
-                        fake_ip: self.fake_ip_draft,
-                    })
-                });
-                // 校验结果和保存结果一样，用保存结果通知弹出。
-                match checked {
-                    Ok(page) => page,
-                    Err(error) => {
-                        self.save_notice = Some(Err(super::backend::humanize_error(error)));
-                        cx.notify();
-                        return;
-                    }
+        let request = match scope {
+            SaveScope::Environment => match self.environment_request(cx) {
+                Ok(request) => request,
+                Err(error) => {
+                    self.save_notice = Some(Err(super::backend::humanize_error(&error)));
+                    cx.notify();
+                    return;
                 }
-            }
+            },
+            SaveScope::Policy => self.page_request(PageDraft::Policy, cx),
+            SaveScope::Settings => match self.limits_valid(cx) {
+                Ok(()) => self.page_request(
+                    PageDraft::Settings {
+                        fake_ip: self.fake_ip_draft,
+                    },
+                    cx,
+                ),
+                // 校验结果和保存结果一样，用保存结果通知弹出。
+                Err(error) => {
+                    self.save_notice = Some(Err(super::backend::humanize_error(error)));
+                    cx.notify();
+                    return;
+                }
+            },
         };
-        self.send_save(page, cx);
+        self.send_save(scope, request, cx);
     }
 
-    /// 点「设为目标」：先确认，确认后立即只保存目标。
-    pub(crate) fn prompt_set_target(
-        &mut self,
-        target: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.locked() || self.profile_path.is_none() {
-            return;
-        }
-        let name = self.environment_display_name(&target);
-        let message = match self.phase() {
-            "idle" => {
-                format!("将 {name} 设为接管目标并立即保存。之后点「启动接管」时接管这个发行版。")
-            }
-            "unknown" => format!(
-                "将 {name} 设为接管目标并立即保存。后台状态还没确认；保存只改目标，不会启动、停止或切换接管。"
-            ),
-            _ => format!(
-                "将 {name} 设为接管目标并立即保存。正在进行的接管不受影响，停止后再次启动时才接管 {name}。"
-            ),
-        };
-        let view = cx.entity().clone();
-        window.open_alert_dialog(cx, move |dialog, _, _| {
-            let ok_view = view.clone();
-            let target = target.clone();
-            dialog
-                .confirm()
-                .title(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::NORMAL)
-                        .child("设为接管目标"),
-                )
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text("确认并保存")
-                        .cancel_text("取消"),
-                )
-                .description(div().text_sm().child(message.clone()))
-                .on_ok(move |_, _, cx| {
-                    let target = target.clone();
-                    ok_view.update(cx, |this, cx| this.save_target(target, cx));
-                    true
-                })
-                .on_cancel(|_, _, _| true)
-        });
-    }
-
-    /// 只保存接管目标；策略、入口端口和住宅代理都用已保存的值。
-    fn save_target(&mut self, target: String, cx: &mut Context<Self>) {
-        // 有别的操作在进行时 `send` 不会发出请求，要告诉用户目标没保存。
-        if !self.send_save(PageDraft::Environment(Some(target)), cx) {
-            self.fail("有操作正在进行，接管目标没有保存；请稍后再设一次。", cx);
-        }
-    }
-
-    /// 发出一页的保存。已保存的入口端口无效时提示并返回 `false`；有别的操作在进行、
-    /// 请求没有发出时也返回 `false`。
-    fn send_save(&mut self, page: PageDraft, cx: &mut Context<Self>) -> bool {
-        let port = match self.saved_port_number() {
-            Ok(port) => port,
-            Err(error) => {
-                self.fail(error, cx);
-                return false;
-            }
-        };
-        let scope = page.scope();
+    fn page_request(&self, page: PageDraft, cx: &App) -> Value {
         let saved = Saved {
             profile: &self.profile,
             revision: &self.revision,
-            target: self.saved_selected.as_deref(),
-            port,
         };
-        let request = save_request(&saved, page, |field| {
+        save_request(&saved, page, |field| {
             Self::field_value(self.profile_input(field), cx)
-        });
+        })
+    }
+
+    /// 环境页的保存请求；输入框的值不合格时返回原因。
+    fn environment_request(&self, cx: &App) -> Result<Value, String> {
+        let distro_id = self.selected.clone().ok_or("请先选一个环境。")?;
+        let residential = self.residential_draft(cx)?;
+        let port = ingress_port_value(&Self::field_value(&self.fields.port, cx))?;
+        let revision = self
+            .selected_row()
+            .map(|row| row["revision"].clone())
+            .unwrap_or(Value::Null);
+        Ok(environment_save_request(
+            &distro_id,
+            residential,
+            port,
+            &revision,
+        ))
+    }
+
+    /// 把旧版本留下的那一份住宅代理分给正在看的环境，或者丢掉它。
+    pub(crate) fn settle_unassigned_residential(&mut self, assign: bool, cx: &mut Context<Self>) {
+        if self.locked() {
+            return;
+        }
+        if self.unsaved.contains(SaveScope::Environment) {
+            self.fail("这个环境的住宅代理有未保存的修改，请先保存。", cx);
+            return;
+        }
+        let request = match (assign, self.selected.clone()) {
+            (true, Some(distro_id)) => {
+                json!({"command":"environment_residential_assign","distro_id":distro_id})
+            }
+            (true, None) => return,
+            (false, _) => json!({"command":"environment_residential_discard"}),
+        };
+        if !self.send_save(SaveScope::Environment, request, cx) {
+            self.fail("有操作正在进行，请稍后再试。", cx);
+        }
+    }
+
+    /// 发出一页的保存。有别的操作在进行、请求没有发出时返回 `false`。
+    fn send_save(&mut self, scope: SaveScope, request: Value, cx: &mut Context<Self>) -> bool {
         // 发出的修改类请求都会让 `epoch` 加一；没加说明请求被丢弃了，
         // 这时可能还有一次保存在途，不能覆盖它记下的页面。
         let epoch = self.epoch;
@@ -1028,34 +1088,6 @@ impl Desktop {
         sent
     }
 
-    /// 已保存的目标发行版已不在 WSL 里（被删除、被注销或不再是 WSL 2）时，自动清掉库里的
-    /// 接管目标，免得重启后首页还显示它、启动接管时才在预检失败。只在拿到发行版列表后调用。
-    pub(crate) fn clear_missing_target(&mut self, cx: &mut Context<Self>) {
-        if self.profile_path.is_none()
-            || !target_missing(self.saved_selected.as_deref(), &self.distributions)
-        {
-            return;
-        }
-        // 自动保存不覆盖页面上原来的提示（例如「环境已删除。」），结果补在它后面。
-        let (notice, error) = (self.notice.clone(), self.error);
-        self.send_save(PageDraft::Environment(None), cx);
-        // 没发出去（有别的操作）就等下次拿到列表再清；后台通信失败时保留那条错误提示。
-        if self.busy == Some(Kind::Save) {
-            self.clearing_target = true;
-            self.notice = notice;
-            self.error = error;
-        }
-    }
-
-    /// 已保存的 Windows 入口端口；环境页、规则页保存时原样带上。
-    fn saved_port_number(&self) -> Result<u16, &'static str> {
-        self.saved_port
-            .parse::<u16>()
-            .ok()
-            .filter(|port| *port >= 1024)
-            .ok_or("已保存的 Windows 入口端口无效，请到设置页改正后保存。")
-    }
-
     pub(crate) fn environment_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.locked() {
             return;
@@ -1063,6 +1095,7 @@ impl Desktop {
         self.environment_editor = Some(EnvironmentEditor::Create);
         self.environment_edit_target = None;
         self.environment_selected = None;
+        self.select_environment(None, window, cx);
         self.environment_detail = None;
         self.environment_started = None;
         self.environment_backup_target = None;
@@ -1103,6 +1136,7 @@ impl Desktop {
         self.environment_editor = Some(EnvironmentEditor::Edit);
         self.environment_edit_target = Some(name.clone());
         self.environment_selected = Some(name.clone());
+        self.select_environment(Some(&name), window, cx);
         self.fields
             .environment_name
             .set_value(name.clone(), window, cx);
@@ -1135,6 +1169,7 @@ impl Desktop {
             return;
         }
         self.environment_selected = Some(name.clone());
+        self.select_environment(Some(&name), window, cx);
         self.environment_editor = None;
         self.environment_edit_target = None;
         self.environment_detail = None;
@@ -1146,6 +1181,39 @@ impl Desktop {
             json!({"command":"environment_view","name":name}),
             cx,
         );
+    }
+
+    /// 环境页换到另一个环境（`None` 表示不看任何环境）：住宅代理和入口端口输入框换成它
+    /// 保存的值，检测结果清掉。`environment_selected` 每次改动都经过这里，`selected`
+    /// 才总是详情里显示的那个环境。上一个环境没保存的修改会丢掉，所以提醒一句。
+    pub(crate) fn select_environment(
+        &mut self,
+        name: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = name.and_then(|name| self.distro_id(name));
+        if id.as_deref().map(str::to_ascii_lowercase)
+            == self.selected.as_deref().map(str::to_ascii_lowercase)
+        {
+            return;
+        }
+        if self.unsaved.contains(SaveScope::Environment) {
+            let previous = self
+                .selected
+                .as_deref()
+                .map(|id| self.environment_display_name(id))
+                .unwrap_or_default();
+            self.reminder = Some(super::state::Reminder {
+                message: format!("{previous} 的住宅代理有没保存的修改，换环境时已丢弃。"),
+                warning: false,
+            });
+        }
+        self.selected = id;
+        self.residential_probe = None;
+        self.residential_probe_error = None;
+        self.residential_probe_at = None;
+        self.load_environment_fields(window, cx);
     }
 
     /// 读当前环境详情对应环境里装的图形应用。静默读取，同一时间只读一次。
@@ -1194,7 +1262,8 @@ impl Desktop {
         cx.notify();
     }
 
-    /// 应用窗口里的流量提示：这个环境不是接管目标、或者接管没启动时，应用直连上网。
+    /// 应用窗口里的流量提示：这个环境没有在接管时，应用直连上网。和后台实际接管的
+    /// 目标比，不是和环境页正在看的那个比。
     pub(crate) fn environment_traffic_hint(&self, name: &str) -> Option<&'static str> {
         let id = self
             .distributions
@@ -1205,13 +1274,18 @@ impl Desktop {
                     .is_some_and(|listed| listed.eq_ignore_ascii_case(name))
             })
             .and_then(|distro| distro["id"].as_str());
-        let target = id.is_some() && self.selected.as_deref() == id;
-        if !target {
-            Some("不是接管目标，应用直连上网")
+        let active = self.active_distro_id();
+        let target = id.is_some_and(|id| {
+            active
+                .as_deref()
+                .is_some_and(|active| active.eq_ignore_ascii_case(id))
+        });
+        if target {
+            None
         } else if self.phase() == "idle" {
             Some("接管未启动，应用直连上网")
         } else {
-            None
+            Some("不是接管目标，应用直连上网")
         }
     }
 

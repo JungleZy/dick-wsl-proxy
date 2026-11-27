@@ -44,6 +44,9 @@ pub(crate) enum Command {
     /// beforehand. Sends nothing through the tunnels; needs no takeover.
     #[command(hide = true)]
     ChainProbe {
+        /// The environment whose residential proxy to use.
+        #[arg(long)]
+        target: String,
         #[arg(long = "name", required = true)]
         names: Vec<String>,
         #[arg(long, default_value = "443")]
@@ -53,14 +56,15 @@ pub(crate) enum Command {
         #[serde(default = "default_probe_rounds")]
         rounds: u32,
     },
-    /// Enable the single-target policy including protected system DNS. First
-    /// sets the target's timezone to the residential exit's and restarts the
-    /// target, ending every process in it.
+    /// Enable the single-target policy including protected system DNS, with
+    /// the target's own residential proxy. First sets the target's timezone to
+    /// the residential exit's and restarts the target, ending every process in
+    /// it. Without `--port`, uses the ingress port saved for the target.
     Start {
         target: String,
-        #[arg(long, default_value = "43531")]
-        #[serde(default = "default_port")]
-        port: NonZeroU16,
+        #[arg(long)]
+        #[serde(default)]
+        port: Option<NonZeroU16>,
         #[arg(long)]
         profile: PathBuf,
         #[arg(long)]
@@ -77,29 +81,24 @@ pub(crate) enum Command {
         #[arg(long)]
         expected_generation: Option<u64>,
     },
-    /// Switch the live managed owner; obtain expected-generation from its last status.
-    /// First sets the new target's timezone to the residential exit's and
-    /// restarts the new target, ending every process in it.
-    Switch {
-        target: String,
-        #[arg(long)]
-        expected_generation: u64,
-        #[arg(long)]
-        port: Option<NonZeroU16>,
-        #[arg(long)]
-        profile: Option<PathBuf>,
-    },
-    /// Import a literal .env into the local SQLite store's residential block.
+    /// Import a literal .env as one environment's residential proxy in the
+    /// local SQLite store. The environment keeps its ingress port.
     ImportCredential {
         #[arg(long)]
         name: String,
+        /// The environment, by name or registry GUID.
+        #[arg(long)]
+        target: String,
         #[arg(long)]
         env_file: PathBuf,
     },
-    /// Clear the residential block in the local SQLite store.
+    /// Clear one environment's residential proxy in the local SQLite store,
+    /// or without `--target` the old unassigned one.
     ForgetCredential {
         #[arg(long)]
         name: String,
+        #[arg(long)]
+        target: Option<String>,
     },
     /// Restore this session's target, or recover a journal left by an exited process.
     Stop {
@@ -297,7 +296,7 @@ pub(crate) fn dispatch_result(
         Command::Preflight { target, port } => {
             let all = registry()?;
             let state = controller.status().map_err(error)?;
-            // Switching to a new target must not test-bind over the daemon's own exclusive
+            // Checking another target must not test-bind over the daemon's own exclusive
             // sockets. The active controller target is the only owner that can reserve them.
             let reserved = if state["phase"] == "forwarding_managed" {
                 let active = state["active_target"].as_str();
@@ -381,42 +380,59 @@ pub(crate) fn dispatch_result(
             })?
         }
         Command::ChainProbe {
+            target,
             names,
             port,
             rounds,
-        } => chain_probe(&names, port, rounds.clamp(1, 20)).map_err(error)?,
-        Command::ImportCredential { name, env_file } => {
+        } => {
+            let all = registry()?;
+            let distro = find(&all, &target)?;
+            chain_probe(&distro.id, &names, port, rounds.clamp(1, 20)).map_err(error)?
+        }
+        Command::ImportCredential {
+            name,
+            target,
+            env_file,
+        } => {
             credential::valid_name(&name).map_err(error)?;
             let settings = credential::settings_from_file(&env_file).map_err(error)?;
-            let record = desktop_store::update_residential(
-                &desktop_store::path().map_err(error)?,
-                Some(name),
-                settings,
-            )
-            .map_err(error)?;
+            let all = registry()?;
+            let distro = find(&all, &target)?;
+            let path = desktop_store::path().map_err(error)?;
+            let record = replace_residential(&path, &distro.id, settings).map_err(error)?;
+            desktop_store::set_credential_name(&path, name).map_err(error)?;
             serde_json::json!({
                 "credential_imported":true,
-                "revision":record.revision.to_string()
+                "target":distro.name,
+                "revision":record.revision.to_string(),
+                "ingress_port":record.ingress_port,
             })
         }
-        Command::ForgetCredential { name } => {
+        Command::ForgetCredential { name, target } => {
             credential::valid_name(&name).map_err(error)?;
-            if controller::journal::load().map_err(error)?.is_some()
-                || transition::load().map_err(error)?.pending.is_some()
-            {
+            let path = desktop_store::path().map_err(error)?;
+            let Some(target) = target else {
+                desktop_store::discard_legacy_residential(&path).map_err(error)?;
+                return Ok((0, serde_json::json!({"credential_removed":true})));
+            };
+            let all = registry()?;
+            let distro = find(&all, &target)?;
+            // The proxy of a live or recorded takeover stays until it is stopped.
+            if owned_by(&distro.id).map_err(error)? {
                 return Err(Failure::new(
                     "target_already_owned",
-                    "Stop before changing stored credentials",
+                    "Stop this target before changing its stored credentials",
                 ));
             }
-            let record = desktop_store::update_residential(
-                &desktop_store::path().map_err(error)?,
-                None,
+            let record = replace_residential(
+                &path,
+                &distro.id,
                 desktop_store::ResidentialSettings::default(),
             )
             .map_err(error)?;
             serde_json::json!({
                 "credential_removed":true,
+                "target":distro.name,
                 "revision":record.revision.to_string()
             })
         }
@@ -436,77 +452,6 @@ pub(crate) fn dispatch_result(
             }
             managed_dns::reset_aliases().map_err(error)?;
             serde_json::json!({"dns_aliases_reset":true})
-        }
-        Command::Switch {
-            target,
-            expected_generation,
-            port,
-            profile,
-        } => {
-            let (source, old_runtime) = controller
-                .switch_source(expected_generation)
-                .map_err(error)?;
-            let source_ingress = source.ingress;
-            let port = port
-                .unwrap_or_else(|| NonZeroU16::new(source_ingress.port()).expect("validated port"));
-            let all = registry()?;
-            if find(&all, &target)?
-                .id
-                .eq_ignore_ascii_case(&source.target.id)
-            {
-                return Err(Failure::new("same_target", "Already managing this target"));
-            }
-            let result = preflight(
-                &all,
-                &target,
-                port,
-                controller.status().map_err(error)?,
-                Some(source_ingress),
-            )?;
-            if !result.passed {
-                return Ok((2, serde_json::json!(result)));
-            }
-            let runtime = match profile {
-                Some(path) => managed::Runtime::from_file(&path),
-                None => old_runtime.for_next_target(),
-            }
-            .map_err(error)?;
-            // Only the new target is touched, before the old one is released:
-            // a failure here leaves the old takeover exactly as it was.
-            let timezone =
-                environment::timezone::sync_and_restart(&runtime, result.target.distribution)
-                    .map_err(|e| Failure::new("timezone_sync_failed", e))?;
-            // The restart made the snapshot stale: everything below uses a fresh one.
-            let restarted = registry()?;
-            let result = preflight(
-                &restarted,
-                &target,
-                port,
-                controller.status().map_err(error)?,
-                Some(source_ingress),
-            )?;
-            if !result.passed {
-                let mut refused = serde_json::json!(result);
-                refused["timezone_synced"] = serde_json::json!(timezone);
-                return Ok((2, refused));
-            }
-            let resolver = managed::resolver(&result.target.snapshot).map_err(error)?;
-            runtime
-                .dns
-                .set_search_suffixes(managed::search_suffixes(&result.target.snapshot));
-            let new = plan::Plan::new(
-                result.target.distribution,
-                &result.target.snapshot,
-                port,
-                Vec::new(),
-                Some(resolver),
-            )
-            .map_err(error)?;
-            controller
-                .switch(expected_generation, new, runtime)
-                .map_err(error)?;
-            let status = controller.status().map_err(error)?;
-            with_timezone(with_unproven_left(controller, status), Some(timezone))
         }
         Command::Start {
             target,
@@ -532,7 +477,7 @@ pub(crate) fn dispatch_result(
             return start(
                 controller,
                 &target,
-                port,
+                Some(port),
                 origins,
                 None,
                 expected_generation,
@@ -579,7 +524,7 @@ pub(crate) fn dispatch_result(
 fn start(
     controller: &mut controller::Controller,
     target: &str,
-    port: NonZeroU16,
+    port: Option<NonZeroU16>,
     origins: Vec<SocketAddrV4>,
     profile: Option<PathBuf>,
     expected_generation: Option<u64>,
@@ -597,6 +542,19 @@ fn start(
         ));
     }
     let all = host::distributions().map_err(|e| Failure::new("enumeration_failed", e))?;
+    let distro_id = find(&all, target)?.id.clone();
+    let port = match (port, profile.as_deref()) {
+        (Some(port), _) => port,
+        (None, Some(path)) if managed::is_store(path) => {
+            // A store from before decision 40 still holds one shared proxy.
+            desktop_store::adopt_legacy_residential(path, &all).map_err(error)?;
+            let row = desktop_store::environment(path, &distro_id)
+                .map_err(error)?
+                .ok_or_else(|| error("residential_credential_incomplete".into()))?;
+            NonZeroU16::new(row.ingress_port).ok_or_else(|| error("invalid_ingress_port".into()))?
+        }
+        (None, _) => default_port(),
+    };
     let first = preflight(
         &all,
         target,
@@ -609,7 +567,7 @@ fn start(
     }
     let runtime = profile
         .as_deref()
-        .map(managed::Runtime::from_file)
+        .map(|path| managed::Runtime::from_file(path, &distro_id))
         .transpose()
         .map_err(error)?;
     let restarted;
@@ -681,6 +639,36 @@ pub(crate) fn dispatch(
     Ok(rc)
 }
 
+/// Whether a live or recorded takeover names this environment.
+pub(crate) fn owned_by(distro_id: &str) -> Result<bool, String> {
+    let owner = controller::journal::load()?;
+    let pending = transition::load()?.pending;
+    let plans = owner.iter().chain(
+        pending
+            .iter()
+            .flat_map(|intent| intent.old.iter().chain(intent.new.iter())),
+    );
+    Ok(plans
+        .into_iter()
+        .any(|plan| plan.target.id.eq_ignore_ascii_case(distro_id)))
+}
+
+/// Replaces one environment's residential proxy, keeping its ingress port.
+fn replace_residential(
+    path: &std::path::Path,
+    distro_id: &str,
+    residential: desktop_store::ResidentialSettings,
+) -> Result<desktop_store::EnvironmentRecord, String> {
+    let current = desktop_store::environment(path, distro_id)?;
+    desktop_store::save_environment(
+        path,
+        distro_id,
+        residential,
+        None,
+        current.map(|row| row.revision.to_string()),
+    )
+}
+
 fn default_probe_port() -> u16 {
     443
 }
@@ -691,10 +679,15 @@ fn default_probe_rounds() -> u32 {
 
 /// Times CONNECT by address and by name, alternating which goes first, for
 /// each non-allowlisted name. Credentials stay inside the policy.
-fn chain_probe(names: &[String], port: u16, rounds: u32) -> Result<serde_json::Value, String> {
+fn chain_probe(
+    distro_id: &str,
+    names: &[String],
+    port: u16,
+    rounds: u32,
+) -> Result<serde_json::Value, String> {
     use crate::policy::ChainTarget;
     use std::net::{SocketAddr, SocketAddrV4};
-    let runtime = managed::Runtime::from_file(&desktop_store::path()?)?;
+    let runtime = managed::Runtime::from_file(&desktop_store::path()?, distro_id)?;
     let mut results = Vec::new();
     for name in names {
         if runtime.policy.allows_domain(name) {
@@ -749,8 +742,8 @@ fn chain_probe(names: &[String], port: u16, rounds: u32) -> Result<serde_json::V
     Ok(serde_json::json!({ "chain_probe": results }))
 }
 
-/// Adds, once, how many entries carrying the old takeover's mark the stop or
-/// switch left in the target because they could not be proven its own
+/// Adds, once, how many entries carrying the old takeover's mark the stop
+/// left in the target because they could not be proven its own
 /// (decision 20); omitted when there were none.
 fn with_unproven_left(
     controller: &mut controller::Controller,

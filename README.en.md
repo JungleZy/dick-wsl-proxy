@@ -18,7 +18,7 @@ Windows desktop app `wsl-proxy-desktop` · controller and CLI `wsl-proxyctl`
 </div>
 
 > [!WARNING]
-> **Every takeover restarts the target distribution.** Before installing any rule, the controller sets the target's timezone to the residential exit's timezone and then restarts only that distribution, ending every program running in it. The CLI `start` and `switch` commands ask for no confirmation. Read [Read this first](#read-this-first) before you start.
+> **Every takeover restarts the target distribution.** Before installing any rule, the controller sets the target's timezone to the residential exit's timezone and then restarts only that distribution, ending every program running in it. The CLI `start` command asks for no confirmation. Read [Read this first](#read-this-first) before you start.
 
 | Overview | Getting started | Reference | Development |
 | --- | --- | --- | --- |
@@ -39,7 +39,7 @@ dick-wsl-proxy takes over only the distribution you choose, from the Windows sid
 - It changes neither the Windows system proxy nor WSL's shared `resolv.conf` or `.wslconfig`, and installs no proxy software or listener inside WSL.
 - When something breaks, traffic is blocked rather than allowed to bypass the proxy. The original network path comes back only when you explicitly stop the takeover.
 
-It is not a general-purpose VPN: it handles one WSL2 distribution, and the backend has been validated only in WSL2 NAT networking mode. Each Windows account can take over only one distribution at a time; a switch first confirms the old target is restored, then takes over the new one, and established TCP connections do not move across.
+It is not a general-purpose VPN: it handles one WSL2 distribution, and the backend has been validated only in WSL2 NAT networking mode. Each distribution has its own residential proxy and Windows ingress port; for now each Windows account can take over only one distribution at a time. To take over a different one, stop the current takeover and start the new one; established TCP connections do not move across.
 
 ## Features
 
@@ -89,7 +89,7 @@ UDP never goes direct on purpose: a web page could use an allowlisted STUN serve
 ## Read this first
 
 **1. A takeover changes the target's timezone and restarts the target.**
-On every start of, or switch to, a target, after the preflight passes and you confirm, and before any rule is installed:
+On every start of a takeover, after the preflight passes and you confirm, and before any rule is installed:
 
 - Windows queries `my.ippure.com` through both hops for the residential exit's timezone;
 - the target's timezone is set to it;
@@ -197,18 +197,21 @@ See [Building from source](#building-from-source).
 
 Keep `wsl-proxy-desktop.exe` and the matching version of `wsl-proxyctl.exe` in the same directory (the installer already does), and open the former. On first launch it starts `wsl-proxyctl.exe` in the background as the current user, as a resident backend.
 
-1. **Settings**:
-   - pick the residential proxy's protocol (SOCKS5 or HTTP, whichever the provider gives for that port), then enter its server IPv4, port, username and password (the password is shown in plain text);
-   - under **Network and DNS**, check the host SOCKS5 address and adjust DNS if needed;
-   - click **Save settings**.
-   - To check the residential proxy first, use **Test** in the residential proxy section. It asks for confirmation, because the direct path sends the username and password in plain text without the first hop.
+1. **Settings**: under **Network and DNS**, check the host SOCKS5 address, adjust DNS if needed, and click **Save settings**. A fresh install must save once before any takeover can start.
 2. **Rules**: fill the direct rules one per line in three columns (IP / CIDR, exact domain, domain suffix), then click **Save rules**. A new configuration store comes pre-filled with suffixes of common services in mainland China.
-3. **Environments**: click **Set as target** on the distribution to take over; it is saved once you confirm. Setting a target alone does not take over the network.
-4. **Home**: click **Start takeover**.
+3. **Environments**: click the distribution to take over, and in the **Takeover** card of its details:
+   - pick the residential proxy's protocol (SOCKS5 or HTTP, whichever the provider gives for that port), then enter its server IPv4, port, username and password (the password is shown in plain text);
+   - leave **Windows ingress port** empty to let the app pick, on save, the first port from 43531 up that no other environment uses, or enter one;
+   - click **Save residential proxy**. Each environment's residential proxy and ingress port are saved separately.
+   - To check the residential proxy first, click **Test residential proxy**. It asks for confirmation, because the direct path sends the username and password in plain text without the first hop.
+4. In the same card, click **Start takeover**.
    - The preflight runs automatically.
    - If kernel modules are missing, the app asks whether to load the ones already in the distribution.
    - A confirmation dialog then states that the timezone will change and the target will restart. The takeover starts once you confirm.
-5. **Stop**: click **Stop takeover** on Home, or **Stop and restore direct** in the tray menu.
+   - Only one environment can be taken over at a time for now: while another one is taken over or needs recovery, the button is disabled and says which one to stop first.
+5. **Stop**: click **Stop takeover** in that environment's **Takeover** card, **Stop takeover** on Home, or **Stop all takeovers** in the tray menu.
+
+When upgrading from 0.1.17 or earlier, the single saved residential proxy and ingress port move to the distribution that was set as the target. If that distribution is gone, the environment details show a residential proxy that is "not assigned to any environment"; assign it to the environment you are viewing, or discard it.
 
 The desktop UI is in Chinese; the labels above are translations.
 
@@ -216,18 +219,18 @@ The desktop UI is in Chinese; the labels above are translations.
 
 | Page | Purpose |
 | --- | --- |
-| Home | Protection status, protection chain, traffic chart, event timeline. The main button changes with the state: choose a target / save changes / start takeover / stop takeover / abandon this record / reconnect |
-| Environments | Distribution list and details; set as target; create, edit components, change timezone, back up, delete a distribution (these five need no takeover in progress) |
+| Home | Takeover overview: the environment being taken over, protection chain, traffic chart, event timeline. The main button changes with the state: go to Environments / stop takeover / abandon this record / reconnect |
+| Environments | Distribution list (each row shows its takeover state) and details; the **Takeover** card in the details holds that environment's residential proxy, ingress port, test, start and stop; create, edit components, change timezone, back up, delete a distribution (these five need no takeover in progress) |
 | Rules | Direct rules in three columns: IP / CIDR, exact domain, domain suffix |
 | Connections | Connection records (the newest 50,000 finished connections are kept), re-check public exit, export redacted diagnostics, reset DNS aliases |
 | Logs | Run log with search and All / Errors / Warnings filters |
-| Settings | Residential proxy, network and DNS, forwarding limits, desktop (start at login), WSL platform, about (update check and upgrade) |
+| Settings | Network and DNS, forwarding limits, desktop (start at login), WSL platform, about (update check and upgrade) |
 
 ### Tray and closing the window
 
 - **Closing the window only hides it to the tray; the proxy keeps running.** If the tray icon could not be shown (for example, Explorer was not ready at login), closing quits the window and leaves the backend running.
 - **The tray icon shows whether a takeover is running.** A green shield with a light sweeping along its pulse line means a takeover is running; a still grey shield means idle; red means recovery is needed; amber with a flat line means the backend state is unconfirmed (a takeover may still be in effect). Hover to see the state and the target distribution.
-- Click the tray icon to open the main window. The right-click menu shows the current state at the top, and its main action follows the state like the main button on Home (**Start takeover**, **Stop and restore direct**, **Reconnect backend** and so on). It also offers **Check public exit**, **View connection records**, **View run log** and **Start at login**.
+- Click the tray icon to open the main window. The right-click menu shows the current state at the top, and its main action follows the state: **Open Environments** when idle, **Stop all takeovers** during a takeover, **Go to recovery** (opens that environment's page) when recovery is needed, **Reconnect backend** when the backend is not reachable. It also offers **Check public exit**, **View connection records**, **View run log** and **Start at login**.
 - **Exit** in the tray menu: when idle, it shuts the backend down and quits; during a takeover it asks first, then stops the takeover, restores direct routing, shuts the backend down and quits. It does not quit if any step fails.
 - If the desktop process is killed or crashes, the backend keeps running; reopen the app to reconnect.
 - Only one desktop window runs at a time. Opening it again brings the existing window to the front.
@@ -307,7 +310,7 @@ If the blockers include `capability.kernel.*` or `baseline.ip*tables*`, the shar
 
 ### Import the residential proxy settings
 
-Prepare an `.env` file. These four keys are required, and `ip` must be IPv4; for an HTTP residential proxy add `protocol=http` (the default is `socks5`), and the username must then not contain a colon:
+Residential proxies are saved per environment, so the import names the distribution with `--target` (name or registry GUID). Prepare an `.env` file. These four keys are required, and `ip` must be IPv4; for an HTTP residential proxy add `protocol=http` (the default is `socks5`), and the username must then not contain a colon:
 
 ```ini
 ip=203.0.113.10
@@ -317,10 +320,10 @@ password=change-me
 ```
 
 ```powershell
-& $ctl import-credential --name my-residence --env-file D:\path\to\residential.env
+& $ctl import-credential --name my-residence --target Ubuntu-24.04 --env-file D:\path\to\residential.env
 ```
 
-The settings are written to `desktop.sqlite` next to the EXE, with the password in plain text. `--name` is only a label recorded in the policy. When you no longer need them, `forget-credential --name my-residence` clears these fields.
+The settings are written to that environment's row in `desktop.sqlite` next to the EXE, with the password in plain text; the first save of an environment also gives it an ingress port from 43531 up. `--name` is only a label recorded in the policy. When you no longer need them, `forget-credential --name my-residence --target Ubuntu-24.04` clears that environment's residential proxy; it is refused while that environment is taken over. Without `--target`, `forget-credential` only discards the one left by an older version that is not assigned to any environment.
 
 ### Start, inspect, stop
 
@@ -337,7 +340,8 @@ Prepare a policy JSON file (fields under [Policy reference](#policy-reference)),
 ```
 
 - `start` runs: preflight → timezone sync and target restart (**no confirmation**) → preflight again → install rules → readiness probes. It returns `forwarding_managed` only when the DNS and HTTPS readiness probes pass. Any failure leaves the state as "recovery required", which needs an explicit `stop`.
-- `profile` may also point to `desktop.sqlite` next to the EXE. The desktop app must then have saved its settings at least once; a CLI import alone does not count, and the start fails with `desktop_store_not_saved`.
+- `profile` may also point to `desktop.sqlite` next to the EXE. The desktop app must then have saved its settings at least once; a CLI import alone does not count, and the start fails with `desktop_store_not_saved`; the target also needs its own saved residential proxy, or the start fails with `residential_credential_incomplete`.
+- The residential proxy is always the target's own, with a policy file too. Without `port`, `desktop.sqlite` uses the ingress port saved for the environment and a policy file uses 43531.
 - Closing the session's standard input (EOF) also stops the takeover.
 
 ### Subcommands
@@ -349,13 +353,12 @@ Prepare a policy JSON file (fields under [Policy reference](#policy-reference)),
 | `prepare-kernel <target> --confirm` | Load existing modules, register empty tables, write boot configuration; requires idle |
 | `wsl-platform` | Read-only report on the WSL platform |
 | `wsl-platform-update --confirm` | Run `wsl --update`; requires idle and stops every distribution |
-| `start <target> --profile <policy> [--port 43531]` | Start a takeover (changes the timezone and restarts the target), then stay in the foreground and stop when stdin closes |
-| `switch <target> --expected-generation <N>` | Switch targets (changes the new target's timezone and restarts it); only inside the `session` that holds the takeover, or through `rpc` to the desktop backend |
+| `start <target> --profile <policy> [--port <port>]` | Start a takeover with the target's own residential proxy (changes the timezone and restarts the target), then stay in the foreground and stop when stdin closes; refused while another takeover exists |
 | `status` | Print the current state as JSON |
 | `stop [--expected-generation <N>]` | Stop a takeover or run recovery; repeating it when idle still succeeds |
 | `abandon --confirm` | Drop the record when the target was unregistered and `stop` cannot finish |
-| `import-credential --name <label> --env-file <path>` | Import residential proxy settings |
-| `forget-credential --name <label>` | Clear residential proxy settings |
+| `import-credential --name <label> --target <target> --env-file <path>` | Import one environment's residential proxy settings |
+| `forget-credential --name <label> [--target <target>]` | Clear one environment's residential proxy; without `--target`, discard the unassigned one |
 | `reset-dns-aliases --confirm` | Clear the alias ledger when allowlisted-name aliases run out; requires idle |
 | `session` | Session mode: read JSON commands line by line, stop the takeover when stdin closes |
 | `rpc` | Read one JSON request from stdin and hand it to the running desktop backend |
@@ -395,15 +398,15 @@ The policy is a JSON file of at most 1 MiB; unknown fields are rejected. Minimal
 | `tcp_idle_timeout_seconds` | no | `1800` | Close after this long with no data in either direction, 30–86400 |
 | `tcp_half_close_timeout_seconds` | no | `60` | Close after one side finishes and the other sends nothing for this long, 5–3600 |
 
-- The ingress port is not part of the policy. Set it with `--port`; the default is 43531 and it must be at least 1024.
+- The ingress port is not part of the policy. Set it with `--port`, at least 1024; without it, `desktop.sqlite` uses the port saved for the environment and a policy file uses 43531.
 - The allowlist must not match `my.ippure.com` (the timezone lookup has to go through the proxy) or `health_domain`.
-- The desktop Settings and Rules pages are a graphical editor for this policy, saved in `desktop.sqlite`.
+- The desktop Settings and Rules pages are a graphical editor for this policy, saved in `desktop.sqlite`; residential proxies and ingress ports are not in the policy and are saved per environment in the same store.
 
 ## Stopping and recovery
 
 **Normal stop**
 
-- Desktop: **Stop takeover** on Home, or **Stop and restore direct** in the tray.
+- Desktop: **Stop takeover** in that environment's details or on Home, or **Stop all takeovers** in the tray.
 - CLI: send `{"command":"stop"}` in the original session.
 
 **Window closed, backend still running**
@@ -446,7 +449,7 @@ Yes, those are fake-ip stand-ins. When a program connects to one, the ingress ha
 With fake-ip on, every name outside the allowlist first gets a stand-in address; only the residential proxy finds out the name does not exist. For the old behavior, turn off **Network and DNS › Remote resolution** in Settings, or set `"fake_ip": false` in the policy.
 
 **The desktop shows "UDP blocked".**
-With an HTTP residential proxy this is expected: HTTP proxies only carry TCP. Otherwise the UDP probe at startup failed: the host proxy or the residential proxy (or both) does not support UDP ASSOCIATE. All UDP, including QUIC, is refused for this takeover and never sent direct; TCP and system DNS are unaffected. The next start or switch probes again.
+With an HTTP residential proxy this is expected: HTTP proxies only carry TCP. Otherwise the UDP probe at startup failed: the host proxy or the residential proxy (or both) does not support UDP ASSOCIATE. All UDP, including QUIC, is refused for this takeover and never sent direct; TCP and system DNS are unaffected. The next start probes again.
 
 **Why does UDP to allowlisted sites go through the proxy?**
 To keep WebRTC from leaking the real exit IP. A web page sends UDP to a STUN server to learn its own public address; if an allowlisted STUN server could be reached directly, the page would see the Windows exit IP.
@@ -505,7 +508,7 @@ The release packaging steps are defined by [`.github/workflows/release.yml`](.gi
 ```text
 src/                  controller wsl-proxyctl
   command.rs, main.rs   CLI and session commands
-  controller*, transition*  takeover start/stop, switching and recovery records
+  controller*, transition*  takeover start/stop and recovery records
   ingress*              Windows ingress: TCP, UDP and IPv6 forwarding
   managed_dns*          managed DNS: cache, fake-ip, allowlist alias ledger
   policy*               policy parsing, two-hop dialer, domestic suffix list
@@ -542,6 +545,7 @@ The project documentation is written in Chinese.
 | [M6: kernel preparation](docs/plans/m6/README.md) | Loading existing modules and registering empty tables after a cold start |
 | [M7: WSL platform check and update](docs/plans/m7/README.md) | Read-only check and explicit `wsl --update` |
 | [M8: update check and one-click upgrade](docs/plans/m8/README.md) | Find a newer GitHub release, download and check it, hand it to the installer |
+| [M9: residential proxy per environment](docs/plans/m9/README.md) | Each environment's own residential proxy and ingress port, start and stop on the environment page (decision 40, phase 1) |
 | [UI specification](design/ui-design-spec.md) | Current desktop UI; the code wins where they differ |
 
 ## Contributing

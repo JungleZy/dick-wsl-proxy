@@ -83,6 +83,12 @@ pub(crate) struct Record {
 
 const FILE_NAME: &str = "desktop.sqlite";
 
+mod environments;
+pub(crate) use environments::{
+    EnvironmentRecord, adopt_legacy_residential, assign_legacy_residential, delete_environment,
+    discard_legacy_residential, environment, environments, load_runtime, save_environment,
+};
+
 /// The store lives beside the EXE. Earlier releases kept it in the per-user
 /// state directory; the first call after such an upgrade moves it here.
 pub(crate) fn path() -> Result<PathBuf, String> {
@@ -231,6 +237,9 @@ fn open(path: &Path) -> Result<Connection, String> {
             CREATE INDEX IF NOT EXISTS connection_records_target_idx
                 ON connection_records (target, id DESC);",
         )
+        .map_err(|e| format!("desktop_store_schema:{e}"))?;
+    connection
+        .execute_batch(environments::SCHEMA)
         .map_err(|e| format!("desktop_store_schema:{e}"))?;
     add_residential_protocol(&connection)?;
     if !wal && !WAL_FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
@@ -905,6 +914,7 @@ pub(crate) fn ensure(path: &Path) -> Result<Record, String> {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn load(path: &Path) -> Result<Record, String> {
     ensure(path)
 }
@@ -913,30 +923,23 @@ pub(crate) fn revision(path: &Path) -> Result<u64, String> {
     Ok(ensure(path)?.revision)
 }
 
+/// Saves the shared policy. The residential proxies and ingress ports are
+/// per environment (`save_environment`); the old single block and the
+/// legacy preferences are kept as they are until they are assigned.
 pub(crate) fn save(
     path: &Path,
     profile: Config,
-    desktop: Preferences,
-    residential: Option<ResidentialSettings>,
     expected_revision: Option<String>,
 ) -> Result<Record, String> {
     profile.validate_draft()?;
-    desktop.validate()?;
     let current = ensure(path)?;
     if expected_revision != Some(current.revision.to_string())
         && !(expected_revision.is_none() && current.revision == 0)
     {
         return Err("stale_profile_revision: reload the saved profile".into());
     }
-    let residential = residential.unwrap_or(current.residential);
-    // Empty means not configured yet; anything partly filled must parse.
-    if !residential.is_blank() {
-        let credential = credential::from_settings(&residential)?;
-        let _ = credential.endpoint();
-    }
     let profile_json = serde_json::to_string(&profile).map_err(|e| e.to_string())?;
-    let desktop_json = serde_json::to_string(&desktop).map_err(|e| e.to_string())?;
-    if profile_json.len() + desktop_json.len() + residential.password.len() > MAX_TEXT {
+    if profile_json.len() > MAX_TEXT {
         return Err("desktop_store_too_large".into());
     }
     let next = current
@@ -944,50 +947,34 @@ pub(crate) fn save(
         .checked_add(1)
         .ok_or("revision_exhausted")?;
     let connection = open(path)?;
-    let transaction = connection
-        .unchecked_transaction()
-        .map_err(|e| format!("desktop_store_transaction:{e}"))?;
-    let changed = transaction
+    let changed = connection
         .execute(
-            "UPDATE desktop_state SET revision=?1, profile_json=?2, desktop_json=?3, residential_ip=?4, residential_port=?5, residential_username=?6, residential_password=?7, residential_protocol=?8 WHERE id=1 AND revision=?9",
-            params![next, profile_json, desktop_json, residential.ip, residential.port, residential.username, residential.password, residential.protocol.as_str(), current.revision],
+            "UPDATE desktop_state SET revision=?1, profile_json=?2 WHERE id=1 AND revision=?3",
+            params![next, profile_json, current.revision],
         )
         .map_err(|e| format!("desktop_store_save:{e}"))?;
     if changed != 1 {
         return Err("stale_profile_revision: reload the saved profile".into());
     }
-    transaction
-        .commit()
-        .map_err(|e| format!("desktop_store_commit:{e}"))?;
     Ok(Record {
         revision: next,
         profile,
-        desktop,
-        residential,
+        desktop: current.desktop,
+        residential: current.residential,
     })
 }
 
-pub(crate) fn load_runtime(path: &Path) -> Result<(Config, credential::Residential), String> {
-    let record = load(path)?;
-    if record.revision == 0 {
-        return Err("desktop_store_not_saved".into());
-    }
-    let residential = credential::from_settings(&record.residential)
-        .map_err(|_| "residential_credential_incomplete".to_string())?;
-    Ok((record.profile, residential))
-}
-
-/// Residential settings for a policy file: the profile references the local
-/// store instead of carrying credentials itself.
-pub(crate) fn load_credential() -> Result<credential::Residential, String> {
-    let record = load(&path()?)?;
-    credential::from_settings(&record.residential)
+/// One environment's residential settings for a policy file: the profile
+/// references the local store instead of carrying credentials itself.
+pub(crate) fn load_credential(distro_id: &str) -> Result<credential::Residential, String> {
+    let row = environment(&path()?, distro_id)?.ok_or("residential_credential_incomplete")?;
+    credential::from_settings(&row.residential)
         .map_err(|_| "residential_credential_incomplete".into())
 }
 
-/// Replaces the residential block (import or forget) without touching the rest
-/// of the policy. An unsaved store keeps revision 0 so the profile still has to
-/// be saved by the user.
+/// Replaces the old single residential block, and optionally names the
+/// credential, without touching the rest of the policy. An unsaved store keeps
+/// revision 0 so the profile still has to be saved by the user.
 pub(crate) fn update_residential(
     path: &Path,
     name: Option<String>,
@@ -1040,15 +1027,29 @@ pub(crate) fn update_residential(
     })
 }
 
-pub(crate) fn view(path: &Path, record: &Record) -> Value {
-    serde_json::json!({
+/// The profile, every environment's residential row, and the old single
+/// block while it is still unassigned (with the target it was saved for).
+/// Names the credential in the saved policy, as `import-credential --name` does.
+pub(crate) fn set_credential_name(path: &Path, name: String) -> Result<(), String> {
+    let current = ensure(path)?;
+    update_residential(path, Some(name), current.residential).map(|_| ())
+}
+
+pub(crate) fn view(path: &Path, record: &Record) -> Result<Value, String> {
+    let unassigned = (!record.residential.is_blank()).then(|| {
+        serde_json::json!({
+            "residential": record.residential.clone(),
+            "target": record.desktop.target.clone(),
+        })
+    });
+    Ok(serde_json::json!({
         "exists": record.revision > 0,
         "revision": if record.revision > 0 { Some(record.revision.to_string()) } else { None::<String> },
         "path": path,
         "profile": record.profile.clone(),
-        "desktop": record.desktop.clone(),
-        "residential": record.residential.clone(),
-    })
+        "environments": environments(path)?,
+        "unassigned_residential": unassigned,
+    }))
 }
 
 #[cfg(test)]
@@ -1099,21 +1100,7 @@ mod tests {
         let legacy = legacy_dir.join(FILE_NAME);
         let path = data_dir.join(FILE_NAME);
         let initial = ensure(&legacy).unwrap();
-        let residential = ResidentialSettings {
-            protocol: credential::Protocol::Socks5,
-            ip: "198.51.100.2".into(),
-            port: 1080,
-            username: "fixture-user".into(),
-            password: "fixture-password".into(),
-        };
-        save(
-            &legacy,
-            initial.profile.clone(),
-            initial.desktop.clone(),
-            Some(residential),
-            Some("0".into()),
-        )
-        .unwrap();
+        save(&legacy, initial.profile.clone(), Some("0".into())).unwrap();
 
         adopt_legacy(&legacy, &path).unwrap();
         assert_eq!(revision(&path).unwrap(), 1);
@@ -1129,7 +1116,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_profile_has_revision_cas_and_runtime_credentials() {
+    fn sqlite_profile_has_revision_cas_and_keeps_the_unassigned_block() {
         let path =
             std::env::temp_dir().join(format!("wpl-desktop-store-{}.sqlite", std::process::id()));
         let _ = fs::remove_file(&path);
@@ -1142,30 +1129,18 @@ mod tests {
             username: "fixture-user".into(),
             password: "fixture-password".into(),
         };
-        let saved = save(
-            &path,
-            initial.profile.clone(),
-            initial.desktop.clone(),
-            Some(residential.clone()),
-            Some("0".into()),
-        )
-        .unwrap();
+        update_residential(&path, None, residential.clone()).unwrap();
+        let saved = save(&path, initial.profile.clone(), Some("0".into())).unwrap();
         assert_eq!(saved.revision, 1);
-        assert!(
-            save(
-                &path,
-                initial.profile.clone(),
-                initial.desktop.clone(),
-                Some(residential.clone()),
-                Some("0".into()),
-            )
-            .is_err()
-        );
-        let (_, loaded) = load_runtime(&path).unwrap();
-        assert_eq!(loaded.endpoint().ip().to_string(), residential.ip);
-        assert_eq!(loaded.endpoint().port(), residential.port);
-        // The password is part of the SQLite row; no Windows credential is used.
+        assert!(save(&path, initial.profile.clone(), Some("0".into())).is_err());
+        // Saving the policy leaves the old block for the user to assign.
         assert!(load(&path).unwrap().residential == residential);
+        let view = view(&path, &load(&path).unwrap()).unwrap();
+        assert_eq!(
+            view["unassigned_residential"]["residential"]["ip"],
+            "198.51.100.2"
+        );
+        assert_eq!(view["environments"], serde_json::json!([]));
         let _ = fs::remove_file(path);
     }
 
@@ -1208,14 +1183,7 @@ mod tests {
         // Rules the user saved, even none, are never refilled on a later open.
         let mut cleared = profile.clone();
         cleared["direct_suffixes"] = serde_json::json!([]);
-        save(
-            &path,
-            serde_json::from_value(cleared).unwrap(),
-            initial.desktop.clone(),
-            None,
-            None,
-        )
-        .unwrap();
+        save(&path, serde_json::from_value(cleared).unwrap(), None).unwrap();
         let reopened = serde_json::to_value(load(&path).unwrap().profile).unwrap();
         assert_eq!(reopened["direct_suffixes"], serde_json::json!([]));
         let _ = fs::remove_file(path);
@@ -1248,14 +1216,7 @@ mod tests {
             "fixture-residence"
         );
 
-        let saved = save(
-            &path,
-            initial.profile.clone(),
-            initial.desktop.clone(),
-            Some(settings.clone()),
-            Some("0".into()),
-        )
-        .unwrap();
+        let saved = save(&path, initial.profile.clone(), Some("0".into())).unwrap();
         assert_eq!(saved.revision, 1);
         let cleared = update_residential(&path, None, ResidentialSettings::default()).unwrap();
         assert_eq!(cleared.revision, 2);
@@ -1302,14 +1263,7 @@ mod tests {
             port: 8080,
             ..old.residential.clone()
         };
-        save(
-            &path,
-            old.profile.clone(),
-            old.desktop.clone(),
-            Some(http.clone()),
-            Some("3".into()),
-        )
-        .unwrap();
+        update_residential(&path, None, http.clone()).unwrap();
         assert!(load(&path).unwrap().residential == http);
         assert_eq!(
             credential::from_settings(&load(&path).unwrap().residential)

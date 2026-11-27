@@ -27,6 +27,12 @@ pub struct Runtime {
     udp_chain_unsupported: AtomicBool,
 }
 
+/// Whether a `--profile` names the desktop's SQLite store rather than a
+/// policy file.
+pub fn is_store(path: &Path) -> bool {
+    path.extension().and_then(|v| v.to_str()) == Some("sqlite")
+}
+
 pub fn valid_resolver(ip: Ipv4Addr) -> bool {
     let [a, b, _, _] = ip.octets();
     a != 0 && a != 127 && a < 224 && !(a == 169 && b == 254)
@@ -117,20 +123,17 @@ pub struct Readiness {
 }
 
 impl Runtime {
-    pub fn from_file(path: &Path) -> Result<Arc<Self>, String> {
-        if path.extension().and_then(|v| v.to_str()) == Some("sqlite") {
-            let (config, residential) = crate::desktop_store::load_runtime(path)?;
+    /// The policy in `path` with `distro_id`'s residential proxy, which lives
+    /// in the local store under that environment (decision 40).
+    pub fn from_file(path: &Path, distro_id: &str) -> Result<Arc<Self>, String> {
+        if is_store(path) {
+            let (config, residential, _) = crate::desktop_store::load_runtime(path, distro_id)?;
             let validated = crate::policy::Validated::new(config)?;
             let policy = Arc::new(Policy::assemble_for_store(validated, residential)?);
             return Self::with_policy(policy);
         }
-        let policy = Arc::new(Policy::from_file(path)?);
+        let policy = Arc::new(Policy::from_file(path, distro_id)?);
         Self::with_policy(policy)
-    }
-
-    /// Keep the selected policy, not the previous distro's DNS aliases or readiness latch.
-    pub fn for_next_target(&self) -> Result<Arc<Self>, String> {
-        Self::with_policy(Arc::clone(&self.policy))
     }
 
     /// A runtime over a fixture policy whose hops are never reached.
