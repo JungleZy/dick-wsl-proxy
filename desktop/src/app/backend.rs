@@ -22,6 +22,10 @@ pub(crate) enum Kind {
     Export,
     Probe,
     EnvironmentView,
+    /// 读环境里装的图形应用：静默，结果只写进环境详情的应用卡片。
+    EnvironmentApps,
+    /// 启动环境里的一个应用：静默，不锁界面，结果弹成通知。
+    EnvironmentLaunch,
     EnvironmentCreate,
     EnvironmentEdit,
     EnvironmentBackup,
@@ -86,6 +90,8 @@ impl Kind {
             Self::Export => "导出诊断",
             Self::Probe => "检测出口",
             Self::EnvironmentView => "查看环境",
+            Self::EnvironmentApps => "读取已安装应用",
+            Self::EnvironmentLaunch => "启动应用",
             Self::EnvironmentCreate => "新增环境",
             Self::EnvironmentEdit => "编辑环境",
             Self::EnvironmentBackup => "备份环境",
@@ -331,6 +337,17 @@ fn humanize_code(code: &str, message: &str) -> String {
         "stop_and_restore_before_daemon_shutdown" => {
             "后台仍在接管或需要恢复，不能关闭；请先停止并恢复直连。".into()
         }
+        "environment_apps_failed" => "在环境里读取应用列表失败，请确认发行版能正常启动。".into(),
+        "environment_app_invalid" => "应用标识无效，请重新读取应用列表。".into(),
+        "environment_app_not_found" => {
+            "环境里已经没有这个应用的入口（可能已卸载），请重新读取应用列表。".into()
+        }
+        "environment_app_entry_invalid" => "这个应用的 .desktop 入口没有可用的启动命令。".into(),
+        "environment_app_command_missing" => {
+            "环境里找不到这个应用的程序（可能已卸载），请重新读取应用列表。".into()
+        }
+        "environment_app_exited" => format!("应用刚启动就退出了（退出码 {}）。", message.trim()),
+        "environment_app_launch_failed" => "没能在环境里启动应用，请确认 WSL 可以正常运行。".into(),
         "environment_job_running" => {
             "后台正在执行环境操作，请等它完成后再试。".into()
         }
@@ -1002,6 +1019,24 @@ mod tests {
         assert_eq!(
             humanize_error("environment_job_running · environment_create is still running for Dev"),
             "后台正在执行环境操作，请等它完成后再试。"
+        );
+    }
+
+    #[test]
+    fn translates_app_launch_failures_for_the_ui() {
+        assert_eq!(
+            humanize_error("desktop_request_failed · environment_app_exited:3"),
+            "应用刚启动就退出了（退出码 3）。"
+        );
+        assert_eq!(
+            humanize_error("desktop_request_failed · environment_app_command_missing"),
+            "环境里找不到这个应用的程序（可能已卸载），请重新读取应用列表。"
+        );
+        assert_eq!(
+            humanize_error(
+                "desktop_request_failed · environment_apps_failed:wsl_exit_failed: exit code: 1: boom"
+            ),
+            "在环境里读取应用列表失败，请确认发行版能正常启动。"
         );
     }
 

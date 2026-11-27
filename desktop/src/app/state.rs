@@ -107,6 +107,14 @@ pub(crate) struct Desktop {
     pub(crate) environment_edit_target: Option<String>,
     pub(crate) environment_selected: Option<String>,
     pub(crate) environment_detail: Option<Value>,
+    /// 环境详情里「已安装应用」卡片：最近一次读到的列表（带环境名）、失败原因、是否在读。
+    pub(crate) environment_apps: Option<Value>,
+    pub(crate) environment_apps_error: Option<String>,
+    pub(crate) environment_apps_loading: bool,
+    /// 在途的应用列表请求是读哪个环境的；回复（包括失败）不是当前环境的就丢掉。
+    pub(crate) environment_apps_requested: Option<String>,
+    /// 正在启动的应用（桌面文件 ID）；同一时间只启动一个。
+    pub(crate) environment_launching: Option<String>,
     pub(crate) environment_started: Option<Instant>,
     /// 最近一次在后台读到的环境操作进度，见 [`EnvironmentProgress`]。
     pub(crate) environment_progress_snapshot: Option<EnvironmentProgress>,

@@ -24,7 +24,7 @@ pub enum LockError {
 #[cfg(windows)]
 pub use windows::{
     acquire, data_dir, distributions, guest_script, guest_script_with_timeout, ipv6_scope_id,
-    state_dir, wsl_command, wsl_executable,
+    launch_user_script, state_dir, user_script_with_timeout, wsl_command, wsl_executable,
 };
 
 /// Whether this process runs with the administrator elevation token. Only the
@@ -107,6 +107,25 @@ pub fn guest_script_with_timeout(
     _script: &str,
     _timeout: std::time::Duration,
 ) -> Result<String, String> {
+    Err("unsupported_platform: Windows host required".into())
+}
+
+#[cfg(not(windows))]
+pub fn user_script_with_timeout(
+    _distro: &Distro,
+    _script: &str,
+    _timeout: std::time::Duration,
+) -> Result<String, String> {
+    Err("unsupported_platform: Windows host required".into())
+}
+
+#[cfg(not(windows))]
+pub fn launch_user_script(
+    _distro: &Distro,
+    _script: &str,
+    _args: &[String],
+    _settle: std::time::Duration,
+) -> Result<(), String> {
     Err("unsupported_platform: Windows host required".into())
 }
 
@@ -434,6 +453,94 @@ mod windows {
             "-s".into(),
         ];
         run_wsl_process(&args, Some(script.as_bytes()), timeout)
+    }
+
+    /// `wsl.exe` arguments that run `/bin/sh -s` as the distribution's default
+    /// user (no `--user`) in that user's home, with `extra` as `$1…`.
+    fn user_shell_args(distro: &Distro, login: bool, extra: &[String]) -> Vec<String> {
+        let mut args: Vec<String> = vec![
+            "--distribution-id".into(),
+            distro.id.clone(),
+            "--cd".into(),
+            "~".into(),
+            "--exec".into(),
+            "/bin/sh".into(),
+        ];
+        if login {
+            args.push("-l".into());
+        }
+        args.push("-s".into());
+        args.extend_from_slice(extra);
+        args
+    }
+
+    /// Like `guest_script_with_timeout`, but as the default user, so `$HOME`
+    /// and the user's own files are the ones that user sees.
+    pub fn user_script_with_timeout(
+        distro: &Distro,
+        script: &str,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        if !valid_distribution_id(&distro.id) {
+            return Err("invalid_distribution_id".into());
+        }
+        let args = user_shell_args(distro, false, &[]);
+        run_wsl_process(&args, Some(script.as_bytes()), timeout)
+    }
+
+    /// Starts `script` in a login shell as the default user and does not wait
+    /// for it: the program it starts (a GUI app) keeps `wsl.exe` alive for as
+    /// long as it runs. Watches the process for `settle` only to report a run
+    /// that fails at once; one still running then is left alone, never killed.
+    pub fn launch_user_script(
+        distro: &Distro,
+        script: &str,
+        extra: &[String],
+        settle: Duration,
+    ) -> Result<(), String> {
+        if cfg!(target_pointer_width = "32") {
+            return Err("unsupported_windows_architecture: 64-bit controller required".into());
+        }
+        if !valid_distribution_id(&distro.id) {
+            return Err("invalid_distribution_id".into());
+        }
+        let directory = system_directory()?;
+        let mut input = scratch().map_err(|e| e.to_string())?;
+        input
+            .write_all(script.as_bytes())
+            .and_then(|_| input.rewind())
+            .map_err(|e| e.to_string())?;
+        // The child holds its own handle; the delete-on-close file goes away
+        // when `wsl.exe` exits.
+        let stdin = input.try_clone().map_err(|e| e.to_string())?;
+        let mut child = Command::new(directory.join("wsl.exe"))
+            .current_dir(&directory)
+            .args(user_shell_args(distro, true, extra))
+            .env("WSL_UTF8", "1")
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+            .stdin(Stdio::from(stdin))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("wsl_start_failed: {error}"))?;
+        drop(input);
+        let start = Instant::now();
+        while start.elapsed() < settle {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|error| format!("wsl_wait_failed: {error}"))?
+            {
+                return match status.code() {
+                    Some(0) => Ok(()),
+                    Some(code) => Err(format!("guest_exit:{code}")),
+                    None => Err(format!("wsl_exit_failed: {status}")),
+                };
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        // Dropping a `Child` closes its handles without ending the process.
+        drop(child);
+        Ok(())
     }
 
     pub fn state_dir() -> Result<PathBuf, String> {

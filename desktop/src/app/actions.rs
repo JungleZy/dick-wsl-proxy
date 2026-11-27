@@ -1059,6 +1059,61 @@ impl Desktop {
         );
     }
 
+    /// 读当前环境详情对应环境里装的图形应用。静默读取，同一时间只读一次。
+    pub(crate) fn refresh_environment_apps(&mut self, cx: &mut Context<Self>) {
+        if self.environment_apps_loading {
+            return;
+        }
+        let Some(name) = self
+            .environment_detail
+            .as_ref()
+            .and_then(|detail| detail["name"].as_str())
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        self.environment_apps_requested = Some(name.clone());
+        self.send(
+            Kind::EnvironmentApps,
+            json!({"command":"environment_apps","name":name}),
+            cx,
+        );
+    }
+
+    /// 应用列表里这个 ID 的显示名；列表里没有时用 ID 去掉 `.desktop`。
+    pub(crate) fn environment_app_name(&self, id: &str) -> String {
+        self.environment_apps
+            .as_ref()
+            .and_then(|apps| apps["apps"].as_array())
+            .into_iter()
+            .flatten()
+            .find(|app| app["id"].as_str() == Some(id))
+            .and_then(|app| app["name"].as_str())
+            .unwrap_or_else(|| id.trim_end_matches(".desktop"))
+            .to_owned()
+    }
+
+    /// 在环境里以默认用户启动一个应用。不要求空闲：在接管中的环境里开应用正是用途。
+    pub(crate) fn environment_launch(&mut self, app: String, cx: &mut Context<Self>) {
+        if self.environment_launching.is_some() || self.busy.is_some() {
+            return;
+        }
+        let Some(name) = self
+            .environment_apps
+            .as_ref()
+            .and_then(|apps| apps["name"].as_str())
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        self.environment_launching = Some(app.clone());
+        self.send(
+            Kind::EnvironmentLaunch,
+            json!({"command":"environment_launch","name":name,"app":app}),
+            cx,
+        );
+    }
+
     pub(crate) fn environment_submit(&mut self, cx: &mut Context<Self>) {
         if self.locked() {
             return;

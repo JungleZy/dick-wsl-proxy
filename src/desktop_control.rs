@@ -50,7 +50,19 @@ fn environment_job() -> MutexGuard<'static, Option<EnvironmentJob>> {
 
 /// Commands refused while an environment operation runs: they would start,
 /// inspect or reshape a distribution that is being created or changed.
-fn blocked_by_environment_job(command: &str, request: &Value, target: &str) -> bool {
+fn blocked_by_environment_job(command: &str, request: &Value, job: &EnvironmentJob) -> bool {
+    let target = job.target.as_str();
+    // Listing or starting apps runs `wsl.exe` in the distribution: not while
+    // that one is being changed, nor while `wsl --update` restarts WSL.
+    let in_distribution = matches!(
+        command,
+        "environment_view" | "environment_apps" | "environment_launch"
+    );
+    if in_distribution
+        && (job.command == "wsl_platform_update" || request["name"].as_str() == Some(target))
+    {
+        return true;
+    }
     matches!(
         command,
         "start"
@@ -64,7 +76,7 @@ fn blocked_by_environment_job(command: &str, request: &Value, target: &str) -> b
             | "environment_backup"
             | "environment_delete"
             | "wsl_platform_update"
-    ) || (command == "environment_view" && request["name"].as_str() == Some(target))
+    )
 }
 
 fn start_environment_job(
@@ -192,6 +204,13 @@ struct EnvironmentEdit {
 #[serde(deny_unknown_fields)]
 struct EnvironmentKey {
     name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvironmentLaunch {
+    name: String,
+    app: String,
 }
 
 #[derive(Deserialize)]
@@ -643,7 +662,7 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
             .ok_or_else(|| bad("missing_command".into()))?
             .to_owned();
         if let Some(job) = environment_job().as_ref().filter(|job| job.running())
-            && blocked_by_environment_job(&cmd, &request, &job.target)
+            && blocked_by_environment_job(&cmd, &request, job)
         {
             return Err(crate::command::Failure::new(
                 "environment_job_running",
@@ -687,6 +706,16 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
             "environment_view" => {
                 let req: EnvironmentKey = fields(&mut request, "invalid_environment_fields")?;
                 environment::view(&req.name).map_err(bad)?
+            }
+            // Neither needs an idle controller: starting apps inside the
+            // environment being taken over is the point.
+            "environment_apps" => {
+                let req: EnvironmentKey = fields(&mut request, "invalid_environment_fields")?;
+                environment::apps::list(&req.name).map_err(bad)?
+            }
+            "environment_launch" => {
+                let req: EnvironmentLaunch = fields(&mut request, "invalid_environment_fields")?;
+                environment::apps::launch(&req.name, &req.app).map_err(bad)?
             }
             "environment_create" => {
                 require_idle(controller)?;
@@ -938,19 +967,23 @@ mod tests {
                 .unwrap_err(),
             "environment_job_running"
         );
+        let job = |command: &'static str, target: &str| EnvironmentJob {
+            command,
+            target: target.into(),
+            worker: None,
+        };
+        let edit_dev = job("environment_edit", "Dev");
+        let edit_other = job("environment_edit", "Other");
+        let wsl_update = job("wsl_platform_update", "WSL");
         let request = json!({"command":"environment_view","name":"Dev"});
-        assert!(blocked_by_environment_job("start", &request, "Dev"));
-        assert!(blocked_by_environment_job(
-            "environment_view",
-            &request,
-            "Dev"
-        ));
-        assert!(!blocked_by_environment_job(
-            "environment_view",
-            &request,
-            "Other"
-        ));
-        assert!(!blocked_by_environment_job("status", &request, "Dev"));
+        assert!(blocked_by_environment_job("start", &request, &edit_dev));
+        assert!(!blocked_by_environment_job("status", &request, &edit_dev));
+        for command in ["environment_view", "environment_apps", "environment_launch"] {
+            assert!(blocked_by_environment_job(command, &request, &edit_dev));
+            assert!(!blocked_by_environment_job(command, &request, &edit_other));
+            // `wsl --update` restarts WSL, so no distribution is safe to touch.
+            assert!(blocked_by_environment_job(command, &request, &wsl_update));
+        }
 
         release.send(()).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

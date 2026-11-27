@@ -308,6 +308,11 @@ impl Desktop {
             environment_edit_target: None,
             environment_selected: None,
             environment_detail: None,
+            environment_apps: None,
+            environment_apps_error: None,
+            environment_apps_loading: false,
+            environment_apps_requested: None,
+            environment_launching: None,
             environment_started: None,
             environment_progress_snapshot: None,
             environment_progress_reading: false,
@@ -388,6 +393,12 @@ impl Desktop {
             // 住宅代理检测同样静默：不锁界面，卡片自己显示「检测中」，结果只写进卡片。
             self.residential_probe_checking = true;
             self.residential_probe_error = None;
+        } else if kind == Kind::EnvironmentApps {
+            // 应用列表同样静默：卡片自己显示「读取中」。
+            self.environment_apps_loading = true;
+            self.environment_apps_error = None;
+        } else if kind == Kind::EnvironmentLaunch {
+            // 启动应用不锁界面：只禁用应用按钮，结果弹成通知。
         } else {
             if self.reading || self.busy.is_some() {
                 return;
@@ -435,6 +446,12 @@ impl Desktop {
             if kind == Kind::ResidentialProbe {
                 self.residential_probe_checking = false;
             }
+            if kind == Kind::EnvironmentApps {
+                self.environment_apps_loading = false;
+            }
+            if kind == Kind::EnvironmentLaunch {
+                self.environment_launching = None;
+            }
             self.fail("后台通信线程已退出，请重新打开窗口。", cx);
         } else {
             // 页面提示文字记录用户操作的进展和结果。读日志、读环境详情是切页面时
@@ -445,6 +462,8 @@ impl Desktop {
                     | Kind::Connections
                     | Kind::Logs
                     | Kind::EnvironmentView
+                    | Kind::EnvironmentApps
+                    | Kind::EnvironmentLaunch
                     | Kind::WslPlatform
                     | Kind::ResidentialProbe
             ) {
@@ -844,6 +863,16 @@ impl Desktop {
             cx.notify();
             return;
         }
+        if reply.kind == Kind::EnvironmentApps {
+            self.accept_environment_apps(reply.result, cx);
+            cx.notify();
+            return;
+        }
+        if reply.kind == Kind::EnvironmentLaunch {
+            self.accept_environment_launch(reply.result);
+            cx.notify();
+            return;
+        }
         if reply.kind == Kind::Status {
             self.refreshing = false;
             if reply.epoch != self.epoch || self.busy.is_some() {
@@ -1115,6 +1144,8 @@ impl Desktop {
             Kind::WslPlatform => {}
             // 已在循环开头单独处理，不会走到这里。
             Kind::ResidentialProbe => {}
+            // 已在循环开头单独处理，不会走到这里。
+            Kind::EnvironmentApps | Kind::EnvironmentLaunch => {}
             Kind::List => {
                 self.distributions = value.as_array().cloned().unwrap_or_default();
                 // 和自动清除用同一条规则判断目标还在不在，界面和库里才不会不一致。
@@ -1318,6 +1349,8 @@ impl Desktop {
                 }
                 self.environment_editor = None;
                 self.environment_edit_target = None;
+                self.environment_apps = None;
+                self.refresh_environment_apps(cx);
                 self.error = false;
                 self.notice = "环境创建成功，组件安装已完成。".into();
             }
@@ -1586,13 +1619,72 @@ impl Desktop {
         }
     }
 
+    /// 应用列表是静默读取：结果和失败原因只写进应用卡片。读的期间换了环境，
+    /// 这次结果不是当前环境的：丢掉，按当前环境再读一次。
+    fn accept_environment_apps(&mut self, result: Result<Value, String>, cx: &mut Context<Self>) {
+        self.environment_apps_loading = false;
+        let requested = self.environment_apps_requested.take();
+        let Some(current) = self
+            .environment_detail
+            .as_ref()
+            .and_then(|detail| detail["name"].as_str())
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        if !requested
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(&current))
+        {
+            self.refresh_environment_apps(cx);
+            return;
+        }
+        match result {
+            Ok(value) => {
+                self.environment_apps = Some(value);
+                self.environment_apps_error = None;
+            }
+            Err(error) => {
+                self.environment_apps_error = Some(super::backend::humanize_error(&error));
+            }
+        }
+    }
+
+    /// 启动结果弹成通知：应用窗口由 WSLg 打开，界面上没有别的地方能看到结果。
+    fn accept_environment_launch(&mut self, result: Result<Value, String>) {
+        let app = self.environment_launching.take();
+        let label = app
+            .as_deref()
+            .map(|id| self.environment_app_name(id))
+            .unwrap_or_else(|| "应用".into());
+        self.save_notice = Some(match result {
+            Ok(_) => Ok(format!("已启动 {label}，窗口出现可能要几秒。")),
+            Err(error) => Err(format!(
+                "启动 {label} 失败：{}",
+                super::backend::humanize_error(&error)
+            )),
+        });
+    }
+
     fn accept_environment_detail(
         &mut self,
         value: Value,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let same_environment = self
+            .environment_apps
+            .as_ref()
+            .and_then(|apps| apps["name"].as_str())
+            .zip(value["name"].as_str())
+            .is_some_and(|(listed, name)| listed.eq_ignore_ascii_case(name));
+        if !same_environment {
+            self.environment_apps = None;
+        }
+        self.environment_apps_error = None;
         self.environment_detail = Some(value.clone());
+        // 每次读详情都重读应用：刷新详情也是用户想看最新状态的时候。
+        self.refresh_environment_apps(cx);
         if let Some(features) = value.get("features") {
             self.environment_zsh = features["zsh"].as_bool().unwrap_or(false);
             self.environment_chrome = features["chrome"].as_bool().unwrap_or(false);
