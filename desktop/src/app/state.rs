@@ -73,6 +73,8 @@ pub(crate) struct Desktop {
     /// with its `scope`, `phase` and `operation_generation`. `status` is the
     /// one the pages show.
     pub(crate) sessions: Vec<Value>,
+    /// 「停止全部」还没停的环境（scope），上一个停下来后依次发出。
+    pub(crate) stop_queue: Vec<String>,
     pub(crate) profile: Value,
     /// 配置库里各环境的住宅代理和入口端口（决策 40），每项带 `distro_id`、`revision`、
     /// `residential`、`ingress_port`。

@@ -342,12 +342,7 @@ impl Desktop {
 
     /// 现在不能升级的原因。安装器自己也会拒绝这些情况，这里先说清楚，免得关了窗口才失败。
     fn upgrade_blocker(&self) -> Option<&'static str> {
-        upgrade_blocker(
-            self.status_valid,
-            self.phase(),
-            !self.status["active_target"].is_null(),
-            self.locked(),
-        )
+        upgrade_blocker(self.status_valid, &self.sessions, self.locked())
     }
 
     fn open_upgrade_dialog(
@@ -364,7 +359,7 @@ impl Desktop {
             None => "直连 GitHub".to_owned(),
         };
         let message = format!(
-            "将下载安装包 {name}（{size}，{route}），核对发布页公布的 SHA-256 后关闭本窗口，运行新包里的 install.ps1 升级 {dir}，装好后自动重新打开。窗口关闭后通常要一两分钟才会重新打开，期间看不到进度；请不要自己打开程序，否则安装器会拒绝这次升级。\n\n后台必须空闲：安装器会请它退出，接管中或需要恢复时会拒绝。升级只替换程序文件，配置库 desktop.sqlite、开机自启和恢复记录都保留。\n\n安装包没有签名：SHA-256 只能发现下载损坏，证明不了发布者是谁；这和手动从发布页下载是同一个信任前提。",
+            "将下载安装包 {name}（{size}，{route}），核对发布页公布的 SHA-256 后关闭本窗口，运行新包里的 install.ps1 升级 {dir}，装好后自动重新打开。窗口关闭后通常要一两分钟才会重新打开，期间看不到进度；请不要自己打开程序，否则安装器会拒绝这次升级。\n\n后台必须空闲：安装器会请它退出，任何一个环境在接管中或需要恢复都会拒绝。升级只替换程序文件，配置库 desktop.sqlite、开机自启和恢复记录都保留。\n\n安装包没有签名：SHA-256 只能发现下载损坏，证明不了发布者是谁；这和手动从发布页下载是同一个信任前提。",
             name = release.package.name,
             size = megabytes(release.package.size),
             dir = install_dir.display(),
@@ -661,7 +656,7 @@ impl Desktop {
                 body.child(div().text_sm().text_color(rgb(RUST)).child(error))
             })
             .child(div().text_sm().text_color(rgb(MUTED)).child(
-                "升级会下载安装包、核对 SHA-256，然后关闭窗口、运行新包里的安装器，装好后自动重新打开；只在没有接管时可用。安装包没有签名：核对只能发现下载损坏，证明不了发布者是谁。",
+                "升级会下载安装包、核对 SHA-256，然后关闭窗口、运行新包里的安装器，装好后自动重新打开；只在所有环境都没有接管时可用。安装包没有签名：核对只能发现下载损坏，证明不了发布者是谁。",
             ))
     }
 
@@ -684,17 +679,18 @@ impl Desktop {
     }
 }
 
-/// 现在不能升级的原因：后台状态没确认、有接管或待恢复、有操作在进行。
-fn upgrade_blocker(
-    status_valid: bool,
-    phase: &str,
-    active_target: bool,
-    locked: bool,
-) -> Option<&'static str> {
+/// 现在不能升级的原因：后台状态没确认、任何一个环境有接管或待恢复、有操作在进行。
+/// `sessions` 是后台每个环境一项的会话状态。
+fn upgrade_blocker(status_valid: bool, sessions: &[Value], locked: bool) -> Option<&'static str> {
+    let owned = |session: &Value| {
+        session["phase"].as_str() != Some("idle") || !session["active_target"].is_null()
+    };
     if !status_valid {
         Some("后台状态未确认，暂时不能升级；请先点底部状态栏的后台图标重新连接。")
-    } else if phase != "idle" || active_target {
-        Some("接管进行中或需要恢复时不能升级，安装器会拒绝。请先停止接管、恢复直连，再升级。")
+    } else if sessions.iter().any(owned) {
+        Some(
+            "有环境在接管中或需要恢复，不能升级，安装器会拒绝。请先停止全部接管、恢复直连，再升级。",
+        )
     } else if locked {
         Some("有操作正在进行，等它结束后再升级。")
     } else {

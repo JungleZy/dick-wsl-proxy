@@ -39,7 +39,7 @@ dick-wsl-proxy takes over only the distribution you choose, from the Windows sid
 - It changes neither the Windows system proxy nor WSL's shared `resolv.conf` or `.wslconfig`, and installs no proxy software or listener inside WSL.
 - When something breaks, traffic is blocked rather than allowed to bypass the proxy. The original network path comes back only when you explicitly stop the takeover.
 
-It is not a general-purpose VPN: it handles one WSL2 distribution, and the backend has been validated only in WSL2 NAT networking mode. Each distribution has its own residential proxy and Windows ingress port; for now each Windows account can take over only one distribution at a time. To take over a different one, stop the current takeover and start the new one; established TCP connections do not move across.
+It is not a general-purpose VPN: it handles the WSL2 distributions you choose, and the backend has been validated only in WSL2 NAT networking mode. Several distributions can be taken over at once, each with its own residential proxy and Windows ingress port and its rules in its own nft tables, without affecting each other; at most one of them may run Docker (they share one network stack, so `docker0` would clash).
 
 ## Features
 
@@ -209,7 +209,7 @@ Keep `wsl-proxy-desktop.exe` and the matching version of `wsl-proxyctl.exe` in t
    - The preflight runs automatically.
    - If kernel modules are missing, the app asks whether to load the ones already in the distribution.
    - A confirmation dialog then states that the timezone will change and the target will restart. The takeover starts once you confirm.
-   - Only one environment can be taken over at a time for now: while another one is taken over or needs recovery, the button is disabled and says which one to stop first.
+   - Several environments can be taken over at once, each started and stopped on its own. At most one of them may run Docker: starting an environment whose Docker is running is refused while another takeover already covers container networks.
 5. **Stop**: click **Stop takeover** in that environment's **Takeover** card, **Stop takeover** on Home, or **Stop all takeovers** in the tray menu.
 
 When upgrading from 0.1.17 or earlier, the single saved residential proxy and ingress port move to the distribution that was set as the target. If that distribution is gone, the environment details show a residential proxy that is "not assigned to any environment"; assign it to the environment you are viewing, or discard it.
@@ -220,7 +220,7 @@ The desktop UI is in Chinese; the labels above are translations.
 
 | Page | Purpose |
 | --- | --- |
-| Home | Takeover overview: the environment being taken over, protection chain, traffic chart, event timeline. The main button changes with the state: go to Environments / stop takeover / abandon this record / reconnect |
+| Home | Takeover overview: the environments taken over or needing recovery (one row each when there are several, each with its own stop, restore or abandon button), protection chain, traffic chart summed over all environments, event timeline. The main button changes with the state: go to Environments / stop takeover / stop all takeovers / abandon this record / reconnect |
 | Environments | Distribution list (each row shows its takeover state) and details; the **Takeover** card in the details holds that environment's residential proxy, ingress port, test, start and stop; create, edit components, change timezone, back up, delete a distribution (these five need no takeover in progress) |
 | Rules | Direct rules in three columns: IP / CIDR, exact domain, domain suffix |
 | Connections | Connection records (the newest 50,000 finished connections are kept), re-check public exit, export redacted diagnostics, reset DNS aliases |
@@ -230,8 +230,8 @@ The desktop UI is in Chinese; the labels above are translations.
 ### Tray and closing the window
 
 - **Closing the window only hides it to the tray; the proxy keeps running.** If the tray icon could not be shown (for example, Explorer was not ready at login), closing quits the window and leaves the backend running.
-- **The tray icon shows whether a takeover is running.** A green shield with a light sweeping along its pulse line means a takeover is running; a still grey shield means idle; red means recovery is needed; amber with a flat line means the backend state is unconfirmed (a takeover may still be in effect). Hover to see the state and the target distribution.
-- Click the tray icon to open the main window. The right-click menu shows the current state at the top, and its main action follows the state: **Open Environments** when idle, **Stop all takeovers** during a takeover, **Go to recovery** (opens that environment's page) when recovery is needed, **Reconnect backend** when the backend is not reachable. It also offers **Check public exit**, **View connection records**, **View run log** and **Start at login**.
+- **The tray icon shows whether a takeover is running.** A green shield with a light sweeping along its pulse line means a takeover is running; a still grey shield means idle; red means recovery is needed; amber with a flat line means the backend state is unconfirmed (a takeover may still be in effect). Hover to see the state and the target distribution, or "N environments" when several are taken over; the icon is red as soon as any environment needs recovery.
+- Click the tray icon to open the main window. The right-click menu shows the current state at the top, and its main action follows the state: **Open Environments** when idle, **Stop all takeovers** during a takeover (one confirmation, then each environment is stopped in turn), **Go to recovery** (opens that environment's page) when recovery is needed, **Reconnect backend** when the backend is not reachable. It also offers **Check public exit**, **View connection records**, **View run log** and **Start at login**.
 - **Exit** in the tray menu: when idle, it shuts the backend down and quits; during a takeover it asks first, then stops the takeover, restores direct routing, shuts the backend down and quits. It does not quit if any step fails.
 - If the desktop process is killed or crashes, the backend keeps running; reopen the app to reconnect.
 - Only one desktop window runs at a time. Opening it again brings the existing window to the front.

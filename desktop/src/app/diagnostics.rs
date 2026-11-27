@@ -5,13 +5,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui_kit::base::Selectable as _;
 use gpui_kit::component::{
-    Sizable as _,
+    Disableable as _, Sizable as _,
     button::{Button, ButtonGroup},
 };
 use gpui_kit::{prelude::*, *};
-use serde_json::Value;
+use serde_json::{Value, json};
 
-use super::backend;
+use super::backend::{self, Kind};
 use super::components::{
     StatusTone, Tip, badge, bytes, design_icon, fact, rate, status_icon, text_tip,
 };
@@ -149,7 +149,11 @@ fn connection_row(row: &ConnectionRow) -> Stateful<Div> {
     };
     let id = match row.record_id {
         Some(record_id) => ElementId::from(("connection-record", record_id as u64)),
-        None => ElementId::from(("connection-live", row.flow_id)),
+        // 流 ID 每次启动入口都从 1 计，多个环境同时接管时只有和入口编号合起来才不重复。
+        None => ElementId::from((
+            ElementId::from(("connection-live", row.session)),
+            row.flow_id.to_string(),
+        )),
     };
     div()
         .id(id)
@@ -246,7 +250,66 @@ fn arrow_value(arrow: &'static str, value: String) -> Div {
         .child(div().font_family(MONO_FONT).child(value))
 }
 
+/// 有转发观测的环境：带 `forwarding.traffic` 的会话。
+fn forwarding_sessions(sessions: &[Value]) -> impl Iterator<Item = &Value> {
+    sessions
+        .iter()
+        .filter(|session| session["forwarding"]["traffic"].is_object())
+}
+
+/// 全部有转发观测的环境的某一项流量之和；一个都没有时返回 `None`。
+fn summed(sessions: &[Value], key: &str) -> Option<f64> {
+    forwarding_sessions(sessions)
+        .map(|session| {
+            session["forwarding"]["traffic"][key]
+                .as_f64()
+                .unwrap_or_default()
+                .max(0.)
+        })
+        .reduce(|total, value| total + value)
+}
+
+/// 全部有转发观测的环境的上行、下行速率之和（字节每秒）；没有任何环境在转发时返回 `None`。
+pub(crate) fn summed_rates(sessions: &[Value]) -> Option<(f64, f64)> {
+    Some((
+        summed(sessions, "tx_bytes_per_sec")?,
+        summed(sessions, "rx_bytes_per_sec")?,
+    ))
+}
+
+/// 能检测公网出口的环境：完整接管（forwarding_managed）的会话。
+fn probe_candidates(sessions: &[Value]) -> Vec<&Value> {
+    sessions
+        .iter()
+        .filter(|session| session["phase"] == "forwarding_managed")
+        .collect()
+}
+
 impl Desktop {
+    /// 检测某一个接管中环境的公网出口，请求带它的 scope 和它自己的操作代数。
+    pub(crate) fn probe_session(&mut self, scope: &str, cx: &mut Context<Self>) {
+        if self.locked() {
+            self.fail(
+                "当前有操作在进行或等待确认，完成或取消后再检测公网出口。",
+                cx,
+            );
+            return;
+        }
+        if self.phase_for(scope) != "forwarding_managed" {
+            self.fail("只有接管中的环境才能检测公网出口。", cx);
+            return;
+        }
+        let Some(generation) = self.generation_for(scope) else {
+            self.fail("后台状态未确认，请先刷新。", cx);
+            return;
+        };
+        self.send(
+            Kind::Probe,
+            json!({"command":"probe_exit","expected_generation":generation,"target":scope}),
+            cx,
+        );
+    }
+
     /// 只有最近一次快照有效、且后台确实在转发时才返回转发观测，避免把过期数据当成实时值。
     pub(crate) fn forwarding(&self) -> Option<&Value> {
         let forwarding = &self.status["forwarding"];
@@ -288,15 +351,37 @@ impl Desktop {
                 Tip::new("系统 DNS").row("状态", "未确认").note(SNAPSHOT),
             )
         };
-        let (worker_tone, worker_tip) = match self
-            .forwarding()
-            .map(|forwarding| forwarding["healthy"].as_bool())
-        {
-            Some(Some(true)) => (StatusTone::Ok, Tip::new("转发线程").row("状态", "运行中")),
-            Some(Some(false)) => (
+        // 多个环境同时接管时，任何一个故障就显示故障，并写出是哪几个环境。
+        let observed: Vec<&Value> = if self.status_valid {
+            forwarding_sessions(&self.sessions).collect()
+        } else {
+            Vec::new()
+        };
+        let failing = observed
+            .iter()
+            .filter(|session| session["forwarding"]["healthy"] == false)
+            .map(|session| Self::session_name(session))
+            .collect::<Vec<_>>();
+        let all_healthy = !observed.is_empty()
+            && observed
+                .iter()
+                .all(|session| session["forwarding"]["healthy"] == true);
+        let (worker_tone, worker_tip) = match (failing.is_empty(), all_healthy) {
+            (true, true) => (
+                StatusTone::Ok,
+                Tip::new("转发线程").row("状态", "运行中").note_if(
+                    observed.len() > 1,
+                    format!("{} 个环境都在转发", observed.len()),
+                ),
+            ),
+            (false, _) => (
                 StatusTone::Error,
                 Tip::new("转发线程")
                     .row("状态", "故障")
+                    .note_if(
+                        observed.len() > 1,
+                        format!("故障环境：{}", failing.join("、")),
+                    )
                     .note("最后一次转发错误见连接页"),
             ),
             _ => (
@@ -315,29 +400,36 @@ impl Desktop {
     /// 状态栏的实时速率和累计流量。没有转发观测（未接管或状态未确认）时显示 0，
     /// 悬停提示说明原因；实时和累计用图标区分，不写文字。
     pub(crate) fn status_observations(&self) -> Div {
-        const NO_DATA: &str = "未接管或后台状态未确认，显示 0";
-        let forwarding = self.forwarding();
-        let traffic = forwarding
-            .map(|forwarding| &forwarding["traffic"])
-            .unwrap_or(&Value::Null);
-        let total = |key: &str| bytes(traffic[key].as_u64().unwrap_or_default());
+        const NO_DATA: &str = "没有环境在接管或后台状态未确认，显示 0";
+        // 多个环境同时接管时显示全部环境之和，和流量曲线一致。
+        let sessions: &[Value] = if self.status_valid {
+            &self.sessions
+        } else {
+            &[]
+        };
+        let observed = forwarding_sessions(sessions).count();
+        let sum = |key: &str| json!(summed(sessions, key).unwrap_or_default());
+        let total = |key: &str| bytes(summed(sessions, key).unwrap_or_default() as u64);
         let (tx_rate, rx_rate) = (
-            rate(&traffic["tx_bytes_per_sec"]),
-            rate(&traffic["rx_bytes_per_sec"]),
+            rate(&sum("tx_bytes_per_sec")),
+            rate(&sum("rx_bytes_per_sec")),
         );
         let (tx_total, rx_total) = (total("tx_bytes"), total("rx_bytes"));
+        let several = format!("{observed} 个环境之和");
         let rate_tip = Tip::new("实时速率")
             .row("↑ 上行", tx_rate.clone())
             .row("↓ 下行", rx_rate.clone())
             .note("目标发行版经 Windows 入口收发的应用层数据")
             .note("按相邻两次状态快照计算")
-            .note_if(forwarding.is_none(), NO_DATA);
+            .note_if(observed > 1, several.clone())
+            .note_if(observed == 0, NO_DATA);
         let total_tip = Tip::new("累计流量（本次接管以来）")
             .row("↑ 上行", tx_total.clone())
             .row("↓ 下行", rx_total.clone())
             .note("应用层字节，不含代理握手和 IP 包头")
             .note("重新启动接管后从零计")
-            .note_if(forwarding.is_none(), NO_DATA);
+            .note_if(observed > 1, several)
+            .note_if(observed == 0, NO_DATA);
         div()
             .flex()
             .flex_shrink_0()
@@ -372,9 +464,15 @@ impl Desktop {
     }
 
     fn exit_fact(&self) -> Stateful<Div> {
-        let exit = &self.status["recent_exit"];
+        // 每个环境有自己的出口检测结果。卡片显示最近检测的那个，悬停提示列出全部环境。
+        let exits = latest_exits(if self.status_valid {
+            &self.sessions
+        } else {
+            &[]
+        });
+        let several = self.owned_sessions().len() > 1 || exits.len() > 1;
         let (label, value, color, tooltip): (String, String, u32, &'static str) =
-            if self.status_valid && exit.is_object() {
+            if let Some((name, exit)) = exits.first() {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|elapsed| elapsed.as_secs())
@@ -383,37 +481,27 @@ impl Desktop {
                     .as_u64()
                     .map(|checked| format!("{}检测", ago(now.saturating_sub(checked))))
                     .unwrap_or_else(|| "检测时间未知".into());
-                let (verdict, color, tooltip) = match exit["matches_residential"].as_bool() {
-                    Some(true) => (
-                        "已匹配",
-                        TEAL,
-                        "出口 IP 与设置里的住宅代理服务器地址相同。结果只代表该次观测。",
-                    ),
-                    Some(false) => (
-                        "未匹配",
-                        AMBER,
-                        "出口 IP 与设置里的住宅代理服务器地址不同。结果只代表该次观测。",
-                    ),
-                    None => ("未比对", INK, "结果只代表该次观测。"),
+                let (_, color, tooltip) = exit_verdict(exit);
+                let label = if several {
+                    format!("公网出口 · {name} · {checked}")
+                } else {
+                    format!("公网出口 · {checked}")
                 };
-                (
-                    format!("公网出口 · {checked}"),
-                    format!(
-                        "{} · {} · {verdict}",
-                        exit["ip"].as_str().unwrap_or("—"),
-                        exit["country"].as_str().unwrap_or("—"),
-                    ),
-                    color,
-                    tooltip,
-                )
+                (label, exit_summary(exit), color, tooltip)
             } else {
                 (
                     "公网出口".into(),
                     "未检测".into(),
                     MUTED,
-                    "接管中点「复核公网出口」检测一次；结果只代表该次观测。",
+                    "在接管中的环境上点「复核公网出口」检测一次；结果只代表该次观测。",
                 )
             };
+        let tip = exits
+            .iter()
+            .fold(Tip::new("公网出口"), |tip, (name, exit)| {
+                tip.row(name.clone(), exit_summary(exit))
+            })
+            .note(tooltip);
         div()
             .id("connection-exit")
             .flex()
@@ -433,7 +521,7 @@ impl Desktop {
                     .truncate()
                     .child(value),
             )
-            .tooltip(move |window, cx| text_tip(tooltip, window, cx))
+            .tooltip(move |window, cx| tip.build(window, cx))
     }
 
     /// 页面上显示的行：进行中的连接（状态有效时）在前，已落盘的记录在后。
@@ -520,21 +608,66 @@ impl Desktop {
             RUST
         };
 
-        let header = div().flex().items_center().justify_end().gap_3().child(
-            ButtonGroup::new("connection-actions")
-                .child(
-                    self.button(
-                        "probe-exit",
-                        "复核公网出口",
-                        UiAction::Probe,
-                        locked || self.phase() != "forwarding_managed",
-                        cx,
-                    )
+        // 每个完整接管中的环境一个检测按钮；只有一个或没有时还是一个「复核公网出口」。
+        let candidates = if self.status_valid {
+            probe_candidates(&self.sessions)
+        } else {
+            Vec::new()
+        };
+        let several = candidates.len() > 1;
+        let current = candidates.len() == 1 && candidates[0]["scope"] == self.status["scope"];
+        let probe_buttons = if current {
+            // 只有一个、且就是当前那个接管：走原来的检测（托盘也用它）。
+            vec![
+                self.button("probe-exit", "复核公网出口", UiAction::Probe, locked, cx)
                     .tooltip("检测目标发行版实际的公网出口；只有接管中可用，结果只代表该次观测。")
                     .small(),
-                )
+            ]
+        } else if candidates.is_empty() {
+            vec![
+                Button::new(("probe-exit", 0usize))
+                    .label("复核公网出口")
+                    .disabled(true)
+                    .tooltip("检测环境实际的公网出口；只有接管中的环境可用，结果只代表该次观测。")
+                    .small(),
+            ]
+        } else {
+            candidates
+                .iter()
+                .enumerate()
+                .map(|(index, session)| {
+                    let name = Self::session_name(session);
+                    let scope = session["scope"].as_str().unwrap_or_default().to_owned();
+                    let (label, tooltip) = if several {
+                        (
+                            format!("复核出口 · {name}"),
+                            format!("检测 {name} 实际的公网出口；结果只代表该次观测。"),
+                        )
+                    } else {
+                        (
+                            "复核公网出口".to_owned(),
+                            format!(
+                                "检测 {name} 实际的公网出口；只有接管中可用，结果只代表该次观测。"
+                            ),
+                        )
+                    };
+                    Button::new(("probe-exit", index))
+                        .label(label)
+                        .disabled(locked)
+                        .tooltip(tooltip)
+                        .small()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.probe_session(&scope, cx);
+                        }))
+                })
+                .collect()
+        };
+        let header = div().flex().items_center().justify_end().gap_3().child(
+            ButtonGroup::new("connection-actions")
+                .children(probe_buttons)
                 .child(
                     self.button("export", "导出脱敏诊断", UiAction::Export, locked, cx)
+                        .tooltip("导出全部环境的状态，密码等敏感信息已去掉。")
                         .small(),
                 )
                 .child(
@@ -542,10 +675,11 @@ impl Desktop {
                         "reset-dns-aliases",
                         "重置 DNS 别名",
                         UiAction::ResetDnsAliases,
-                        locked || self.phase() != "idle",
+                        // 别名记录是全部环境共用的：所有环境都空闲时才能重置。
+                        locked || !self.status_valid || !self.owned_sessions().is_empty(),
                         cx,
                     )
-                    .tooltip("只在提示 DNS 别名号段已用完时使用；需要先停止接管。")
+                    .tooltip("只在提示 DNS 别名号段已用完时使用；需要先停止全部环境的接管。")
                     .small(),
                 )
                 .child(
@@ -580,14 +714,26 @@ impl Desktop {
             .child(self.exit_fact());
 
         let mut banners = Vec::new();
-        if let Some(error) = self
-            .forwarding()
-            .and_then(|forwarding| forwarding["last_error"].as_str())
-        {
+        // 每个环境各有自己的转发，错误分别显示；多个环境同时接管时写明是哪个环境。
+        let forwarding = if self.status_valid {
+            forwarding_sessions(&self.sessions).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let named = forwarding.len() > 1;
+        for (index, session) in forwarding.iter().enumerate() {
+            let Some(error) = session["forwarding"]["last_error"].as_str() else {
+                continue;
+            };
+            let place = if named {
+                format!("{} ", Self::session_name(session))
+            } else {
+                String::new()
+            };
             banners.push(banner(
-                "connection-last-error",
+                ("connection-last-error", index),
                 format!(
-                    "最后一次转发错误（后台报告）：{}",
+                    "{place}最后一次转发错误（后台报告）：{}",
                     backend::humanize_error(error)
                 ),
                 RUST,
@@ -662,7 +808,7 @@ impl Desktop {
                         "后台状态未确认，暂不显示进行中的连接。".into()
                     }
                     ConnectionFilter::Active if self.idle() => {
-                        "当前未接管，没有进行中的连接。".into()
+                        "当前没有环境在接管，没有进行中的连接。".into()
                     }
                     ConnectionFilter::Active => "当前没有进行中的连接。".into(),
                     ConnectionFilter::Failed => "没有失败的连接记录。".into(),
@@ -797,6 +943,43 @@ impl Desktop {
     }
 }
 
+/// 各环境最近一次的出口检测结果，按检测时间从新到旧。
+fn latest_exits(sessions: &[Value]) -> Vec<(String, &Value)> {
+    let mut exits = sessions
+        .iter()
+        .filter(|session| session["recent_exit"].is_object())
+        .map(|session| (Desktop::session_name(session), &session["recent_exit"]))
+        .collect::<Vec<_>>();
+    exits.sort_by_key(|(_, exit)| std::cmp::Reverse(exit["checked_unix_seconds"].as_u64()));
+    exits
+}
+
+fn exit_verdict(exit: &Value) -> (&'static str, u32, &'static str) {
+    match exit["matches_residential"].as_bool() {
+        Some(true) => (
+            "已匹配",
+            TEAL,
+            "出口 IP 与该环境的住宅代理服务器地址相同。结果只代表该次观测。",
+        ),
+        Some(false) => (
+            "未匹配",
+            AMBER,
+            "出口 IP 与该环境的住宅代理服务器地址不同。结果只代表该次观测。",
+        ),
+        None => ("未比对", INK, "结果只代表该次观测。"),
+    }
+}
+
+/// 一次出口检测的结果，例如 `203.0.113.7 · US · 已匹配`。
+fn exit_summary(exit: &Value) -> String {
+    format!(
+        "{} · {} · {}",
+        exit["ip"].as_str().unwrap_or("—"),
+        exit["country"].as_str().unwrap_or("—"),
+        exit_verdict(exit).0,
+    )
+}
+
 fn grouped(value: u64) -> String {
     let digits = value.to_string();
     let mut grouped = String::new();
@@ -810,7 +993,7 @@ fn grouped(value: u64) -> String {
 }
 
 /// 页面上的单行提示条；全文放在 tooltip，避免长错误把表格挤出首屏。
-fn banner(id: &'static str, text: String, color: u32, background: u32) -> Stateful<Div> {
+fn banner(id: impl Into<ElementId>, text: String, color: u32, background: u32) -> Stateful<Div> {
     let tooltip: SharedString = text.clone().into();
     div()
         .id(id)
@@ -830,7 +1013,10 @@ fn banner(id: &'static str, text: String, color: u32, background: u32) -> Statef
 mod tests {
     use serde_json::json;
 
-    use super::{ago, duration, grouped, route_label, stage_label};
+    use super::{
+        ago, duration, grouped, latest_exits, probe_candidates, route_label, stage_label,
+        summed_rates,
+    };
     use crate::app::components::{bytes, rate};
     use crate::app::model::{ConnectionFilter, ConnectionHistory, ConnectionRow};
 
@@ -867,6 +1053,81 @@ mod tests {
         );
         assert!(ConnectionFilter::Failed.matches(&rows[2]));
         assert!(ConnectionRow::live_list(&serde_json::Value::Null, None).is_empty());
+    }
+
+    /// 两个环境同时接管：流 ID 都从 1 计，入口编号不同。
+    fn two_sessions() -> Vec<serde_json::Value> {
+        vec![
+            json!({
+                "scope": "env-a", "phase": "forwarding_managed", "operation_generation": 3,
+                "active_target": "Env-A",
+                "forwarding": {
+                    "traffic": {"tx_bytes_per_sec": 100.0, "rx_bytes_per_sec": 400.5},
+                    "connections": {"session": 7, "persisted": true, "active": [
+                        {"id": 1, "protocol": "tcp", "status": "active", "stage": "relay", "age_ms": 5000},
+                    ]},
+                },
+                "recent_exit": {"ip": "203.0.113.7", "checked_unix_seconds": 100},
+            }),
+            json!({
+                "scope": "env-b", "phase": "forwarding_scoped", "operation_generation": 1,
+                "active_target": "Env-B",
+                "forwarding": {
+                    "traffic": {"tx_bytes_per_sec": 20.0, "rx_bytes_per_sec": -3.0},
+                    "connections": {"session": 8, "persisted": false, "active": [
+                        {"id": 1, "protocol": "udp", "status": "active", "stage": "relay", "age_ms": 200},
+                    ], "recent": [
+                        {"id": 2, "protocol": "tcp", "status": "failed", "stage": "connect"},
+                    ]},
+                },
+                "recent_exit": {"ip": "198.51.100.9", "checked_unix_seconds": 200},
+            }),
+            json!({"scope": "env-c", "phase": "idle", "operation_generation": 2, "active_target": null}),
+        ]
+    }
+
+    #[test]
+    fn live_rows_merge_every_environment_with_its_own_name() {
+        let rows = ConnectionRow::live_sessions(&two_sessions());
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.target.as_deref(), row.key()))
+                .collect::<Vec<_>>(),
+            [
+                (Some("Env-B"), (8, 1)),
+                (Some("Env-A"), (7, 1)),
+                (Some("Env-B"), (8, 2)),
+            ],
+            "active rows first, newest first across environments; same flow ids stay distinct"
+        );
+        assert!(ConnectionRow::live_sessions(&[]).is_empty());
+    }
+
+    #[test]
+    fn traffic_sums_every_forwarding_environment_and_is_none_without_any() {
+        let sessions = two_sessions();
+        assert_eq!(summed_rates(&sessions), Some((120.0, 400.5)));
+        assert_eq!(summed_rates(&sessions[2..]), None);
+        assert_eq!(summed_rates(&[]), None);
+    }
+
+    #[test]
+    fn only_managed_environments_can_probe_and_exits_list_newest_first() {
+        let sessions = two_sessions();
+        assert_eq!(
+            probe_candidates(&sessions)
+                .iter()
+                .map(|session| session["scope"].as_str())
+                .collect::<Vec<_>>(),
+            [Some("env-a")]
+        );
+        assert_eq!(
+            latest_exits(&sessions)
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["Env-B", "Env-A"]
+        );
     }
 
     fn page(ids: std::ops::RangeInclusive<i64>, has_more: bool) -> serde_json::Value {

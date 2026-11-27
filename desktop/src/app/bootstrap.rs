@@ -297,6 +297,7 @@ impl Desktop {
             distributions: Vec::new(),
             selected: None,
             sessions: Vec::new(),
+            stop_queue: Vec::new(),
             profile: Value::Null,
             environments: Vec::new(),
             unassigned_residential: Value::Null,
@@ -987,7 +988,15 @@ impl Desktop {
         if let Some(error) = status_error {
             self.fail(error, cx);
         }
-        if self.exiting && reply.kind == Kind::Stop {
+        // 停止全部：上一个停下来了就接着停下一个；有一个失败就不再往下停。
+        let queued_next = reply.kind == Kind::Stop
+            && if result_succeeded {
+                self.continue_stop_queue(cx)
+            } else {
+                self.stop_queue.clear();
+                false
+            };
+        if self.exiting && reply.kind == Kind::Stop && !queued_next {
             self.continue_exit_after_stop(result_succeeded, cx);
         }
         if environment_operation {
@@ -1525,24 +1534,15 @@ impl Desktop {
             Command::Recover => self.open_recovery_environment(window, cx),
             Command::Connections => self.open_page(Page::Connection, cx),
             Command::Logs => self.open_page(Page::Logs, cx),
+            // 「停止全部接管」：每个在接管或需要恢复的环境都停（decision 40）。
             Command::Stop => {
                 self.page = Page::Overview;
-                if self.phase() == "idle" {
-                    self.notice = "当前没有正在接管的目标。".into();
-                    self.error = false;
-                    self.reminder = Some(Reminder {
-                        message: self.notice.clone(),
-                        warning: false,
-                    });
-                    cx.notify();
-                } else {
-                    self.prepare(Kind::Stop, window, cx);
-                }
+                self.prompt_stop_all(window, cx);
             }
             Command::Abandon => {
                 self.page = Page::Overview;
-                if self.target_gone() {
-                    self.prepare(Kind::Abandon, window, cx);
+                if let Some(scope) = self.gone_scope() {
+                    self.prepare_for(Kind::Abandon, scope, window, cx);
                 } else {
                     self.fail(
                         "目标发行版仍在 WSL 注册表里，不需要放弃记录；请用「停止并恢复直连」。",
@@ -1636,21 +1636,20 @@ impl Desktop {
                 serde_json::json!({"phase":"idle","active_target":null,"operation_generation":0,"scope":null})
             });
         if status["phase"].is_string() && status["operation_generation"].is_u64() {
-            let traffic = &status["forwarding"]["traffic"];
-            if traffic.is_object() {
+            // 多个环境同时接管时，曲线画的是全部转发中环境的速率之和。
+            if let Some((tx, rx)) = super::diagnostics::summed_rates(&self.sessions) {
                 // 后台的速率是浮点数。每次有效快照都采样（包括 0），横轴才对应真实时间。
-                let rate = |key: &str| traffic[key].as_f64().unwrap_or_default().max(0.) as f32;
                 self.traffic_history.push(super::model::TrafficSample {
                     at: Instant::now(),
-                    tx: rate("tx_bytes_per_sec"),
-                    rx: rate("rx_bytes_per_sec"),
+                    tx: tx as f32,
+                    rx: rx as f32,
                 });
                 if self.traffic_history.len() > TRAFFIC_SAMPLE_LIMIT {
                     let excess = self.traffic_history.len() - TRAFFIC_SAMPLE_LIMIT;
                     self.traffic_history.drain(0..excess);
                 }
             } else {
-                // 未接管或需要恢复时没有转发观测，不保留上一次接管的曲线。
+                // 没有任何环境有转发观测（都未接管或需要恢复），不保留上一次接管的曲线。
                 self.traffic_history.clear();
             }
             let dns_latency = status["startup_verified"]["dns_latency_ms"]
@@ -1667,10 +1666,7 @@ impl Desktop {
                     self.dns_history.drain(0..excess);
                 }
             }
-            self.live_connections = super::model::ConnectionRow::live_list(
-                &status["forwarding"]["connections"],
-                status["active_target"].as_str(),
-            );
+            self.live_connections = super::model::ConnectionRow::live_sessions(&self.sessions);
             self.status = status;
             self.status_valid = true;
             self.status_at = Some(Instant::now());

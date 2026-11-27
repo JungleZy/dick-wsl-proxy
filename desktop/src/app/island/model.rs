@@ -91,6 +91,113 @@ pub(crate) struct Details {
     pub(crate) apps: Apps,
     /// 正在从岛上启动的应用（桌面文件 ID）；同一时间只启动一个。
     pub(crate) launching: Option<String>,
+    /// 同时接管多个环境时每个环境一行（决策 40），转发中的在前。只有一个环境时为空，
+    /// 卡片照上面那些字段画；有两行以上时卡片改成按环境列出，上面那些字段不再显示。
+    pub(crate) environments: Vec<Environment>,
+}
+
+/// 多个环境时卡片上的一行：哪个环境、走哪个出口、各自的速率。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Environment {
+    pub(crate) name: String,
+    pub(crate) exit_ip: Option<String>,
+    pub(crate) exit_country: Option<String>,
+    pub(crate) exit_matches: Option<bool>,
+    /// 这个环境需要恢复：转发观测可能还在，但不算正常接管，不显示出口和速率。
+    pub(crate) recovering: bool,
+    /// 这个环境的实时速率；没有转发观测时为空。
+    pub(crate) rates: Option<Rates>,
+}
+
+/// 卡片最多列几行环境：再多就把最后一行换成「另外 N 个环境」，卡片不加高。
+pub(crate) const ENVIRONMENT_ROWS: usize = 3;
+/// 一行环境的高度和行间距。
+pub(crate) const ENVIRONMENT_ROW_HEIGHT: f32 = 26.;
+pub(crate) const ENVIRONMENT_ROW_GAP: f32 = 4.;
+
+/// 卡片按环境列出还是只画一个环境的详情。
+pub(crate) fn lists_environments(details: Option<&Details>) -> bool {
+    details.is_some_and(|details| details.environments.len() > 1)
+}
+
+/// 卡片上列出的一行。
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Line {
+    /// 一个环境：名字、出口（含颜色档）、速率（`↓ … ↑ …`，没有时为空）。
+    Environment {
+        name: String,
+        exit: Fact,
+        rates: Option<String>,
+    },
+    /// 放不下的环境数。
+    More(usize),
+}
+
+/// 多个环境时要列出的行：放得下就全列，放不下最后一行写还有几个。
+pub(crate) fn environment_lines(details: &Details) -> Vec<Line> {
+    let all = &details.environments;
+    let shown = if all.len() > ENVIRONMENT_ROWS {
+        ENVIRONMENT_ROWS - 1
+    } else {
+        all.len()
+    };
+    let mut lines: Vec<Line> = all[..shown]
+        .iter()
+        .map(|environment| Line::Environment {
+            name: environment.name.clone(),
+            exit: environment_exit(environment),
+            rates: environment
+                .rates
+                .filter(|_| !environment.recovering)
+                .map(|r| format!("↓ {} ↑ {}", short_rate(r.down), short_rate(r.up))),
+        })
+        .collect();
+    if shown < all.len() {
+        lines.push(Line::More(all.len() - shown));
+    }
+    lines
+}
+
+/// 一行里的出口：位置窄，只写 IP 和国家，核对结果用颜色表示；需要恢复的写需要恢复。
+fn environment_exit(environment: &Environment) -> Fact {
+    let fact = |value: String, tone| Fact {
+        label: "出口",
+        value,
+        tone,
+    };
+    if environment.recovering {
+        return fact("需要恢复".to_owned(), Tone::Error);
+    }
+    let Some(ip) = &environment.exit_ip else {
+        return fact("未检测".to_owned(), Tone::Off);
+    };
+    let value = match &environment.exit_country {
+        Some(country) => format!("{ip} · {country}"),
+        None => ip.clone(),
+    };
+    let tone = match environment.exit_matches {
+        Some(true) => Tone::Ok,
+        Some(false) => Tone::Warn,
+        None => Tone::Off,
+    };
+    fact(value, tone)
+}
+
+/// 汇总行（收起时的药丸、展开时的右上角）用的速率：多个环境时是在转发的各环境之和，
+/// 需要恢复的不算；只有一个环境时就是传进来的那份。
+pub(crate) fn summary_rates(rates: Option<Rates>, details: Option<&Details>) -> Option<Rates> {
+    let Some(details) = details.filter(|details| details.environments.len() > 1) else {
+        return rates;
+    };
+    details
+        .environments
+        .iter()
+        .filter(|environment| !environment.recovering)
+        .filter_map(|environment| environment.rates)
+        .reduce(|total, rates| Rates {
+            up: total.up + rates.up,
+            down: total.down + rates.down,
+        })
 }
 
 /// 被接管环境的应用列表读到哪一步了。
@@ -195,7 +302,8 @@ pub(crate) fn cells(details: &Details) -> [Fact; 3] {
     [dns, udp, connections]
 }
 
-/// 展开时的卡片大小：有环境信息就用高的那种。
+/// 展开时的卡片大小：有环境信息就用高的那种。按环境列出时也用它：
+/// 最多 [`ENVIRONMENT_ROWS`] 行，和出口一行加三格一样高，窗口不用变大。
 pub(crate) fn card_size(details: Option<&Details>) -> (f32, f32) {
     if details.is_some() {
         CARD_DETAILED
@@ -978,6 +1086,111 @@ mod tests {
         assert_eq!(exit_fact(&Details::default()).value, "未检测");
         assert_eq!(card_size(Some(&worse)), CARD_DETAILED);
         assert_eq!(card_size(None), CARD);
+    }
+
+    fn environment(name: &str, down: f32) -> Environment {
+        Environment {
+            name: name.into(),
+            rates: Some(Rates { up: 1024., down }),
+            ..Environment::default()
+        }
+    }
+
+    #[test]
+    fn several_environments_add_up_their_rates() {
+        let single = Some(Rates { up: 1., down: 2. });
+        assert_eq!(summary_rates(single, None), single);
+        // 只有一个环境：用传进来的速率，不看行。
+        let one = Details {
+            environments: vec![environment("Test-Alpha", 9.)],
+            ..Details::default()
+        };
+        assert_eq!(summary_rates(single, Some(&one)), single);
+        assert!(!lists_environments(Some(&one)));
+        let mut stuck = environment("Test-Gamma", 1e6);
+        stuck.recovering = true;
+        let many = Details {
+            environments: vec![
+                environment("Test-Alpha", 1024.),
+                environment("Test-Beta", 2048.),
+                stuck,
+            ],
+            ..Details::default()
+        };
+        assert!(lists_environments(Some(&many)));
+        assert_eq!(
+            summary_rates(single, Some(&many)),
+            Some(Rates {
+                up: 2048.,
+                down: 3072.
+            }),
+            "需要恢复的环境不计入合计"
+        );
+        let quiet = Details {
+            environments: vec![Environment::default(), Environment::default()],
+            ..Details::default()
+        };
+        assert_eq!(summary_rates(single, Some(&quiet)), None);
+        assert_eq!(card_size(Some(&many)), CARD_DETAILED);
+    }
+
+    #[test]
+    fn each_environment_line_names_its_exit_and_rates() {
+        let mut checked = environment("Test-Alpha", 1.5 * 1024. * 1024.);
+        checked.exit_ip = Some("203.0.113.7".into());
+        checked.exit_country = Some("US".into());
+        checked.exit_matches = Some(false);
+        let mut stuck = environment("Test-Gamma", 1024.);
+        stuck.recovering = true;
+        let details = Details {
+            environments: vec![checked, environment("Test-Beta", 0.), stuck],
+            ..Details::default()
+        };
+        let lines = environment_lines(&details);
+        let Line::Environment { name, exit, rates } = &lines[0] else {
+            panic!("{lines:?}");
+        };
+        assert_eq!(name, "Test-Alpha");
+        assert_eq!(
+            (exit.value.as_str(), exit.tone),
+            ("203.0.113.7 · US", Tone::Warn)
+        );
+        assert_eq!(rates.as_deref(), Some("↓ 1.5M/s ↑ 1.0K/s"));
+        let Line::Environment { exit, rates, .. } = &lines[1] else {
+            panic!("{lines:?}");
+        };
+        assert_eq!((exit.value.as_str(), exit.tone), ("未检测", Tone::Off));
+        assert_eq!(rates.as_deref(), Some("↓ 0 B/s ↑ 1.0K/s"));
+        let Line::Environment { exit, rates, .. } = &lines[2] else {
+            panic!("{lines:?}");
+        };
+        assert_eq!((exit.value.as_str(), exit.tone), ("需要恢复", Tone::Error));
+        assert_eq!(rates, &None);
+    }
+
+    #[test]
+    fn environments_that_do_not_fit_fold_into_one_line() {
+        let details = |count: usize| Details {
+            environments: (0..count)
+                .map(|i| environment(&format!("Test-{i}"), 0.))
+                .collect(),
+            ..Details::default()
+        };
+        assert_eq!(
+            environment_lines(&details(ENVIRONMENT_ROWS)).len(),
+            ENVIRONMENT_ROWS
+        );
+        let lines = environment_lines(&details(5));
+        assert_eq!(lines.len(), ENVIRONMENT_ROWS);
+        assert_eq!(
+            lines[ENVIRONMENT_ROWS - 1],
+            Line::More(5 - (ENVIRONMENT_ROWS - 1))
+        );
+        // 列出的几行和出口一行加三格一样高，放得进详情卡片：
+        // 14 上边距 + 38 标题 + 8 + 行 + 8 + 8 + 36 按钮 + 14 下边距。
+        let rows = ENVIRONMENT_ROWS as f32;
+        let list = rows * ENVIRONMENT_ROW_HEIGHT + (rows - 1.) * ENVIRONMENT_ROW_GAP;
+        assert!(14. + 38. + 8. + list + 8. + 8. + 36. + 14. <= CARD_DETAILED.1);
     }
 
     #[test]

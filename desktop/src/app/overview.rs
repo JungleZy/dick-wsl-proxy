@@ -46,11 +46,16 @@ impl Desktop {
     }
 
     /// 首页主卡：一句话状态、唯一的主操作、最近的转发错误和保护链路。
+    /// 同时有多个环境在接管或需要恢复时，主卡下面逐个列出，每个带自己的按钮（决策 40）。
     fn protection_card(&self, cx: &Context<Self>) -> Div {
         let (tone, title, summary) = self.protection_summary();
         let (color, background) = tone.colors();
+        let owned = self.owned_sessions();
+        let several = owned.len() > 1;
+        // 多个时转发错误跟着各自那一行显示，不在这里只挑一个。
         let last_error = self
             .forwarding()
+            .filter(|_| !several)
             .and_then(|forwarding| forwarding["last_error"].as_str())
             .map(backend::humanize_error);
         div()
@@ -117,12 +122,108 @@ impl Desktop {
                             .child(format!("最近一次转发错误：{error}")),
                     )
             }))
+            .children(several.then(|| self.session_list(&owned, cx)))
             .child(self.protection_path())
+    }
+
+    /// 接管中或需要恢复的各环境，一行一个：名字、阶段、入口地址、需要恢复的原因、
+    /// 最近一次转发错误，右侧是只作用于这个环境的按钮。
+    fn session_list(&self, owned: &[&Value], cx: &Context<Self>) -> Div {
+        let locked = self.locked();
+        let mut list = div().flex().flex_col().gap_2();
+        for (index, session) in owned.iter().enumerate() {
+            let (label, tone) = session_phase(session);
+            let (color, _) = tone.colors();
+            let reason = session_reason(session);
+            let last_error = session["forwarding"]["last_error"]
+                .as_str()
+                .map(backend::humanize_error);
+            let action = session["scope"].as_str().map(|scope| {
+                let (label, kind) = session_action(session);
+                self.button(
+                    "overview-session-action",
+                    label,
+                    UiAction::PrepareFor(kind, scope.to_owned()),
+                    locked,
+                    cx,
+                )
+            });
+            list = list.child(
+                div()
+                    .id(("overview-session", index))
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgb(SURFACE_SOFT))
+                    .child(div().flex_shrink_0().child(status_dot(color)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .text_color(rgb(INK))
+                                            .truncate()
+                                            .child(Self::session_name(session)),
+                                    )
+                                    .child(
+                                        div().flex_shrink_0().text_color(rgb(color)).child(label),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .font_family(MONO_FONT)
+                                            .text_color(rgb(MUTED))
+                                            .child(
+                                                session["ingress"]
+                                                    .as_str()
+                                                    .unwrap_or("—")
+                                                    .to_owned(),
+                                            ),
+                                    ),
+                            )
+                            // 原因是完整的一句话，换行显示，不截成半句。
+                            .children(
+                                reason.map(|reason| div().text_color(rgb(RUST)).child(reason)),
+                            )
+                            .children(last_error.map(|error| {
+                                div()
+                                    .text_color(rgb(RUST))
+                                    .child(format!("最近一次转发错误：{error}"))
+                            })),
+                    )
+                    .children(action.map(|action| div().flex_shrink_0().child(action))),
+            );
+        }
+        list
     }
 
     /// 目标发行版已不在 WSL 注册表里：正常停止清不掉它的规则，只能放弃本次记录。
     pub(crate) fn target_gone(&self) -> bool {
-        self.phase() == "recovery_required" && self.status["target_registered"] == false
+        self.gone_scope().is_some()
+    }
+
+    /// An environment that needs recovery and is no longer registered:
+    /// nothing is left to stop, only its record to abandon.
+    pub(crate) fn gone_scope(&self) -> Option<String> {
+        self.owned_sessions()
+            .into_iter()
+            .find(|session| {
+                session["phase"] == "recovery_required" && session["target_registered"] == false
+            })
+            .and_then(|session| session["scope"].as_str().map(str::to_owned))
     }
 
     /// 状态色、一句话状态和一句说明。
@@ -139,6 +240,10 @@ impl Desktop {
                 "后台状态未确认",
                 format!("无法确认接管状态；{since}。"),
             );
+        }
+        let owned = self.owned_sessions();
+        if owned.len() > 1 {
+            return several_summary(&owned);
         }
         let target = self.status_target().unwrap_or("目标发行版").to_owned();
         let generation = self
@@ -204,76 +309,89 @@ impl Desktop {
                 .to_owned()
         } else {
             format!(
-                "{configured} 个环境已配好住宅代理；到「环境」页选一个启动接管，一次只能接管一个。"
+                "{configured} 个环境已配好住宅代理；到「环境」页启动接管，多个环境可以同时接管。"
             )
         }
     }
 
-    /// 唯一的主操作，跟着状态走：先连上后台，再选目标、保存，最后启动或停止。
+    /// 唯一的主操作，跟着状态走：先连上后台；有多个环境在接管时停止全部，只有一个时
+    /// 只作用于那一个，空闲时带用户去环境页启动。
     /// 托盘菜单的主操作（[`Self::tray_snapshot`]）照同样的顺序选。
     fn protection_action(&self, cx: &Context<Self>) -> Button {
         let locked = self.locked();
-        if !self.status_valid {
-            return Button::new("overview-reconnect")
+        let owned = self.owned_sessions();
+        match primary_action(self.status_valid, &owned) {
+            Primary::Reconnect => Button::new("overview-reconnect")
                 .label("重新连接")
                 .icon(design_icon("refresh", 15., SURFACE))
                 .primary()
                 .disabled(locked)
-                .on_click(cx.listener(|this, _, _, cx| this.refresh_or_reconnect(cx)));
-        }
-        if self.target_gone() {
-            return self
+                .on_click(cx.listener(|this, _, _, cx| this.refresh_or_reconnect(cx))),
+            Primary::StopAll => self
                 .button(
-                    "overview-session-action",
-                    "放弃本次记录",
-                    UiAction::Prepare(Kind::Abandon),
+                    "overview-stop-all",
+                    "停止全部接管",
+                    UiAction::StopAll,
                     locked,
                     cx,
                 )
                 .icon(design_icon("close", 15., SURFACE))
-                .primary();
-        }
-        if self.phase() != "idle" {
-            return self
+                .primary(),
+            Primary::One { label, kind, scope } => self
                 .button(
                     "overview-session-action",
-                    "停止接管",
-                    UiAction::Prepare(Kind::Stop),
+                    label,
+                    match scope {
+                        Some(scope) => UiAction::PrepareFor(kind, scope),
+                        None => UiAction::Prepare(kind),
+                    },
                     locked,
                     cx,
                 )
                 .icon(design_icon("close", 15., SURFACE))
-                .primary();
+                .primary(),
+            // 首页不启动接管：启动在各环境的页面上，带用户过去。
+            Primary::Environments => Button::new("overview-environments")
+                .label("去环境页")
+                .icon(design_icon("environment", 15., SURFACE))
+                .primary()
+                .on_click(cx.listener(|this, _, _, cx| this.open_page(Page::Environment, cx))),
         }
-        // 首页不启动接管：启动在各环境的页面上，带用户过去。
-        Button::new("overview-environments")
-            .label("去环境页")
-            .icon(design_icon("environment", 15., SURFACE))
-            .primary()
-            .on_click(cx.listener(|this, _, _, cx| this.open_page(Page::Environment, cx)))
     }
 
     /// 托盘要显示的状态和菜单里的主操作。主操作和 [`Self::protection_action`] 的选择一致，
     /// 改其中一个时两边一起改。
     pub(crate) fn tray_snapshot(&self) -> super::tray::Snapshot {
         use super::tray::{Look, Primary, Snapshot};
-        let look = Look::from_status(self.status_valid, self.phase());
-        let primary = if !self.status_valid {
-            Primary::Reconnect
-        } else if self.target_gone() {
-            Primary::Abandon
-        } else if self.phase() == "recovery_required" {
-            Primary::Recover
-        } else if self.phase() != "idle" {
-            Primary::Stop
-        } else {
-            Primary::Environments
+        // 多个环境同时接管时（决策 40），任一环境需要恢复就显示需要恢复。
+        let owned: Vec<(&str, String)> = self
+            .owned_sessions()
+            .into_iter()
+            .map(|session| {
+                (
+                    session["phase"].as_str().unwrap_or(""),
+                    Self::session_name(session),
+                )
+            })
+            .collect();
+        let look = Look::of_sessions(
+            self.status_valid,
+            self.phase(),
+            owned.iter().map(|(phase, _)| *phase),
+        );
+        // 和首页主按钮（`primary_action`）同一套选法：一个环境时按它的状态，
+        // 多个时「停止全部接管」。
+        let sessions = self.owned_sessions();
+        let primary = match sessions.as_slice() {
+            _ if !self.status_valid => Primary::Reconnect,
+            [] => Primary::Environments,
+            [session] if session["target_registered"] == false => Primary::Abandon,
+            [session] if session["phase"] == "recovery_required" => Primary::Recover,
+            _ => Primary::Stop,
         };
-        // 只在后台确认有接管记录时写目标名；状态没确认时那份状态已经过时。
-        let target = matches!(look, Look::Managed | Look::Scoped | Look::Recovery)
-            .then(|| self.status_target())
-            .flatten()
-            .map(str::to_owned);
+        // 只在后台确认有接管记录时写目标名（状态没确认时会话列表为空）；
+        // 和状态说的是同一批环境，多个时写「N 个环境」。
+        let target = look.target_label(&owned);
         let running = self.busy.or(self.reading_kind.filter(|_| self.reading));
         let busy = match running {
             Some(kind) => Some(format!("正在{}…", kind.label())),
@@ -292,10 +410,40 @@ impl Desktop {
 
     /// 接管中交给状态岛的环境信息：公网出口、DNS、UDP、连接数，说法和首页一致，
     /// 再加上被接管环境里的图形应用。只在后台确认正在接管时给；其余情况岛不显示这些。
+    /// 多个环境在接管或需要恢复时改成每个环境一行（出口和速率），不列应用：应用列表
+    /// 只跟着一个接管目标，和一列环境放在一起分不清应用会在哪个环境里启动。
     pub(crate) fn island_details(&self) -> Option<super::island::Details> {
+        let text = |value: &Value| value.as_str().map(str::to_owned);
+        let owned = self.owned_sessions();
+        if owned.len() > 1 {
+            let environments = owned
+                .into_iter()
+                .map(|session| {
+                    let exit = &session["recent_exit"];
+                    let traffic = &session["forwarding"]["traffic"];
+                    let rate = |key: &str| traffic[key].as_f64().unwrap_or_default().max(0.) as f32;
+                    let recovering = session["phase"] == "recovery_required";
+                    super::island::Environment {
+                        name: Self::session_name(session),
+                        exit_ip: text(&exit["ip"]),
+                        exit_country: text(&exit["country"]),
+                        exit_matches: exit["matches_residential"].as_bool(),
+                        recovering,
+                        rates: (!recovering && traffic.is_object()).then(|| super::island::Rates {
+                            up: rate("tx_bytes_per_sec"),
+                            down: rate("rx_bytes_per_sec"),
+                        }),
+                    }
+                })
+                .collect();
+            return Some(super::island::Details {
+                apps: super::island::Apps::Listed(Vec::new()),
+                environments,
+                ..Default::default()
+            });
+        }
         self.island_target()?;
         let exit = &self.status["recent_exit"];
-        let text = |value: &Value| value.as_str().map(str::to_owned);
         Some(super::island::Details {
             exit_ip: text(&exit["ip"]),
             exit_country: text(&exit["country"]),
@@ -306,6 +454,7 @@ impl Desktop {
             active_tcp: self.status["forwarding"]["active_tcp"].as_u64(),
             apps: self.island_apps_state(),
             launching: self.island_launching.clone(),
+            environments: Vec::new(),
         })
     }
 
@@ -334,12 +483,21 @@ impl Desktop {
 
     /// 接管中各节点按实际状态着色，值取正在运行的配置；没在转发时显示已保存的配置，
     /// 节点为未启用。需要恢复时转发观测可能还在，但链路不算正常，不能显示成绿色。
+    ///
+    /// 有多个环境在接管时，`self.status` 只是挑出来的一个：目标、入口、住宅出口、
+    /// 系统 DNS 改为汇总，颜色取最差的那个，各环境的值放进悬停提示。
     fn path_nodes(&self) -> Vec<PathNode> {
         let valid = self.status_valid;
         let phase = self.phase();
+        let owned = self.owned_sessions();
+        let several = owned.len() > 1;
         let forwarding = self.forwarding().is_some();
         let managed = valid && phase == "forwarding_managed";
-        let healthy = forwarding && matches!(phase, "forwarding_managed" | "forwarding_scoped");
+        let healthy = if several {
+            owned.iter().all(|session| session_forwarding(session))
+        } else {
+            forwarding && matches!(phase, "forwarding_managed" | "forwarding_scoped")
+        };
         let live = |in_use: bool| {
             if !in_use {
                 StatusTone::Off
@@ -365,35 +523,68 @@ impl Desktop {
 
         let running = valid.then(|| self.status_target()).flatten();
         let (target_value, target_detail, target_tone) = match running {
-            Some(name) if healthy => (name.to_owned(), "接管中", StatusTone::Ok),
-            Some(name) => (name.to_owned(), "需要恢复", StatusTone::Error),
-            None => ("未接管".to_owned(), "在「环境」页启动", StatusTone::Off),
+            _ if several => several_target(&owned),
+            Some(name) if healthy => (name.to_owned(), "接管中".to_owned(), StatusTone::Ok),
+            Some(name) => (name.to_owned(), "需要恢复".to_owned(), StatusTone::Error),
+            None => (
+                "未接管".to_owned(),
+                "在「环境」页启动".to_owned(),
+                StatusTone::Off,
+            ),
         };
-        let target_tip = Tip::new("目标 WSL")
-            .row("接管中", running.unwrap_or("—"))
-            .note("接管在各环境的页面上启动和停止")
-            .note("一次只能接管一个环境");
+        let target_tip = if several {
+            owned.iter().fold(Tip::new("目标 WSL"), |tip, session| {
+                tip.row(Self::session_name(session), session_phase(session).0)
+            })
+        } else {
+            Tip::new("目标 WSL").row("接管中", running.unwrap_or("—"))
+        }
+        .note("接管在各环境的页面上启动和停止")
+        .note("多个环境可以同时接管，互不影响");
 
         let ingress = valid.then(|| self.status["ingress"].as_str()).flatten();
-        let (ingress_value, ingress_detail, ingress_tone) = if forwarding {
-            (ingress.unwrap_or("—").to_owned(), "监听中", live(true))
+        let (ingress_value, ingress_detail, ingress_tone) = if several {
+            let listening = owned
+                .iter()
+                .filter(|session| session_forwarding(session))
+                .count();
+            let detail = if listening == owned.len() {
+                "各自监听中".to_owned()
+            } else {
+                format!("{listening}/{} 个监听中", owned.len())
+            };
+            ("各环境不同".to_owned(), detail, live(true))
+        } else if forwarding {
+            (
+                ingress.unwrap_or("—").to_owned(),
+                "监听中".to_owned(),
+                live(true),
+            )
         } else if valid && self.status["port_reserved"] == true {
             (
                 ingress.unwrap_or("—").to_owned(),
-                "端口仍保留",
+                "端口仍保留".to_owned(),
                 StatusTone::Warn,
             )
         } else if valid {
-            ("—".to_owned(), "未监听", StatusTone::Off)
+            ("—".to_owned(), "未监听".to_owned(), StatusTone::Off)
         } else {
             // 状态未确认时可能仍在转发，不能说「未监听」。
-            ("—".to_owned(), "状态未知", StatusTone::Off)
+            ("—".to_owned(), "状态未知".to_owned(), StatusTone::Off)
         };
-        let ingress_tip = Tip::new("Windows 入口")
-            .row("地址", ingress_value.clone())
-            .note("目标发行版的流量从这里进入代理")
-            .note("每个环境有自己的端口，在「环境」页查看和修改")
-            .note_if(!forwarding, "启动接管后才会监听");
+        let ingress_tip = if several {
+            owned.iter().fold(Tip::new("Windows 入口"), |tip, session| {
+                tip.row(
+                    Self::session_name(session),
+                    session["ingress"].as_str().unwrap_or("—").to_owned(),
+                )
+            })
+        } else {
+            Tip::new("Windows 入口").row("地址", ingress_value.clone())
+        }
+        .note("目标发行版的流量从这里进入代理")
+        .note("每个环境有自己的端口，在「环境」页查看和修改")
+        .note_if(!forwarding && !several, "启动接管后才会监听");
 
         let (first_hop, hop_pending) = config("first_hop");
         let (hop_value, hop_detail, hop_tone) = if first_hop.is_empty() {
@@ -416,7 +607,8 @@ impl Desktop {
             .note("双跳代理的第一跳，在「设置」页修改")
             .note_if(running_policy, "接管中改的设置要下次启动接管才生效");
 
-        // 首页只显示正在接管（或需要恢复）的那个环境的住宅代理；各环境的在「环境」页看。
+        // 只有一个环境在接管（或需要恢复）时显示它的住宅代理；多个时各环境不同，
+        // 汇总在下面，各自的值在悬停提示里。各环境保存的值在「环境」页看。
         // 后台解析住宅地址前会去掉首尾空格，库里存的是原样输入。
         let active_residential = self
             .active_distro_id()
@@ -501,6 +693,21 @@ impl Desktop {
                 running_residential.is_some(),
                 "接管中改的设置要下次启动接管才生效",
             );
+        // 公网出口和 UDP 是每个环境各自的，不能拿挑出来的那一个代表全部。
+        let (exit_value, exit_detail, exit_tone, exit_tip) = if several {
+            let (value, detail, tone) = several_exit(&owned);
+            let tip = owned
+                .iter()
+                .fold(Tip::new("住宅出口"), |tip, session| {
+                    tip.row(Self::session_name(session), session_exit(session))
+                })
+                .note("双跳代理的第二跳，流量最终从这里出网")
+                .note("每个环境有自己的住宅代理，在「环境」页修改")
+                .note("接管中可以在「连接」页复核公网出口");
+            (value, detail, tone, tip)
+        } else {
+            (exit_value, exit_detail, exit_tone, exit_tip)
+        };
 
         let (dns_host, dns_host_pending) = config("dns_tls_name");
         let (dns_upstream, dns_upstream_pending) = config("dns_upstream");
@@ -509,6 +716,8 @@ impl Desktop {
             .filter(|_| valid);
         let (dns_detail, dns_tone) = if !valid {
             ("状态未知".to_owned(), StatusTone::Warn)
+        } else if several {
+            several_dns(&owned)
         } else if self.status["dns_managed"] == true {
             (
                 latency
@@ -530,7 +739,12 @@ impl Desktop {
             .take(5)
             .map(|ms| format!("{ms:.0}"))
             .collect::<Vec<_>>();
-        let dns_tip = Tip::new("系统 DNS")
+        let dns_tip = owned
+            .iter()
+            .filter(|_| several)
+            .fold(Tip::new("系统 DNS"), |tip, session| {
+                tip.row(Self::session_name(session), session_dns(session))
+            })
             .row(
                 "DoH 主机",
                 if dns_host.is_empty() {
@@ -566,7 +780,7 @@ impl Desktop {
                 id: "path-target",
                 label: "目标 WSL",
                 value: target_value,
-                detail: target_detail.to_owned(),
+                detail: target_detail,
                 tone: target_tone,
                 tip: target_tip,
             },
@@ -574,7 +788,7 @@ impl Desktop {
                 id: "path-ingress",
                 label: "Windows 入口",
                 value: ingress_value,
-                detail: ingress_detail.to_owned(),
+                detail: ingress_detail,
                 tone: ingress_tone,
                 tip: ingress_tip,
             },
@@ -785,6 +999,252 @@ impl Desktop {
         } else {
             "未确认"
         }
+    }
+}
+
+/// 首页的主操作。
+enum Primary {
+    Reconnect,
+    StopAll,
+    /// 只有一个环境在接管或需要恢复：只作用于它（`scope` 缺失时退回作用于当前接管）。
+    One {
+        label: &'static str,
+        kind: Kind,
+        scope: Option<String>,
+    },
+    Environments,
+}
+
+/// 主操作的选择：后台没连上先重连；不止一个环境在接管或需要恢复时停止全部；
+/// 只有一个时针对它；都没有时去环境页启动。
+fn primary_action(valid: bool, owned: &[&Value]) -> Primary {
+    match owned {
+        _ if !valid => Primary::Reconnect,
+        [] => Primary::Environments,
+        [session] => {
+            let (label, kind) = session_action(session);
+            Primary::One {
+                label,
+                kind,
+                scope: session["scope"].as_str().map(str::to_owned),
+            }
+        }
+        _ => Primary::StopAll,
+    }
+}
+
+/// 这个环境正在转发（接管中或诊断转发），并且有转发观测。
+fn session_forwarding(session: &Value) -> bool {
+    session["phase"]
+        .as_str()
+        .is_some_and(|phase| phase.starts_with("forwarding"))
+        && session["forwarding"].is_object()
+}
+
+/// 一个环境的阶段标签和颜色。
+fn session_phase(session: &Value) -> (&'static str, StatusTone) {
+    match session["phase"].as_str() {
+        Some("forwarding_managed") => ("接管中", StatusTone::Ok),
+        Some("forwarding_scoped") => ("诊断转发中", StatusTone::Warn),
+        Some("recovery_required") => ("需要恢复", StatusTone::Error),
+        Some("idle") => ("未接管", StatusTone::Off),
+        _ => ("状态未确认", StatusTone::Warn),
+    }
+}
+
+/// 只作用于这个环境的按钮，和环境页的说法一致：目标已不在 WSL 注册表里只能放弃记录，
+/// 需要恢复时恢复直连，接管中停止。
+fn session_action(session: &Value) -> (&'static str, Kind) {
+    if session["target_registered"] == false {
+        ("放弃本次记录", Kind::Abandon)
+    } else if session["phase"] == "recovery_required" {
+        ("恢复直连", Kind::Stop)
+    } else {
+        ("停止接管", Kind::Stop)
+    }
+}
+
+/// 需要恢复的环境的原因；其余阶段为 `None`。
+fn session_reason(session: &Value) -> Option<String> {
+    if session["phase"] != "recovery_required" {
+        return None;
+    }
+    let name = Desktop::session_name(session);
+    Some(if session["target_registered"] == false {
+        format!("{name} 已不在 WSL 注册表里，只能放弃本次接管记录。")
+    } else {
+        recovery_reason(
+            session["issue"].as_str().unwrap_or(""),
+            block_state(&session["protection_check"]["fallback_block"]),
+            &name,
+        )
+    })
+}
+
+/// 各阶段的环境名，「、」连接；没有时为 `None`。
+fn names_in(owned: &[&Value], phase: impl Fn(&str) -> bool) -> Option<(usize, String)> {
+    let names: Vec<String> = owned
+        .iter()
+        .filter(|session| phase(session["phase"].as_str().unwrap_or("")))
+        .map(|session| Desktop::session_name(session))
+        .collect();
+    (!names.is_empty()).then(|| (names.len(), names.join("、")))
+}
+
+/// 不止一个环境在接管或需要恢复时的状态色、一句话状态和说明。颜色取最差的那个。
+fn several_summary(owned: &[&Value]) -> (StatusTone, &'static str, String) {
+    let total = owned.len();
+    let managed = names_in(owned, |phase| phase == "forwarding_managed");
+    let scoped = names_in(owned, |phase| phase == "forwarding_scoped");
+    let recovering = names_in(owned, |phase| phase == "recovery_required");
+    let unknown = names_in(owned, |phase| {
+        !matches!(
+            phase,
+            "forwarding_managed" | "forwarding_scoped" | "recovery_required"
+        )
+    });
+    let parts = [
+        managed.as_ref().map(|(_, names)| format!("{names} 接管中")),
+        scoped
+            .as_ref()
+            .map(|(_, names)| format!("{names} 诊断转发中（系统 DNS 没有接管）")),
+        recovering
+            .as_ref()
+            .map(|(_, names)| format!("{names} 需要恢复")),
+        unknown
+            .as_ref()
+            .map(|(_, names)| format!("{names} 状态未确认")),
+    ];
+    let detail = parts.into_iter().flatten().collect::<Vec<_>>().join("；");
+    if let Some((count, _)) = recovering {
+        (
+            StatusTone::Error,
+            "需要恢复",
+            format!("{total} 个环境里有 {count} 个需要恢复：{detail}。在下面逐个处理。"),
+        )
+    } else if unknown.is_some() {
+        (
+            StatusTone::Warn,
+            "状态未确认",
+            format!("{total} 个环境：{detail}。请刷新后再操作。"),
+        )
+    } else if scoped.is_some() {
+        (
+            StatusTone::Warn,
+            "接管中",
+            format!("{total} 个环境在转发：{detail}。"),
+        )
+    } else {
+        (
+            StatusTone::Ok,
+            "接管中",
+            format!("{total} 个环境接管中：{detail}，TCP 和系统 DNS 各自经双跳代理出网。"),
+        )
+    }
+}
+
+/// 多个环境时的目标节点：值是个数，说明和颜色按最差的那个。
+fn several_target(owned: &[&Value]) -> (String, String, StatusTone) {
+    let total = owned.len();
+    let value = format!("{total} 个环境");
+    let forwarding = owned
+        .iter()
+        .filter(|session| session_forwarding(session))
+        .count();
+    match names_in(owned, |phase| phase == "recovery_required") {
+        Some((count, _)) => (
+            value,
+            format!("{forwarding} 个接管中 · {count} 个需要恢复"),
+            StatusTone::Error,
+        ),
+        None if forwarding == total => (value, "接管中".to_owned(), StatusTone::Ok),
+        None => (value, format!("{forwarding} 个接管中"), StatusTone::Warn),
+    }
+}
+
+/// 这个环境的住宅出口有没有问题：公网出口和住宅地址不一致，或者本次接管 UDP 已阻断。
+fn exit_issue(session: &Value) -> bool {
+    session["recent_exit"]["matches_residential"] == false
+        || (session["phase"] == "forwarding_managed"
+            && session["startup_verified"]["udp_supported"] == false)
+}
+
+/// 多个环境时的住宅出口节点：每个环境的住宅代理不同，只说有没有问题。
+fn several_exit(owned: &[&Value]) -> (String, String, StatusTone) {
+    let value = "各环境不同".to_owned();
+    let issues = owned.iter().filter(|session| exit_issue(session)).count();
+    if issues > 0 {
+        (value, format!("{issues} 个环境需要留意"), StatusTone::Warn)
+    } else if owned.iter().all(|session| session_forwarding(session)) {
+        (value, "第二跳".to_owned(), StatusTone::Ok)
+    } else {
+        (value, "第二跳".to_owned(), StatusTone::Warn)
+    }
+}
+
+/// 悬停提示里一个环境的住宅出口：运行中的住宅地址、公网出口和核对结果、UDP。
+fn session_exit(session: &Value) -> String {
+    let residential = session["active_policy"]["residential"]
+        .as_str()
+        .filter(|address| !address.is_empty())
+        .unwrap_or("—");
+    let exit = &session["recent_exit"];
+    let verdict = if !exit.is_object() {
+        "出口未检测".to_owned()
+    } else {
+        format!(
+            "出口 {} {}",
+            exit["ip"].as_str().unwrap_or("—"),
+            match exit["matches_residential"].as_bool() {
+                Some(true) => "一致",
+                Some(false) => "不一致",
+                None => "未比对",
+            }
+        )
+    };
+    let udp = if session["phase"] == "forwarding_managed"
+        && session["startup_verified"]["udp_supported"] == false
+    {
+        " · UDP 已阻断"
+    } else {
+        ""
+    };
+    format!("{residential} · {verdict}{udp}")
+}
+
+/// 多个环境时的系统 DNS 节点。
+fn several_dns(owned: &[&Value]) -> (String, StatusTone) {
+    let total = owned.len();
+    let managed = owned
+        .iter()
+        .filter(|session| session["dns_managed"] == true)
+        .count();
+    if owned
+        .iter()
+        .any(|session| session["phase"] == "recovery_required")
+    {
+        (
+            format!("{managed}/{total} 已接管 · 有需要恢复"),
+            StatusTone::Error,
+        )
+    } else if managed == total {
+        ("均已接管".to_owned(), StatusTone::Ok)
+    } else {
+        (format!("{managed}/{total} 已接管"), StatusTone::Warn)
+    }
+}
+
+/// 悬停提示里一个环境的系统 DNS。
+fn session_dns(session: &Value) -> String {
+    if session["dns_managed"] == true {
+        session["startup_verified"]["dns_latency_ms"]
+            .as_f64()
+            .map(|ms| format!("已接管 · {ms:.0} ms"))
+            .unwrap_or_else(|| "已接管".to_owned())
+    } else if session["phase"] == "recovery_required" {
+        "需要恢复".to_owned()
+    } else {
+        "未接管".to_owned()
     }
 }
 
@@ -1017,7 +1477,141 @@ fn residential_address(saved: String, running: Option<&str>) -> (String, Option<
 
 #[cfg(test)]
 mod tests {
-    use super::{ago, block_state, event_time, recovery_reason, residential_address};
+    use super::{
+        Kind, Primary, StatusTone, ago, block_state, event_time, primary_action, recovery_reason,
+        residential_address, session_action, session_exit, session_reason, several_dns,
+        several_exit, several_summary, several_target,
+    };
+    use serde_json::{Value, json};
+
+    fn managed(scope: &str, name: &str, ingress: &str) -> Value {
+        json!({
+            "scope": scope,
+            "phase": "forwarding_managed",
+            "active_target": name,
+            "ingress": ingress,
+            "dns_managed": true,
+            "target_registered": true,
+            "forwarding": {"active_tcp": 1},
+            "active_policy": {"residential": "198.51.100.9:1080"},
+            "startup_verified": {"udp_supported": true, "dns_latency_ms": 12.0},
+        })
+    }
+
+    fn recovering(scope: &str, name: &str) -> Value {
+        json!({
+            "scope": scope,
+            "phase": "recovery_required",
+            "recorded_target": name,
+            "issue": "",
+            "target_registered": true,
+        })
+    }
+
+    #[test]
+    fn the_main_action_follows_how_many_environments_are_taken_over() {
+        let dev = managed("aaaa", "Dev", "127.0.0.1:41000");
+        let work = recovering("bbbb", "Work");
+        assert!(matches!(primary_action(false, &[&dev]), Primary::Reconnect));
+        assert!(matches!(primary_action(true, &[]), Primary::Environments));
+        assert!(matches!(
+            primary_action(true, &[&dev, &work]),
+            Primary::StopAll
+        ));
+        match primary_action(true, &[&work]) {
+            Primary::One { label, kind, scope } => {
+                assert_eq!(label, "恢复直连");
+                assert!(kind == Kind::Stop);
+                assert_eq!(scope.as_deref(), Some("bbbb"));
+            }
+            _ => panic!("one environment needs recovery"),
+        }
+        // A gone target among several still leaves the main action at stop all.
+        let mut gone = recovering("cccc", "Old");
+        gone["target_registered"] = json!(false);
+        assert!(matches!(
+            primary_action(true, &[&dev, &gone]),
+            Primary::StopAll
+        ));
+    }
+
+    #[test]
+    fn each_environment_gets_its_own_button_and_reason() {
+        let dev = managed("aaaa", "Dev", "127.0.0.1:41000");
+        let work = recovering("bbbb", "Work");
+        let mut gone = recovering("cccc", "Old");
+        gone["target_registered"] = json!(false);
+        let (label, kind) = session_action(&dev);
+        assert!(label == "停止接管" && kind == Kind::Stop);
+        let (label, kind) = session_action(&work);
+        assert!(label == "恢复直连" && kind == Kind::Stop);
+        let (label, kind) = session_action(&gone);
+        assert!(label == "放弃本次记录" && kind == Kind::Abandon);
+        assert_eq!(session_reason(&dev), None);
+        assert_eq!(
+            session_reason(&work).as_deref(),
+            Some("Work 的上次接管没有正常结束，请停止接管并恢复直连。")
+        );
+        assert_eq!(
+            session_reason(&gone).as_deref(),
+            Some("Old 已不在 WSL 注册表里，只能放弃本次接管记录。")
+        );
+    }
+
+    #[test]
+    fn several_takeovers_are_summed_up_by_the_worst_one() {
+        let dev = managed("aaaa", "Dev", "127.0.0.1:41000");
+        let lab = managed("dddd", "Lab", "127.0.0.1:41001");
+        let work = recovering("bbbb", "Work");
+
+        let (tone, title, summary) = several_summary(&[&dev, &lab]);
+        assert!(tone == StatusTone::Ok);
+        assert_eq!(title, "接管中");
+        assert!(
+            summary.starts_with("2 个环境接管中：Dev、Lab 接管中"),
+            "{summary}"
+        );
+
+        let (tone, title, summary) = several_summary(&[&dev, &work]);
+        assert!(tone == StatusTone::Error);
+        assert_eq!(title, "需要恢复");
+        assert!(summary.contains("2 个环境里有 1 个需要恢复"), "{summary}");
+        assert!(summary.contains("Dev 接管中；Work 需要恢复"), "{summary}");
+
+        let (value, detail, tone) = several_target(&[&dev, &work]);
+        assert_eq!(value, "2 个环境");
+        assert_eq!(detail, "1 个接管中 · 1 个需要恢复");
+        assert!(tone == StatusTone::Error);
+        let (_, detail, tone) = several_target(&[&dev, &lab]);
+        assert_eq!(detail, "接管中");
+        assert!(tone == StatusTone::Ok);
+
+        let (dns, tone) = several_dns(&[&dev, &lab]);
+        assert_eq!(dns, "均已接管");
+        assert!(tone == StatusTone::Ok);
+        let (dns, tone) = several_dns(&[&dev, &work]);
+        assert_eq!(dns, "1/2 已接管 · 有需要恢复");
+        assert!(tone == StatusTone::Error);
+    }
+
+    #[test]
+    fn several_exits_do_not_borrow_one_environments_address() {
+        let dev = managed("aaaa", "Dev", "127.0.0.1:41000");
+        let mut lab = managed("dddd", "Lab", "127.0.0.1:41001");
+        let (value, _, tone) = several_exit(&[&dev, &lab]);
+        assert_eq!(value, "各环境不同");
+        assert!(tone == StatusTone::Ok);
+        lab["recent_exit"] =
+            json!({"ip": "203.0.113.50", "country": "US", "matches_residential": false});
+        let (_, detail, tone) = several_exit(&[&dev, &lab]);
+        assert_eq!(detail, "1 个环境需要留意");
+        assert!(tone == StatusTone::Warn);
+        assert_eq!(session_exit(&dev), "198.51.100.9:1080 · 出口未检测");
+        assert_eq!(
+            session_exit(&lab),
+            "198.51.100.9:1080 · 出口 203.0.113.50 不一致"
+        );
+    }
 
     #[test]
     fn a_takeover_shows_the_residential_address_it_runs_with() {

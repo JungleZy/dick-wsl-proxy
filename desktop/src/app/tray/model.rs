@@ -36,6 +36,40 @@ impl Look {
         }
     }
 
+    /// 后台能同时接管多个环境（决策 40）：`phase` 是挑出来的那一个会话的阶段，
+    /// `owned` 是所有接管中或需要恢复的会话的阶段。任一环境需要恢复就显示需要恢复，
+    /// 免得它藏在另一个正常接管的环境后面。
+    pub(crate) fn of_sessions<'a>(
+        status_valid: bool,
+        phase: &str,
+        owned: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        if status_valid && owned.into_iter().any(|phase| phase == "recovery_required") {
+            return Self::Recovery;
+        }
+        Self::from_status(status_valid, phase)
+    }
+
+    /// 状态后面跟着的目标：和状态说的是同一批环境。需要恢复时只数需要恢复的，其余只数
+    /// 在转发的；一个就写名字，多个写「N 个环境」。`owned` 是接管中或需要恢复的会话的
+    /// （阶段，名字）；空闲和状态未确认时没有目标。
+    pub(crate) fn target_label(self, owned: &[(&str, String)]) -> Option<String> {
+        let counts = |phase: &str| match self {
+            Self::Recovery => phase == "recovery_required",
+            Self::Managed | Self::Scoped => phase.starts_with("forwarding"),
+            Self::Unknown | Self::Idle => false,
+        };
+        let mut names = owned
+            .iter()
+            .filter(|(phase, _)| counts(phase))
+            .map(|(_, name)| name);
+        let first = names.next()?;
+        match names.count() {
+            0 => Some(first.clone()),
+            more => Some(format!("{} 个环境", more + 1)),
+        }
+    }
+
     /// 只有接管中才动：动效只表达「正在接管」这一件事。
     pub(crate) fn animated(self) -> bool {
         self == Self::Managed
@@ -89,7 +123,7 @@ impl Primary {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Snapshot {
     pub(crate) look: Look,
-    /// 正在接管或需要恢复的发行版；空闲和状态未确认时为空。
+    /// 正在接管或需要恢复的发行版，多个时是「N 个环境」；空闲和状态未确认时为空。
     pub(crate) target: Option<String>,
     pub(crate) primary: Primary,
     /// 界面有操作在进行或在等确认时的说明，例如「正在启动接管…」。
@@ -427,6 +461,75 @@ mod tests {
             "WSL Proxy\n接管中 · Test-Target\n正在检测出口…"
         );
         assert_eq!(Snapshot::INITIAL.tooltip(), "WSL Proxy\n后台状态未确认");
+    }
+
+    #[test]
+    fn any_environment_needing_recovery_shows_recovery() {
+        let owned = ["forwarding_managed", "recovery_required"];
+        assert_eq!(
+            Look::of_sessions(true, "forwarding_managed", owned),
+            Look::Recovery
+        );
+        assert_eq!(
+            Look::of_sessions(true, "forwarding_managed", ["forwarding_managed"; 2]),
+            Look::Managed
+        );
+        assert_eq!(Look::of_sessions(true, "idle", []), Look::Idle);
+        assert_eq!(
+            Look::of_sessions(false, "forwarding_managed", owned),
+            Look::Unknown,
+            "状态没确认时那份会话列表已经过时"
+        );
+    }
+
+    #[test]
+    fn the_target_counts_the_environments_the_state_is_about() {
+        let session = |phase, name: &str| (phase, name.to_owned());
+        let managed = session("forwarding_managed", "Test-Alpha");
+        let scoped = session("forwarding_scoped", "Test-Beta");
+        let stuck = session("recovery_required", "Test-Gamma");
+        assert_eq!(Look::Managed.target_label(&[]), None);
+        assert_eq!(
+            Look::Managed
+                .target_label(std::slice::from_ref(&managed))
+                .as_deref(),
+            Some("Test-Alpha")
+        );
+        assert_eq!(
+            Look::Managed
+                .target_label(&[managed.clone(), scoped.clone()])
+                .as_deref(),
+            Some("2 个环境")
+        );
+        // 一个在转发、一个要恢复：状态是需要恢复，目标就是要恢复的那一个。
+        assert_eq!(
+            Look::Recovery
+                .target_label(&[managed.clone(), stuck.clone()])
+                .as_deref(),
+            Some("Test-Gamma")
+        );
+        assert_eq!(
+            Look::Recovery
+                .target_label(&[
+                    managed.clone(),
+                    stuck.clone(),
+                    session("recovery_required", "Test-Delta")
+                ])
+                .as_deref(),
+            Some("2 个环境")
+        );
+        assert_eq!(
+            Look::Idle.target_label(std::slice::from_ref(&managed)),
+            None
+        );
+        assert_eq!(Look::Unknown.target_label(&[managed]), None);
+
+        let snapshot = Snapshot {
+            target: Some("2 个环境".into()),
+            ..snapshot(Look::Managed, Primary::Stop)
+        };
+        assert_eq!(snapshot.status_line(), "接管中 · 2 个环境");
+        assert_eq!(snapshot.tooltip(), "WSL Proxy\n接管中 · 2 个环境");
     }
 
     #[test]

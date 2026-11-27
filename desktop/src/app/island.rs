@@ -50,8 +50,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use winreg::RegKey;
 use winreg::enums::HKEY_CURRENT_USER;
 
-use self::model::{Action, AppTile, Fact, Morph, Presence, Shape, Tone};
-pub(crate) use self::model::{Apps, Details, Rates};
+use self::model::{Action, AppTile, Fact, Line, Morph, Presence, Shape, Tone};
+pub(crate) use self::model::{Apps, Details, Environment, Rates};
 use super::theme::{PREFERENCES_KEY, UI_FONT};
 use super::tray::{Command, Look, Snapshot};
 
@@ -408,6 +408,11 @@ impl Island {
         model::card_size(self.details.as_ref())
     }
 
+    /// 汇总行的速率：多个环境时是各环境之和（主界面只交来它挑出的那一个的速率）。
+    fn summary_rates(&self) -> Option<Rates> {
+        model::summary_rates(self.rates, self.details.as_ref())
+    }
+
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.polls.is_multiple_of(FULLSCREEN_EVERY) && self.press.is_none() {
             self.hidden = fullscreen_in_front();
@@ -675,7 +680,7 @@ impl Island {
                     .text_size(px(12.5))
                     .text_color(rgb(palette.tone(tone)))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(model::trailing(&self.snapshot, self.rates)),
+                    .child(model::trailing(&self.snapshot, self.summary_rates())),
             )
     }
 
@@ -691,7 +696,7 @@ impl Island {
             .into_iter()
             .map(|action| button(action, palette, cx));
         let rates = self
-            .rates
+            .summary_rates()
             .filter(|_| self.snapshot.look == Look::Managed)
             .map(|rates| {
                 div()
@@ -750,46 +755,55 @@ impl Island {
                     ),
             )
             .children(rates);
-        let details = self.details.as_ref().map(|details| {
-            let exit = model::exit_fact(details);
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(6.))
-                .child(
-                    div()
-                        .h(px(30.))
-                        .px(px(10.))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .rounded(px(10.))
-                        .bg(rgba(palette.fill))
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .text_size(px(11.5))
-                                .text_color(rgba(palette.secondary))
-                                .child(exit.label),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(px(12.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(fact_color(&exit, palette)))
-                                .child(exit.value),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .gap(px(6.))
-                        .children(model::cells(details).map(|fact| cell(fact, palette))),
-                )
-        });
+        let environments = self
+            .details
+            .as_ref()
+            .filter(|_| model::lists_environments(self.details.as_ref()))
+            .map(|details| environment_list(details, palette));
+        let details = self
+            .details
+            .as_ref()
+            .filter(|_| environments.is_none())
+            .map(|details| {
+                let exit = model::exit_fact(details);
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .h(px(30.))
+                            .px(px(10.))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .rounded(px(10.))
+                            .bg(rgba(palette.fill))
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(11.5))
+                                    .text_color(rgba(palette.secondary))
+                                    .child(exit.label),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(12.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(fact_color(&exit, palette)))
+                                    .child(exit.value),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(6.))
+                            .children(model::cells(details).map(|fact| cell(fact, palette))),
+                    )
+            });
         div()
             .w(px(card.0))
             .h(px(card.1))
@@ -801,6 +815,7 @@ impl Island {
             .pt(px(14.))
             .pb(px(14.))
             .child(header)
+            .children(environments)
             .children(details)
             .child(div().flex_1())
             .child(div().flex().gap(px(8.)).children(buttons))
@@ -823,6 +838,56 @@ fn fact_color(fact: &Fact, palette: Palette) -> u32 {
         Tone::Off => palette.ink,
         tone => palette.tone(tone),
     }
+}
+
+/// 同时接管多个环境时的列表：每个环境一行，名字、出口、上下行速率。
+fn environment_list(details: &Details, palette: Palette) -> Div {
+    let row = || {
+        div()
+            .h(px(model::ENVIRONMENT_ROW_HEIGHT))
+            .px(px(10.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .rounded(px(8.))
+            .bg(rgba(palette.fill))
+            .text_size(px(12.))
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(model::ENVIRONMENT_ROW_GAP))
+        .children(model::environment_lines(details).into_iter().map(|line| {
+            match line {
+                Line::Environment { name, exit, rates } => row()
+                    .child(
+                        div()
+                            .w(px(76.))
+                            .flex_shrink_0()
+                            .truncate()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(rgb(fact_color(&exit, palette)))
+                            .child(exit.value),
+                    )
+                    .children(rates.map(|rates| {
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(11.))
+                            .text_color(rgba(palette.secondary))
+                            .child(rates)
+                    })),
+                Line::More(count) => row()
+                    .text_color(rgba(palette.secondary))
+                    .child(format!("另外 {count} 个环境，打开主窗口查看")),
+            }
+        }))
 }
 
 /// 一格环境信息：上面小字标签，下面数值。

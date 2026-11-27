@@ -28,29 +28,31 @@ fn outcome(ok: bool, stage: &str) -> Outcome {
 
 #[test]
 fn upgrades_wait_for_a_confirmed_idle_backend_and_no_running_operation() {
-    assert_eq!(upgrade_blocker(true, "idle", false, false), None);
+    let session = |phase: &str, target: Option<&str>| serde_json::json!({"phase": phase, "active_target": target, "operation_generation": 1});
+    let idle = session("idle", None);
+    assert_eq!(upgrade_blocker(true, &[], false), None);
+    assert_eq!(
+        upgrade_blocker(true, std::slice::from_ref(&idle), false),
+        None
+    );
     assert!(
-        upgrade_blocker(false, "idle", false, false)
+        upgrade_blocker(false, std::slice::from_ref(&idle), false)
             .unwrap()
             .contains("后台状态未确认")
     );
+    // 任何一个环境非空闲都要拦住，文案要求先停止全部接管。
+    for busy in [
+        session("forwarding_managed", Some("Env-B")),
+        session("forwarding_scoped", Some("Env-B")),
+        session("idle", Some("Env-B")),
+        session("recovery_required", None),
+    ] {
+        let reason = upgrade_blocker(true, &[idle.clone(), busy], false).unwrap();
+        assert!(reason.contains("停止全部接管"), "{reason}");
+        assert!(reason.contains("恢复"), "{reason}");
+    }
     assert!(
-        upgrade_blocker(true, "managed", true, false)
-            .unwrap()
-            .contains("停止接管")
-    );
-    assert!(
-        upgrade_blocker(true, "idle", true, false)
-            .unwrap()
-            .contains("停止接管")
-    );
-    assert!(
-        upgrade_blocker(true, "recovery_required", false, false)
-            .unwrap()
-            .contains("恢复")
-    );
-    assert!(
-        upgrade_blocker(true, "idle", false, true)
+        upgrade_blocker(true, std::slice::from_ref(&idle), true)
             .unwrap()
             .contains("操作正在进行")
     );

@@ -189,6 +189,23 @@ impl ConnectionRow {
             .collect()
     }
 
+    /// 所有环境的状态快照合在一起：每个环境的行用各自的接管目标补上环境名。
+    /// 进行中的连接排在前面、跨环境按已持续时间从新到旧；最近结束的连接随后，按环境顺序。
+    pub(crate) fn live_sessions(sessions: &[Value]) -> Vec<Self> {
+        let (mut active, recent): (Vec<_>, Vec<_>) = sessions
+            .iter()
+            .flat_map(|session| {
+                Self::live_list(
+                    &session["forwarding"]["connections"],
+                    session["active_target"].as_str(),
+                )
+            })
+            .partition(Self::active);
+        active.sort_by_key(|row| row.duration_ms);
+        active.extend(recent);
+        active
+    }
+
     pub(crate) fn key(&self) -> (u64, u64) {
         (self.session, self.flow_id)
     }
@@ -396,6 +413,8 @@ pub(crate) struct Confirmation {
     pub(crate) message: String,
     /// 这是托盘「退出」发起的停止：确认执行后才进入退出流程，取消则什么都不变。
     pub(crate) exit: bool,
+    /// 「停止全部」时，这一个停下来之后还要依次停的环境（scope）。
+    pub(crate) queue: Vec<String>,
 }
 pub(crate) struct PendingPrepare {
     pub(crate) kind: Kind,
@@ -416,6 +435,10 @@ pub(crate) enum UiAction {
     Save(super::drafts::SaveScope),
     Probe,
     Prepare(Kind),
+    /// 停止或放弃某一个环境的接管（scope 或注册表 GUID）。
+    PrepareFor(Kind, String),
+    /// 停止全部接管。
+    StopAll,
     Reveal,
     EnvironmentCreate,
     EnvironmentSubmit,

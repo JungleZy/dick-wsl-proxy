@@ -91,6 +91,10 @@ impl Desktop {
                     UiAction::Save(scope) => this.save(scope, cx),
                     UiAction::Probe => this.probe(cx),
                     UiAction::Prepare(kind) => this.prepare(kind, window, cx),
+                    UiAction::PrepareFor(kind, target) => {
+                        this.prepare_for(kind, target, window, cx)
+                    }
+                    UiAction::StopAll => this.prompt_stop_all(window, cx),
                     UiAction::Reveal => {
                         if let Some(path) = &this.export_path {
                             cx.reveal_path(std::path::Path::new(path));

@@ -24,7 +24,7 @@ use super::components::{
     StatusTone, Tip, app_icon, badge, design_icon, icon, status_chip, status_dot, status_icon,
     text, text_tip,
 };
-use super::drafts::{RESIDENTIAL_PROTOCOLS, SaveScope, names_target};
+use super::drafts::{RESIDENTIAL_PROTOCOLS, SaveScope};
 use super::environment_facts::{self, Component, ComponentState, Systemd};
 use super::model::{EnvironmentEditor, Field, LogFilter, Page, RuntimeLog, UiAction};
 use super::state::Desktop;
@@ -1545,12 +1545,10 @@ impl Desktop {
 
     /// 这个环境此刻的接管状态：接管中、需要恢复、配好了住宅代理或还没配。
     fn environment_role_badge(&self, id: &str) -> Div {
-        let active = self
-            .active_distro_id()
-            .is_some_and(|active| active.eq_ignore_ascii_case(id));
-        if active && self.phase() == "recovery_required" {
+        let phase = self.phase_for(id);
+        if phase == "recovery_required" {
             badge("需要恢复", RUST, super::theme::DANGER_BG)
-        } else if active {
+        } else if phase.starts_with("forwarding") {
             badge("接管中", ACCENT, super::theme::TARGET_BG)
         } else if super::drafts::residential_configured(super::drafts::environment_row(
             &self.environments,
@@ -1563,7 +1561,7 @@ impl Desktop {
     }
 
     /// 环境详情里的「接管」卡片：这个环境的启动、停止按钮，它自己的住宅代理和 Windows
-    /// 入口端口（决策 40），以及住宅代理检测。一次只能接管一个环境。
+    /// 入口端口（决策 40），以及住宅代理检测。各环境的接管互不影响。
     fn environment_takeover_card(&self, id: &str, cx: &Context<Self>) -> Div {
         // 输入框和按钮作用于 `selected`；和详情里的环境对不上时宁可不画，也不能让
         // 保存或启动落到另一个环境上。
@@ -1578,22 +1576,24 @@ impl Desktop {
                 .child("正在读取这个环境的接管设置…");
         }
         let locked = self.locked();
-        let active = self
-            .active_distro_id()
-            .is_some_and(|active| active.eq_ignore_ascii_case(id));
-        let action = if active && self.target_gone() {
+        let phase = self.phase_for(id);
+        let active = phase != "idle" && phase != "unknown";
+        let gone = self
+            .session_for(id)
+            .is_some_and(|session| session["target_registered"] == false);
+        let action = if active && gone {
             self.button(
                 "environment-takeover-abandon",
                 "放弃本次记录",
-                UiAction::Prepare(Kind::Abandon),
+                UiAction::PrepareFor(Kind::Abandon, id.to_owned()),
                 locked,
                 cx,
             )
-        } else if active && self.phase() == "recovery_required" {
+        } else if phase == "recovery_required" {
             self.button(
                 "environment-takeover-recover",
                 "恢复直连",
-                UiAction::Prepare(Kind::Stop),
+                UiAction::PrepareFor(Kind::Stop, id.to_owned()),
                 locked,
                 cx,
             )
@@ -1601,7 +1601,7 @@ impl Desktop {
             self.button(
                 "environment-takeover-stop",
                 "停止接管",
-                UiAction::Prepare(Kind::Stop),
+                UiAction::PrepareFor(Kind::Stop, id.to_owned()),
                 locked,
                 cx,
             )
@@ -1668,7 +1668,7 @@ impl Desktop {
                     .gap_3()
                     .child(card_header(
                         "接管",
-                        "这个环境用自己的住宅代理出网；一次只能接管一个环境。",
+                        "这个环境用自己的住宅代理和入口端口出网；可以和别的环境同时接管。",
                     ))
                     .child(action),
             )
@@ -1796,9 +1796,7 @@ impl Desktop {
             let id = text(distro, "id", "");
             let name = text(distro, "name", "未命名发行版");
             let version = distro["version"].as_u64().unwrap_or_default();
-            let target = self
-                .active_distro_id()
-                .is_some_and(|active| names_target(distro, &active));
+            let target = self.phase_for(&id) != "idle" && self.phase_for(&id) != "unknown";
             let active = selected == Some(name.as_str()) || selected == Some(id.as_str());
             let row_name = name.clone();
             let view_name = row_name.clone();
@@ -2530,7 +2528,7 @@ impl Desktop {
     /// 设置页「关于」分区：logo、名称、版本和一句说明，下面是组成、运行平台和配置库位置。
     /// 版本是这个桌面端编译时的版本；后台状态里没有版本号，这里不显示正在运行的后台版本。
     fn about_page(&self) -> SettingPage {
-        const SUMMARY: &str = "接管选定的 WSL2 发行版新建的出站连接，每个环境用自己的住宅代理：命中直连规则的直接出网，其余经宿主 SOCKS5 和住宅代理两跳出网；其他发行版和 Windows 本身的网络不变。现在一次只能接管一个环境。";
+        const SUMMARY: &str = "接管选定的 WSL2 发行版新建的出站连接，每个环境用自己的住宅代理：命中直连规则的直接出网，其余经宿主 SOCKS5 和住宅代理两跳出网；其他发行版和 Windows 本身的网络不变。可以同时接管多个环境。";
         let version = env!("CARGO_PKG_VERSION");
         let profile_path: SharedString = self
             .profile_path

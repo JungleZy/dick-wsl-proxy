@@ -261,6 +261,55 @@ impl Desktop {
         self.distro_id(name)
     }
 
+    /// The backend's session of one environment, if it has records for it
+    /// (decision 40: every environment has its own).
+    pub(crate) fn session_for(&self, distro_id: &str) -> Option<&Value> {
+        let scope = record_scope(distro_id);
+        self.sessions
+            .iter()
+            .find(|session| session["scope"].as_str() == Some(scope.as_str()))
+    }
+
+    /// One environment's phase: `idle` when the backend has no records for
+    /// it, `unknown` while the status is unconfirmed.
+    pub(crate) fn phase_for(&self, distro_id: &str) -> &str {
+        if !self.status_valid {
+            return "unknown";
+        }
+        self.session_for(distro_id)
+            .and_then(|session| session["phase"].as_str())
+            .unwrap_or("idle")
+    }
+
+    /// Every environment that is taken over or needs recovery, forwarding
+    /// ones first.
+    pub(crate) fn owned_sessions(&self) -> Vec<&Value> {
+        if !self.status_valid {
+            return Vec::new();
+        }
+        let mut owned: Vec<&Value> = self
+            .sessions
+            .iter()
+            .filter(|session| session["phase"].as_str() != Some("idle"))
+            .collect();
+        owned.sort_by_key(|session| {
+            !session["phase"]
+                .as_str()
+                .is_some_and(|phase| phase.starts_with("forwarding"))
+        });
+        owned
+    }
+
+    /// The name a session goes by: its live, recorded or last target.
+    pub(crate) fn session_name(session: &Value) -> String {
+        session["active_target"]
+            .as_str()
+            .or_else(|| session["recorded_target"].as_str())
+            .or_else(|| session["last_target"].as_str())
+            .unwrap_or("未知环境")
+            .to_owned()
+    }
+
     pub(crate) fn residential_inputs(&self) -> [(&Field, &'static str); 4] {
         [
             (&self.fields.residential_ip, "ip"),
@@ -332,14 +381,11 @@ impl Desktop {
         if !self.status_valid {
             return Some("后台状态未确认".into());
         }
-        if let Some(active) = self.active_distro_id() {
-            let name = self.environment_display_name(&active);
-            return Some(format!(
-                "{name} 正在接管或需要恢复；一次只能接管一个环境，请先停止它"
-            ));
-        }
-        if self.phase() != "idle" {
-            return Some("当前有接管任务，请先停止".into());
+        // Other environments may be taken over (decision 40); this one may not.
+        if let Some(selected) = self.selected.as_deref()
+            && self.phase_for(selected) != "idle"
+        {
+            return Some("这个环境正在接管或需要恢复".into());
         }
         if let Some(message) = self.unsaved_message() {
             return Some(message);
@@ -347,15 +393,17 @@ impl Desktop {
         self.selection().err()
     }
 
-    /// 托盘「去恢复接管」：打开需要恢复的那个环境的页面。
+    /// 托盘「去恢复接管」：打开（第一个）需要恢复的那个环境的页面。
     pub(crate) fn open_recovery_environment(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let name = self
-            .active_distro_id()
-            .map(|id| self.environment_display_name(&id));
+            .owned_sessions()
+            .into_iter()
+            .find(|session| session["phase"] == "recovery_required")
+            .map(Self::session_name);
         match name {
             Some(name) => {
                 self.open_page(super::model::Page::Environment, cx);
@@ -502,9 +550,162 @@ impl Desktop {
             request,
             message,
             exit: false,
+            queue: Vec::new(),
         });
         self.confirmation_pending = true;
         cx.notify();
+    }
+
+    /// Stop or abandon one environment's takeover, named by its scope or
+    /// registry GUID (decision 40).
+    pub(crate) fn prepare_for(
+        &mut self,
+        kind: Kind,
+        target: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.locked() {
+            return;
+        }
+        let scope = record_scope(&target);
+        let Some(generation) = self.generation_for(&scope) else {
+            self.fail("后台状态未确认，请先刷新。", cx);
+            return;
+        };
+        let name = self
+            .session_for(&scope)
+            .map(Self::session_name)
+            .unwrap_or_else(|| self.environment_display_name(&target));
+        let (request, message) = match kind {
+            Kind::Abandon => (
+                json!({"command":"abandon","confirm":true,"expected_generation":generation,"target":scope}),
+                format!(
+                    "{name} 已不在 WSL 注册表里，无法在它里面清理规则。将释放它占用的端口并清掉恢复记录；还有别的环境在接管时，后台会在那个环境里删掉它的规则表，否则下次启动接管前请先在终端执行一次 wsl --shutdown（会关闭所有发行版）。"
+                ),
+            ),
+            Kind::Stop => (
+                json!({"command":"stop","expected_generation":generation,"target":scope}),
+                format!(
+                    "将停止 {name} 的接管并恢复直连。它现有的 TCP 连接会中断，需要重连；别的环境的接管不受影响。"
+                ),
+            ),
+            _ => return,
+        };
+        self.confirmation = Some(Confirmation {
+            kind,
+            generation,
+            request,
+            message,
+            exit: false,
+            queue: Vec::new(),
+        });
+        self.open_confirmation_dialog(window, cx);
+        cx.notify();
+    }
+
+    /// 停止全部接管：一次确认，然后按顺序逐个停止（后台同一时间只做一个）。
+    /// 没有在接管的环境时为 `None`；`exit` 表示是托盘「退出」发起的。
+    pub(crate) fn stop_all_confirmation(&self, exit: bool) -> Option<Confirmation> {
+        // An unregistered environment has nothing left to stop: a stop of it
+        // fails and would end the queue. It is abandoned on its own.
+        let gone: Vec<String> = self
+            .owned_sessions()
+            .into_iter()
+            .filter(|session| session["target_registered"] == false)
+            .map(Self::session_name)
+            .collect();
+        let owned: Vec<(String, String)> = self
+            .owned_sessions()
+            .into_iter()
+            .filter(|session| session["target_registered"] != false)
+            .filter_map(|session| {
+                Some((
+                    session["scope"].as_str()?.to_owned(),
+                    Self::session_name(session),
+                ))
+            })
+            .collect();
+        let ((first, _), rest) = owned.split_first()?;
+        let generation = self.generation_for(first)?;
+        let names = owned
+            .iter()
+            .map(|(_, name)| name.as_str())
+            .collect::<Vec<_>>()
+            .join("、");
+        let message = match (exit, owned.len()) {
+            (true, 1) => format!(
+                "退出程序会先停止 {names} 的接管并恢复直连，再关闭后台。现有 TCP 连接会中断，需要重连。停止没有完成时程序不会退出。"
+            ),
+            (true, _) => format!(
+                "退出程序会先依次停止 {names} 的接管并恢复直连，再关闭后台。现有 TCP 连接会中断，需要重连。有一个没停下来，程序就不会退出。"
+            ),
+            (false, 1) => {
+                format!("将停止 {names} 的接管并恢复直连。现有 TCP 连接会中断，需要重连。")
+            }
+            (false, _) => format!(
+                "将依次停止 {names} 的接管并恢复直连。现有 TCP 连接会中断，需要重连；有一个没停下来就不再往下停。"
+            ),
+        };
+        let message = if gone.is_empty() {
+            message
+        } else {
+            format!(
+                "{message}{} 已不在 WSL 注册表里，停止不了，请在它那一行单独「放弃本次记录」。",
+                gone.join("、")
+            )
+        };
+        Some(Confirmation {
+            kind: Kind::Stop,
+            generation,
+            request: json!({"command":"stop","expected_generation":generation,"target":first}),
+            message,
+            exit,
+            queue: rest.iter().map(|(scope, _)| scope.clone()).collect(),
+        })
+    }
+
+    /// 托盘、首页的「停止全部接管」。
+    pub(crate) fn prompt_stop_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.locked() {
+            return;
+        }
+        match self.stop_all_confirmation(false) {
+            Some(confirmation) => {
+                self.confirmation = Some(confirmation);
+                self.open_confirmation_dialog(window, cx);
+            }
+            None => {
+                self.notice = "当前没有正在接管的环境。".into();
+                self.error = false;
+                self.reminder = Some(super::state::Reminder {
+                    message: self.notice.clone(),
+                    warning: false,
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// 停止全部时，上一个停下来后接着停下一个；发出了请求返回 `true`。
+    pub(crate) fn continue_stop_queue(&mut self, cx: &mut Context<Self>) -> bool {
+        while !self.stop_queue.is_empty() {
+            let scope = self.stop_queue.remove(0);
+            if self.phase_for(&scope) == "idle" {
+                continue;
+            }
+            let Some(generation) = self.generation_for(&scope) else {
+                self.stop_queue.clear();
+                return false;
+            };
+            self.send(
+                Kind::Stop,
+                json!({"command":"stop","expected_generation":generation,"target":scope}),
+                cx,
+            );
+            return self.busy == Some(Kind::Stop);
+        }
+        false
     }
 
     pub(crate) fn prepare(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
@@ -525,6 +726,7 @@ impl Desktop {
                 request: json!({"command":"abandon","confirm":true,"expected_generation":generation,"target":scope}),
                 message: "目标发行版已不在 WSL 注册表里，无法清理它的规则。将释放本次接管占用的端口并清掉恢复记录。WSL 里可能还残留本次接管的规则：下次启动接管前，请先在终端执行一次 wsl --shutdown（会关闭所有发行版）。".into(),
                 exit: false,
+                queue: Vec::new(),
             });
             self.open_confirmation_dialog(window, cx);
             cx.notify();
@@ -539,6 +741,7 @@ impl Desktop {
                     "将停止接管并恢复直连。现有 TCP 连接会中断，需要重连；只清理本控制器的规则。"
                         .into(),
                 exit: false,
+                queue: Vec::new(),
             });
             self.open_confirmation_dialog(window, cx);
             cx.notify();
@@ -603,6 +806,7 @@ impl Desktop {
                 "预检发现 {target_name} 缺少所需的内核能力（例如 xt_cgroup、ip6table_nat）。是否现在加载发行版里已有的模块、创建空的 filter/nat 表，并写入开机配置（/etc/modules-load.d/wsl-proxy.conf 和一个注册空表的 systemd oneshot），让以后 WSL 启动时自动准备好？这些文件会保留在发行版里，可手工删除；不安装软件包，也不启动接管。"
             ),
             exit: false,
+            queue: Vec::new(),
         });
         self.pending_prepare = Some(PendingPrepare {
             kind,
@@ -623,8 +827,8 @@ impl Desktop {
         if self.locked() {
             return;
         }
-        if self.phase() != "idle" {
-            self.fail("请先停止接管并恢复直连，再重置 DNS 别名。", cx);
+        if !self.owned_sessions().is_empty() || !self.status_valid {
+            self.fail("请先停止全部环境的接管并恢复直连，再重置 DNS 别名。", cx);
             return;
         }
         let Some(generation) = self.generation() else {
@@ -637,6 +841,7 @@ impl Desktop {
             request: json!({"command":"reset_dns_aliases","confirm":true}),
             message: "将清空白名单域名的 DNS 别名记录（包括没写完的那次修改），只在提示 DNS 别名号段已用完或别名记录异常时使用。重置后旧别名可能分给别的域名：请先确认目标发行版里没有还在用旧解析结果的程序，例如重启目标发行版，或等几分钟再重置。".into(),
             exit: false,
+            queue: Vec::new(),
         });
         self.open_confirmation_dialog(window, cx);
         cx.notify();
@@ -652,8 +857,10 @@ impl Desktop {
             return;
         }
         self.send(confirmation.kind, confirmation.request, cx);
-        // 只有停止真的发出去了才进入退出流程。
-        self.exiting = confirmation.exit && self.busy == Some(confirmation.kind);
+        // 只有停止真的发出去了才进入退出流程、排上后面要停的环境。
+        let sent = self.busy == Some(confirmation.kind);
+        self.stop_queue = if sent { confirmation.queue } else { Vec::new() };
+        self.exiting = confirmation.exit && sent;
     }
 
     /// 检查 WSL 平台：进入设置页和点「检查」时调用。只读，不占界面，不发页面提示。
@@ -885,19 +1092,13 @@ impl Desktop {
         }
     }
 
-    /// 接管中或需要恢复时的退出：先确认停止并恢复直连。
+    /// 有接管或需要恢复时的退出：先确认停止全部接管并恢复直连。
     fn request_stop_and_exit(&mut self, cx: &mut Context<Self>) {
-        let Some(generation) = self.generation() else {
+        let Some(confirmation) = self.stop_all_confirmation(true) else {
             self.fail("后台状态未确认，程序没有退出；请先刷新。", cx);
             return;
         };
-        self.confirmation = Some(Confirmation {
-            kind: Kind::Stop,
-            generation,
-            request: json!({"command":"stop","expected_generation":generation,"target":self.status["scope"]}),
-            message: "退出程序会先停止接管并恢复直连，再关闭后台。现有 TCP 连接会中断，需要重连；只清理本控制器的规则。停止没有完成时程序不会退出。".into(),
-            exit: true,
-        });
+        self.confirmation = Some(confirmation);
         // 由 tick 在加载框关掉后再打开，免得被同一帧关加载框时一并关掉。
         self.confirmation_pending = true;
         cx.notify();
@@ -1012,19 +1213,18 @@ impl Desktop {
             );
             return;
         }
-        if self.phase() != "forwarding_managed" {
-            self.fail("只有接管中的目标才能检测公网出口。", cx);
-            return;
-        }
-        let Some(generation) = self.generation() else {
-            self.fail("后台状态未确认，请先刷新。", cx);
+        // The first environment that is fully taken over; the connections
+        // page offers one button per environment when there are several.
+        let Some(scope) = self
+            .owned_sessions()
+            .into_iter()
+            .find(|session| session["phase"] == "forwarding_managed")
+            .and_then(|session| session["scope"].as_str().map(str::to_owned))
+        else {
+            self.fail("只有接管中的环境才能检测公网出口。", cx);
             return;
         };
-        self.send(
-            Kind::Probe,
-            json!({"command":"probe_exit","expected_generation":generation,"target":self.status["scope"]}),
-            cx,
-        );
+        self.probe_session(&scope, cx);
     }
 
     /// 保存一页：规则页、设置页只发这一页的输入，其他页的字段用已保存的值；
@@ -1306,18 +1506,10 @@ impl Desktop {
                     .is_some_and(|listed| listed.eq_ignore_ascii_case(name))
             })
             .and_then(|distro| distro["id"].as_str());
-        let active = self.active_distro_id();
-        let target = id.is_some_and(|id| {
-            active
-                .as_deref()
-                .is_some_and(|active| active.eq_ignore_ascii_case(id))
-        });
-        if target {
-            None
-        } else if self.phase() == "idle" {
-            Some("接管未启动，应用直连上网")
-        } else {
-            Some("不是接管目标，应用直连上网")
+        match id.map(|id| self.phase_for(id)) {
+            Some("forwarding_managed") => None,
+            Some("recovery_required") => Some("这个环境需要恢复，应用可能上不了网"),
+            _ => Some("这个环境没在接管，应用直连上网"),
         }
     }
 
