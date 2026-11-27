@@ -252,24 +252,44 @@ pub(crate) fn merge_profile(
     Value::Object(profile)
 }
 
-/// 设置页住宅代理四项要保存的值，参数是输入框里去掉首尾空白的文字。四项都空表示还没
-/// 配置，按后台的空记录发（端口为 0）；填了任何一项，端口就必须是 1–65535 的整数，
-/// 其余由后台校验。
+/// 住宅代理的协议：后台字段值和界面上的名字。
+pub(crate) const RESIDENTIAL_PROTOCOLS: [(&str, &str); 2] =
+    [("socks5", "SOCKS5"), ("http", "HTTP")];
+
+/// 已保存的住宅代理协议；没存过协议的旧配置是 SOCKS5。
+pub(crate) fn saved_residential_protocol(residential: &Value) -> &'static str {
+    match residential["protocol"].as_str() {
+        Some("http") => "http",
+        _ => "socks5",
+    }
+}
+
+/// 设置页住宅代理要保存的值，参数是协议和输入框里去掉首尾空白的文字。四项都空表示
+/// 还没配置，按后台的空记录发（端口为 0）；填了任何一项，端口就必须是 1–65535 的
+/// 整数，其余由后台校验。
 pub(crate) fn residential_value(
+    protocol: &str,
     ip: &str,
     port: &str,
     username: &str,
     password: &str,
 ) -> Result<Value, &'static str> {
     if ip.is_empty() && username.is_empty() && password.is_empty() && matches!(port, "" | "0") {
-        return Ok(json!({"ip": "", "port": 0, "username": "", "password": ""}));
+        return Ok(
+            json!({"protocol": protocol, "ip": "", "port": 0, "username": "", "password": ""}),
+        );
     }
     let port = port
         .parse::<u16>()
         .ok()
         .filter(|port| *port > 0)
         .ok_or("住宅服务器端口需为 1–65535 的整数。")?;
-    Ok(json!({"ip": ip, "port": port, "username": username, "password": password}))
+    if protocol == "http" && username.contains(':') {
+        return Err("HTTP 代理的用户名不能含英文冒号（:）。");
+    }
+    Ok(
+        json!({"protocol": protocol, "ip": ip, "port": port, "username": username, "password": password}),
+    )
 }
 
 /// 已保存的住宅代理在输入框里显示成什么文字；也用来判断输入框有没有改过。
@@ -470,8 +490,8 @@ mod tests {
 
     use super::{
         FailedSaves, PageDraft, ProfileField, SaveScope, Saved, Unsaved, merge_profile,
-        profile_changed, residential_value, save_request, saved_fake_ip, saved_residential_text,
-        saved_text, target_missing,
+        profile_changed, residential_value, save_request, saved_fake_ip,
+        saved_residential_protocol, saved_residential_text, saved_text, target_missing,
     };
 
     fn saved() -> Value {
@@ -772,17 +792,24 @@ mod tests {
 
     #[test]
     fn an_unconfigured_residential_proxy_can_be_saved_empty() {
-        let empty = json!({"ip": "", "port": 0, "username": "", "password": ""});
-        assert_eq!(residential_value("", "", "", ""), Ok(empty.clone()));
-        assert_eq!(residential_value("", "0", "", ""), Ok(empty.clone()));
+        let empty =
+            json!({"protocol": "socks5", "ip": "", "port": 0, "username": "", "password": ""});
+        assert_eq!(
+            residential_value("socks5", "", "", "", ""),
+            Ok(empty.clone())
+        );
+        assert_eq!(
+            residential_value("socks5", "", "0", "", ""),
+            Ok(empty.clone())
+        );
         // 已保存的空记录显示成四个空框，和输入框比较时不算改过。
         for key in ["ip", "port", "username", "password"] {
             assert_eq!(saved_residential_text(&empty, key), "");
         }
         assert_eq!(
-            residential_value("203.0.113.9", "1080", "user", "secret"),
+            residential_value("socks5", "203.0.113.9", "1080", "user", "secret"),
             Ok(
-                json!({"ip": "203.0.113.9", "port": 1080, "username": "user", "password": "secret"})
+                json!({"protocol": "socks5", "ip": "203.0.113.9", "port": 1080, "username": "user", "password": "secret"})
             )
         );
         assert_eq!(
@@ -790,9 +817,28 @@ mod tests {
             "1080"
         );
         // 填了一部分时端口必须有效。
-        assert!(residential_value("203.0.113.9", "", "", "").is_err());
-        assert!(residential_value("", "0", "user", "").is_err());
-        assert!(residential_value("203.0.113.9", "70000", "user", "secret").is_err());
+        assert!(residential_value("socks5", "203.0.113.9", "", "", "").is_err());
+        assert!(residential_value("socks5", "", "0", "user", "").is_err());
+        assert!(residential_value("socks5", "203.0.113.9", "70000", "user", "secret").is_err());
+    }
+
+    #[test]
+    fn an_http_residential_proxy_keeps_its_protocol_and_refuses_a_colon_username() {
+        assert_eq!(
+            residential_value("http", "203.0.113.9", "8080", "user", "secret"),
+            Ok(
+                json!({"protocol": "http", "ip": "203.0.113.9", "port": 8080, "username": "user", "password": "secret"})
+            )
+        );
+        assert!(residential_value("http", "203.0.113.9", "8080", "a:b", "secret").is_err());
+        assert!(residential_value("socks5", "203.0.113.9", "1080", "a:b", "secret").is_ok());
+        assert_eq!(
+            saved_residential_protocol(&json!({"protocol": "http"})),
+            "http"
+        );
+        // 没存过协议的旧配置按 SOCKS5。
+        assert_eq!(saved_residential_protocol(&json!({"ip": ""})), "socks5");
+        assert_eq!(saved_residential_protocol(&Value::Null), "socks5");
     }
 
     #[test]

@@ -15,11 +15,14 @@ use crate::credential::{self, Residential};
 
 mod dialer;
 pub(crate) mod domestic;
+mod http_connect;
 pub(crate) mod profile;
 mod residential_probe;
 pub(crate) use dialer::ChainTarget;
 use dialer::Dialer;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
+/// Why a UDP chain is refused when the residential proxy is an HTTP proxy.
+pub(crate) const RESIDENTIAL_HTTP_NO_UDP: &str = "residential HTTP proxy cannot relay UDP";
 const MAX_CONFIG: u64 = 1024 * 1024;
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -572,14 +575,15 @@ impl Policy {
     /// to the next one: the desktop shows the address the exit check is
     /// against, not the one saved since. Never the username or password.
     pub(crate) fn public_summary(&self) -> serde_json::Value {
-        serde_json::json!({"first_hop":self.first_hop,"residential":self.residential.endpoint(),"credential":self.credential_ref,"dns_upstream":self.dns_upstream,"dns_tls_name":self.dns_tls_name,"health_domain":self.health_domain,"tunnels":self.dialer.report()})
+        serde_json::json!({"first_hop":self.first_hop,"residential":self.residential.endpoint(),"residential_protocol":self.residential.protocol().as_str(),"credential":self.credential_ref,"dns_upstream":self.dns_upstream,"dns_tls_name":self.dns_tls_name,"health_domain":self.health_domain,"tunnels":self.dialer.report()})
     }
 
     pub(crate) fn matches_residence(&self, ip: Ipv4Addr) -> bool {
         self.residential.endpoint().ip() == &ip
     }
 
-    /// Establishes first-hop SOCKS5 -> authenticated residential SOCKS5 -> literal IPv4.
+    /// Establishes first-hop SOCKS5 -> authenticated residential proxy (SOCKS5
+    /// or HTTP CONNECT) -> literal IPv4.
     /// The single deadline covers both handshakes, including partial reads and writes.
     pub fn chain(&self, dest: SocketAddrV4) -> Result<TcpStream, String> {
         if dest == self.first_hop
@@ -660,6 +664,11 @@ impl Policy {
     }
 
     fn associate(&self, target: UdpTarget) -> Result<UdpChain, String> {
+        // Nothing is dialed: an HTTP proxy has no UDP to offer, and SOCKS5
+        // bytes, credentials least of all, must not reach it.
+        if self.residential.protocol() == credential::Protocol::Http {
+            return Err(RESIDENTIAL_HTTP_NO_UDP.into());
+        }
         let deadline = Instant::now() + SETUP_TIMEOUT;
         let mut first_control =
             TcpStream::connect_timeout(&SocketAddr::V4(self.first_hop), remaining(deadline)?)
@@ -1344,6 +1353,24 @@ mod tests {
         assert_eq!(summary["residential"], "198.51.100.9:1080");
         let text = summary.to_string();
         assert!(!text.contains("fixture-user") && !text.contains("fixture-password"));
+    }
+
+    #[test]
+    fn an_http_residential_refuses_udp_without_dialing_anything() {
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let policy = Policy::assemble(
+            Validated::new(config(endpoint(&first))).unwrap(),
+            credential::http_fixture("198.51.100.9:8080".parse().unwrap()),
+        )
+        .unwrap();
+        let error = policy
+            .chain_udp(SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 1), 443))
+            .err()
+            .unwrap();
+        assert_eq!(error, RESIDENTIAL_HTTP_NO_UDP);
+        first.set_nonblocking(true).unwrap();
+        assert!(first.accept().is_err(), "nothing may reach the first hop");
+        assert_eq!(policy.public_summary()["residential_protocol"], "http");
     }
 
     #[test]

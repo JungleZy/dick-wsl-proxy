@@ -58,10 +58,20 @@ pub(crate) struct RuntimeLogEntry {
 #[derive(Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ResidentialSettings {
+    /// Settings saved before HTTP proxies were supported have no protocol.
+    #[serde(default)]
+    pub(crate) protocol: credential::Protocol,
     pub(crate) ip: String,
     pub(crate) port: u16,
     pub(crate) username: String,
     pub(crate) password: String,
+}
+
+impl ResidentialSettings {
+    /// Nothing typed yet. The protocol alone does not configure a proxy.
+    pub(crate) fn is_blank(&self) -> bool {
+        self.ip.is_empty() && self.port == 0 && self.username.is_empty() && self.password.is_empty()
+    }
 }
 
 pub(crate) struct Record {
@@ -222,6 +232,7 @@ fn open(path: &Path) -> Result<Connection, String> {
                 ON connection_records (target, id DESC);",
         )
         .map_err(|e| format!("desktop_store_schema:{e}"))?;
+    add_residential_protocol(&connection)?;
     if !wal && !WAL_FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
         let _ = insert_runtime_log(
             &connection,
@@ -237,6 +248,27 @@ fn open(path: &Path) -> Result<Connection, String> {
         );
     }
     Ok(connection)
+}
+
+/// Stores written before HTTP proxies were supported lack the protocol
+/// column; their saved proxy is SOCKS5. Earlier releases name the columns they
+/// read and write, so they keep working on a migrated store.
+fn add_residential_protocol(connection: &Connection) -> Result<(), String> {
+    let present: bool = connection
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('desktop_state') WHERE name = 'residential_protocol'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("desktop_store_schema:{e}"))?;
+    if !present {
+        connection
+            .execute_batch(
+                "ALTER TABLE desktop_state ADD COLUMN residential_protocol TEXT NOT NULL DEFAULT 'socks5'",
+            )
+            .map_err(|e| format!("desktop_store_schema:{e}"))?;
+    }
+    Ok(())
 }
 
 /// Set once the rollback-journal fallback has been logged by this process.
@@ -769,6 +801,16 @@ fn decode_row(row: &rusqlite::Row<'_>) -> Result<Record, rusqlite::Error> {
         profile,
         desktop,
         residential: ResidentialSettings {
+            protocol: {
+                let text: String = row.get(7)?;
+                credential::Protocol::parse(&text).ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        7,
+                        rusqlite::types::Type::Text,
+                        "unknown residential protocol".into(),
+                    )
+                })?
+            },
             ip: row.get(3)?,
             port: row.get(4)?,
             username: row.get(5)?,
@@ -780,7 +822,7 @@ fn decode_row(row: &rusqlite::Row<'_>) -> Result<Record, rusqlite::Error> {
 fn read_optional(connection: &Connection) -> Result<Option<Record>, String> {
     let record = connection
         .query_row(
-            "SELECT revision, profile_json, desktop_json, residential_ip, residential_port, residential_username, residential_password FROM desktop_state WHERE id = 1",
+            "SELECT revision, profile_json, desktop_json, residential_ip, residential_port, residential_username, residential_password, residential_protocol FROM desktop_state WHERE id = 1",
             [],
             decode_row,
         )
@@ -821,7 +863,7 @@ pub(crate) fn ensure(path: &Path) -> Result<Record, String> {
             let desktop_json = serde_json::to_string(&legacy.desktop).map_err(|e| e.to_string())?;
             connection
                     .execute(
-                        "INSERT OR REPLACE INTO desktop_state (id, revision, profile_json, desktop_json, residential_ip, residential_port, residential_username, residential_password) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        "INSERT OR REPLACE INTO desktop_state (id, revision, profile_json, desktop_json, residential_ip, residential_port, residential_username, residential_password, residential_protocol) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                         params![
                             legacy.revision,
                             profile_json,
@@ -829,7 +871,8 @@ pub(crate) fn ensure(path: &Path) -> Result<Record, String> {
                             residential.ip,
                             residential.port,
                             residential.username,
-                            residential.password
+                            residential.password,
+                            residential.protocol.as_str()
                         ],
                     )
                     .map_err(|e| format!("desktop_store_legacy_migrate:{e}"))?;
@@ -850,8 +893,8 @@ pub(crate) fn ensure(path: &Path) -> Result<Record, String> {
     let desktop_json = serde_json::to_string(&desktop).map_err(|e| e.to_string())?;
     connection
         .execute(
-            "INSERT OR REPLACE INTO desktop_state (id, revision, profile_json, desktop_json, residential_ip, residential_port, residential_username, residential_password) VALUES (1, 0, ?1, ?2, ?3, ?4, ?5, ?6)",
-            params![profile_json, desktop_json, residential.ip, residential.port, residential.username, residential.password],
+            "INSERT OR REPLACE INTO desktop_state (id, revision, profile_json, desktop_json, residential_ip, residential_port, residential_username, residential_password, residential_protocol) VALUES (1, 0, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![profile_json, desktop_json, residential.ip, residential.port, residential.username, residential.password, residential.protocol.as_str()],
         )
         .map_err(|e| format!("desktop_store_default:{e}"))?;
     Ok(Record {
@@ -887,7 +930,7 @@ pub(crate) fn save(
     }
     let residential = residential.unwrap_or(current.residential);
     // Empty means not configured yet; anything partly filled must parse.
-    if residential != ResidentialSettings::default() {
+    if !residential.is_blank() {
         let credential = credential::from_settings(&residential)?;
         let _ = credential.endpoint();
     }
@@ -906,8 +949,8 @@ pub(crate) fn save(
         .map_err(|e| format!("desktop_store_transaction:{e}"))?;
     let changed = transaction
         .execute(
-            "UPDATE desktop_state SET revision=?1, profile_json=?2, desktop_json=?3, residential_ip=?4, residential_port=?5, residential_username=?6, residential_password=?7 WHERE id=1 AND revision=?8",
-            params![next, profile_json, desktop_json, residential.ip, residential.port, residential.username, residential.password, current.revision],
+            "UPDATE desktop_state SET revision=?1, profile_json=?2, desktop_json=?3, residential_ip=?4, residential_port=?5, residential_username=?6, residential_password=?7, residential_protocol=?8 WHERE id=1 AND revision=?9",
+            params![next, profile_json, desktop_json, residential.ip, residential.port, residential.username, residential.password, residential.protocol.as_str(), current.revision],
         )
         .map_err(|e| format!("desktop_store_save:{e}"))?;
     if changed != 1 {
@@ -950,7 +993,7 @@ pub(crate) fn update_residential(
     name: Option<String>,
     residential: ResidentialSettings,
 ) -> Result<Record, String> {
-    if residential != ResidentialSettings::default() {
+    if !residential.is_blank() {
         credential::from_settings(&residential)?;
     }
     let current = ensure(path)?;
@@ -973,7 +1016,7 @@ pub(crate) fn update_residential(
     let connection = open(path)?;
     let changed = connection
         .execute(
-            "UPDATE desktop_state SET revision=?1, profile_json=?2, residential_ip=?3, residential_port=?4, residential_username=?5, residential_password=?6 WHERE id=1 AND revision=?7",
+            "UPDATE desktop_state SET revision=?1, profile_json=?2, residential_ip=?3, residential_port=?4, residential_username=?5, residential_password=?6, residential_protocol=?7 WHERE id=1 AND revision=?8",
             params![
                 next,
                 profile_json,
@@ -981,6 +1024,7 @@ pub(crate) fn update_residential(
                 residential.port,
                 residential.username,
                 residential.password,
+                residential.protocol.as_str(),
                 current.revision
             ],
         )
@@ -1056,6 +1100,7 @@ mod tests {
         let path = data_dir.join(FILE_NAME);
         let initial = ensure(&legacy).unwrap();
         let residential = ResidentialSettings {
+            protocol: credential::Protocol::Socks5,
             ip: "198.51.100.2".into(),
             port: 1080,
             username: "fixture-user".into(),
@@ -1091,6 +1136,7 @@ mod tests {
         let initial = ensure(&path).unwrap();
         assert_eq!(initial.revision, 0);
         let residential = ResidentialSettings {
+            protocol: credential::Protocol::Socks5,
             ip: "198.51.100.2".into(),
             port: 1080,
             username: "fixture-user".into(),
@@ -1185,6 +1231,7 @@ mod tests {
         let initial = ensure(&path).unwrap();
         assert!(initial.residential == ResidentialSettings::default());
         let settings = ResidentialSettings {
+            protocol: credential::Protocol::Socks5,
             ip: "198.51.100.7".into(),
             port: 1080,
             username: "fixture-user".into(),
@@ -1213,6 +1260,70 @@ mod tests {
         let cleared = update_residential(&path, None, ResidentialSettings::default()).unwrap();
         assert_eq!(cleared.revision, 2);
         assert!(load(&path).unwrap().residential == ResidentialSettings::default());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_store_from_before_http_proxies_loads_its_proxy_as_socks5_and_keeps_http() {
+        let path =
+            std::env::temp_dir().join(format!("wpl-protocol-store-{}.sqlite", std::process::id()));
+        let _ = fs::remove_file(&path);
+        {
+            // The table exactly as earlier releases created it.
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE desktop_state (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        revision INTEGER NOT NULL,
+                        profile_json TEXT NOT NULL,
+                        desktop_json TEXT NOT NULL,
+                        residential_ip TEXT NOT NULL,
+                        residential_port INTEGER NOT NULL,
+                        residential_username TEXT NOT NULL,
+                        residential_password TEXT NOT NULL
+                    );",
+                )
+                .unwrap();
+            let profile = serde_json::to_string(&default_profile().unwrap()).unwrap();
+            let desktop = serde_json::to_string(&Preferences::default()).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO desktop_state VALUES (1, 3, ?1, ?2, '198.51.100.8', 1080, 'fixture-user', 'fixture-password')",
+                    params![profile, desktop],
+                )
+                .unwrap();
+        }
+        let old = load(&path).unwrap();
+        assert_eq!(old.residential.protocol, credential::Protocol::Socks5);
+        assert_eq!(old.residential.ip, "198.51.100.8");
+        let http = ResidentialSettings {
+            protocol: credential::Protocol::Http,
+            port: 8080,
+            ..old.residential.clone()
+        };
+        save(
+            &path,
+            old.profile.clone(),
+            old.desktop.clone(),
+            Some(http.clone()),
+            Some("3".into()),
+        )
+        .unwrap();
+        assert!(load(&path).unwrap().residential == http);
+        assert_eq!(
+            credential::from_settings(&load(&path).unwrap().residential)
+                .unwrap()
+                .protocol(),
+            credential::Protocol::Http
+        );
+        // Picking a protocol alone is still "not configured".
+        let blank = ResidentialSettings {
+            protocol: credential::Protocol::Http,
+            ..ResidentialSettings::default()
+        };
+        assert!(blank.is_blank());
+        update_residential(&path, None, blank).unwrap();
         let _ = fs::remove_file(path);
     }
 

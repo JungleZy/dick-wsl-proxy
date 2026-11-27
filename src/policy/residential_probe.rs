@@ -1,4 +1,4 @@
-//! Tells whether the saved residential SOCKS5 answers straight from Windows,
+//! Tells whether the saved residential proxy answers straight from Windows,
 //! through the first hop, or neither. Takeover traffic always uses the chain;
 //! this probe only reports what each path can do.
 
@@ -8,7 +8,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use super::{AuthPacket, Policy, connect, expect, remaining, send};
+use super::dialer::ChainTarget;
+use super::http_connect::{self, Refusal};
+use super::{AuthPacket, Policy, connect, expect, receive, remaining, send};
+use crate::credential::Protocol;
 
 /// Each path gets its own deadline, handshakes included. Both run at once, so
 /// the request holds the controller for at most this long.
@@ -18,7 +21,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 type Outcome = Result<(), &'static str>;
 
 impl Policy {
-    /// Authenticates to the residential SOCKS5 and asks it to CONNECT to the
+    /// Authenticates to the residential proxy and asks it to CONNECT to the
     /// DNS upstream, once straight from Windows and once inside the first hop.
     /// The direct path sends the credentials without the first hop, so the
     /// desktop asks the user before requesting this.
@@ -56,12 +59,22 @@ impl Policy {
         self.residential_handshake(&mut stream, deadline)
     }
 
-    /// Method selection, username/password authentication, then CONNECT to a
-    /// literal address so the residential side needs no name resolution.
+    /// Logs in and CONNECTs to a literal address so the residential side
+    /// needs no name resolution. A reply in the other protocol is named as
+    /// such, since a wrong protocol choice is the likely cause.
     fn residential_handshake(&self, stream: &mut TcpStream, deadline: Instant) -> Outcome {
-        send(stream, &[5, 1, 2], deadline)
-            .and_then(|()| expect(stream, &[5, 2], deadline, "rejected"))
-            .map_err(|_| "residential_method_rejected")?;
+        if self.residential.protocol() == Protocol::Http {
+            return self.http_handshake(stream, deadline);
+        }
+        send(stream, &[5, 1, 2], deadline).map_err(|_| "residential_method_rejected")?;
+        let mut method = [0; 2];
+        receive(stream, &mut method, deadline).map_err(|_| "residential_method_rejected")?;
+        if &method == b"HT" {
+            return Err("residential_speaks_http");
+        }
+        if method != [5, 2] {
+            return Err("residential_method_rejected");
+        }
         {
             let mut packet = AuthPacket([0; 513]);
             let len = self.residential.auth_packet(&mut packet.0);
@@ -69,6 +82,24 @@ impl Policy {
         }
         expect(stream, &[1, 0], deadline, "rejected").map_err(|_| "residential_auth_rejected")?;
         connect(stream, self.dns_upstream, deadline).map_err(|_| "residential_connect_rejected")
+    }
+
+    /// The same login and CONNECT as one HTTP CONNECT request.
+    fn http_handshake(&self, stream: &mut TcpStream, deadline: Instant) -> Outcome {
+        let target = ChainTarget::Address(SocketAddr::V4(self.dns_upstream));
+        let request = http_connect::request(&target, &self.residential);
+        send(stream, &request.0, deadline).map_err(|_| "residential_not_http")?;
+        let mut first = [0; 1];
+        receive(stream, &mut first, deadline).map_err(|_| "residential_not_http")?;
+        // A SOCKS5 server answers anything with a version-5 byte, if at all.
+        if first[0] == 5 {
+            return Err("residential_speaks_socks5");
+        }
+        http_connect::reply_rest(stream, first[0], deadline).map_err(|refusal| match refusal {
+            Refusal::Authentication => "residential_auth_rejected",
+            Refusal::Status(_) => "residential_connect_rejected",
+            Refusal::Malformed | Refusal::Broken(_) => "residential_not_http",
+        })
     }
 }
 
@@ -292,6 +323,102 @@ mod tests {
             report["direct"],
             json!({"ok": false, "stage": "residential_auth_rejected"})
         );
+    }
+
+    fn http_policy(first_hop: SocketAddrV4, residential: SocketAddrV4) -> Policy {
+        let config: Config = serde_json::from_value(json!({
+            "first_hop": first_hop.to_string(),
+            "credential": "fixture",
+            "dns_upstream": "8.8.8.8:443",
+            "dns_tls_name": "dns.google",
+            "direct_ips": [],
+            "direct_domains": [],
+            "direct_suffixes": [],
+            "allow_loopback_residential": true
+        }))
+        .unwrap();
+        Policy::assemble(
+            Validated::new(config).unwrap(),
+            credential::http_fixture(residential),
+        )
+        .unwrap()
+    }
+
+    /// Serves one HTTP CONNECT, answers `reply`, and returns the request.
+    fn http_session(stream: TcpStream, reply: &str) -> String {
+        let mut stream = timed(stream);
+        let mut header = Vec::new();
+        while !header.ends_with(b"\r\n\r\n") {
+            header.push(read_exact::<1>(&mut stream)[0]);
+        }
+        stream.write_all(reply.as_bytes()).unwrap();
+        String::from_utf8(header).unwrap()
+    }
+
+    #[test]
+    fn an_http_residential_is_logged_into_with_one_connect() {
+        let residential = TcpListener::bind("127.0.0.1:0").unwrap();
+        let policy = http_policy(closed_port(), endpoint(&residential));
+        let server = thread::spawn(move || {
+            http_session(
+                residential.accept().unwrap().0,
+                "HTTP/1.1 200 Connection established\r\n\r\n",
+            )
+        });
+        let report = policy.probe_residential();
+        let request = server.join().unwrap();
+        assert!(
+            request.starts_with("CONNECT 8.8.8.8:443 HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(request.contains("Proxy-Authorization: Basic "), "{request}");
+        assert_eq!(report["verdict"], "direct_only");
+        assert_eq!(report["direct"], json!({"ok": true}));
+    }
+
+    #[test]
+    fn an_http_407_is_a_credential_problem() {
+        let residential = TcpListener::bind("127.0.0.1:0").unwrap();
+        let policy = http_policy(closed_port(), endpoint(&residential));
+        let server = thread::spawn(move || {
+            http_session(
+                residential.accept().unwrap().0,
+                "HTTP/1.1 407 Proxy Authentication Required\r\n\r\n",
+            )
+        });
+        let report = policy.probe_residential();
+        server.join().unwrap();
+        assert_eq!(report["verdict"], "credential_rejected");
+        assert_eq!(report["direct"]["stage"], "residential_auth_rejected");
+    }
+
+    #[test]
+    fn the_wrong_protocol_is_named_both_ways() {
+        // SOCKS5 saved, HTTP proxy listening: it answers the greeting with 400.
+        let residential = TcpListener::bind("127.0.0.1:0").unwrap();
+        let policy = policy(closed_port(), endpoint(&residential));
+        let server = thread::spawn(move || {
+            let mut stream = timed(residential.accept().unwrap().0);
+            assert_eq!(read_exact::<3>(&mut stream), [5, 1, 2]);
+            stream
+                .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                .unwrap();
+        });
+        let report = policy.probe_residential();
+        server.join().unwrap();
+        assert_eq!(report["direct"]["stage"], "residential_speaks_http");
+
+        // HTTP saved, SOCKS5 server listening: it answers with version 5.
+        let residential = TcpListener::bind("127.0.0.1:0").unwrap();
+        let policy = http_policy(closed_port(), endpoint(&residential));
+        let server = thread::spawn(move || {
+            let mut stream = timed(residential.accept().unwrap().0);
+            read_exact::<1>(&mut stream);
+            stream.write_all(&[5, 0xff]).unwrap();
+        });
+        let report = policy.probe_residential();
+        server.join().unwrap();
+        assert_eq!(report["direct"]["stage"], "residential_speaks_socks5");
     }
 
     #[test]

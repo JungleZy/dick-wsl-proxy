@@ -8,7 +8,8 @@ use super::backend::Kind;
 use super::components::text;
 use super::drafts::{
     PageDraft, ProfileField, SaveScope, Saved, Unsaved, names_target, profile_changed,
-    residential_value, save_request, saved_fake_ip, saved_residential_text, target_missing,
+    residential_value, save_request, saved_fake_ip, saved_residential_protocol,
+    saved_residential_text, target_missing,
 };
 use super::model::{Confirmation, EnvironmentEditor, Field, PendingPrepare};
 use super::state::Desktop;
@@ -183,6 +184,17 @@ impl Desktop {
         cx.notify();
     }
 
+    /// 选择设置页住宅代理的协议。
+    pub(crate) fn set_residential_protocol_draft(
+        &mut self,
+        protocol: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        self.residential_protocol_draft = protocol;
+        self.input_edited(Some(SaveScope::Settings), cx);
+        cx.notify();
+    }
+
     pub(crate) fn residential_inputs(&self) -> [(&Field, &'static str); 4] {
         [
             (&self.fields.residential_ip, "ip"),
@@ -197,6 +209,7 @@ impl Desktop {
         let draft = |field| Self::field_value(self.profile_input(field), cx);
         let settings = Self::field_value(&self.fields.port, cx) != self.saved_port
             || self.fake_ip_draft != saved_fake_ip(&self.profile)
+            || self.residential_protocol_draft != saved_residential_protocol(&self.residential)
             || profile_changed(&self.profile, SaveScope::Settings, draft)
             || self.residential_inputs().into_iter().any(|(field, key)| {
                 Self::field_value(field, cx) != saved_residential_text(&self.residential, key)
@@ -290,9 +303,10 @@ impl Desktop {
         Ok(())
     }
 
-    /// 住宅代理四项都空时按「还没配置」保存，否则端口必须有效。
+    /// 住宅代理四项都空时按「还没配置」保存，否则端口必须有效。协议随选择一起保存。
     pub(crate) fn residential_draft(&self, cx: &App) -> Result<Value, &'static str> {
         residential_value(
+            self.residential_protocol_draft,
             &Self::field_value(&self.fields.residential_ip, cx),
             &Self::field_value(&self.fields.residential_port, cx),
             &Self::field_value(&self.fields.residential_username, cx),
@@ -651,7 +665,14 @@ impl Desktop {
             self.fail("还没有保存住宅代理，请先填写服务器和账号并保存设置。", cx);
             return;
         }
-        let message = "将用已保存的住宅代理配置检测两条路：一条从 Windows 直接连住宅服务器，一条经宿主 SOCKS5 连过去。两条都会登录，并让住宅代理连一次 DNS 上游，各自最多 8 秒。直连那一条不经前置代理：SOCKS5 的用户名和密码是明文，会经本地网络直接发出，住宅服务商也会看到你的真实 IP。检测不改变接管状态和规则。";
+        let credentials = if saved_residential_protocol(&self.residential) == "http" {
+            "HTTP 代理的用户名和密码只做 Base64 编码，等于明文"
+        } else {
+            "SOCKS5 的用户名和密码是明文"
+        };
+        let message = format!(
+            "将用已保存的住宅代理配置检测两条路：一条从 Windows 直接连住宅服务器，一条经宿主 SOCKS5 连过去。两条都会登录，并让住宅代理连一次 DNS 上游，各自最多 8 秒。直连那一条不经前置代理：{credentials}，会经本地网络直接发出，住宅服务商也会看到你的真实 IP。检测不改变接管状态和规则。"
+        );
         let view = cx.entity().clone();
         window.open_alert_dialog(cx, move |dialog, _, _| {
             let ok_view = view.clone();
@@ -669,7 +690,7 @@ impl Desktop {
                         .ok_text("检测")
                         .cancel_text("取消"),
                 )
-                .description(div().text_sm().child(message))
+                .description(div().text_sm().child(message.clone()))
                 .on_ok(move |_, _, cx| {
                     ok_view.update(cx, |this, cx| {
                         this.send(

@@ -21,7 +21,7 @@ use super::backend::{Job, Kind, Reply, worker};
 use super::components::design_icon;
 use super::drafts::{
     FailedSaves, SaveScope, Unsaved, names_target, profile_fields, saved_fake_ip,
-    saved_residential_text, saved_text, target_missing,
+    saved_residential_protocol, saved_residential_text, saved_text, target_missing,
 };
 use super::model::{
     EnvironmentProgress, EnvironmentResult, Field, Fields, LogFilter, Page, RuntimeLog,
@@ -314,6 +314,7 @@ impl Desktop {
             dialog_error: None,
             autostart_enabled: super::autostart::enabled().unwrap_or(false),
             fake_ip_draft: true,
+            residential_protocol_draft: "socks5",
             confirmation: None,
             confirmation_pending: false,
             kernel_prepare_offered: false,
@@ -1469,7 +1470,13 @@ impl Desktop {
                 } else {
                     let udp_blocked =
                         kind != Kind::Stop && value["startup_verified"]["udp_supported"] == false;
-                    self.notice = if udp_blocked {
+                    let http_residential = value["active_policy"]["residential_protocol"] == "http";
+                    self.notice = if udp_blocked && http_residential {
+                        format!(
+                            "{}已完成。住宅代理是 HTTP 代理，不能转发 UDP：UDP（含 QUIC，直连例外也一样）已阻断，不会直连；TCP 和系统 DNS 照常经代理链。",
+                            kind.label()
+                        )
+                    } else if udp_blocked {
                         format!(
                             "{}已完成，但住宅出口没有通过 UDP 探测：UDP（含 QUIC，直连例外也一样）已阻断，不会直连；TCP 和系统 DNS 照常经代理链。",
                             kind.label()
@@ -1790,6 +1797,7 @@ impl Desktop {
                     .port
                     .set_value(self.saved_port.clone(), window, cx);
                 self.fake_ip_draft = saved_fake_ip(&self.profile);
+                self.residential_protocol_draft = saved_residential_protocol(&self.residential);
                 for (field, key) in self.residential_inputs() {
                     let value = saved_residential_text(&self.residential, key);
                     field.set_value(value, window, cx);

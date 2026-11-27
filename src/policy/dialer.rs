@@ -1,12 +1,15 @@
-//! First hop -> authenticated residential SOCKS5 -> destination, with a small
-//! pool of tunnels already authenticated at the residential proxy. A pooled
-//! tunnel only needs its CONNECT, which saves the first-hop CONNECT and the
-//! residential method and authentication round trips of a fresh chain.
+//! First hop -> authenticated residential proxy -> destination, with a small
+//! pool of tunnels ready at the residential proxy. A pooled SOCKS5 tunnel is
+//! already authenticated and only needs its CONNECT, which saves the
+//! first-hop CONNECT and the residential method and authentication round
+//! trips of a fresh chain. An HTTP proxy takes the credentials with every
+//! CONNECT, so a pooled HTTP tunnel only saves the first-hop CONNECT.
+use super::http_connect;
 use super::{
     AuthPacket, SETUP_TIMEOUT, WipedBytes, connect, connect_reply, connect_request, expect,
     receive, remaining, send,
 };
-use crate::credential::Residential;
+use crate::credential::{Protocol, Residential};
 use std::collections::VecDeque;
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4, TcpStream};
@@ -258,6 +261,7 @@ impl Dialer {
                 .iter()
                 .map(|gap| gap.as_secs())
                 .collect::<Vec<_>>(),
+            "protocol": self.residential.protocol().as_str(),
             "pipelined": self.pipeline.load(Ordering::Relaxed),
             "idle_limit_ms": u64::try_from(self.idle_limit().as_millis()).unwrap_or(u64::MAX),
             "hits": count(&self.stats.hits),
@@ -294,7 +298,7 @@ impl Dialer {
         let pooled = self.take();
         self.refill();
         if let Some((mut stream, idle)) = pooled {
-            match pooled_connect(&mut stream, target, deadline) {
+            match pooled_connect(&mut stream, target, &self.residential, deadline) {
                 Ok(()) => {
                     self.stats.hits.fetch_add(1, Ordering::Relaxed);
                     return finish(stream);
@@ -319,6 +323,12 @@ impl Dialer {
     }
 
     fn fresh(&self, target: &ChainTarget, deadline: Instant) -> Result<TcpStream, String> {
+        if self.residential.protocol() == Protocol::Http {
+            let mut stream = self.open_residential(deadline)?;
+            http_connect::connect(&mut stream, target, &self.residential, deadline)
+                .map_err(|refusal| refusal.message())?;
+            return Ok(stream);
+        }
         let pipelined = self.pipeline.load(Ordering::Relaxed);
         let mut stream = self.open_residential(deadline)?;
         match self.residential_connect(&mut stream, target, deadline, pipelined) {
@@ -535,11 +545,14 @@ impl Dialer {
         largest.clamp(POOL_MIN.min(self.max), self.max)
     }
 
-    /// Background: builds one authenticated tunnel, pools it, and closes it
-    /// again if it is still unused when its idle limit passes.
+    /// Background: builds one tunnel (authenticated, for SOCKS5), pools it,
+    /// and closes it again if it is still unused when its idle limit passes.
     fn prepare(self: Arc<Self>) {
         let deadline = Instant::now() + SETUP_TIMEOUT;
         let built = self.open_residential(deadline).and_then(|mut stream| {
+            if self.residential.protocol() == Protocol::Http {
+                return Ok(stream);
+            }
             authenticate(&mut stream, &self.residential, deadline)
                 .map_err(Setup::into_message)
                 .map(|()| stream)
@@ -699,6 +712,14 @@ impl Dialer {
     pub(super) fn probe_connect(&self, target: &ChainTarget) -> Result<Duration, String> {
         let deadline = Instant::now() + SETUP_TIMEOUT;
         let mut stream = self.open_residential(deadline)?;
+        if self.residential.protocol() == Protocol::Http {
+            // The credentials ride on the CONNECT itself, so the time covers
+            // the proxy checking them as well as reaching the target.
+            let started = Instant::now();
+            http_connect::connect(&mut stream, target, &self.residential, deadline)
+                .map_err(|refusal| refusal.message())?;
+            return Ok(started.elapsed());
+        }
         authenticate(&mut stream, &self.residential, deadline).map_err(Setup::into_message)?;
         let request = target_request(target)?;
         let started = Instant::now();
@@ -750,14 +771,25 @@ fn authenticate(
     .map_err(Setup::Failed)
 }
 
-/// CONNECT on a pooled, already authenticated tunnel. A tunnel that cannot
-/// take the request closed while pooled; one that takes it and then gives
-/// no reply is unanswered; a reply that refuses is final.
+/// CONNECT on a pooled tunnel. A tunnel that cannot take the request closed
+/// while pooled; one that takes it and then gives no reply is unanswered; a
+/// reply that refuses is final.
 fn pooled_connect(
     stream: &mut TcpStream,
     target: &ChainTarget,
+    residential: &Residential,
     deadline: Instant,
 ) -> Result<(), PooledFailure> {
+    if residential.protocol() == Protocol::Http {
+        let request = http_connect::request(target, residential);
+        if send(stream, &request.0, deadline).is_err() {
+            return Err(PooledFailure::Closed);
+        }
+        let mut first = [0; 1];
+        receive(stream, &mut first, deadline).map_err(|_| PooledFailure::Unanswered)?;
+        return http_connect::reply_rest(stream, first[0], deadline)
+            .map_err(|refusal| PooledFailure::Failed(refusal.message()));
+    }
     let request = target_request(target).map_err(PooledFailure::Failed)?;
     if send(stream, &request, deadline).is_err() {
         return Err(PooledFailure::Closed);
@@ -1273,5 +1305,112 @@ mod tests {
     fn dialer_with_target(first_hop: SocketAddrV4, target: usize) -> Arc<Dialer> {
         let residential = crate::credential::fixture(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1));
         Arc::new(Dialer::new(first_hop, residential, settings(target)))
+    }
+
+    /// A first hop as in `proxies`, in front of an HTTP proxy that keeps each
+    /// CONNECT header it reads, answers `status`, and then sends a banner
+    /// before the client says anything. Each entry records whether the
+    /// tunnel had sat idle before its CONNECT ("pooled") or not ("fresh").
+    #[allow(clippy::type_complexity)]
+    fn http_proxies(
+        status: &'static str,
+    ) -> (SocketAddrV4, Arc<Mutex<Vec<(&'static str, String)>>>) {
+        let first = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let residential = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let first_endpoint = local(&first);
+        let residential_endpoint = local(&residential);
+        thread::spawn(move || {
+            for stream in first.incoming() {
+                let mut stream = stream.unwrap();
+                thread::spawn(move || {
+                    assert_eq!(read_exact::<3>(&mut stream), [5, 1, 0]);
+                    stream.write_all(&[5, 0]).unwrap();
+                    read_exact::<10>(&mut stream);
+                    let target = TcpStream::connect(residential_endpoint).unwrap();
+                    stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+                    relay(stream, target);
+                });
+            }
+        });
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&log);
+        thread::spawn(move || {
+            for stream in residential.incoming() {
+                let mut stream = stream.unwrap();
+                let record = Arc::clone(&record);
+                thread::spawn(move || {
+                    let opened = Instant::now();
+                    let mut header = Vec::new();
+                    let mut byte = [0];
+                    while !header.ends_with(b"\r\n\r\n") {
+                        if stream.read_exact(&mut byte).is_err() {
+                            return; // A pooled tunnel closed unused.
+                        }
+                        header.push(byte[0]);
+                    }
+                    let waited = opened.elapsed() >= Duration::from_millis(100);
+                    record.lock().unwrap().push((
+                        if waited { "pooled" } else { "fresh" },
+                        String::from_utf8(header).unwrap(),
+                    ));
+                    let reply = format!("HTTP/1.1 {status}\r\n\r\nbanner");
+                    stream.write_all(reply.as_bytes()).unwrap();
+                    let mut rest = Vec::new();
+                    let _ = stream.read_to_end(&mut rest);
+                });
+            }
+        });
+        (first_endpoint, log)
+    }
+
+    fn http_dialer(first_hop: SocketAddrV4) -> Arc<Dialer> {
+        let residential =
+            crate::credential::http_fixture(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1));
+        Arc::new(Dialer::new(first_hop, residential, settings(2)))
+    }
+
+    #[test]
+    fn an_http_proxy_gets_an_authenticated_connect_fresh_and_on_a_pooled_tunnel() {
+        let (first_hop, log) = http_proxies("200 Connection established");
+        let dialer = http_dialer(first_hop);
+        let target = ChainTarget::Name("media.example.com".into(), 443);
+        let mut stream = dialer.chain(&target).unwrap();
+        let mut banner = [0; 6];
+        stream.read_exact(&mut banner).unwrap();
+        assert_eq!(&banner, b"banner");
+        drop(stream);
+        wait_for_pool(&dialer, 2);
+        // Long enough for the residential side to tell a pooled tunnel apart.
+        thread::sleep(Duration::from_millis(150));
+        let mut stream = dialer.chain(&target).unwrap();
+        stream.read_exact(&mut banner).unwrap();
+        assert_eq!(&banner, b"banner");
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+            ["fresh", "pooled"]
+        );
+        for (_, header) in log.iter() {
+            assert_eq!(
+                header,
+                "CONNECT media.example.com:443 HTTP/1.1\r\nHost: media.example.com:443\r\n\
+                 Proxy-Authorization: Basic Zml4dHVyZS11c2VyOmZpeHR1cmUtcGFzc3dvcmQ=\r\n\r\n"
+            );
+        }
+        assert_eq!(dialer.report()["protocol"], "http");
+        assert_eq!(dialer.report()["hits"], 1);
+        dialer.close();
+    }
+
+    #[test]
+    fn an_http_refusal_is_final_and_says_why() {
+        let (first_hop, _) = http_proxies("407 Proxy Authentication Required");
+        let dialer = http_dialer(first_hop);
+        let target = ChainTarget::Address("192.0.2.1:443".parse().unwrap());
+        let error = dialer.chain(&target).err().unwrap();
+        assert_eq!(error, "residential HTTP proxy authentication rejected");
+        let (first_hop, _) = http_proxies("502 Bad Gateway");
+        let error = http_dialer(first_hop).probe_connect(&target).err().unwrap();
+        assert_eq!(error, "residential HTTP CONNECT refused with status 502");
     }
 }

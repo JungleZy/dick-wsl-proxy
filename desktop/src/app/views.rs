@@ -9,6 +9,7 @@ use gpui_kit::component::{
     group_box::GroupBoxVariant,
     input::{Input, Textarea},
     progress::Progress,
+    radio::{Radio, RadioGroup},
     resizable::{h_resizable, resizable_panel},
     select::Select,
     setting::{SettingGroup, SettingItem, SettingPage, Settings},
@@ -23,7 +24,7 @@ use super::components::{
     StatusTone, Tip, app_icon, badge, design_icon, icon, status_chip, status_dot, status_icon,
     text, text_tip,
 };
-use super::drafts::{SaveScope, names_target};
+use super::drafts::{RESIDENTIAL_PROTOCOLS, SaveScope, names_target};
 use super::environment_facts::{self, Component, ComponentState, Systemd};
 use super::model::{EnvironmentEditor, Field, LogFilter, Page, RuntimeLog, UiAction};
 use super::state::Desktop;
@@ -2379,11 +2380,38 @@ impl Desktop {
                 setting_input(&field, locked, horizontal)
             })
         };
+        let protocol = setting_row("协议", {
+            let view = view.clone();
+            let selected = RESIDENTIAL_PROTOCOLS
+                .iter()
+                .position(|(value, _)| *value == self.residential_protocol_draft);
+            move |_| {
+                let view = view.clone();
+                RadioGroup::horizontal("settings-residential-protocol")
+                    .children(
+                        RESIDENTIAL_PROTOCOLS
+                            .iter()
+                            .map(|(value, label)| Radio::new(*value).label(*label)),
+                    )
+                    .selected_index(selected)
+                    .disabled(locked)
+                    .on_click(move |index: &usize, _, cx: &mut App| {
+                        let protocol = RESIDENTIAL_PROTOCOLS[*index].0;
+                        view.update(cx, |this, cx| {
+                            this.set_residential_protocol_draft(protocol, cx)
+                        });
+                    })
+            }
+        });
         let residential = SettingPage::new("住宅代理")
             .resettable(false)
             .group(
                 SettingGroup::new()
                     .title("服务器")
+                    .description(
+                        "协议按服务商给这个端口的类型选。HTTP 代理只能转发 TCP：选 HTTP 时接管期间的 UDP（含 QUIC、WebRTC、游戏和语音）一律拒绝，不会直连；网页通常会自动退回 TCP。用户名和密码在两种协议下都是明文发送，接管时经宿主 SOCKS5 发出。",
+                    )
+                    .item(protocol)
                     .item(input("服务器 IPv4", &self.fields.residential_ip))
                     .item(input("服务器端口", &self.fields.residential_port))
                     .item(input("用户名", &self.fields.residential_username))

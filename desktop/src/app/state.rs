@@ -92,6 +92,8 @@ pub(crate) struct Desktop {
     pub(crate) autostart_enabled: bool,
     /// 设置页「远端解析」勾选框的当前值；保存设置时写进策略的 `fake_ip`。
     pub(crate) fake_ip_draft: bool,
+    /// 设置页住宅代理「协议」的当前选择（`socks5` 或 `http`）；保存设置时随住宅代理写入。
+    pub(crate) residential_protocol_draft: &'static str,
     pub(crate) confirmation: Option<Confirmation>,
     pub(crate) confirmation_pending: bool,
     /// 本次启动尝试已经就缺少的内核能力问过一次；避免预检失败后反复弹框。

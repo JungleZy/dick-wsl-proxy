@@ -45,7 +45,7 @@ It is not a general-purpose VPN: it handles one WSL2 distribution, and the backe
 
 - **Per-distribution takeover**: installs iptables rules tagged with this instance into the target, matched by cgroup so that only this distribution's processes are redirected to the Windows ingress.
 - **Direct allowlist**: IPs, CIDRs, exact domains and domain suffixes. Matching TCP is connected directly by Windows. A new configuration store comes pre-filled with suffixes of common services in mainland China.
-- **Two-hop chain**: other traffic first goes through the SOCKS5 proxy already running on the host (first hop), then through a residential SOCKS5 proxy with username/password authentication (second hop).
+- **Two-hop chain**: other traffic first goes through the SOCKS5 proxy already running on the host (first hop), then through a residential proxy with username/password authentication (SOCKS5, or an HTTP proxy that only carries TCP, so UDP is refused with it) (second hop).
 - **Fail closed**: if either hop fails, the connection fails; faults keep traffic blocked rather than degrading to direct.
 - **System DNS takeover**: the target's system DNS is answered by Windows and never falls back to a local or ISP resolver. Names outside the allowlist use fake-ip and are resolved by the residential proxy by default; allowlisted names go to a domestic DoH resolver.
 - **UDP and QUIC**: forwarded through the proxies' UDP ASSOCIATE. If the proxies do not support UDP, such UDP is refused for the rest of that takeover and never sent direct.
@@ -68,7 +68,7 @@ It is not a general-purpose VPN: it handles one WSL2 distribution, and the backe
 | Traffic | Route |
 | --- | --- |
 | Allowlisted TCP | Direct from Windows |
-| Other TCP (including IPv6 when managed IPv6 is on) | Host SOCKS5 → residential SOCKS5; if either hop fails, the connection fails |
+| Other TCP (including IPv6 when managed IPv6 is on) | Host SOCKS5 → residential proxy (SOCKS5 or HTTP); if either hop fails, the connection fails |
 | UDP, including QUIC, **allowlisted or not** | UDP ASSOCIATE through both proxies. If the startup probe fails, all such UDP is refused for that takeover and the desktop shows "UDP blocked" |
 | System DNS (the resolver in the target's `resolv.conf`, UDP/TCP 53) | Answered by Windows; see the next section |
 | Queries sent straight to another DNS server on port 53 (e.g. `dig @1.1.1.1`) | Refused, neither proxied nor direct |
@@ -130,7 +130,7 @@ The SHA-256 checksum shows the file is intact; it does not identify the publishe
 
 - Windows x64. Running it needs no administrator rights.
 - An existing SOCKS5 proxy on this machine as the first hop. Its address must be a loopback IPv4 address with no authentication, for example the SOCKS5 port of a local proxy app. A new configuration store is pre-filled with `127.0.0.1:7892`.
-- A residential SOCKS5 proxy with username/password authentication.
+- A residential proxy with username/password authentication: SOCKS5, or an HTTP proxy (TCP only; all UDP is then refused).
 - For UDP (including QUIC) to work, **both** the host proxy and the residential proxy must support UDP ASSOCIATE. If either lacks it, the takeover still starts but UDP is refused.
 
 **Target distribution**
@@ -198,7 +198,7 @@ See [Building from source](#building-from-source).
 Keep `wsl-proxy-desktop.exe` and the matching version of `wsl-proxyctl.exe` in the same directory (the installer already does), and open the former. On first launch it starts `wsl-proxyctl.exe` in the background as the current user, as a resident backend.
 
 1. **Settings**:
-   - enter the residential proxy's server IPv4, port, username and password (the password is shown in plain text);
+   - pick the residential proxy's protocol (SOCKS5 or HTTP, whichever the provider gives for that port), then enter its server IPv4, port, username and password (the password is shown in plain text);
    - under **Network and DNS**, check the host SOCKS5 address and adjust DNS if needed;
    - click **Save settings**.
    - To check the residential proxy first, use **Test** in the residential proxy section. It asks for confirmation, because the direct path sends the username and password in plain text without the first hop.
@@ -307,7 +307,7 @@ If the blockers include `capability.kernel.*` or `baseline.ip*tables*`, the shar
 
 ### Import the residential proxy settings
 
-Prepare an `.env` file. Only these four keys are allowed, and `ip` must be IPv4:
+Prepare an `.env` file. These four keys are required, and `ip` must be IPv4; for an HTTP residential proxy add `protocol=http` (the default is `socks5`), and the username must then not contain a colon:
 
 ```ini
 ip=203.0.113.10
@@ -446,7 +446,7 @@ Yes, those are fake-ip stand-ins. When a program connects to one, the ingress ha
 With fake-ip on, every name outside the allowlist first gets a stand-in address; only the residential proxy finds out the name does not exist. For the old behavior, turn off **Network and DNS › Remote resolution** in Settings, or set `"fake_ip": false` in the policy.
 
 **The desktop shows "UDP blocked".**
-The UDP probe at startup failed: the host proxy or the residential proxy (or both) does not support UDP ASSOCIATE. All UDP, including QUIC, is refused for this takeover and never sent direct; TCP and system DNS are unaffected. The next start or switch probes again.
+With an HTTP residential proxy this is expected: HTTP proxies only carry TCP. Otherwise the UDP probe at startup failed: the host proxy or the residential proxy (or both) does not support UDP ASSOCIATE. All UDP, including QUIC, is refused for this takeover and never sent direct; TCP and system DNS are unaffected. The next start or switch probes again.
 
 **Why does UDP to allowlisted sites go through the proxy?**
 To keep WebRTC from leaking the real exit IP. A web page sends UDP to a STUN server to learn its own public address; if an allowlisted STUN server could be reached directly, the page would see the Windows exit IP.
@@ -574,7 +574,7 @@ Issues and pull requests are welcome. Contributions of code and documentation ar
 
 - Residential proxy credentials are stored in plain text in `desktop.sqlite` next to the EXE, protected only by the Windows account's file permissions.
 - The named pipe between the desktop app and the backend accepts only processes of the same Windows account whose integrity level is not lower than the backend's ([decision 21](docs/decisions.md)). When the backend runs as administrator, normal-privilege processes cannot reach it.
-- The direct path of the residential proxy test sends the SOCKS5 username and password in plain text without the first hop, and the residential provider sees your real IP. The app therefore asks for confirmation before testing.
+- The direct path of the residential proxy test sends the residential username and password in plain text without the first hop, and the residential provider sees your real IP. The app therefore asks for confirmation before testing.
 - "Export redacted diagnostics" keeps only states and numeric counters, with no destination addresses, domains or credentials; still treat the file as internal.
 - Release packages are unsigned and nobody has yet confirmed the third-party redistribution obligations; from v0.1.12 on they are still published as regular releases, and each release note lists both under its known limitations. Packages released after v0.1.11 carry a GitHub build provenance attestation; see [Installation](#installation).
 - This project does not defend against a local administrator or against root inside the target distribution.

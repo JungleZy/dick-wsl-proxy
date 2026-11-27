@@ -610,7 +610,16 @@ pub(crate) fn residential_stage_text(path: &Value) -> String {
         Some("first_hop_rejected") => "宿主 SOCKS5 拒绝了握手（它需要免认证的 SOCKS5）".into(),
         Some("first_hop_connect_rejected") => "宿主 SOCKS5 没能连到住宅服务器".into(),
         Some("residential_unreachable") => "连不上住宅服务器".into(),
-        Some("residential_method_rejected") => "住宅服务器没有按 SOCKS5 用户名密码方式应答".into(),
+        Some("residential_method_rejected") => {
+            "住宅服务器没有按 SOCKS5 用户名密码方式应答；如果服务商给的是 HTTP 代理端口，把协议改成 HTTP".into()
+        }
+        Some("residential_speaks_http") => {
+            "住宅服务器回的是 HTTP 应答，这个端口是 HTTP 代理；把协议改成 HTTP 再试".into()
+        }
+        Some("residential_speaks_socks5") => {
+            "住宅服务器回的是 SOCKS5 应答，这个端口是 SOCKS5 代理；把协议改成 SOCKS5 再试".into()
+        }
+        Some("residential_not_http") => "住宅服务器没有按 HTTP 代理方式应答".into(),
         Some("residential_auth_rejected") => "住宅服务器拒绝了登录".into(),
         Some("residential_connect_rejected") => "登录成功，但住宅服务器没能连到外部地址".into(),
         Some(other) => format!("检测出错（{other}）"),
