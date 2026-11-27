@@ -256,6 +256,11 @@ pub(crate) fn sync(
     });
 }
 
+/// 设置里改了不透明度：岛重画一次。
+pub(crate) fn refresh(cx: &mut App) {
+    with_island(cx, |_, _, cx| cx.notify());
+}
+
 /// 主界面弹出的提醒也在岛上展开显示。
 pub(crate) fn notify(message: &str, warning: bool, cx: &mut App) {
     with_island(cx, |island, _, _| {
@@ -734,6 +739,14 @@ fn cell(fact: Fact, palette: Palette) -> Div {
 /// 一侧的肩：一段向内凹的四分之一圆弧，把主体的竖直侧边接到屏幕顶边上。
 /// 画法是一个粗边框的正圆环，被方框裁出四分之一：圆环内圈就是这段凹弧。
 /// 用圆角和边框画，边缘和主体一样是逐像素抗锯齿；方框向主体多伸 1px，接缝处不漏光。
+/// 岛身和两肩的底色，按设置里的不透明度透出后面的内容；文字和图标仍是实色。
+fn translucent(color: u32) -> Rgba {
+    Rgba {
+        a: super::opacity::alpha(),
+        ..rgb(color)
+    }
+}
+
 fn shoulder(edge: f32, right: bool, color: u32) -> Div {
     let f = model::FILLET;
     // 圆环要盖住方框里离圆心最远的角（约 1.45 倍半径处）。
@@ -750,7 +763,7 @@ fn shoulder(edge: f32, right: bool, color: u32) -> Div {
         .top(px(f - outer))
         .size(px(outer * 2.))
         .rounded_full()
-        .border_color(rgb(color));
+        .border_color(translucent(color));
     let width: AbsoluteLength = px(band).into();
     let borders = &mut ring.style().border_widths;
     borders.top = Some(width);
@@ -802,7 +815,7 @@ impl Render for Island {
                     .flex()
                     .justify_center()
                     .rounded_b(px(self.shape.radius))
-                    .bg(rgb(palette.bg))
+                    .bg(translucent(palette.bg))
                     .text_color(rgb(palette.ink))
                     .font_family(UI_FONT)
                     .text_size(px(13.))
@@ -914,7 +927,7 @@ fn button(action: Action, palette: Palette, cx: &mut Context<Island>) -> Statefu
         }))
 }
 
-fn hwnd_of(window: &Window) -> HWND {
+pub(crate) fn hwnd_of(window: &Window) -> HWND {
     match HasWindowHandle::window_handle(window).map(|handle| handle.as_raw()) {
         Ok(RawWindowHandle::Win32(handle)) => handle.hwnd.get() as HWND,
         _ => null_mut(),

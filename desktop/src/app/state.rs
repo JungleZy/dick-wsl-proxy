@@ -98,6 +98,8 @@ pub(crate) struct Desktop {
     pub(crate) kernel_prepare_offered: bool,
     /// 托盘「退出」进行中：停止接管成功后接着关闭后台，后台关闭后退出程序。
     pub(crate) exiting: bool,
+    /// 托盘「退出」时没有接管：等加载框关掉后弹退出确认框。
+    pub(crate) exit_confirm_pending: bool,
     /// 退出时联系不上后台：等加载框关掉后询问是否只退出界面。
     pub(crate) exit_anyway_pending: bool,
     /// 询问「仍然退出界面」时的标题和说明；`None` 用联系不上后台的通用说明。
@@ -161,6 +163,8 @@ pub(crate) struct Desktop {
     pub(crate) status_notice: Option<String>,
     /// 屏幕顶部状态岛是否打开，见 [`super::island`]。
     pub(crate) island_enabled: bool,
+    /// 设置页的全局不透明度滑块（状态岛和应用窗口共用），见 [`super::opacity`]。
+    pub(crate) opacity: gpui_kit::Entity<gpui_kit::component::slider::SliderState>,
     /// 检查更新与一键升级，见 [`super::update`]。
     pub(crate) updater: super::update::Updater,
 }

@@ -17,6 +17,7 @@ mod integrity;
 mod island;
 mod launcher;
 mod model;
+mod opacity;
 mod overview;
 mod policy;
 mod state;
@@ -55,6 +56,9 @@ pub fn run() {
             options.window_min_size = Some(size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)));
             let opened = gpui_kit::open_window(options, cx, |window, cx| {
                 window.set_window_title(TITLE);
+                // 托盘靠这个句柄找主窗口（显示、藏起、退出时关闭）；按枚举找会把
+                // 同进程的状态岛、应用窗口错认成主窗口。
+                tray::set_main_window(island::hwnd_of(window));
                 window.on_window_should_close(cx, |_window, cx| {
                     let closing = if tray::consume_exit_request() {
                         true

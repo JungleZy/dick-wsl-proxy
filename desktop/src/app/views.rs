@@ -2458,6 +2458,7 @@ impl Desktop {
         let autostart_view = view.clone();
         let island = self.island_enabled;
         let island_view = view.clone();
+        let opacity = self.opacity.clone();
         let runtime = SettingPage::new("桌面运行").resettable(false).group(
             SettingGroup::new()
                 .item(setting_row("开机自动启动", move |_| {
@@ -2476,6 +2477,9 @@ impl Desktop {
                             view.update(cx, |this, cx| this.set_island(*checked, cx));
                         },
                     )
+                }))
+                .item(setting_row("不透明度", move |_| {
+                    opacity_control(&opacity)
                 }))
                 .item(value_item("关闭窗口", "隐藏到托盘"))
                 .item(value_item("托盘退出", "停止接管并关闭后台"))
@@ -2548,6 +2552,29 @@ const SETTING_LABEL_WIDTH: f32 = 160.;
 /// 把名称和输入框推到两端，窗口一宽中间就空出一大块，所以设置页的项都用这个自己排。
 /// 分区窄到上下排时名称在上、内容占满一行，`field` 收到的参数表示当前是否横排。
 /// 自定义项默认只在搜索框为空时显示，名称同时设为搜索关键字，照样能按名称过滤。
+/// 全局不透明度滑块（状态岛和应用窗口共用），右边写当前百分比。只调底色，
+/// 文字始终是实色。
+fn opacity_control(state: &Entity<gpui_kit::component::slider::SliderState>) -> Div {
+    div()
+        .w(px(260.))
+        .flex()
+        .items_center()
+        .gap_3()
+        .child(
+            div().flex_1().child(
+                gpui_kit::component::slider::Slider::new(state).accessibility_label("不透明度"),
+            ),
+        )
+        .child(
+            div()
+                .w(px(40.))
+                .text_sm()
+                .font_family(MONO_FONT)
+                .text_color(rgb(MUTED))
+                .child(format!("{}%", super::opacity::percent())),
+        )
+}
+
 fn setting_row<E: IntoElement>(
     label: &'static str,
     field: impl Fn(bool) -> E + 'static,

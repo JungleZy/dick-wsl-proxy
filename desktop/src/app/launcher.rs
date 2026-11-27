@@ -11,27 +11,44 @@
 //! 它留着；程序真正退出前要调用 [`close`]，还有窗口开着 gpui 就不会退出进程。
 
 use std::cell::RefCell;
+use std::ffi::c_void;
+use std::ptr::null_mut;
+use std::sync::atomic::{AtomicPtr, Ordering};
+
+use windows_sys::Win32::Foundation::HWND;
 
 use gpui_kit::component::{
-    Disableable as _, IconName, TitleBar,
+    Disableable as _, IconName, Sizable as _, TitleBar,
     button::{Button, ButtonVariants as _},
+    skeleton::Skeleton,
+    spinner::Spinner,
 };
 use gpui_kit::{prelude::*, *};
 
-use super::components::{app_icon, design_icon};
+use super::components::{app_icon, design_icon, text_tip};
 use super::state::Desktop;
 use super::theme::{
-    AMBER, HOVER, INK, MONO_FONT, MUTED, PAPER, RULE, RUST, SURFACE, SURFACE_SOFT, TEAL, UI_FONT,
+    AMBER, HOVER, INK, MUTED, PAPER, RULE, RUST, SURFACE, SURFACE_SOFT, TEAL, UI_FONT,
     app_rgb as rgb,
 };
 use super::views::window_control_button;
 
 const TITLE: &str = "WSL Proxy 已安装应用";
-const WIDTH: f32 = 460.;
-const HEIGHT: f32 = 560.;
+const WIDTH: f32 = 560.;
+const HEIGHT: f32 = 520.;
+/// 网格格子宽度和图标边长。
+const TILE: f32 = 104.;
+const ICON: f32 = 48.;
 
 thread_local! {
     static HANDLE: RefCell<Option<AnyWindowHandle>> = const { RefCell::new(None) };
+}
+
+/// 应用窗口的 Win32 句柄，托盘找主窗口时据此排除它；没开着时为空。
+static WINDOW: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+
+pub(crate) fn hwnd() -> HWND {
+    WINDOW.load(Ordering::Acquire)
 }
 
 /// 应用窗口是否开着。主界面据此决定读详情时要不要顺带重读应用列表。
@@ -39,13 +56,33 @@ pub(crate) fn is_open() -> bool {
     HANDLE.with(|slot| slot.borrow().is_some())
 }
 
+/// 网格里的一个应用。
+#[derive(Clone, PartialEq)]
+pub(crate) struct AppTile {
+    /// 桌面文件 ID，启动时交给后台。
+    pub(crate) id: String,
+    pub(crate) name: String,
+    /// 图标文件在 Windows 上的路径（`\\wsl.localhost\发行版\…`）；找不到图标时是 `None`。
+    pub(crate) icon: Option<std::path::PathBuf>,
+}
+
+/// 发行版里的绝对路径换成 Windows 经 WSL 网络共享读它的路径。
+fn windows_path(distribution: &str, path: &str) -> std::path::PathBuf {
+    let mut windows = format!(r"\\wsl.localhost\{distribution}");
+    for part in path.split('/').filter(|part| !part.is_empty()) {
+        windows.push('\\');
+        windows.push_str(part);
+    }
+    windows.into()
+}
+
 /// 窗口要画的全部内容，从主界面拍下来。
 #[derive(Clone, Default, PartialEq)]
 pub(crate) struct Snapshot {
     /// 列表所属的环境；还没读到列表时是详情页正在看的环境。
     pub(crate) environment: Option<String>,
-    /// `(桌面文件 ID, 显示名)`；`None` 是还没读到。
-    pub(crate) apps: Option<Vec<(String, String)>>,
+    /// 还没读到列表时是 `None`。
+    pub(crate) apps: Option<Vec<AppTile>>,
     pub(crate) loading: bool,
     pub(crate) error: Option<String>,
     /// 主界面有变更操作在执行（编辑、删除环境等）。
@@ -56,6 +93,8 @@ pub(crate) struct Snapshot {
     pub(crate) traffic: Option<&'static str>,
     /// 主题会变：主界面切换主题后快照不同，窗口跟着重画。
     pub(crate) dark: bool,
+    /// 底色不透明度（百分比），设置里拖动时窗口跟着重画。
+    pub(crate) opacity: u32,
 }
 
 impl Desktop {
@@ -69,12 +108,20 @@ impl Desktop {
                     .and_then(|detail| detail["name"].as_str())
             })
             .map(str::to_owned);
+        let distribution = listed.and_then(|apps| apps["name"].as_str());
         let apps = listed.and_then(|apps| apps["apps"].as_array()).map(|apps| {
             apps.iter()
                 .filter_map(|app| {
                     let id = app["id"].as_str()?;
                     let name = app["name"].as_str().unwrap_or(id);
-                    Some((id.to_owned(), name.to_owned()))
+                    let icon = distribution
+                        .zip(app["icon"].as_str())
+                        .map(|(distribution, path)| windows_path(distribution, path));
+                    Some(AppTile {
+                        id: id.to_owned(),
+                        name: name.to_owned(),
+                        icon,
+                    })
                 })
                 .collect()
         });
@@ -92,6 +139,7 @@ impl Desktop {
             result: self.environment_launch_result.clone(),
             traffic,
             dark: super::theme::is_dark(),
+            opacity: super::opacity::percent(),
         }
     }
 }
@@ -107,26 +155,39 @@ pub(crate) fn open(desktop: Entity<Desktop>, snapshot: Snapshot, cx: &mut App) {
             return;
         }
         HANDLE.with(|slot| *slot.borrow_mut() = None);
+        WINDOW.store(null_mut(), Ordering::Release);
     }
     let bounds = Bounds::centered(None, size(px(WIDTH), px(HEIGHT)), cx);
     let mut options = TitleBar::window_options();
     options.window_bounds = Some(WindowBounds::Windowed(bounds));
     options.window_min_size = Some(size(px(360.), px(320.)));
+    options.window_background = WindowBackgroundAppearance::Blurred;
     let opened = gpui_kit::open_window(options, cx, |window, cx| {
         window.set_window_title(TITLE);
+        WINDOW.store(super::island::hwnd_of(window), Ordering::Release);
         window.on_window_should_close(cx, |_, _| {
             HANDLE.with(|slot| *slot.borrow_mut() = None);
+            WINDOW.store(null_mut(), Ordering::Release);
             true
         });
         cx.new(|cx| Launcher::new(desktop, snapshot, cx))
     });
     if let Ok((handle, _)) = opened {
+        // gpui-kit 的 Root 按主题铺一层不透明底色；它自己的样式最后生效，设成透明，
+        // 底色由下面半透明的界面自己画。
+        let _ = handle.update(cx, |_, window, cx| {
+            gpui_kit::base::Root::update(window, cx, |root, _, cx| {
+                root.style().background = Some(transparent_black().into());
+                cx.notify();
+            });
+        });
         HANDLE.with(|slot| *slot.borrow_mut() = Some(handle));
     }
 }
 
 /// 关掉应用窗口。主窗口真正关闭前调用。
 pub(crate) fn close(cx: &mut App) {
+    WINDOW.store(null_mut(), Ordering::Release);
     if let Some(handle) = HANDLE.with(|slot| slot.borrow_mut().take()) {
         let _ = handle.update(cx, |_, window, _| window.remove_window());
     }
@@ -156,10 +217,10 @@ impl Launcher {
     }
 }
 
-fn title_bar(environment: Option<&str>) -> Div {
+fn title_bar(environment: Option<&str>, refresh: AnyElement, opacity: u32) -> Div {
     let title = match environment {
-        Some(name) => format!("已安装应用 · {name}"),
-        None => "已安装应用".into(),
+        Some(name) => format!("应用 · {name}"),
+        None => "应用".into(),
     };
     div()
         .w_full()
@@ -167,7 +228,7 @@ fn title_bar(environment: Option<&str>) -> Div {
         .flex()
         .flex_shrink_0()
         .items_center()
-        .bg(rgb(SURFACE))
+        .bg(translucent(SURFACE, opacity))
         .border_b_1()
         .border_color(rgb(RULE))
         .child(
@@ -196,6 +257,7 @@ fn title_bar(environment: Option<&str>) -> Div {
                 .flex()
                 .flex_shrink_0()
                 .items_center()
+                .child(div().px_1().child(refresh))
                 .child(window_control_button(
                     WindowControlArea::Min,
                     IconName::WindowMinimize,
@@ -209,63 +271,127 @@ fn title_bar(environment: Option<&str>) -> Div {
         )
 }
 
+/// 主题色加上设置里的不透明度。窗口用模糊背景，后面的内容模糊后透出来；
+/// 文字仍是实色。
+fn translucent(color: u32, opacity: u32) -> Rgba {
+    Rgba {
+        a: opacity as f32 / 100.,
+        ..rgb(color)
+    }
+}
+
 fn note(message: impl Into<SharedString>, color: u32) -> Div {
     div().text_sm().text_color(rgb(color)).child(message.into())
 }
 
-/// 一行一个应用：名称、桌面文件 ID，右边写「启动」或「启动中…」。整行可点。
-fn app_row(
+/// 没有图标或图标读不出来时的占位：圆角方块里写应用名的第一个字。
+fn placeholder(name: &str) -> AnyElement {
+    let initial: String = name
+        .chars()
+        .find(|character| !character.is_whitespace())
+        .map(|character| character.to_uppercase().collect())
+        .unwrap_or_default();
+    div()
+        .size(px(ICON))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_lg()
+        .bg(rgb(SURFACE_SOFT))
+        .border_1()
+        .border_color(rgb(RULE))
+        .text_xl()
+        .text_color(rgb(MUTED))
+        .child(initial)
+        .into_any_element()
+}
+
+/// 第一次读取时网格里放的骨架格子数，大约两行。
+const SKELETON_TILES: usize = 10;
+
+/// 读取中的网格：和应用格子同样大小的骨架（图标方块加一条名字），一起明暗呼吸。
+fn skeleton_grid() -> Div {
+    let mut grid = div().flex().flex_wrap().gap_1();
+    for _ in 0..SKELETON_TILES {
+        grid = grid.child(
+            div()
+                .w(px(TILE))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_2()
+                .px_1()
+                .pt_3()
+                .pb_2()
+                .child(Skeleton::new().size(px(ICON)).rounded_lg())
+                .child(
+                    div()
+                        .h(px(32.))
+                        .w_full()
+                        .flex()
+                        .justify_center()
+                        .child(Skeleton::new().w(px(56.)).h(px(10.)).rounded_sm()),
+                ),
+        );
+    }
+    grid
+}
+
+/// 一个格子：上面大图标，下面应用名（最多两行）。整格可点。
+fn app_tile(
     index: usize,
-    (id, name): &(String, String),
+    app: &AppTile,
     launching: Option<&str>,
     disabled: bool,
     desktop: WeakEntity<Desktop>,
 ) -> Stateful<Div> {
-    let id = id.clone();
-    let name = name.clone();
-    let starting = launching == Some(id.as_str());
-    let action = if starting { "启动中…" } else { "启动" };
-    let row = div()
+    let starting = launching == Some(app.id.as_str());
+    let icon = match app.icon.clone() {
+        Some(path) => {
+            let name = app.name.clone();
+            img(path)
+                .size(px(ICON))
+                .object_fit(ObjectFit::Contain)
+                .with_fallback(move || placeholder(&name))
+                .into_any_element()
+        }
+        None => placeholder(&app.name),
+    };
+    let label = if starting {
+        "启动中…".to_owned()
+    } else {
+        app.name.clone()
+    };
+    let tip = app.name.clone();
+    let tile = div()
         .id(("launcher-app", index))
+        .w(px(TILE))
         .flex()
+        .flex_col()
         .items_center()
-        .gap_3()
-        .px_3()
-        .py_2()
-        .rounded_md()
-        .bg(rgb(SURFACE_SOFT))
-        .child(design_icon(
-            "play",
-            14.,
-            if disabled { MUTED } else { TEAL },
-        ))
+        .gap_2()
+        .px_1()
+        .pt_3()
+        .pb_2()
+        .rounded_lg()
+        .when(disabled && !starting, |tile| tile.opacity(0.5))
+        .child(icon)
         .child(
             div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_w_0()
-                .child(div().text_sm().truncate().child(name))
-                .child(
-                    div()
-                        .font_family(MONO_FONT)
-                        .text_xs()
-                        .text_color(rgb(MUTED))
-                        .truncate()
-                        .child(id.clone()),
-                ),
+                .w_full()
+                .h(px(32.))
+                .text_xs()
+                .text_center()
+                .line_clamp(2)
+                .text_color(rgb(if starting { AMBER } else { INK }))
+                .child(label),
         )
-        .child(
-            div()
-                .flex_shrink_0()
-                .text_sm()
-                .text_color(rgb(if starting { AMBER } else { MUTED }))
-                .child(action),
-        );
+        .tooltip(move |window, cx| text_tip(tip.clone(), window, cx));
     if disabled {
-        return row;
+        return tile;
     }
-    row.cursor_pointer()
+    let id = app.id.clone();
+    tile.cursor_pointer()
         .hover(|style| style.bg(rgb(HOVER)))
         .on_click(move |_, _, cx| {
             let _ = desktop.update(cx, |desktop, cx| desktop.environment_launch(id.clone(), cx));
@@ -280,74 +406,57 @@ impl Render for Launcher {
         let disabled = !snapshot.graphics || snapshot.busy || launching.is_some();
         let weak = self.desktop.clone();
 
-        let header = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .text_sm()
-                            .truncate()
-                            .child(environment.unwrap_or("未选择环境").to_owned()),
-                    )
-                    .children(
-                        snapshot
-                            .apps
-                            .as_ref()
-                            .map(|apps| note(format!("{} 个应用", apps.len()), MUTED)),
-                    ),
-            )
-            .child({
-                let weak = weak.clone();
-                Button::new("launcher-refresh")
-                    .icon(design_icon("refresh", 15., MUTED))
-                    .accessibility_label("重新读取应用列表")
-                    .tooltip("重新读取应用列表")
-                    .ghost()
-                    .compact()
-                    .disabled(snapshot.loading || snapshot.busy || environment.is_none())
-                    .on_click(move |_, _, cx| {
-                        let _ = weak.update(cx, |desktop, cx| desktop.refresh_environment_apps(cx));
-                    })
-            });
-
-        let body = if let Some(error) = snapshot.error.as_ref() {
-            note(format!("读取应用列表失败：{error}"), AMBER)
-        } else if let Some(apps) = snapshot.apps.as_ref() {
-            if apps.is_empty() {
-                note(
-                    "没有找到图形应用。这里只列 .desktop 入口里登记、不在终端里运行的程序。",
-                    MUTED,
-                )
-            } else {
-                let mut list = div().flex().flex_col().gap_1();
-                for (index, app) in apps.iter().enumerate() {
-                    list = list.child(app_row(index, app, launching, disabled, weak.clone()));
-                }
-                list
-            }
-        } else if snapshot.loading {
-            note("正在读取环境里的应用…", MUTED)
-        } else if environment.is_none() {
-            note(
-                "在主窗口的环境页点一个环境，再点详情右上角的应用按钮。",
-                MUTED,
-            )
+        // 读取中把刷新按钮换成转圈的加载图标，占同样的位置，标题栏不跳动。
+        let refresh = if snapshot.loading {
+            div()
+                .size(px(28.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(Spinner::new().small().color(rgb(MUTED).into()))
+                .into_any_element()
         } else {
-            note("还没有读取应用列表，点右上角重新读取。", MUTED)
+            let weak = weak.clone();
+            Button::new("launcher-refresh")
+                .icon(design_icon("refresh", 15., MUTED))
+                .accessibility_label("重新读取")
+                .tooltip("重新读取")
+                .ghost()
+                .compact()
+                .disabled(snapshot.busy || environment.is_none())
+                .on_click(move |_, _, cx| {
+                    let _ = weak.update(cx, |desktop, cx| desktop.refresh_environment_apps(cx));
+                })
+                .into_any_element()
         };
 
-        let result = snapshot.result.as_ref().map(|result| match result {
-            Ok(message) => note(message.clone(), TEAL),
-            Err(message) => note(message.clone(), RUST),
-        });
+        let body = if let Some(error) = snapshot.error.as_ref() {
+            note(format!("读取失败：{error}"), AMBER)
+        } else if let Some(apps) = snapshot.apps.as_ref() {
+            if apps.is_empty() {
+                note("没有图形应用", MUTED)
+            } else {
+                let mut grid = div().flex().flex_wrap().gap_1();
+                for (index, app) in apps.iter().enumerate() {
+                    grid = grid.child(app_tile(index, app, launching, disabled, weak.clone()));
+                }
+                grid
+            }
+        } else if snapshot.loading {
+            skeleton_grid()
+        } else if environment.is_none() {
+            note("先在主窗口选一个环境", MUTED)
+        } else {
+            note("点右上角读取", MUTED)
+        };
+
+        // 顶部最多一行状态：启动结果优先，其次缺 WSLg，再次流量直连。
+        let status = match snapshot.result.as_ref() {
+            Some(Ok(message)) => Some(note(message.clone(), TEAL)),
+            Some(Err(message)) => Some(note(message.clone(), RUST)),
+            None if !snapshot.graphics => Some(note("WSLg 不可用", AMBER)),
+            None => snapshot.traffic.map(|message| note(message, AMBER)),
+        };
 
         div()
             .size_full()
@@ -356,35 +465,17 @@ impl Render for Launcher {
             .font_family(UI_FONT)
             .text_sm()
             .text_color(rgb(INK))
-            .bg(rgb(PAPER))
-            .child(title_bar(environment))
+            .bg(translucent(PAPER, snapshot.opacity))
+            .child(title_bar(environment, refresh, snapshot.opacity))
+            .children(status.map(|status| div().px_3().pt_2().child(status)))
             .child(
                 div()
-                    .flex()
-                    .flex_col()
+                    .id("launcher-scroll")
                     .flex_1()
                     .min_h_0()
-                    .gap_2()
-                    .p_3()
-                    .child(header)
-                    .children(
-                        (!snapshot.graphics)
-                            .then(|| note("WSLg 不可用，无法启动图形应用。", AMBER)),
-                    )
-                    .children(snapshot.traffic.map(|message| note(message, AMBER)))
-                    .children(result)
-                    .child(
-                        div()
-                            .id("launcher-scroll")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .child(body),
-                    )
-                    .child(note(
-                        "以环境的默认用户启动；环境没运行时会先启动它。",
-                        MUTED,
-                    )),
+                    .overflow_y_scroll()
+                    .p_2()
+                    .child(body),
             )
     }
 }

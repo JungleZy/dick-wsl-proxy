@@ -90,6 +90,20 @@ impl Desktop {
         }
     }
 
+    /// 设置页的全局不透明度滑块：拖动中立即重画状态岛和应用窗口；松手（`save`）时
+    /// 再写注册表，拖动过程中不反复写。
+    pub(crate) fn set_opacity(&mut self, percent: u32, save: bool, cx: &mut Context<Self>) {
+        if super::opacity::percent() != percent {
+            super::opacity::apply(percent);
+            super::island::refresh(cx);
+            // 应用窗口观察主界面，快照里的不透明度变了就重画。
+            cx.notify();
+        }
+        if save && let Err(error) = super::opacity::save() {
+            self.fail(format!("不透明度没能保存，下次启动会恢复原样：{error}"), cx);
+        }
+    }
+
     pub(crate) fn fail(&mut self, error: impl Into<String>, cx: &mut Context<Self>) {
         self.notice = super::backend::humanize_error(&error.into());
         self.error = true;
@@ -294,6 +308,8 @@ impl Desktop {
         let kernel_prompt = confirmation.kind == Kind::PrepareKernel;
         let (title, ok_text) = if kernel_prompt {
             ("准备内核环境", "加载并继续")
+        } else if confirmation.exit {
+            ("退出 WSL Proxy", "停止接管并退出")
         } else {
             ("确认保护操作", "确认并执行")
         };
@@ -671,18 +687,70 @@ impl Desktop {
         });
     }
 
-    /// 托盘「退出」。空闲或状态未知时直接请求关闭后台，由后台自己核对是否空闲；
-    /// 接管中或需要恢复时先确认停止并恢复直连，停止成功、后台回到空闲后再关闭后台。
-    /// 任何一步没成功，程序都不退出，并提示原因。
+    /// 托盘「退出」。总要用户先确认：空闲或状态未知时问一句是否退出，确认后请求
+    /// 关闭后台，由后台自己核对是否空闲；接管中或需要恢复时确认框说明会先停止并恢复
+    /// 直连，停止成功、后台回到空闲后再关闭后台。任何一步没成功，程序都不退出，并提示原因。
     pub(crate) fn request_exit(&mut self, cx: &mut Context<Self>) {
         if self.locked() {
             self.fail("当前操作还没完成，程序没有退出；完成后再从托盘退出。", cx);
             return;
         }
         if matches!(self.phase(), "idle" | "unknown") {
-            self.send_shutdown(cx);
+            // 由 tick 在加载框关掉后打开确认框（打开对话框要用 `Window`）。
+            self.exit_confirm_pending = true;
+            cx.notify();
             return;
         }
+        self.request_stop_and_exit(cx);
+    }
+
+    /// 空闲时的退出确认框。
+    pub(crate) fn open_exit_confirm_dialog(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.entity().clone();
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let ok_view = view.clone();
+            dialog
+                .confirm()
+                .title(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::NORMAL)
+                        .child("退出 WSL Proxy"),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("退出")
+                        .cancel_text("取消"),
+                )
+                .description(
+                    div()
+                        .text_sm()
+                        .child("会关闭后台、状态岛和应用窗口，程序完全退出。"),
+                )
+                .on_ok(move |_, _, cx| {
+                    ok_view.update(cx, |this, cx| this.exit_confirmed(cx));
+                    true
+                })
+                .on_cancel(|_, _, _| true)
+        });
+    }
+
+    /// 用户在退出确认框里点了「退出」。确认框开着的时候状态可能变了（例如别处启动了
+    /// 接管），所以按现在的状态再判断一次；已经不空闲就改走停止并退出的确认。
+    fn exit_confirmed(&mut self, cx: &mut Context<Self>) {
+        if self.locked() {
+            self.fail("当前操作还没完成，程序没有退出；完成后再从托盘退出。", cx);
+            return;
+        }
+        if matches!(self.phase(), "idle" | "unknown") {
+            self.send_shutdown(cx);
+        } else {
+            self.request_stop_and_exit(cx);
+        }
+    }
+
+    /// 接管中或需要恢复时的退出：先确认停止并恢复直连。
+    fn request_stop_and_exit(&mut self, cx: &mut Context<Self>) {
         let Some(generation) = self.generation() else {
             self.fail("后台状态未确认，程序没有退出；请先刷新。", cx);
             return;
@@ -1118,9 +1186,9 @@ impl Desktop {
             .and_then(|distro| distro["id"].as_str());
         let target = id.is_some() && self.selected.as_deref() == id;
         if !target {
-            Some("这个环境不是接管目标：从这里启动的应用直连上网，不经代理。")
+            Some("不是接管目标，应用直连上网")
         } else if self.phase() == "idle" {
-            Some("接管没有启动：从这里启动的应用现在直连上网。")
+            Some("接管未启动，应用直连上网")
         } else {
             None
         }

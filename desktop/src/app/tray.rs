@@ -36,7 +36,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, ChangeWindowMessageFilterEx, CreateIconIndirect, CreatePopupMenu, CreateWindowExW,
     DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, EnumWindows,
     FindWindowW, GetClassNameW, GetCursorPos, GetMessageW, GetSystemMetrics,
-    GetWindowThreadProcessId, HICON, ICONINFO, IDI_APPLICATION, IMAGE_ICON, KillTimer,
+    GetWindowThreadProcessId, HICON, ICONINFO, IDI_APPLICATION, IMAGE_ICON, IsWindow, KillTimer,
     LR_DEFAULTSIZE, LR_SHARED, LoadIconW, LoadImageW, MF_CHECKED, MF_GRAYED, MF_SEPARATOR,
     MF_STRING, MSG, MSGFLT_ALLOW, PostMessageW, PostQuitMessage, RegisterClassW,
     RegisterWindowMessageW, SM_CXSMICON, SW_HIDE, SW_RESTORE, SetForegroundWindow,
@@ -69,6 +69,15 @@ static TRAY_READY: AtomicBool = AtomicBool::new(false);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 /// The tray window, null until [`run`] creates it and after it is destroyed.
 static TRAY_WINDOW: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+/// The main window, recorded when it is created. The island and the apps
+/// window belong to the same process and gpui window class, so the main window
+/// cannot be told apart from them by enumeration.
+static MAIN_WINDOW: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+
+/// Records the main window's handle; called once right after it is created.
+pub(crate) fn set_main_window(hwnd: HWND) {
+    MAIN_WINDOW.store(hwnd, Ordering::Release);
+}
 /// What the interface last published.
 static SNAPSHOT: Mutex<Snapshot> = Mutex::new(Snapshot::INITIAL);
 /// The menu command the interface has yet to carry out.
@@ -473,6 +482,17 @@ fn show_menu(hwnd: HWND) {
 }
 
 fn find_main_window(excluded: HWND) -> HWND {
+    let recorded = MAIN_WINDOW.load(Ordering::Acquire);
+    if !recorded.is_null() {
+        // SAFETY: IsWindow only looks the handle up; a destroyed window yields 0.
+        let alive = unsafe { IsWindow(recorded) } != 0;
+        return if alive && recorded != excluded {
+            recorded
+        } else {
+            null_mut()
+        };
+    }
+    // Only before the handle is recorded, or when gpui gave no Win32 handle.
     struct Search {
         pid: u32,
         excluded: HWND,
@@ -495,9 +515,15 @@ fn find_main_window(excluded: HWND) -> HWND {
         };
         let is_tray_window = class_length > 0
             && String::from_utf16_lossy(&class[..class_length as usize]) == TRAY_CLASS;
-        // 状态岛和主窗口同属这个进程、同一个 gpui 窗口类，只能按句柄排除。
+        // 状态岛、应用窗口和主窗口同属这个进程、同一个 gpui 窗口类，只能按句柄排除。
         let is_island = hwnd == super::island::hwnd();
-        if pid == search.pid && hwnd != search.excluded && !is_tray_window && !is_island {
+        let is_launcher = hwnd == super::launcher::hwnd();
+        if pid == search.pid
+            && hwnd != search.excluded
+            && !is_tray_window
+            && !is_island
+            && !is_launcher
+        {
             search.hwnd = hwnd;
             0
         } else {

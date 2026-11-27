@@ -46,10 +46,20 @@ pub(crate) fn valid_app_id(id: &str) -> bool {
         })
 }
 
-/// Prints one `ID<TAB>name` line per entry worth showing in a launcher:
-/// `Type=Application` with an `Exec`, not hidden, not a terminal program (no
-/// console window exists to show it), not limited to one desktop environment
-/// (WSLg runs no desktop environment) and with its `TryExec` program present.
+/// Where an `Icon=` name is looked up, in order: the hicolor theme every app
+/// installs into (largest raster sizes first, then scalable), then pixmaps.
+const ICON_THEME_DIRS: &str = r#""$HOME/.local/share/icons/hicolor" \
+        "$HOME/.local/share/flatpak/exports/share/icons/hicolor" \
+        /var/lib/flatpak/exports/share/icons/hicolor \
+        /usr/local/share/icons/hicolor \
+        /usr/share/icons/hicolor"#;
+
+/// Prints one `ID<TAB>name<TAB>icon` line per entry worth showing in a
+/// launcher: `Type=Application` with an `Exec`, not hidden, not a terminal
+/// program (no console window exists to show it), not limited to one desktop
+/// environment (WSLg runs no desktop environment) and with its `TryExec`
+/// program present. `icon` is the real path of a PNG or SVG file for the
+/// entry's `Icon=`, or `-` when none is found.
 fn list_script() -> String {
     format!(
         r#"#!/bin/sh
@@ -65,11 +75,43 @@ for dir in {APPLICATION_DIRS}; do
 done
 [ "$#" -gt 0 ] || exit 0
 tab=$(printf '\t')
+# Prints the real path of the icon file for an `Icon=` value, or nothing.
+resolve_icon() {{
+    icon=$1
+    case "$icon" in
+        ''|-) return ;;
+        /*)
+            case "$icon" in *.png|*.svg|*.PNG|*.SVG) ;; *) return ;; esac
+            [ -f "$icon" ] && readlink -f "$icon"
+            return
+            ;;
+    esac
+    icon=${{icon%.png}}
+    icon=${{icon%.svg}}
+    icon=${{icon%.xpm}}
+    for size in 256x256 128x128 512x512 96x96 64x64 48x48 scalable; do
+        for theme in {ICON_THEME_DIRS}; do
+            for ext in png svg; do
+                candidate="$theme/$size/apps/$icon.$ext"
+                if [ -f "$candidate" ]; then
+                    readlink -f "$candidate"
+                    return
+                fi
+            done
+        done
+    done
+    for ext in png svg; do
+        if [ -f "/usr/share/pixmaps/$icon.$ext" ]; then
+            readlink -f "/usr/share/pixmaps/$icon.$ext"
+            return
+        fi
+    done
+}}
 awk '
 function reset() {{
     file = FILENAME; group = ""; type = ""; command = ""; tryexec = ""
     name = ""; name_zh_cn = ""; name_zh = ""
-    nodisplay = ""; hidden = ""; terminal = ""; onlyshowin = ""
+    nodisplay = ""; hidden = ""; terminal = ""; onlyshowin = ""; icon = ""
 }}
 function flush(    id, label) {{
     if (file == "") return
@@ -83,7 +125,9 @@ function flush(    id, label) {{
     gsub(/[\t\r]/, " ", label)
     if (label == "") label = id
     gsub(/[\t\r]/, " ", tryexec)
-    print id "\t" label "\t" tryexec
+    gsub(/[\t\r]/, " ", icon)
+    # Empty fields become "-": read collapses runs of tabs.
+    print id "\t" label "\t" (tryexec == "" ? "-" : tryexec) "\t" (icon == "" ? "-" : icon)
 }}
 FNR == 1 {{ flush(); reset() }}
 /^[ \t]*#/ {{ next }}
@@ -111,16 +155,18 @@ index($0, "=") > 0 {{
     else if (key == "Hidden") hidden = tolower(value)
     else if (key == "Terminal") terminal = tolower(value)
     else if (key == "OnlyShowIn") onlyshowin = value
+    else if (key == "Icon") icon = value
 }}
 END {{ flush() }}
-' "$@" 2>/dev/null | while IFS="$tab" read -r id label tryexec; do
-    if [ -n "$tryexec" ]; then
+' "$@" 2>/dev/null | while IFS="$tab" read -r id label tryexec icon; do
+    if [ "$tryexec" != - ]; then
         case "$tryexec" in
             /*) [ -x "$tryexec" ] || continue ;;
             *) command -v "$tryexec" >/dev/null 2>&1 || continue ;;
         esac
     fi
-    printf '%s\t%s\n' "$id" "$label"
+    path=$(resolve_icon "$icon" | tr -d '\t\r\n')
+    printf '%s\t%s\t%s\n' "$id" "$label" "${{path:--}}"
 done
 "#
     )
@@ -180,34 +226,49 @@ main "$@"
 }
 
 /// Turns the list script's lines into entries sorted by name. Lines that do
-/// not carry a valid ID are dropped; a repeated ID keeps its first line.
+/// not carry a valid ID are dropped; a repeated ID keeps its first line. The
+/// icon is kept only as an absolute path to a PNG or SVG file; the desktop
+/// reads it through `\\wsl.localhost`.
 fn parse_apps(output: &str) -> Vec<Value> {
     let mut seen = HashSet::new();
-    let mut apps: Vec<(String, String)> = output
+    let mut apps: Vec<(String, String, Option<String>)> = output
         .lines()
         .filter_map(|line| {
-            let (id, name) = line.split_once('\t')?;
-            let id = id.trim();
+            let mut fields = line.split('\t');
+            let id = fields.next()?.trim();
+            let name = fields.next()?.trim();
             if !valid_app_id(id) || !seen.insert(id.to_owned()) {
                 return None;
             }
-            let name = name.trim();
             let name = if name.is_empty() {
                 id.trim_end_matches(".desktop")
             } else {
                 name
             };
-            Some((id.to_owned(), name.to_owned()))
+            let icon = fields
+                .next()
+                .map(str::trim)
+                .filter(|path| valid_icon_path(path));
+            Some((id.to_owned(), name.to_owned(), icon.map(str::to_owned)))
         })
         .collect();
-    apps.sort_by(|(left_id, left), (right_id, right)| {
+    apps.sort_by(|(left_id, left, _), (right_id, right, _)| {
         left.to_lowercase()
             .cmp(&right.to_lowercase())
             .then_with(|| left_id.cmp(right_id))
     });
     apps.into_iter()
-        .map(|(id, name)| json!({"id": id, "name": name}))
+        .map(|(id, name, icon)| json!({"id": id, "name": name, "icon": icon}))
         .collect()
+}
+
+fn valid_icon_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    path.starts_with('/')
+        && path.len() <= 1024
+        && (lower.ends_with(".png") || lower.ends_with(".svg"))
+        && !path.chars().any(char::is_control)
+        && !path.split('/').any(|part| part == "..")
 }
 
 fn launch_failure(error: String) -> String {
@@ -260,18 +321,30 @@ mod tests {
 
     #[test]
     fn listed_apps_are_sorted_by_name_and_deduplicated() {
-        let output = "org.gnome.TextEditor.desktop\t文本编辑器\n\
-                      google-chrome.desktop\tGoogle Chrome\n\
-                      google-chrome.desktop\tShadowed copy\n\
-                      bad name.desktop\tSkipped\n\
+        let output = "org.gnome.TextEditor.desktop\t文本编辑器\t/usr/share/icons/hicolor/scalable/apps/editor.svg\n\
+                      google-chrome.desktop\tGoogle Chrome\t/opt/google/chrome/product_logo_256.png\n\
+                      google-chrome.desktop\tShadowed copy\t-\n\
+                      bad name.desktop\tSkipped\t-\n\
                       no-tab-line\n\
-                      blank.desktop\t \n";
+                      relative.desktop\tRelative\ticons/x.png\n\
+                      xpm.desktop\tXpm\t/usr/share/pixmaps/x.xpm\n\
+                      blank.desktop\t \t-\n";
         assert_eq!(
             parse_apps(output),
             [
-                json!({"id": "blank.desktop", "name": "blank"}),
-                json!({"id": "google-chrome.desktop", "name": "Google Chrome"}),
-                json!({"id": "org.gnome.TextEditor.desktop", "name": "文本编辑器"}),
+                json!({"id": "blank.desktop", "name": "blank", "icon": null}),
+                json!({
+                    "id": "google-chrome.desktop",
+                    "name": "Google Chrome",
+                    "icon": "/opt/google/chrome/product_logo_256.png"
+                }),
+                json!({"id": "relative.desktop", "name": "Relative", "icon": null}),
+                json!({"id": "xpm.desktop", "name": "Xpm", "icon": null}),
+                json!({
+                    "id": "org.gnome.TextEditor.desktop",
+                    "name": "文本编辑器",
+                    "icon": "/usr/share/icons/hicolor/scalable/apps/editor.svg"
+                }),
             ]
         );
     }
@@ -326,7 +399,19 @@ mod tests {
         };
         entry(
             "editor.desktop",
-            "Type=Application\nName=Editor\nName[zh_CN]=编辑器\nExec=sh -c 'exit 0' %U",
+            "Type=Application\nName=Editor\nName[zh_CN]=编辑器\nExec=sh -c 'exit 0' %U\nIcon=wsl-proxy-test-editor",
+        );
+        let icon_dir = home.join(".local/share/icons/hicolor/128x128/apps");
+        fs::create_dir_all(&icon_dir).unwrap();
+        fs::write(icon_dir.join("wsl-proxy-test-editor.png"), b"png").unwrap();
+        let absolute_icon = home.join("logo.svg");
+        fs::write(&absolute_icon, b"svg").unwrap();
+        entry(
+            "absolute.desktop",
+            &format!(
+                "Type=Application\nName=Absolute\nExec=sh\nIcon={}",
+                absolute_icon.display()
+            ),
         );
         entry(
             "hidden.desktop",
@@ -384,7 +469,24 @@ mod tests {
         ] {
             assert!(!ids.iter().any(|id| id == skipped), "{skipped} listed");
         }
-        assert!(listed.contains("editor.desktop\t编辑器"));
+        let icon_of = |id: &str| {
+            parse_apps(&listed)
+                .into_iter()
+                .find(|app| app["id"] == id)
+                .map(|app| app["icon"].clone())
+                .unwrap()
+        };
+        let canonical = |path: std::path::PathBuf| fs::canonicalize(path).unwrap();
+        assert_eq!(
+            icon_of("editor.desktop"),
+            json!(canonical(icon_dir.join("wsl-proxy-test-editor.png")))
+        );
+        assert_eq!(
+            icon_of("absolute.desktop"),
+            json!(canonical(absolute_icon.clone()))
+        );
+        assert_eq!(icon_of("actions.desktop"), json!(null));
+        assert!(listed.contains("editor.desktop\t编辑器\t"));
 
         let launch = |id: &str| {
             Command::new("/bin/sh")

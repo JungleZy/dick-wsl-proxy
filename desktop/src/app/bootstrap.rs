@@ -13,6 +13,7 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::select::{SelectEvent, SelectState};
+use gpui_kit::component::slider::{SliderEvent, SliderState};
 use gpui_kit::{prelude::*, *};
 use serde_json::{Value, json};
 
@@ -235,6 +236,22 @@ impl Desktop {
                 }
             },
         ));
+        // 设置页的全局不透明度滑块：拖动时立即生效，松手时保存。
+        let saved_opacity = super::opacity::load();
+        let opacity = cx.new(|_| {
+            SliderState::new()
+                .min(super::opacity::MIN as f32)
+                .max(super::opacity::MAX as f32)
+                .step(1.)
+                .default_value(saved_opacity as f32)
+        });
+        subscriptions.push(cx.subscribe(&opacity, |this, _, event, cx| {
+            let (value, save) = match event {
+                SliderEvent::Change(value) => (value, false),
+                SliderEvent::Release(value) => (value, true),
+            };
+            this.set_opacity(value.start().round() as u32, save, cx);
+        }));
         let (sender, replies) = worker();
         let mut this = Self {
             page: Page::Overview,
@@ -301,6 +318,7 @@ impl Desktop {
             confirmation_pending: false,
             kernel_prepare_offered: false,
             exiting: false,
+            exit_confirm_pending: false,
             exit_anyway_pending: false,
             exit_anyway_reason: None,
             export_path: None,
@@ -343,6 +361,7 @@ impl Desktop {
             reminder: None,
             status_notice: None,
             island_enabled: super::island::enabled_preference(),
+            opacity,
             updater: super::update::Updater::new(),
         };
         this.send(Kind::Bootstrap, Value::Null, cx);
@@ -803,6 +822,10 @@ impl Desktop {
         if self.confirmation_pending && !self.loading_dialog_open {
             self.confirmation_pending = false;
             self.open_confirmation_dialog(window, cx);
+        }
+        if self.exit_confirm_pending && !self.loading_dialog_open {
+            self.exit_confirm_pending = false;
+            self.open_exit_confirm_dialog(window, cx);
         }
         if self.exit_anyway_pending && !self.loading_dialog_open {
             self.exit_anyway_pending = false;
@@ -1661,7 +1684,7 @@ impl Desktop {
             .map(|id| self.environment_app_name(id))
             .unwrap_or_else(|| "应用".into());
         self.environment_launch_result = Some(match result {
-            Ok(_) => Ok(format!("已启动 {label}，窗口出现可能要几秒。")),
+            Ok(_) => Ok(format!("已启动 {label}")),
             Err(error) => Err(format!(
                 "启动 {label} 失败：{}",
                 super::backend::humanize_error(&error)
