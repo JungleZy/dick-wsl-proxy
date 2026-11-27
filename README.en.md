@@ -8,7 +8,7 @@ Windows desktop app `wsl-proxy-desktop` · controller and CLI `wsl-proxyctl`
 
 ![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078D6)
 ![WSL](https://img.shields.io/badge/WSL2-NAT%20mode-4E9A06)
-![Source version](https://img.shields.io/badge/source%20version-0.1.16-informational)
+![Source version](https://img.shields.io/badge/source%20version-0.1.17-informational)
 [![Latest release](https://img.shields.io/github/v/release/JungleZy/dick-wsl-proxy?include_prereleases&label=latest%20release)](https://github.com/JungleZy/dick-wsl-proxy/releases)
 ![Rust](https://img.shields.io/badge/Rust-2024%20edition-B7410E)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
