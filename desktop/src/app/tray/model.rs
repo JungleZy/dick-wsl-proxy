@@ -132,6 +132,8 @@ pub(crate) struct Snapshot {
     pub(crate) autostart: bool,
     /// 屏幕顶部状态岛是否打开。
     pub(crate) island: bool,
+    /// 在接管或需要恢复的环境有几个（决策 40）；主操作「停止」多于一个时是停止全部。
+    pub(crate) owned: usize,
 }
 
 impl Snapshot {
@@ -143,6 +145,7 @@ impl Snapshot {
         busy: None,
         autostart: false,
         island: true,
+        owned: 0,
     };
 
     /// 一行状态，例如「接管中 · Ubuntu-24.04」。

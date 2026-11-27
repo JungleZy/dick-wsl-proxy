@@ -405,6 +405,7 @@ impl Desktop {
             busy,
             autostart: self.autostart_enabled,
             island: self.island_enabled,
+            owned: self.owned_sessions().len(),
         }
     }
 

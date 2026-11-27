@@ -372,7 +372,12 @@ pub(crate) fn actions(snapshot: &Snapshot) -> Vec<Action> {
     let primary = snapshot.primary.command();
     let mut actions = vec![Action {
         command: primary,
-        label: short_label(primary),
+        // 多个环境时「停止」会停掉全部，按钮上要这么写。
+        label: if primary == Command::Stop && snapshot.owned > 1 {
+            "全部停止"
+        } else {
+            short_label(primary)
+        },
         enabled: idle_ui || snapshot.primary.navigates(),
         primary: true,
     }];
@@ -919,6 +924,12 @@ mod tests {
         };
         let labels: Vec<_> = actions(&managed).iter().map(|a| a.label).collect();
         assert_eq!(labels, ["停止接管", "检测出口", "打开主窗口"]);
+        // Several environments: the stop stops them all, and says so.
+        let several = Snapshot {
+            owned: 2,
+            ..managed.clone()
+        };
+        assert_eq!(actions(&several)[0].label, "全部停止");
         for primary in [
             Primary::Reconnect,
             Primary::Environments,
