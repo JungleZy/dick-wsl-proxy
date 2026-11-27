@@ -26,6 +26,10 @@ pub(crate) enum Kind {
     EnvironmentApps,
     /// 启动环境里的一个应用：静默，不锁界面，结果弹成通知。
     EnvironmentLaunch,
+    /// 读被接管环境里的图形应用，列在状态岛上：静默，和环境页的应用列表互不影响。
+    IslandApps,
+    /// 从状态岛上启动被接管环境里的一个应用：静默，结果显示在岛上。
+    IslandLaunch,
     EnvironmentCreate,
     EnvironmentEdit,
     EnvironmentBackup,
@@ -92,6 +96,8 @@ impl Kind {
             Self::EnvironmentView => "查看环境",
             Self::EnvironmentApps => "读取已安装应用",
             Self::EnvironmentLaunch => "启动应用",
+            Self::IslandApps => "读取接管环境的应用",
+            Self::IslandLaunch => "启动接管环境的应用",
             Self::EnvironmentCreate => "新增环境",
             Self::EnvironmentEdit => "编辑环境",
             Self::EnvironmentBackup => "备份环境",

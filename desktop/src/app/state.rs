@@ -122,6 +122,17 @@ pub(crate) struct Desktop {
     pub(crate) environment_launching: Option<String>,
     /// 最近一次启动的结果，显示在应用窗口里：`Ok` 是成功说明，`Err` 是失败原因。
     pub(crate) environment_launch_result: Option<Result<String, String>>,
+    /// 状态岛上列的被接管环境的应用，和上面环境页那一份分开：那一份跟着环境页正在看的
+    /// 环境走，这一份只跟着接管目标走。`island_apps_for` 是这一份属于哪个接管目标
+    /// （后台的 `active_target`），接管结束时清空；每次接管只读一次，失败了等用户在岛上点重试。
+    pub(crate) island_apps_for: Option<String>,
+    pub(crate) island_apps: Option<Value>,
+    pub(crate) island_apps_error: Option<String>,
+    pub(crate) island_apps_loading: bool,
+    /// 在途的岛上应用列表请求是读哪个接管目标的。
+    pub(crate) island_apps_requested: Option<String>,
+    /// 正在从岛上启动的应用（桌面文件 ID）。
+    pub(crate) island_launching: Option<String>,
     pub(crate) environment_started: Option<Instant>,
     /// 最近一次在后台读到的环境操作进度，见 [`EnvironmentProgress`]。
     pub(crate) environment_progress_snapshot: Option<EnvironmentProgress>,

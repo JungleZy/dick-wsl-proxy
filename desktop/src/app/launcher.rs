@@ -57,7 +57,7 @@ pub(crate) fn is_open() -> bool {
 }
 
 /// 网格里的一个应用。
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AppTile {
     /// 桌面文件 ID，启动时交给后台。
     pub(crate) id: String,
@@ -74,6 +74,29 @@ fn windows_path(distribution: &str, path: &str) -> std::path::PathBuf {
         windows.push_str(part);
     }
     windows.into()
+}
+
+/// 后台 `environment_apps` 的回复（`{"name": 发行版, "apps": [...]}`）里的应用。
+/// 状态岛列被接管环境的应用时也用它。
+pub(crate) fn tiles(listed: &serde_json::Value) -> Option<Vec<AppTile>> {
+    let distribution = listed["name"].as_str();
+    let apps = listed["apps"].as_array()?;
+    Some(
+        apps.iter()
+            .filter_map(|app| {
+                let id = app["id"].as_str()?;
+                let name = app["name"].as_str().unwrap_or(id);
+                let icon = distribution
+                    .zip(app["icon"].as_str())
+                    .map(|(distribution, path)| windows_path(distribution, path));
+                Some(AppTile {
+                    id: id.to_owned(),
+                    name: name.to_owned(),
+                    icon,
+                })
+            })
+            .collect(),
+    )
 }
 
 /// 窗口要画的全部内容，从主界面拍下来。
@@ -108,23 +131,7 @@ impl Desktop {
                     .and_then(|detail| detail["name"].as_str())
             })
             .map(str::to_owned);
-        let distribution = listed.and_then(|apps| apps["name"].as_str());
-        let apps = listed.and_then(|apps| apps["apps"].as_array()).map(|apps| {
-            apps.iter()
-                .filter_map(|app| {
-                    let id = app["id"].as_str()?;
-                    let name = app["name"].as_str().unwrap_or(id);
-                    let icon = distribution
-                        .zip(app["icon"].as_str())
-                        .map(|(distribution, path)| windows_path(distribution, path));
-                    Some(AppTile {
-                        id: id.to_owned(),
-                        name: name.to_owned(),
-                        icon,
-                    })
-                })
-                .collect()
-        });
+        let apps = listed.and_then(tiles);
         let traffic = environment
             .as_deref()
             .and_then(|name| self.environment_traffic_hint(name));

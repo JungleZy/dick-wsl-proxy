@@ -1254,6 +1254,94 @@ impl Desktop {
         );
     }
 
+    /// 后台确认正在接管时的接管目标（`active_target`，发行版 ID 或名称）；其余情况为空。
+    pub(crate) fn island_target(&self) -> Option<&str> {
+        if !self.status_valid || self.phase() != "forwarding_managed" {
+            return None;
+        }
+        self.status["active_target"].as_str()
+    }
+
+    /// 每次刷新调用：接管目标变了就换一份岛上的应用列表并读一次，接管结束就清空。
+    /// 清空要紧：图标是 `\\wsl.localhost` 下的文件，停止后还去读会把发行版又拉起来。
+    pub(crate) fn sync_island_apps(&mut self, cx: &mut Context<Self>) {
+        let target = self.island_target().map(str::to_owned);
+        if target == self.island_apps_for {
+            return;
+        }
+        self.island_apps = None;
+        self.island_apps_error = None;
+        self.island_apps_for = target;
+        if self.island_apps_for.is_some() {
+            self.request_island_apps(cx);
+        }
+    }
+
+    pub(crate) fn request_island_apps(&mut self, cx: &mut Context<Self>) {
+        if self.island_apps_loading {
+            return;
+        }
+        let Some(target) = self.island_apps_for.clone() else {
+            return;
+        };
+        self.island_apps_requested = Some(target.clone());
+        self.send(
+            Kind::IslandApps,
+            json!({"command":"environment_apps","name":target}),
+            cx,
+        );
+    }
+
+    /// 岛上的应用胶囊该画什么。
+    pub(crate) fn island_apps_state(&self) -> super::island::Apps {
+        use super::island::Apps;
+        if let Some(error) = &self.island_apps_error {
+            return Apps::Failed(error.clone());
+        }
+        match self.island_apps.as_ref().and_then(super::launcher::tiles) {
+            Some(tiles) => Apps::Listed(tiles),
+            None => Apps::Loading,
+        }
+    }
+
+    /// 处理岛上的点击：启动应用，或者重读失败的列表。
+    pub(crate) fn handle_island_request(
+        &mut self,
+        request: super::island::Request,
+        cx: &mut Context<Self>,
+    ) {
+        match request {
+            super::island::Request::RetryApps => {
+                if self.island_apps_for.is_some() {
+                    self.island_apps_error = None;
+                    self.request_island_apps(cx);
+                }
+            }
+            super::island::Request::Launch(app) => {
+                // 停止、切换进行中阶段还是「接管中」，这时启动的应用可能落在已经恢复直连的
+                // 环境里；和环境页一样等操作结束。
+                if self.island_launching.is_some() || self.busy.is_some() {
+                    return;
+                }
+                let Some(name) = self
+                    .island_apps
+                    .as_ref()
+                    .and_then(|apps| apps["name"].as_str())
+                    .map(str::to_owned)
+                else {
+                    return;
+                };
+                self.island_launching = Some(app.clone());
+                self.send(
+                    Kind::IslandLaunch,
+                    json!({"command":"environment_launch","name":name,"app":app}),
+                    cx,
+                );
+            }
+        }
+        cx.notify();
+    }
+
     pub(crate) fn environment_submit(&mut self, cx: &mut Context<Self>) {
         if self.locked() {
             return;

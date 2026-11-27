@@ -3,13 +3,19 @@
 //! 状态变化、有提醒或鼠标移上去时，平滑地展开成卡片，接管中还列出被接管环境的出口、
 //! DNS、UDP 和连接数。按住岛横向拖动可以沿顶边换位置。
 //!
+//! 接管中岛的边缘有两道光沿着轮廓流动（系统设置了减少动态效果时只留静止的描边），
+//! 一眼就能和未接管区分开；展开时卡片右边另起一条竖胶囊，列出被接管环境里的图形应用，
+//! 点一下就以默认用户启动，主窗口不出来，结果显示在岛上。
+//!
 //! 岛不自己判断状态：界面每次刷新把托盘用的 [`Snapshot`] 和环境信息交给 [`sync`]，
-//! 按钮也和托盘菜单一样先叫出主窗口、再把 [`Command`] 交给界面。点岛本身不做任何事。
+//! 按钮也和托盘菜单一样先叫出主窗口、再把 [`Command`] 交给界面；应用胶囊上的点击记成
+//! [`Request`]，由界面下次刷新时取走处理。点岛本身不做任何事。
 //! 窗口是 gpui 的 `PopUp`（置顶、不占任务栏）。
 //!
 //! 窗口大小固定为 [`model::WINDOW`]，形变动画只在窗口里画；窗口区域（`SetWindowRgn`）
-//! 裁成当前形状，所以透明的地方不挡下面窗口的点击。鼠标离开窗口时 gpui 不发悬停回调，
-//! 所以展开和收回靠岛自己每 50ms 比较一次光标位置。
+//! 裁成当前形状（展开时加上应用胶囊），所以透明的地方不挡下面窗口的点击。鼠标离开窗口时
+//! gpui 不发悬停回调，所以展开和收回靠岛自己每 33ms 比较一次光标位置；流动的光也跟着
+//! 这个节拍重画（约每秒 30 帧），不按显示器刷新率一直重画。
 
 mod model;
 
@@ -17,6 +23,7 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::Sizable as _;
@@ -28,8 +35,9 @@ use windows_sys::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    CreatePolygonRgn, DeleteObject, GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
-    MonitorFromPoint, SetWindowRgn, WINDING,
+    ClientToScreen, CombineRgn, CreatePolygonRgn, CreateRoundRectRgn, DeleteObject,
+    GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, RGN_OR, SetWindowRgn,
+    WINDING,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
 use windows_sys::Win32::UI::Shell::{
@@ -42,8 +50,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use winreg::RegKey;
 use winreg::enums::HKEY_CURRENT_USER;
 
-use self::model::{Action, Fact, Morph, Presence, Shape, Tone};
-pub(crate) use self::model::{Details, Rates};
+use self::model::{Action, AppTile, Fact, Morph, Presence, Shape, Tone};
+pub(crate) use self::model::{Apps, Details, Rates};
 use super::theme::{PREFERENCES_KEY, UI_FONT};
 use super::tray::{Command, Look, Snapshot};
 
@@ -54,9 +62,9 @@ const POSITION_VALUE: &str = "DesktopIslandPosition";
 /// 离屏幕顶边的距离：0，岛吸在顶边上。
 const TOP_GAP: f32 = 0.;
 const TITLE: &str = "WSL Proxy 状态岛";
-/// 岛自己看光标的间隔；全屏检测每隔几次才做一次。
-const POLL: Duration = Duration::from_millis(50);
-const FULLSCREEN_EVERY: u32 = 4;
+/// 岛自己看光标的间隔，也是流动光重画的节拍；全屏检测每隔几次才做一次（约 200ms）。
+const POLL: Duration = Duration::from_millis(33);
+const FULLSCREEN_EVERY: u32 = 6;
 
 /// 岛的配色，跟随软件主题。
 #[derive(Clone, Copy)]
@@ -117,6 +125,29 @@ impl Palette {
             Tone::Off => self.off,
         }
     }
+}
+
+/// 应用胶囊上的点击，交给界面处理：岛不和后台通信。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Request {
+    /// 以默认用户启动这个应用（桌面文件 ID）。
+    Launch(String),
+    /// 应用列表读失败了，再读一次。
+    RetryApps,
+}
+
+static REQUEST: Mutex<Option<Request>> = Mutex::new(None);
+
+/// 界面每次刷新取走岛上最近一次点击；同一时间只留一个，后点的盖掉先点的。
+pub(crate) fn take_request() -> Option<Request> {
+    REQUEST
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+}
+
+fn request(request: Request) {
+    *REQUEST.lock().unwrap_or_else(PoisonError::into_inner) = Some(request);
 }
 
 /// 岛的窗口句柄，托盘找主窗口时要排除它；没有岛时为空。
@@ -314,8 +345,15 @@ struct Island {
     morph: Morph,
     /// 最近一帧画出的外形，看光标在不在岛上时用。
     shape: Shape,
-    /// 最近一次设置的窗口区域（物理像素），没变就不重设。
-    region: Option<[i32; 4]>,
+    /// 最近一次设置的窗口区域（物理像素：外形、应用胶囊的高度（不显示时为 0）、
+    /// 客户区相对窗口矩形的偏移），没变就不重设。
+    region: Option<[i32; 7]>,
+    /// 最近一帧应用胶囊有没有画出来，看光标在不在岛上时用。
+    strip: bool,
+    /// 光标停在应用胶囊的哪一格上：卡片的说明行换成它的名字。
+    hint: Option<String>,
+    /// 流动光的起点。
+    born: Instant,
     hidden: bool,
     polls: u32,
     /// 窗口中心在主显示器宽度上的比例，0.5 是正中。
@@ -350,6 +388,9 @@ impl Island {
             morph: Morph::default(),
             shape: model::shape(0., model::CARD),
             region: None,
+            strip: false,
+            hint: None,
+            born: Instant::now(),
             hidden: false,
             polls: 0,
             position: load_position(),
@@ -385,9 +426,37 @@ impl Island {
                 self.morph.aim(expanded, now);
             }
             cx.notify();
-        } else if notice.as_deref() != self.presence.notice() {
+        } else if notice.as_deref() != self.presence.notice() || self.flowing(cx) {
             cx.notify();
         }
+    }
+
+    /// 接管中、看得见、系统没要求减少动态效果时，边缘的光在流动，要按节拍重画。
+    fn flowing(&self, cx: &App) -> bool {
+        self.glows() && !self.hidden && !cx.reduce_motion()
+    }
+
+    /// 接管中才描边。界面读详情、等确认这些短暂的操作不影响，免得边框一闪一闪。
+    fn glows(&self) -> bool {
+        self.snapshot.look == Look::Managed
+    }
+
+    /// 应用胶囊这一帧的位置和大小（窗口内的逻辑像素）：卡片右边，顶边留一点空，
+    /// 高度按格数收紧，最高和卡片齐平，再多就滚动。
+    fn strip_bounds(&self) -> (f32, f32, f32, f32) {
+        let slots = self
+            .details
+            .as_ref()
+            .map_or(1, |details| match &details.apps {
+                Apps::Listed(apps) => apps.len().max(1),
+                Apps::Loading | Apps::Failed(_) => 1,
+            });
+        (
+            self.left() + self.shape.width + model::STRIP_GAP,
+            model::STRIP_TOP,
+            model::STRIP_WIDTH,
+            model::strip_height(slots, self.shape.height - model::STRIP_TOP),
+        )
     }
 
     /// 主键在岛上按下。
@@ -508,42 +577,80 @@ impl Island {
 
     fn cursor_inside(&self, scale: f32) -> bool {
         let mut cursor = POINT::default();
-        let mut rect = RECT::default();
-        // SAFETY: both out-parameters are writable locals; a stale handle makes the call fail.
-        let read = !self.hwnd.is_null()
-            && unsafe {
-                GetCursorPos(&mut cursor) != 0 && GetWindowRect(self.hwnd, &mut rect) != 0
-            };
-        if !read {
+        // SAFETY: `cursor` is a writable local.
+        let Some(origin) =
+            client_origin(self.hwnd).filter(|_| unsafe { GetCursorPos(&mut cursor) } != 0)
+        else {
             return false;
-        }
-        let x = (cursor.x - rect.left) as f32 / scale - self.left();
-        let y = (cursor.y - rect.top) as f32 / scale;
-        x >= 0. && x < self.shape.width && y >= 0. && y < self.shape.height
+        };
+        // 岛画在客户区里；窗口矩形还带着系统留的一圈看不见的边框，不能拿它当原点。
+        let x = (cursor.x - origin.x) as f32 / scale;
+        let y = (cursor.y - origin.y) as f32 / scale;
+        let within = |(left, top, width, height): (f32, f32, f32, f32)| {
+            x >= left && x < left + width && y >= top && y < top + height
+        };
+        within((self.left(), 0., self.shape.width, self.shape.height))
+            || (self.strip && within(self.strip_bounds()))
     }
 
     /// 把能点到的范围裁成当前的刘海轮廓。轮廓向外多扩一点，岛边缘的抗锯齿像素不被裁掉。
     /// 只改命中范围、不要求重绘：重绘由 gpui 自己的下一帧负责，免得闪一下。
     fn clip(&mut self, scale: f32) {
+        let strip = self.strip.then(|| self.strip_bounds());
+        // 窗口区域按窗口矩形算，岛画在客户区里：Windows 给这个窗口留了一圈看不见的边框
+        // （实测左边 8px），不加上这段偏移，轮廓右边那一截会被裁掉。
+        let mut frame = RECT::default();
+        // SAFETY: `frame` is a writable local; a stale handle makes the call fail.
+        let Some(origin) = client_origin(self.hwnd)
+            .filter(|_| unsafe { GetWindowRect(self.hwnd, &mut frame) } != 0)
+        else {
+            return;
+        };
+        let (dx, dy) = (origin.x - frame.left, origin.y - frame.top);
         let s = |value: f32| (value * scale).round() as i32;
         let region = [
             s(self.left()),
             s(self.shape.width),
             s(self.shape.height),
             s(self.shape.radius),
+            strip.map_or(0, |(_, _, _, height)| s(height)),
+            dx,
+            dy,
         ];
         if self.hwnd.is_null() || self.region == Some(region) {
             return;
         }
         let points: Vec<POINT> = model::outline(self.shape, self.left(), 1.5)
             .into_iter()
-            .map(|(x, y)| POINT { x: s(x), y: s(y) })
+            .map(|(x, y)| POINT {
+                x: s(x) + dx,
+                y: s(y) + dy,
+            })
             .collect();
-        // SAFETY: `points` outlives the call and its length is passed with it; on
-        // success the window owns the region, on failure it stays ours and is deleted here.
+        // SAFETY: `points` outlives the call and its length is passed with it. The
+        // capsule's region is merged into the outline's and then deleted; on success
+        // the window owns the merged region, on failure it stays ours and is deleted here.
         unsafe {
             let rgn = CreatePolygonRgn(points.as_ptr(), points.len() as i32, WINDING);
-            if !rgn.is_null() && SetWindowRgn(self.hwnd, rgn, 0) == 0 {
+            if rgn.is_null() {
+                return;
+            }
+            if let Some((left, top, width, height)) = strip {
+                // 和外形一样向外多扩一点，边缘的抗锯齿像素不被裁掉。
+                let capsule = CreateRoundRectRgn(
+                    s(left - 1.5) + dx,
+                    s(top - 1.5) + dy,
+                    s(left + width + 1.5) + 1 + dx,
+                    s(top + height + 1.5) + 1 + dy,
+                    s(width + 3.),
+                    s(width + 3.),
+                );
+                if !capsule.is_null() {
+                    CombineRgn(rgn, rgn, capsule, RGN_OR);
+                    DeleteObject(capsule);
+                }
+            }
+            if SetWindowRgn(self.hwnd, rgn, 0) == 0 {
                 DeleteObject(rgn);
             }
         }
@@ -576,7 +683,10 @@ impl Island {
     /// DNS / UDP / 连接三格；底部一排等宽胶囊按钮。
     fn expanded(&self, tone: Tone, cx: &mut Context<Self>) -> Div {
         let palette = self.palette();
-        let caption = model::caption(&self.snapshot, self.presence.notice());
+        let caption = self
+            .hint
+            .clone()
+            .unwrap_or_else(|| model::caption(&self.snapshot, self.presence.notice()));
         let buttons = model::actions(&self.snapshot)
             .into_iter()
             .map(|action| button(action, palette, cx));
@@ -628,7 +738,14 @@ impl Island {
                             .text_size(px(12.))
                             .line_height(px(16.))
                             .text_color(rgba(palette.secondary))
-                            .line_clamp(2)
+                            // 悬停应用胶囊时的说明只占一行，卡片不因此变高、内容不往下挤。
+                            .map(|text| {
+                                if self.hint.is_some() {
+                                    text.truncate()
+                                } else {
+                                    text.line_clamp(2)
+                                }
+                            })
                             .child(caption),
                     ),
             )
@@ -748,12 +865,29 @@ fn translucent(color: u32) -> Rgba {
 }
 
 fn shoulder(edge: f32, right: bool, color: u32) -> Div {
-    let f = model::FILLET;
     // 圆环要盖住方框里离圆心最远的角（约 1.45 倍半径处）。
-    let band = f * 0.5 + 2.;
+    quarter_ring(
+        edge,
+        right,
+        model::FILLET * 0.5 + 2.,
+        1.,
+        translucent(color),
+    )
+}
+
+/// 肩的描边：贴着肩的凹弧内侧的一条细圆环，和主体两侧的竖直描边接上。
+fn shoulder_outline(edge: f32, right: bool, color: Rgba) -> Div {
+    // 方框多伸进主体 2px，细环靠近主体那头不被裁掉半个像素，和竖直描边接得上。
+    quarter_ring(edge, right, 1.5, 2., color)
+}
+
+/// 肩的方框里，一个内圈半径等于肩宽、宽 `band` 的圆环被裁出的四分之一。
+/// 方框向主体多伸 `spill`，接缝处不漏光。
+fn quarter_ring(edge: f32, right: bool, band: f32, spill: f32, color: Rgba) -> Div {
+    let f = model::FILLET;
     let outer = f + band;
     let (left, center) = if right {
-        (edge - 1., f + 1.)
+        (edge - spill, f + spill)
     } else {
         (edge - f, 0.)
     };
@@ -763,7 +897,7 @@ fn shoulder(edge: f32, right: bool, color: u32) -> Div {
         .top(px(f - outer))
         .size(px(outer * 2.))
         .rounded_full()
-        .border_color(translucent(color));
+        .border_color(color);
     let width: AbsoluteLength = px(band).into();
     let borders = &mut ring.style().border_widths;
     borders.top = Some(width);
@@ -774,7 +908,7 @@ fn shoulder(edge: f32, right: bool, color: u32) -> Div {
         .absolute()
         .top_0()
         .left(px(left))
-        .w(px(f + 1.))
+        .w(px(f + spill))
         .h(px(f))
         .overflow_hidden()
         .child(ring)
@@ -789,15 +923,37 @@ impl Render for Island {
             window.request_animation_frame();
         }
         self.shape = model::shape(m, self.card());
-        self.clip(window.scale_factor());
         let palette = self.palette();
         let tone = Tone::of(&self.snapshot);
         let (compact, full) = fades(m);
+        self.strip = full > 0. && model::shows_strip(self.details.as_ref());
+        if !self.strip {
+            self.hint = None;
+        }
+        self.clip(window.scale_factor());
         let content = if full > 0. {
             self.expanded(tone, cx).opacity(full)
         } else {
             self.compact(tone).opacity(compact)
         };
+        let strip = self
+            .details
+            .as_ref()
+            .filter(|_| self.strip)
+            .map(|details| self.apps_capsule(details, cx).opacity(full));
+        // 接管中的描边：主体左、右、底三边一圈淡淡的状态色（div 边框，边缘逐像素抗锯齿，
+        // 静止的线不会有台阶）；再叠上沿轮廓流动的光。减少动态效果时描边加深、不流动。
+        let motion = !cx.reduce_motion();
+        let outline_color = self.glows().then(|| Rgba {
+            a: if motion { 0.45 } else { 0.85 },
+            ..rgb(palette.ok)
+        });
+        let flow = (self.glows() && motion).then(|| {
+            let phase = (now.duration_since(self.born).as_secs_f32()
+                / model::FLOW_PERIOD.as_secs_f32())
+            .fract();
+            flowing_light(self.shape, self.left(), phase, palette)
+        });
         let left = self.left();
         div()
             .size_full()
@@ -847,7 +1003,269 @@ impl Render for Island {
                     )
                     .child(content),
             )
+            .children(outline_color.map(|color| shoulder_outline(left, false, color)))
+            .children(
+                outline_color.map(|color| shoulder_outline(left + self.shape.width, true, color)),
+            )
+            .children(outline_color.map(|color| {
+                // 静止描边单独一层压在主体上，从肩的圆弧收拢处（往下一个肩高）才开始：
+                // 再往上外沿是肩的圆弧（由上面两段肩的描边画），主体那段竖直边在形状里面，
+                // 描上色会多出一截直线。
+                let width: AbsoluteLength = px(1.5).into();
+                let mut outline = div()
+                    .absolute()
+                    .left(px(left))
+                    // 往上多 1px 和肩的描边重叠，接缝处不留暗点；这 1px 里圆弧离竖直边
+                    // 不到 0.1px，看不出直线。
+                    .top(px(model::FILLET - 1.))
+                    .w(px(self.shape.width))
+                    .h(px((self.shape.height - model::FILLET + 1.).max(0.)))
+                    .rounded_b(px(self.shape.radius))
+                    .border_color(color);
+                let borders = &mut outline.style().border_widths;
+                borders.left = Some(width);
+                borders.right = Some(width);
+                borders.bottom = Some(width);
+                outline
+            }))
+            .children(flow)
+            .children(strip)
     }
+}
+
+impl Island {
+    /// 卡片右边的应用胶囊：竖着一列图标，放不下时滚轮滚动。读取中转圈，读失败放一颗重试。
+    fn apps_capsule(&self, details: &Details, cx: &mut Context<Self>) -> Stateful<Div> {
+        let palette = self.palette();
+        let (left, top, width, height) = self.strip_bounds();
+        let capsule = div()
+            .id("island-apps")
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(width))
+            .h(px(height))
+            .rounded(px(width / 2.))
+            .overflow_hidden()
+            .bg(translucent(palette.bg))
+            .text_color(rgb(palette.ink))
+            .font_family(UI_FONT);
+        match &details.apps {
+            Apps::Loading => capsule.flex().items_center().justify_center().child(
+                gpui_kit::component::spinner::Spinner::new()
+                    .small()
+                    .color(rgba(palette.secondary).into()),
+            ),
+            Apps::Failed(reason) => {
+                let hint = format!("点一下重试 · 读取应用失败：{reason}");
+                capsule.flex().items_center().justify_center().child(slot(
+                    "island-apps-retry",
+                    hint,
+                    icon(REFRESH, palette.warn, 18.).into_any_element(),
+                    Some(Request::RetryApps),
+                    palette,
+                    cx,
+                ))
+            }
+            Apps::Listed(apps) => {
+                let launching = details.launching.as_deref();
+                // 主窗口有操作在进行（停止、切换接管也在其中）时不启动，免得应用落在已经
+                // 恢复直连的环境里。
+                let busy = self.snapshot.busy.as_deref();
+                let mut column = div()
+                    .id("island-apps-scroll")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(model::STRIP_SPACING))
+                    .py(px(model::STRIP_PADDING));
+                for (index, app) in apps.iter().enumerate() {
+                    let starting = launching == Some(app.id.as_str());
+                    let (hint, action) = match (launching, busy) {
+                        (Some(_), _) if starting => (format!("正在启动 {}…", app.name), None),
+                        (Some(_), _) => (format!("{}（等上一个启动完）", app.name), None),
+                        (None, Some(busy)) => (format!("{}（{busy}）", app.name), None),
+                        (None, None) => (
+                            format!("启动 {}", app.name),
+                            Some(Request::Launch(app.id.clone())),
+                        ),
+                    };
+                    let face = app_face(app, palette).opacity(match (launching, busy) {
+                        (Some(_), _) if starting => 0.45,
+                        (Some(_), _) | (None, Some(_)) => 0.6,
+                        (None, None) => 1.,
+                    });
+                    column = column.child(slot(
+                        ("island-app", index),
+                        hint,
+                        face.into_any_element(),
+                        action,
+                        palette,
+                        cx,
+                    ));
+                }
+                capsule.child(column)
+            }
+        }
+    }
+}
+
+/// 刷新箭头，应用列表读失败时的重试按钮。
+const REFRESH: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M15.5 10a5.5 5.5 0 1 1-1.6-3.9" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M14.4 3.2v3.4H11" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
+
+fn icon(data: &'static [u8], color: u32, size: f32) -> gpui_kit::component::Icon {
+    gpui_kit::component::Icon::default()
+        .data(data)
+        .text_color(rgb(color))
+        .with_size(gpui_kit::component::Size::Size(px(size)))
+}
+
+/// 应用的图标；没有图标或读不出来时，圆角方块里写应用名的第一个字。
+fn app_face(app: &AppTile, palette: Palette) -> Div {
+    let size = model::STRIP_ICON;
+    let initial: String = app
+        .name
+        .chars()
+        .find(|character| !character.is_whitespace())
+        .map(|character| character.to_uppercase().collect())
+        .unwrap_or_default();
+    let placeholder = move || {
+        div()
+            .size(px(size))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(8.))
+            .bg(rgba(palette.fill_hover))
+            .text_size(px(13.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(palette.ink))
+            .child(initial.clone())
+            .into_any_element()
+    };
+    let face = match app.icon.clone() {
+        Some(path) => img(path)
+            .size(px(size))
+            .object_fit(ObjectFit::Contain)
+            .with_fallback(placeholder)
+            .into_any_element(),
+        None => placeholder(),
+    };
+    div().size(px(size)).child(face)
+}
+
+/// 胶囊里的一格：悬停时卡片说明行换成 `hint`，点了把 `action` 交给界面；
+/// `action` 为空时只显示不响应。按下也要记成「按在按钮上」，长按照样能拖岛。
+fn slot(
+    id: impl Into<ElementId>,
+    hint: String,
+    face: AnyElement,
+    action: Option<Request>,
+    palette: Palette,
+    cx: &mut Context<Island>,
+) -> Stateful<Div> {
+    let shown = hint.clone();
+    let cell = div()
+        .id(id)
+        .flex_shrink_0()
+        .size(px(model::STRIP_SLOT))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(12.))
+        .child(face)
+        .on_hover(cx.listener(move |island, hovered: &bool, _, cx| {
+            if *hovered {
+                island.hint = Some(shown.clone());
+            } else if island.hint.as_deref() == Some(shown.as_str()) {
+                island.hint = None;
+            }
+            cx.notify();
+        }))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|island, _, _, cx| {
+                cx.stop_propagation();
+                island.press_start(true);
+                cx.notify();
+            }),
+        );
+    let Some(action) = action else {
+        return cell;
+    };
+    cell.cursor_pointer()
+        .hover(move |style| style.bg(rgba(palette.fill_hover)))
+        .active(|style| style.opacity(0.7))
+        .on_click(cx.listener(move |island, _, _, cx| {
+            cx.stop_propagation();
+            if island.take_click() {
+                request(action.clone());
+                island.hint = None;
+                cx.notify();
+            }
+        }))
+}
+
+/// 接管中沿岛的轮廓（不含贴着屏幕顶边的那条边）流动的两道光，从尾到头逐渐变亮。
+/// 画在轮廓往里 1px 处，压在主体的描边上，不会被窗口区域裁掉。
+fn flowing_light(shape: Shape, left: f32, phase: f32, palette: Palette) -> Canvas<()> {
+    // 深色岛上光头偏白，浅色岛上用饱和的状态色，两种底色上都看得清。
+    let head = if palette.bg == DARK.bg {
+        mix(palette.ok, 0xffffff, 0.55)
+    } else {
+        palette.ok
+    };
+    canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _| {
+            let points = model::outline(shape, left, -0.75);
+            for (piece, brightness) in model::flow(&points, phase) {
+                let color = Rgba {
+                    a: brightness,
+                    ..rgb(head)
+                };
+                stroke(window, bounds.origin, &piece, 2., color);
+            }
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
+}
+
+fn stroke(
+    window: &mut Window,
+    origin: Point<Pixels>,
+    points: &[(f32, f32)],
+    width: f32,
+    color: Rgba,
+) {
+    let mut points = points
+        .iter()
+        .map(|&(x, y)| point(origin.x + px(x), origin.y + px(y)));
+    let Some(first) = points.next() else {
+        return;
+    };
+    let mut builder = PathBuilder::stroke(px(width));
+    builder.move_to(first);
+    for next in points {
+        builder.line_to(next);
+    }
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, color);
+    }
+}
+
+/// 两个 `0xRRGGBB` 颜色按 `t` 混合（0 是 `a`，1 是 `b`）。
+fn mix(a: u32, b: u32, t: f32) -> u32 {
+    let channel = |shift: u32| {
+        let (x, y) = (((a >> shift) & 0xff) as f32, ((b >> shift) & 0xff) as f32);
+        ((x + (y - x) * t).round() as u32) << shift
+    };
+    channel(16) | channel(8) | channel(0)
 }
 
 /// 盾牌状态图标：接管中打勾，需要恢复和未确认画感叹号，处理中画省略号，未接管是空盾牌。
@@ -927,6 +1345,13 @@ fn button(action: Action, palette: Palette, cx: &mut Context<Island>) -> Statefu
         }))
 }
 
+/// 客户区左上角在屏幕上的位置（物理像素）。
+fn client_origin(hwnd: HWND) -> Option<POINT> {
+    let mut origin = POINT::default();
+    // SAFETY: `origin` is a writable local; a null or stale handle makes the call fail.
+    (!hwnd.is_null() && unsafe { ClientToScreen(hwnd, &mut origin) } != 0).then_some(origin)
+}
+
 pub(crate) fn hwnd_of(window: &Window) -> HWND {
     match HasWindowHandle::window_handle(window).map(|handle| handle.as_raw()) {
         Ok(RawWindowHandle::Win32(handle)) => handle.hwnd.get() as HWND,
@@ -998,12 +1423,18 @@ fn place(hwnd: HWND, scale: f32, hidden: bool, ratio: f32) {
     let Some(screen) = primary_screen() else {
         return;
     };
-    let width = (model::WINDOW.0 * scale).round() as i32;
-    let left = model::window_left(screen.left, screen.right - screen.left, width, ratio);
-    let top = screen.top + (TOP_GAP * scale).round() as i32;
     let mut rect = RECT::default();
     // SAFETY: as above; `rect` is a writable local.
     let current = unsafe { GetWindowRect(hwnd, &mut rect) } != 0;
+    // 用窗口矩形的实际宽度（含系统留的看不见的边框）居中，岛才落在比例对应的位置上；
+    // 拖动后记位置（`ratio_of`）用的也是它。
+    let width = if current {
+        rect.right - rect.left
+    } else {
+        (model::WINDOW.0 * scale).round() as i32
+    };
+    let left = model::window_left(screen.left, screen.right - screen.left, width, ratio);
+    let top = screen.top + (TOP_GAP * scale).round() as i32;
     if !current || rect.left != left || rect.top != top {
         // SAFETY: as above.
         unsafe {

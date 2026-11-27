@@ -316,12 +316,10 @@ impl Desktop {
         }
     }
 
-    /// 接管中交给状态岛的环境信息：公网出口、DNS、UDP、连接数，说法和首页一致。
-    /// 只在后台确认正在接管时给；其余情况岛不显示这些。
+    /// 接管中交给状态岛的环境信息：公网出口、DNS、UDP、连接数，说法和首页一致，
+    /// 再加上被接管环境里的图形应用。只在后台确认正在接管时给；其余情况岛不显示这些。
     pub(crate) fn island_details(&self) -> Option<super::island::Details> {
-        if !self.status_valid || self.phase() != "forwarding_managed" {
-            return None;
-        }
+        self.island_target()?;
         let exit = &self.status["recent_exit"];
         let text = |value: &Value| value.as_str().map(str::to_owned);
         Some(super::island::Details {
@@ -332,6 +330,8 @@ impl Desktop {
             dns_latency_ms: self.status["startup_verified"]["dns_latency_ms"].as_f64(),
             udp: self.udp_state_label(),
             active_tcp: self.status["forwarding"]["active_tcp"].as_u64(),
+            apps: self.island_apps_state(),
+            launching: self.island_launching.clone(),
         })
     }
 

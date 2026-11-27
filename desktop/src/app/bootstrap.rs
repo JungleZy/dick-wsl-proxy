@@ -333,6 +333,12 @@ impl Desktop {
             environment_apps_requested: None,
             environment_launching: None,
             environment_launch_result: None,
+            island_apps_for: None,
+            island_apps: None,
+            island_apps_error: None,
+            island_apps_loading: false,
+            island_apps_requested: None,
+            island_launching: None,
             environment_started: None,
             environment_progress_snapshot: None,
             environment_progress_reading: false,
@@ -420,6 +426,12 @@ impl Desktop {
             self.environment_apps_error = None;
         } else if kind == Kind::EnvironmentLaunch {
             // 启动应用不锁界面：只禁用应用按钮，结果弹成通知。
+        } else if kind == Kind::IslandApps {
+            // 岛上的应用列表同样静默：岛自己转圈。
+            self.island_apps_loading = true;
+            self.island_apps_error = None;
+        } else if kind == Kind::IslandLaunch {
+            // 从岛上启动应用不锁界面，结果显示在岛上。
         } else {
             if self.reading || self.busy.is_some() {
                 return;
@@ -473,6 +485,13 @@ impl Desktop {
             if kind == Kind::EnvironmentLaunch {
                 self.environment_launching = None;
             }
+            if kind == Kind::IslandApps {
+                self.island_apps_loading = false;
+                self.island_apps_error = Some("后台通信线程已退出".into());
+            }
+            if kind == Kind::IslandLaunch {
+                self.island_launching = None;
+            }
             self.fail("后台通信线程已退出，请重新打开窗口。", cx);
         } else {
             // 页面提示文字记录用户操作的进展和结果。读日志、读环境详情是切页面时
@@ -485,6 +504,8 @@ impl Desktop {
                     | Kind::EnvironmentView
                     | Kind::EnvironmentApps
                     | Kind::EnvironmentLaunch
+                    | Kind::IslandApps
+                    | Kind::IslandLaunch
                     | Kind::WslPlatform
                     | Kind::ResidentialProbe
             ) {
@@ -812,6 +833,10 @@ impl Desktop {
                 up: sample.tx,
                 down: sample.rx,
             });
+        self.sync_island_apps(cx);
+        if let Some(request) = super::island::take_request().filter(|_| !self.exiting) {
+            self.handle_island_request(request, cx);
+        }
         let details = self.island_details();
         super::island::sync(&snapshot, rates, details, super::theme::is_dark(), cx);
         super::tray::publish(snapshot);
@@ -895,6 +920,16 @@ impl Desktop {
         }
         if reply.kind == Kind::EnvironmentLaunch {
             self.accept_environment_launch(reply.result);
+            cx.notify();
+            return;
+        }
+        if reply.kind == Kind::IslandApps {
+            self.accept_island_apps(reply.result, cx);
+            cx.notify();
+            return;
+        }
+        if reply.kind == Kind::IslandLaunch {
+            self.accept_island_launch(reply.result, cx);
             cx.notify();
             return;
         }
@@ -1170,7 +1205,10 @@ impl Desktop {
             // 已在循环开头单独处理，不会走到这里。
             Kind::ResidentialProbe => {}
             // 已在循环开头单独处理，不会走到这里。
-            Kind::EnvironmentApps | Kind::EnvironmentLaunch => {}
+            Kind::EnvironmentApps
+            | Kind::EnvironmentLaunch
+            | Kind::IslandApps
+            | Kind::IslandLaunch => {}
             Kind::List => {
                 self.distributions = value.as_array().cloned().unwrap_or_default();
                 // 和自动清除用同一条规则判断目标还在不在，界面和库里才不会不一致。
@@ -1680,6 +1718,57 @@ impl Desktop {
             Err(error) => {
                 self.environment_apps_error = Some(super::backend::humanize_error(&error));
             }
+        }
+    }
+
+    /// 岛上的应用列表：回复不是当前接管目标的（读的期间接管换了或停了）就丢掉，
+    /// 还在接管就按当前目标再读一次。
+    fn accept_island_apps(&mut self, result: Result<Value, String>, cx: &mut Context<Self>) {
+        self.island_apps_loading = false;
+        let requested = self.island_apps_requested.take();
+        if self.island_apps_for.is_none() {
+            return;
+        }
+        if requested != self.island_apps_for {
+            self.request_island_apps(cx);
+            return;
+        }
+        match result {
+            Ok(value) => {
+                self.island_apps = Some(value);
+                self.island_apps_error = None;
+            }
+            Err(error) => {
+                self.island_apps_error = Some(super::backend::humanize_error(&error));
+            }
+        }
+    }
+
+    /// 从岛上启动的结果显示在岛上：用户是在岛上点的，主窗口可能在托盘里。
+    fn accept_island_launch(&mut self, result: Result<Value, String>, cx: &mut Context<Self>) {
+        let app = self.island_launching.take();
+        let label = app
+            .as_deref()
+            .and_then(|id| {
+                self.island_apps
+                    .as_ref()
+                    .and_then(super::launcher::tiles)?
+                    .into_iter()
+                    .find(|tile| tile.id == id)
+                    .map(|tile| tile.name)
+            })
+            .or_else(|| app.map(|id| id.trim_end_matches(".desktop").to_owned()))
+            .unwrap_or_else(|| "应用".into());
+        match result {
+            Ok(_) => super::island::notify(&format!("已启动 {label}"), false, cx),
+            Err(error) => super::island::notify(
+                &format!(
+                    "启动 {label} 失败：{}",
+                    super::backend::humanize_error(&error)
+                ),
+                true,
+                cx,
+            ),
         }
     }
 

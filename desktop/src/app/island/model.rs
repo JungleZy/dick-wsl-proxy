@@ -3,6 +3,7 @@
 
 use std::time::{Duration, Instant};
 
+pub(crate) use crate::app::launcher::AppTile;
 use crate::app::tray::{Command, Look, Snapshot};
 
 /// 收起时的药丸大小（逻辑像素，不含顶部两侧的肩）。中间留空，内容只放左右两端，
@@ -17,9 +18,24 @@ pub(crate) const CARD_RADIUS: f32 = 30.;
 /// 岛贴着屏幕顶边，左右上角各有一段向内凹的圆弧（「肩」），和屏幕边缘平滑接上。
 /// 这是圆弧的半径：肩在顶边处向外伸出这么宽，往下这么高收拢到竖直侧边。
 pub(crate) const FILLET: f32 = 12.;
-/// 窗口始终是这么大：卡片加两侧的肩，再留一圈余量，形变动画冲过头时不被裁掉。
-/// 能点到的范围由窗口区域裁成当前形状，其余部分不挡下面窗口的点击。
-pub(crate) const WINDOW: (f32, f32) = (CARD.0 + 2. * FILLET + 32., CARD_DETAILED.1 + 16.);
+/// 接管中展开时，卡片右边另起一条竖着的胶囊，列出被接管环境里的图形应用，
+/// 和 Apple 灵动岛旁边的小岛一样不和卡片连在一起。这是它的宽度、离卡片的间距
+/// 和离屏幕顶边的距离。
+pub(crate) const STRIP_WIDTH: f32 = 48.;
+pub(crate) const STRIP_GAP: f32 = 8.;
+pub(crate) const STRIP_TOP: f32 = 6.;
+/// 应用胶囊里一格的边长和格间距，图标比格子小一圈。
+pub(crate) const STRIP_SLOT: f32 = 38.;
+pub(crate) const STRIP_ICON: f32 = 28.;
+/// 卡片最宽能到多少：形变动画冲过头时也不超过它。
+const MAX_WIDTH: f32 = CARD.0 + 28.;
+/// 窗口始终是这么大：卡片两侧各留出应用胶囊和一圈余量（卡片始终居中，所以左边也留），
+/// 形变动画冲过头时不被裁掉。能点到的范围由窗口区域裁成当前形状，其余部分不挡下面
+/// 窗口的点击。
+pub(crate) const WINDOW: (f32, f32) = (
+    MAX_WIDTH + 2. * (STRIP_GAP + STRIP_WIDTH + 8.),
+    CARD_DETAILED.1 + 16.,
+);
 
 /// 在按钮上按住多久算长按、开始拖动；在岛的其他地方按下后一移动就开始拖。
 pub(crate) const LONG_PRESS: Duration = Duration::from_millis(400);
@@ -71,6 +87,39 @@ pub(crate) struct Details {
     pub(crate) udp: &'static str,
     /// 正在转发的 TCP 连接数。
     pub(crate) active_tcp: Option<u64>,
+    /// 被接管环境里的图形应用，列在卡片旁边的胶囊里。
+    pub(crate) apps: Apps,
+    /// 正在从岛上启动的应用（桌面文件 ID）；同一时间只启动一个。
+    pub(crate) launching: Option<String>,
+}
+
+/// 被接管环境的应用列表读到哪一步了。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) enum Apps {
+    /// 还在读：胶囊里转圈。
+    #[default]
+    Loading,
+    /// 读失败了：胶囊里放一颗重试按钮，原因悬停时显示。
+    Failed(String),
+    /// 读到了；一个都没有时不显示胶囊。
+    Listed(Vec<AppTile>),
+}
+
+/// 应用胶囊上下各留的空和格与格的间距。
+pub(crate) const STRIP_PADDING: f32 = 5.;
+pub(crate) const STRIP_SPACING: f32 = 4.;
+
+/// 应用胶囊的高度：刚好放下 `slots` 格，最高 `limit`（和卡片齐平），再多就在里面滚动；
+/// 最矮是个圆。
+pub(crate) fn strip_height(slots: usize, limit: f32) -> f32 {
+    let slots = slots.max(1) as f32;
+    let content = 2. * STRIP_PADDING + slots * STRIP_SLOT + (slots - 1.) * STRIP_SPACING;
+    content.min(limit).max(STRIP_WIDTH)
+}
+
+/// 应用胶囊显不显示：读到了空列表就不占地方，其余（读取中、失败、有应用）都显示。
+pub(crate) fn shows_strip(details: Option<&Details>) -> bool {
+    details.is_some_and(|details| !matches!(&details.apps, Apps::Listed(apps) if apps.is_empty()))
 }
 
 /// 卡片上的一格信息：小字标签、数值和颜色档。
@@ -291,7 +340,7 @@ pub(crate) fn shape(m: f32, card: (f32, f32)) -> Shape {
     let lerp = |a: f32, b: f32| a + (b - a) * m;
     let height = lerp(PILL.1, card.1).clamp(PILL.1 * 0.7, WINDOW.1);
     Shape {
-        width: lerp(PILL.0, card.0).clamp(PILL.0 * 0.9, WINDOW.0 - 2. * FILLET - 4.),
+        width: lerp(PILL.0, card.0).clamp(PILL.0 * 0.9, MAX_WIDTH),
         height,
         radius: (PILL.1 / 2. + (CARD_RADIUS - PILL.1 / 2.) * m.clamp(0., 1.)).min(height / 2.),
     }
@@ -333,6 +382,83 @@ pub(crate) fn outline(shape: Shape, left: f32, grow: f32) -> Vec<(f32, f32)> {
         .map(|&(y, _, right)| (right, y))
         .chain(rows.iter().rev().map(|&(y, l, _)| (l, y)))
         .collect()
+}
+
+/// 接管中沿岛边缘流动的光：一圈多长时间。
+pub(crate) const FLOW_PERIOD: Duration = Duration::from_millis(3200);
+/// 一道光（含渐隐的尾巴）占轮廓全长的比例。
+const FLOW_LENGTH: f32 = 0.3;
+/// 一道光切成几段，从尾到头逐段变亮。
+const FLOW_PIECES: usize = 12;
+
+/// 折线上从起点量起 `from` 到 `to` 这一段（按长度），两端落在线段中间时插值。
+/// `cumulative[i]` 是第 `i` 个点离起点的长度。
+fn slice(points: &[(f32, f32)], cumulative: &[f32], from: f32, to: f32) -> Vec<(f32, f32)> {
+    let at = |length: f32| {
+        let i = cumulative
+            .partition_point(|&c| c < length)
+            .clamp(1, points.len() - 1);
+        let (a, b) = (points[i - 1], points[i]);
+        let span = cumulative[i] - cumulative[i - 1];
+        let t = if span > 0. {
+            ((length - cumulative[i - 1]) / span).clamp(0., 1.)
+        } else {
+            0.
+        };
+        (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t)
+    };
+    let mut piece = vec![at(from)];
+    piece.extend(
+        points
+            .iter()
+            .zip(cumulative)
+            .filter(|&(_, &c)| c > from && c < to)
+            .map(|(&point, _)| point),
+    );
+    piece.push(at(to));
+    piece
+}
+
+/// 流动光这一刻要画的几段折线和各自的亮度（0 到 1，越靠光头越亮）。
+///
+/// `points` 是岛的轮廓（不含顶边，从右肩沿右侧、底边绕到左肩），`phase` 是一圈里走到
+/// 哪了（0 到 1）。两道光相隔半圈，从右肩进来、绕过底边、从左肩出去；光头出了轮廓，
+/// 尾巴还会接着走完，所以任何时候边上都有光。
+pub(crate) fn flow(points: &[(f32, f32)], phase: f32) -> Vec<(Vec<(f32, f32)>, f32)> {
+    if points.len() < 2 {
+        return Vec::new();
+    }
+    let mut cumulative = Vec::with_capacity(points.len());
+    let mut total = 0.;
+    cumulative.push(0.);
+    for pair in points.windows(2) {
+        total += (pair[1].0 - pair[0].0).hypot(pair[1].1 - pair[0].1);
+        cumulative.push(total);
+    }
+    if total <= 0. {
+        return Vec::new();
+    }
+    let tail = total * FLOW_LENGTH;
+    let step = tail / FLOW_PIECES as f32;
+    let mut pieces = Vec::new();
+    for offset in [0., 0.5] {
+        // 光头从起点前一个光长走到终点，走完正好一圈，接上下一圈不跳。
+        let head = (phase + offset).fract() * (total + tail);
+        for k in 0..FLOW_PIECES {
+            let from = head - tail + k as f32 * step;
+            let to = from + step;
+            let (from, to) = (from.max(0.), to.min(total));
+            if to - from < 0.5 {
+                continue;
+            }
+            let brightness = (k + 1) as f32 / FLOW_PIECES as f32;
+            pieces.push((
+                slice(points, &cumulative, from, to),
+                brightness * brightness,
+            ));
+        }
+    }
+    pieces
 }
 
 /// 一段临界阻尼弹簧：平滑减速，正好停在终点，不冲过头、不来回晃。`omega` 越大越快。
@@ -786,6 +912,7 @@ mod tests {
             dns_latency_ms: Some(23.4),
             udp: "经代理链",
             active_tcp: Some(12),
+            ..Details::default()
         };
         let exit = exit_fact(&details);
         assert_eq!(exit.value, "203.0.113.7 · US · 与住宅地址一致");
@@ -810,6 +937,48 @@ mod tests {
         assert_eq!(exit_fact(&Details::default()).value, "未检测");
         assert_eq!(card_size(Some(&worse)), CARD_DETAILED);
         assert_eq!(card_size(None), CARD);
+    }
+
+    #[test]
+    fn the_app_strip_hides_only_for_an_empty_list() {
+        assert!(!shows_strip(None));
+        let mut details = Details::default();
+        assert!(shows_strip(Some(&details)), "读取中也占位，读到后卡片不跳");
+        details.apps = Apps::Failed("读不到".into());
+        assert!(shows_strip(Some(&details)));
+        details.apps = Apps::Listed(Vec::new());
+        assert!(!shows_strip(Some(&details)));
+        // 高度跟着格数走，到卡片高度为止。
+        assert_eq!(strip_height(1, 200.), STRIP_WIDTH);
+        assert_eq!(strip_height(3, 200.), 10. + 3. * STRIP_SLOT + 8.);
+        assert_eq!(strip_height(40, 200.), 200.);
+        // 展开的卡片加上胶囊仍在窗口里。
+        let right = (WINDOW.0 + CARD_DETAILED.0) / 2. + STRIP_GAP + STRIP_WIDTH;
+        assert!(right <= WINDOW.0);
+    }
+
+    #[test]
+    fn the_flowing_light_stays_on_the_outline_and_brightens_toward_its_head() {
+        let shape = shape(1., CARD_DETAILED);
+        let left = (WINDOW.0 - shape.width) / 2.;
+        let points = outline(shape, left, -1.);
+        for i in 0..=40 {
+            let pieces = flow(&points, i as f32 / 40.);
+            assert!(!pieces.is_empty(), "phase {i}/40 时边上没有光");
+            for (piece, brightness) in &pieces {
+                assert!(piece.len() >= 2);
+                assert!(*brightness > 0. && *brightness <= 1.);
+                for &(x, y) in piece {
+                    assert!(x >= 0. && x <= WINDOW.0 && y >= 0. && y <= WINDOW.1);
+                }
+            }
+        }
+        // 每道光从尾到头逐段变亮。
+        let pieces = flow(&points, 0.3);
+        assert!(pieces.windows(2).any(|pair| pair[1].1 > pair[0].1));
+        // 一圈首尾相接：phase 0 和 1 画的一样。
+        assert_eq!(flow(&points, 0.), flow(&points, 1.));
+        assert!(flow(&points[..1], 0.5).is_empty());
     }
 
     #[test]
