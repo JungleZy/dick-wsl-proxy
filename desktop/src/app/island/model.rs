@@ -250,7 +250,8 @@ fn short_label(command: Command) -> &'static str {
         Command::Stop => "停止接管",
         Command::Abandon => "放弃记录",
         Command::Probe => "检测出口",
-        Command::ChooseTarget => "选择目标",
+        Command::Environments => "去环境页",
+        Command::Recover => "去恢复",
         Command::Reconnect => "重新连接",
         Command::Open => "打开主窗口",
         other => other.label(),
@@ -791,7 +792,7 @@ mod tests {
         assert!(actions(&busy).iter().all(|a| a.enabled));
         let idle = Snapshot {
             look: Look::Idle,
-            primary: Primary::ChooseTarget,
+            primary: Primary::Environments,
             busy: Some("等待在主窗口确认".into()),
             ..Snapshot::INITIAL
         };
@@ -812,9 +813,8 @@ mod tests {
         assert_eq!(labels, ["停止接管", "检测出口", "打开主窗口"]);
         for primary in [
             Primary::Reconnect,
-            Primary::ChooseTarget,
-            Primary::GoSave,
-            Primary::Start,
+            Primary::Environments,
+            Primary::Recover,
             Primary::Stop,
             Primary::Abandon,
         ] {

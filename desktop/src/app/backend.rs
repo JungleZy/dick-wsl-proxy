@@ -17,7 +17,6 @@ pub(crate) enum Kind {
     PrepareKernel,
     Save,
     Start,
-    Switch,
     Stop,
     Export,
     Probe,
@@ -53,7 +52,6 @@ impl Kind {
             Self::Save
                 | Self::PrepareKernel
                 | Self::Start
-                | Self::Switch
                 | Self::Stop
                 | Self::Probe
                 | Self::EnvironmentCreate
@@ -89,7 +87,6 @@ impl Kind {
             Self::PrepareKernel => "准备内核环境",
             Self::Save => "保存修改",
             Self::Start => "启动接管",
-            Self::Switch => "切换目标",
             Self::Stop => "停止并恢复",
             Self::Export => "导出诊断",
             Self::Probe => "检测出口",
@@ -185,13 +182,13 @@ fn policy_field_error(error: &str) -> Option<String> {
             "设置页「半关闭等待」",
             "范围 5–3600 秒。",
         ),
-        ("credential ip", "设置页住宅代理的「服务器 IPv4」", ""),
+        ("credential ip", "环境页住宅代理的「服务器 IPv4」", ""),
         (
             "credential endpoint",
-            "设置页住宅代理的「服务器 IPv4」或「服务器端口」",
+            "环境页住宅代理的「服务器 IPv4」或「服务器端口」",
             "",
         ),
-        ("credential port", "设置页住宅代理的「服务器端口」", ""),
+        ("credential port", "环境页住宅代理的「服务器端口」", ""),
     ];
     // 后台另有 `controller_error · ` 之类的外层包装时，取里面的原文。
     let detail = error.rsplit(" · ").next().unwrap_or(error).trim();
@@ -258,7 +255,7 @@ fn humanize_code(code: &str, message: &str) -> String {
             "内核环境准备失败，请确认目标发行版能启动，并且带有内核模块。".into()
         }
         "residential_credential_incomplete" => {
-            "住宅服务器信息不完整，请在设置页的住宅代理里填写完整的服务器地址、端口、用户名和密码并保存。".into()
+            "这个环境的住宅代理不完整，请在环境页填写完整的服务器地址、端口、用户名和密码并保存。".into()
         }
         "environment_requires_idle" => "请先停止接管并恢复直连，再管理 WSL 环境。".into(),
         "wsl_platform_failed" => "检查 WSL 平台失败，请确认 WSL 可以正常运行后重试。".into(),
@@ -273,7 +270,23 @@ fn humanize_code(code: &str, message: &str) -> String {
             "升级 WSL 失败：{} 请检查网络、Windows 更新和权限；也可以在以管理员身份打开的终端里运行 wsl --update，或用 wsl --update --web-download 从 GitHub 下载更新。",
             message.trim()
         ),
-        "same_target" => "当前目标没有变化。".into(),
+        "stale_environment_revision" => {
+            "这个环境的住宅代理已在别处改过，请刷新后重新填写。".into()
+        }
+        "saved_environment_revision_required" => {
+            "这个环境的住宅代理和界面上显示的不一致，请刷新后再启动。".into()
+        }
+        "ingress_port_in_use" => {
+            "这个 Windows 入口端口已分给另一个环境，请换一个，或留空由程序分配。".into()
+        }
+        "invalid_ingress_port" => "Windows 入口端口需为 1024–65535 的整数。".into(),
+        "environment_residential_in_use" => {
+            "这个环境正在接管或需要恢复，先停止它再改住宅代理和入口端口。".into()
+        }
+        "environment_residential_exists" => {
+            "这个环境已经有自己的住宅代理；要换成旧的那一份，先清空这个环境的住宅代理并保存。".into()
+        }
+        "unassigned_residential_missing" => "没有未分配的住宅代理了，请刷新。".into(),
         "environment_name_invalid" => "环境名称只能使用字母、数字、点、下划线和短横线。".into(),
         "environment_name_exists" => "环境名称已经存在，请换一个名称。".into(),
         "environment_distribution_invalid" => "发行版选择无效，请从列表中重新选择。".into(),
@@ -469,8 +482,8 @@ pub(crate) fn kernel_gap(blockers: &[String]) -> bool {
 }
 
 /// Whether a failed preflight should ask about preparing the kernel. Only a
-/// start from idle can do it, and only once per attempt: a switch keeps the old
-/// target running, and repeating the question after a failed attempt is noise.
+/// start from idle can do it, and only once per attempt: repeating the
+/// question after a failed attempt is noise.
 pub(crate) fn offer_kernel_prepare(kind: Option<Kind>, offered: bool, blockers: &[String]) -> bool {
     // An old kernel stays refused whatever is loaded: asking would only lead
     // to a second refusal.
@@ -560,7 +573,7 @@ pub(crate) fn wsl_platform_badge(
     }
 }
 
-/// 设置页住宅代理检测的状态标签：`(文字, 色调)`。`stale` 表示检测之后设置又保存过，
+/// 环境页住宅代理检测的状态标签：`(文字, 色调)`。`stale` 表示检测之后住宅代理或设置又保存过，
 /// 旧结果不再对应当前配置。
 pub(crate) fn residential_probe_badge(
     report: Option<&Value>,
@@ -818,7 +831,7 @@ mod tests {
         .collect();
         assert!(offer_kernel_prepare(Some(Kind::Start), false, &gap));
         assert!(!offer_kernel_prepare(Some(Kind::Start), true, &gap));
-        assert!(!offer_kernel_prepare(Some(Kind::Switch), false, &gap));
+        assert!(!offer_kernel_prepare(Some(Kind::Stop), false, &gap));
         assert!(!offer_kernel_prepare(None, false, &gap));
         assert!(!offer_kernel_prepare(
             Some(Kind::Start),
@@ -1081,7 +1094,7 @@ mod tests {
         );
         assert_eq!(
             humanize_error("credential ip must be literal IPv4"),
-            "设置页住宅代理的「服务器 IPv4」填写有误。"
+            "环境页住宅代理的「服务器 IPv4」填写有误。"
         );
         // A code that merely starts with a field name is not a field error.
         assert!(!humanize_error("first_hop_unreachable").contains("填写有误"));

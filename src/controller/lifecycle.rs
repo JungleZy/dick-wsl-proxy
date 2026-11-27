@@ -125,14 +125,11 @@ impl Controller {
         if current.pending.is_some() {
             return Err("operation_pending: explicit recovery required".into());
         }
-        let (p, ingress) = self
-            .live
-            .as_ref()
-            .ok_or("switch_requires_live_managed_owner")?;
+        let (p, ingress) = self.live.as_ref().ok_or("requires_live_managed_owner")?;
         let runtime = self
             .runtime
             .as_deref()
-            .ok_or("switch_requires_live_managed_owner")?;
+            .ok_or("requires_live_managed_owner")?;
         if journal::load()?.as_ref() != Some(p)
             || !self.readiness.as_ref().is_some_and(Result::is_ok)
         {
@@ -157,30 +154,6 @@ impl Controller {
         let window = kernel::precheck(&p)?;
         let record = transition::begin(&current, Kind::Start, None, Some(&p))?;
         self.activate_and_commit(p, runtime, &record, window)
-    }
-    pub fn switch(&mut self, expected: u64, p: Plan, runtime: Arc<Runtime>) -> Result<(), String> {
-        let (old, _) = self.switch_source(expected)?;
-        if old.target.id.eq_ignore_ascii_case(&p.target.id) {
-            return Err("same_target".into());
-        }
-        if p.system_dns.is_none() || p.cookie == old.cookie {
-            return Err("invalid_switch_candidate".into());
-        }
-        let old = old.clone();
-        kernel::precheck(&p)?; // still no change to A, including its operation generation
-        let current = checked(Some(expected))?;
-        let record = transition::begin(&current, Kind::Switch, Some(&old), Some(&p))?;
-        self.retire(&old)?; // verifies absence, stops old workers and drops per-target runtime
-        let restored = transition::advance(&record, Stage::OldRestored)?;
-        let window = match registered(&p).and_then(|_| kernel::precheck(&p)) {
-            Ok(window) => window,
-            Err(e) => {
-                transition::finish(&restored)?;
-                return Err(format!("old_restored_candidate_rejected:{e}"));
-            }
-        };
-        let next = transition::advance(&restored, Stage::StartingNew)?;
-        self.activate_and_commit(p, Some(runtime), &next, window)
     }
     fn activate_and_commit(
         &mut self,

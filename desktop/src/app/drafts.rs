@@ -1,17 +1,18 @@
-//! 每页只保存自己的字段：规则页存直连规则，设置页存代理链、DNS、转发限制、入口端口和
-//! 住宅代理，环境页确认后只存接管目标。后台每次保存整份配置，所以保存请求以已保存的值
-//! 打底，只换上本页输入框里的内容。
+//! 每页只保存自己的字段：规则页存直连规则，设置页存代理链、DNS 和转发限制，环境页存
+//! 正在看的那个环境的住宅代理和 Windows 入口端口（决策 40）。后台每次保存整份共用配置，
+//! 所以规则页、设置页的保存请求以已保存的值打底，只换上本页输入框里的内容；环境页的
+//! 保存是单独的请求，只写那一个环境。
 
 use serde_json::{Value, json};
 
 /// 有保存动作的三个页面。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SaveScope {
-    /// 环境页：接管目标。点「设为目标」确认后立即保存，没有未保存状态。
+    /// 环境页：正在看的环境的住宅代理和 Windows 入口端口。
     Environment,
     /// 规则页：直连规则。
     Policy,
-    /// 设置页：代理链、DNS、转发限制、Windows 入口端口和住宅代理。
+    /// 设置页：代理链、DNS 和转发限制。
     Settings,
 }
 
@@ -27,7 +28,7 @@ impl SaveScope {
     /// 失败提示里的动作名，例如「保存规则失败：…」。
     pub(crate) fn action(self) -> &'static str {
         match self {
-            Self::Environment => "保存接管目标",
+            Self::Environment => "保存住宅代理",
             Self::Policy => "保存规则",
             Self::Settings => "保存设置",
         }
@@ -35,7 +36,7 @@ impl SaveScope {
 
     pub(crate) fn saved_notice(self) -> &'static str {
         match self {
-            Self::Environment => "接管目标已保存；不会立即改变当前接管。",
+            Self::Environment => "住宅代理已保存；下次启动这个环境的接管时生效。",
             Self::Policy => "规则已保存；不会立即改变当前接管。",
             Self::Settings => "设置已保存；不会立即改变当前接管。",
         }
@@ -264,7 +265,7 @@ pub(crate) fn saved_residential_protocol(residential: &Value) -> &'static str {
     }
 }
 
-/// 设置页住宅代理要保存的值，参数是协议和输入框里去掉首尾空白的文字。四项都空表示
+/// 环境页住宅代理要保存的值，参数是协议和输入框里去掉首尾空白的文字。四项都空表示
 /// 还没配置，按后台的空记录发（端口为 0）；填了任何一项，端口就必须是 1–65535 的
 /// 整数，其余由后台校验。
 pub(crate) fn residential_value(
@@ -306,80 +307,103 @@ pub(crate) fn saved_residential_text(residential: &Value, key: &str) -> String {
     }
 }
 
-/// 后台最近一次返回的已保存配置里，各页保存时要原样带上的部分。
+/// 后台最近一次返回的已保存配置里，规则页、设置页保存时要原样带上的部分。
 pub(crate) struct Saved<'a> {
     pub(crate) profile: &'a Value,
     pub(crate) revision: &'a Value,
-    pub(crate) target: Option<&'a str>,
-    pub(crate) port: u16,
 }
 
-/// 一次保存里本页的内容；输入框的值已经校验过。
+/// 规则页、设置页一次保存里本页的内容；输入框的值已经校验过。
 pub(crate) enum PageDraft {
-    /// 环境页：要保存的接管目标，`None` 表示清除目标。
-    Environment(Option<String>),
     /// 规则页：直连规则全在策略里，由 `draft` 给出。
     Policy,
-    /// 设置页：Windows 入口端口、住宅代理和远端解析开关，其余字段在策略里，由 `draft`
-    /// 给出。
-    Settings {
-        port: u16,
-        residential: Value,
-        fake_ip: bool,
-    },
+    /// 设置页：远端解析开关，其余字段在策略里，由 `draft` 给出。
+    Settings { fake_ip: bool },
 }
 
 impl PageDraft {
     pub(crate) fn scope(&self) -> SaveScope {
         match self {
-            Self::Environment(_) => SaveScope::Environment,
             Self::Policy => SaveScope::Policy,
             Self::Settings { .. } => SaveScope::Settings,
         }
     }
 }
 
-/// 一次保存的请求：只有本页的内容取输入，目标、入口端口、住宅代理和其他页的策略字段
-/// 都用已保存的值。不是设置页的保存不带住宅代理，后台沿用已保存的那份。
+/// 规则页、设置页一次保存的请求：只有本页的内容取输入，其他页的策略字段用已保存的值。
+/// 住宅代理和入口端口不在这里，由环境页单独保存。
 pub(crate) fn save_request(
     saved: &Saved<'_>,
     page: PageDraft,
     draft: impl Fn(ProfileField) -> String,
 ) -> Value {
     let mut profile = merge_profile(saved.profile, page.scope(), draft);
-    let saved_target = saved.target.map(str::to_owned);
-    let (target, port, residential) = match page {
-        PageDraft::Environment(target) => (target, saved.port, None),
-        PageDraft::Policy => (saved_target, saved.port, None),
-        PageDraft::Settings {
-            port,
-            residential,
-            fake_ip,
-        } => {
-            // 开着是默认值，不写。
-            if let Some(profile) = profile.as_object_mut() {
-                if fake_ip {
-                    profile.remove("fake_ip");
-                } else {
-                    profile.insert("fake_ip".into(), Value::Bool(false));
-                }
-            }
-            (saved_target, port, Some(residential))
+    if let PageDraft::Settings { fake_ip } = page
+        && let Some(profile) = profile.as_object_mut()
+    {
+        // 开着是默认值，不写。
+        if fake_ip {
+            profile.remove("fake_ip");
+        } else {
+            profile.insert("fake_ip".into(), Value::Bool(false));
         }
-    };
-    let mut request = json!({
+    }
+    json!({
         "command": "profile_save",
         "profile": profile,
         "expected_revision": saved.revision,
-        "desktop": {"target": target, "port": port},
-    });
-    if let Some(residential) = residential {
-        request["residential"] = residential;
-    }
-    request
+    })
 }
 
-/// 这个发行版就是保存的目标 `target`。和后台认目标的规则一致：名称完全相同，
+/// 环境页的保存请求：这个环境的住宅代理和入口端口。`port` 为 `None` 时后台沿用已保存的
+/// 端口，第一次保存时从 43531 起分一个别的环境没用的端口。`revision` 是这个环境已保存的
+/// 版本，从没保存过时为 `null`。
+pub(crate) fn environment_save_request(
+    distro_id: &str,
+    residential: Value,
+    port: Option<u16>,
+    revision: &Value,
+) -> Value {
+    json!({
+        "command": "environment_residential_save",
+        "distro_id": distro_id,
+        "residential": residential,
+        "ingress_port": port,
+        "expected_revision": revision,
+    })
+}
+
+/// Windows 入口端口输入框的值：留空表示让后台分配，否则要是 1024–65535 的整数。
+pub(crate) fn ingress_port_value(text: &str) -> Result<Option<u16>, &'static str> {
+    if text.is_empty() {
+        return Ok(None);
+    }
+    text.parse::<u16>()
+        .ok()
+        .filter(|port| *port >= 1024)
+        .map(Some)
+        .ok_or("Windows 入口端口需为 1024–65535 的整数，留空由程序分配。")
+}
+
+/// 配置库里这个环境的那一行；没保存过时为 `None`。和后台一样，ID 不区分大小写。
+pub(crate) fn environment_row<'a>(rows: &'a [Value], distro_id: &str) -> Option<&'a Value> {
+    rows.iter().find(|row| {
+        row["distro_id"]
+            .as_str()
+            .is_some_and(|id| id.eq_ignore_ascii_case(distro_id))
+    })
+}
+
+/// 这个环境保存了能用的住宅代理：服务器地址和端口都填了。
+pub(crate) fn residential_configured(row: Option<&Value>) -> bool {
+    row.is_some_and(|row| {
+        let residential = &row["residential"];
+        residential["ip"].as_str().is_some_and(|ip| !ip.is_empty())
+            && residential["port"].as_u64().is_some_and(|port| port != 0)
+    })
+}
+
+/// 这个发行版就是 `target`。和后台认目标的规则一致：名称完全相同，
 /// 或者 ID 不区分大小写相同。
 pub(crate) fn names_target(distro: &Value, target: &str) -> bool {
     distro["name"].as_str() == Some(target)
@@ -388,26 +412,10 @@ pub(crate) fn names_target(distro: &Value, target: &str) -> bool {
             .is_some_and(|id| id.eq_ignore_ascii_case(target))
 }
 
-/// 保存的接管目标已经不能用了：发行版列表里没有它，或者它不再是 WSL 2。
-///
-/// 列表里只要有一条不是后台的发行版格式（字符串 `id`、`name`，数字 `version`），
-/// 就说明两边协议对不上，判断不了，一律当作「还在」：自动清除会改写用户保存的配置，
-/// 宁可不清。
-pub(crate) fn target_missing(saved: Option<&str>, distributions: &[Value]) -> bool {
-    let well_formed = |distro: &Value| {
-        distro["id"].is_string() && distro["name"].is_string() && distro["version"].is_u64()
-    };
-    saved.is_some_and(|target| {
-        distributions.iter().all(well_formed)
-            && !distributions
-                .iter()
-                .any(|distro| names_target(distro, target) && distro["version"] == 2)
-    })
-}
-
-/// 规则页、设置页各自有没有没保存的输入。环境页选了目标就立即保存，没有草稿。
+/// 环境页、规则页、设置页各自有没有没保存的输入。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Unsaved {
+    pub(crate) environment: bool,
     pub(crate) policy: bool,
     pub(crate) settings: bool,
 }
@@ -415,7 +423,7 @@ pub(crate) struct Unsaved {
 impl Unsaved {
     pub(crate) fn contains(self, scope: SaveScope) -> bool {
         match scope {
-            SaveScope::Environment => false,
+            SaveScope::Environment => self.environment,
             SaveScope::Policy => self.policy,
             SaveScope::Settings => self.settings,
         }
@@ -432,20 +440,17 @@ impl Unsaved {
         .filter(move |scope| !self.contains(*scope))
     }
 
-    /// 第一个有未保存输入的页面。
-    pub(crate) fn first(self) -> Option<SaveScope> {
-        [SaveScope::Policy, SaveScope::Settings]
-            .into_iter()
-            .find(|scope| self.contains(*scope))
-    }
-
     /// 有未保存输入的页面，例如「规则页、设置页」；都保存了时为 `None`。
     pub(crate) fn pages(self) -> Option<String> {
-        let pages = [SaveScope::Policy, SaveScope::Settings]
-            .into_iter()
-            .filter(|scope| self.contains(*scope))
-            .map(SaveScope::page_name)
-            .collect::<Vec<_>>();
+        let pages = [
+            SaveScope::Environment,
+            SaveScope::Policy,
+            SaveScope::Settings,
+        ]
+        .into_iter()
+        .filter(|scope| self.contains(*scope))
+        .map(SaveScope::page_name)
+        .collect::<Vec<_>>();
         (!pages.is_empty()).then(|| pages.join("、"))
     }
 }
@@ -489,9 +494,10 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        FailedSaves, PageDraft, ProfileField, SaveScope, Saved, Unsaved, merge_profile,
-        profile_changed, residential_value, save_request, saved_fake_ip,
-        saved_residential_protocol, saved_residential_text, saved_text, target_missing,
+        FailedSaves, PageDraft, ProfileField, SaveScope, Saved, Unsaved, environment_row,
+        environment_save_request, ingress_port_value, merge_profile, profile_changed,
+        residential_configured, residential_value, save_request, saved_fake_ip,
+        saved_residential_protocol, saved_residential_text, saved_text,
     };
 
     fn saved() -> Value {
@@ -534,8 +540,6 @@ mod tests {
         let record = Saved {
             profile: &profile,
             revision: &revision,
-            target: Some("{11111111-1111-1111-1111-111111111111}"),
-            port: 43531,
         };
         save_request(&record, page, draft)
     }
@@ -622,95 +626,93 @@ mod tests {
     }
 
     #[test]
-    fn saving_the_target_leaves_the_profile_as_saved() {
+    fn the_environment_page_leaves_the_shared_profile_as_saved() {
         let profile = merge_profile(&saved(), SaveScope::Environment, draft);
         assert_eq!(profile, saved());
     }
 
     #[test]
-    fn a_rules_save_carries_the_saved_target_port_and_residential() {
+    fn a_rules_save_carries_only_the_shared_profile() {
         let request = request(PageDraft::Policy);
         assert_eq!(request["command"], "profile_save");
         assert_eq!(request["expected_revision"], "7");
-        assert_eq!(
-            request["desktop"],
-            json!({"target": "{11111111-1111-1111-1111-111111111111}", "port": 43531})
-        );
-        // 不带住宅代理，后台沿用已保存的。
-        assert!(request.get("residential").is_none());
+        // 住宅代理、入口端口和目标都不在共用配置里。
+        for key in ["desktop", "residential"] {
+            assert!(request.get(key).is_none(), "{key}");
+        }
         assert_eq!(request["profile"]["first_hop"], "127.0.0.1:7892");
         assert_eq!(
             request["profile"]["direct_ips"],
             json!(["192.0.2.0/24", "198.51.100.7"])
         );
-    }
-
-    #[test]
-    fn a_settings_save_carries_its_port_and_residential_but_the_saved_target() {
-        let residential =
-            json!({"ip": "203.0.113.9", "port": 1080, "username": "user", "password": "secret"});
-        let request = request(PageDraft::Settings {
-            port: 44000,
-            residential: residential.clone(),
-            fake_ip: true,
-        });
-        assert_eq!(
-            request["desktop"],
-            json!({"target": "{11111111-1111-1111-1111-111111111111}", "port": 44000})
+        let settings = super::save_request(
+            &Saved {
+                profile: &saved(),
+                revision: &json!("7"),
+            },
+            PageDraft::Settings { fake_ip: true },
+            draft,
         );
-        assert_eq!(request["residential"], residential);
-        assert_eq!(request["profile"]["first_hop"], "127.0.0.1:1080");
-        assert_eq!(request["profile"]["direct_ips"], json!(["192.0.2.0/24"]));
+        assert_eq!(settings["profile"]["first_hop"], "127.0.0.1:1080");
+        assert_eq!(settings["profile"]["direct_ips"], json!(["192.0.2.0/24"]));
     }
 
     #[test]
     fn the_fake_ip_switch_is_written_only_when_off_and_only_by_the_settings_page() {
-        let residential = json!({"ip": "", "port": 0, "username": "", "password": ""});
-        let off = request(PageDraft::Settings {
-            port: 44000,
-            residential: residential.clone(),
-            fake_ip: false,
-        });
+        let off = request(PageDraft::Settings { fake_ip: false });
         assert_eq!(off["profile"]["fake_ip"], json!(false));
-        let on = request(PageDraft::Settings {
-            port: 44000,
-            residential,
-            fake_ip: true,
-        });
+        let on = request(PageDraft::Settings { fake_ip: true });
         assert!(on["profile"].get("fake_ip").is_none());
         assert!(saved_fake_ip(&json!({})));
         assert!(!saved_fake_ip(&json!({"fake_ip": false})));
-        // Other pages keep a saved `false` as it is.
+        // The rules page keeps a saved `false` as it is.
         let mut profile = saved();
         profile["fake_ip"] = json!(false);
         let revision = json!("7");
         let record = Saved {
             profile: &profile,
             revision: &revision,
-            target: Some("{11111111-1111-1111-1111-111111111111}"),
-            port: 43531,
         };
-        for page in [PageDraft::Policy, PageDraft::Environment(None)] {
-            let request = save_request(&record, page, draft);
-            assert_eq!(request["profile"]["fake_ip"], json!(false));
-        }
+        let request = save_request(&record, PageDraft::Policy, draft);
+        assert_eq!(request["profile"]["fake_ip"], json!(false));
     }
 
     #[test]
-    fn a_target_save_changes_only_the_target() {
-        let chosen = request(PageDraft::Environment(Some(
-            "{44444444-4444-4444-4444-444444444444}".into(),
-        )));
+    fn an_environment_save_names_its_environment_and_revision() {
+        let residential = json!({"protocol": "socks5", "ip": "203.0.113.9", "port": 1080, "username": "user", "password": "secret"});
+        let first = environment_save_request("{4444}", residential.clone(), None, &Value::Null);
+        assert_eq!(first["command"], "environment_residential_save");
+        assert_eq!(first["distro_id"], "{4444}");
+        assert_eq!(first["residential"], residential);
+        // 没填端口：后台沿用或分配。
+        assert_eq!(first["ingress_port"], Value::Null);
+        assert_eq!(first["expected_revision"], Value::Null);
+        let later = environment_save_request("{4444}", residential, Some(44000), &json!("3"));
+        assert_eq!(later["ingress_port"], 44000);
+        assert_eq!(later["expected_revision"], "3");
+        assert_eq!(ingress_port_value(""), Ok(None));
+        assert_eq!(ingress_port_value("44000"), Ok(Some(44000)));
+        assert!(ingress_port_value("80").is_err());
+        assert!(ingress_port_value("port").is_err());
+    }
+
+    #[test]
+    fn finds_an_environment_row_by_id_without_regard_to_case() {
+        let rows = [
+            json!({"distro_id": "{aaaa}", "revision": "1", "ingress_port": 43531,
+                "residential": {"ip": "203.0.113.9", "port": 1080}}),
+            json!({"distro_id": "{bbbb}", "revision": "2", "ingress_port": 43532,
+                "residential": {"ip": "", "port": 0}}),
+        ];
         assert_eq!(
-            chosen["desktop"],
-            json!({"target": "{44444444-4444-4444-4444-444444444444}", "port": 43531})
+            environment_row(&rows, "{AAAA}").map(|row| &row["ingress_port"]),
+            Some(&json!(43531))
         );
-        assert!(chosen.get("residential").is_none());
-        assert_eq!(chosen["profile"], saved());
-        // 清除目标时发 null。
-        let cleared = request(PageDraft::Environment(None));
-        assert_eq!(cleared["desktop"]["target"], Value::Null);
-        assert_eq!(cleared["desktop"]["port"], 43531);
+        assert!(environment_row(&rows, "{cccc}").is_none());
+        assert!(residential_configured(environment_row(&rows, "{aaaa}")));
+        // 保存过空的住宅代理（例如清空后）不算配置好。
+        assert!(!residential_configured(environment_row(&rows, "{bbbb}")));
+        assert!(!residential_configured(None));
     }
 
     #[test]
@@ -721,73 +723,36 @@ mod tests {
         };
         assert!(profile_changed(&saved(), SaveScope::Policy, rules_only));
         assert!(!profile_changed(&saved(), SaveScope::Settings, rules_only));
+        // 环境页不写共用配置里的字段。
         assert!(!profile_changed(
             &saved(),
             SaveScope::Environment,
             rules_only
         ));
-    }
-
-    #[test]
-    fn a_saved_target_is_missing_only_when_no_wsl2_distribution_matches() {
-        let distributions = [
-            json!({"id": "{11111111-1111-1111-1111-111111111111}", "name": "Test-Target", "version": 2}),
-            json!({"id": "{22222222-2222-2222-2222-222222222222}", "name": "Legacy-One", "version": 1}),
-        ];
-        assert!(!target_missing(None, &distributions));
-        assert!(!target_missing(
-            Some("{11111111-1111-1111-1111-111111111111}"),
-            &distributions
-        ));
-        // 和后台一样，ID 不区分大小写。
-        assert!(!target_missing(
-            Some(
-                "{11111111-1111-1111-1111-111111111111}"
-                    .to_uppercase()
-                    .as_str()
-            ),
-            &distributions
-        ));
-        // 旧版本按名称保存的目标也算存在。
-        assert!(!target_missing(Some("Test-Target"), &distributions));
-        // 已被删除或注销。
-        assert!(target_missing(
-            Some("{33333333-3333-3333-3333-333333333333}"),
-            &distributions
-        ));
-        // 转成了 WSL 1。
-        assert!(target_missing(
-            Some("{22222222-2222-2222-2222-222222222222}"),
-            &distributions
-        ));
-        assert!(target_missing(Some("Test-Target"), &[]));
-        // 后台改了字段名或类型：判断不了，不能把用户保存的目标清掉。
-        for drifted in [
-            json!({"id": "{11111111-1111-1111-1111-111111111111}", "name": "Test-Target", "wsl_version": 2}),
-            json!({"id": "{11111111-1111-1111-1111-111111111111}", "name": "Test-Target", "version": "2"}),
-            json!({"distribution_id": "{11111111-1111-1111-1111-111111111111}", "name": "Test-Target", "version": 2}),
-        ] {
-            assert!(!target_missing(Some("Test-Target"), &[drifted]));
-        }
+        assert_eq!(super::profile_fields(SaveScope::Environment).count(), 0);
     }
 
     #[test]
     fn names_the_pages_with_unsaved_edits() {
         assert_eq!(Unsaved::default().pages(), None);
-        assert_eq!(Unsaved::default().first(), None);
         let settings = Unsaved {
-            policy: false,
             settings: true,
+            ..Unsaved::default()
         };
         assert_eq!(settings.pages().as_deref(), Some("设置页"));
-        assert_eq!(settings.first(), Some(SaveScope::Settings));
         assert!(!settings.contains(SaveScope::Policy));
         let both = Unsaved {
             policy: true,
             settings: true,
+            ..Unsaved::default()
         };
         assert_eq!(both.pages().as_deref(), Some("规则页、设置页"));
-        assert_eq!(both.first(), Some(SaveScope::Policy));
+        let all = Unsaved {
+            environment: true,
+            policy: true,
+            settings: true,
+        };
+        assert_eq!(all.pages().as_deref(), Some("环境页、规则页、设置页"));
     }
 
     #[test]
@@ -844,8 +809,8 @@ mod tests {
     #[test]
     fn a_reconnect_reloads_only_pages_without_edits() {
         let settings_edited = Unsaved {
-            policy: false,
             settings: true,
+            ..Unsaved::default()
         };
         assert_eq!(
             settings_edited.clean_pages().collect::<Vec<_>>(),

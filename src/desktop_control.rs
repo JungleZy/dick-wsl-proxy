@@ -3,7 +3,7 @@ use crate::{
     desktop_store::{self, ResidentialSettings},
     environment::{self, InstallOptions},
     host,
-    policy::{Config, profile::Preferences},
+    policy::Config,
     wsl_platform,
 };
 use serde::Deserialize;
@@ -66,7 +66,6 @@ fn blocked_by_environment_job(command: &str, request: &Value, job: &EnvironmentJ
     matches!(
         command,
         "start"
-            | "switch"
             | "preflight"
             | "prepare_kernel"
             | "probe_exit"
@@ -164,10 +163,24 @@ fn log_environment_result(command: &str, result: &Result<Value, String>) {
 #[serde(deny_unknown_fields)]
 struct SqliteSave {
     profile: Config,
-    desktop: Preferences,
-    #[serde(default)]
-    residential: Option<ResidentialSettings>,
     expected_revision: Option<String>,
+}
+
+/// One environment's residential proxy and ingress port (decision 40).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvironmentResidentialSave {
+    distro_id: String,
+    residential: ResidentialSettings,
+    #[serde(default)]
+    ingress_port: Option<u16>,
+    expected_revision: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvironmentResidentialAssign {
+    distro_id: String,
 }
 
 #[derive(Deserialize)]
@@ -314,33 +327,57 @@ fn residential_probe_confirmed(request: &Value) -> Result<(), crate::command::Fa
     ))
 }
 
-fn residential_probe() -> Result<Value, String> {
+fn residential_probe(distro_id: &str) -> Result<Value, String> {
     let path = profile_path()?;
-    let revision = desktop_store::revision(&path)?;
-    let (config, residential) = desktop_store::load_runtime(&path)?;
+    let revision = desktop_store::environment(&path, distro_id)?
+        .ok_or("residential_credential_incomplete")?
+        .revision;
+    let (config, residential, _) = desktop_store::load_runtime(&path, distro_id)?;
     let policy = crate::policy::Policy::assemble_for_store(
         crate::policy::Validated::new(config)?,
         residential,
     )?;
     let mut report = policy.probe_residential();
     report["revision"] = json!(revision.to_string());
+    report["distro_id"] = json!(distro_id.to_ascii_lowercase());
+    // The first hop is in the shared profile: a later save there also makes
+    // this result stale.
+    report["profile_revision"] = json!(desktop_store::revision(&path)?.to_string());
     Ok(json!({"residential_probe": report}))
 }
 
+/// The saved profile and every environment's residential row. A store from
+/// before decision 40 first gives its single proxy to the environment it was
+/// saved for, when that one is still registered.
 fn sqlite_view(path: &Path) -> Result<Value, String> {
+    if let Ok(distributions) = host::distributions() {
+        desktop_store::adopt_legacy_residential(path, &distributions)?;
+    }
     let record = desktop_store::ensure(path)?;
-    Ok(desktop_store::view(path, &record))
+    desktop_store::view(path, &record)
 }
 
 fn sqlite_save(path: &Path, req: SqliteSave) -> Result<Value, String> {
-    let record = desktop_store::save(
-        path,
-        req.profile,
-        req.desktop,
+    let record = desktop_store::save(path, req.profile, req.expected_revision)?;
+    desktop_store::view(path, &record)
+}
+
+/// A live or recorded takeover's proxy and port change only after it stops.
+fn environment_residential_save(req: EnvironmentResidentialSave) -> Result<Value, String> {
+    if crate::command::owned_by(&req.distro_id)? {
+        return Err(
+            "environment_residential_in_use: stop this environment's takeover first".into(),
+        );
+    }
+    let path = profile_path()?;
+    desktop_store::save_environment(
+        &path,
+        &req.distro_id,
         req.residential,
+        req.ingress_port,
         req.expected_revision,
     )?;
-    Ok(desktop_store::view(path, &record))
+    sqlite_view(&path)
 }
 
 fn log_command(command: &str) -> bool {
@@ -350,7 +387,6 @@ fn log_command(command: &str) -> bool {
             | "preflight"
             | "prepare_kernel"
             | "start"
-            | "switch"
             | "stop"
             | "probe_exit"
             | "residential_probe"
@@ -359,6 +395,9 @@ fn log_command(command: &str) -> bool {
             | "environment_edit"
             | "environment_backup"
             | "environment_delete"
+            | "environment_residential_save"
+            | "environment_residential_assign"
+            | "environment_residential_discard"
             | "import_credential"
             | "forget_credential"
             | "reset_dns_aliases"
@@ -410,7 +449,9 @@ fn failed_action(command: &str) -> &'static str {
         "environment_delete" => "删除环境",
         "wsl_platform_update" => "升级 WSL",
         "start" => "启动接管",
-        "switch" => "切换目标",
+        "environment_residential_save" => "保存住宅代理",
+        "environment_residential_assign" => "分配住宅代理",
+        "environment_residential_discard" => "丢弃住宅代理",
         "stop" => "停止接管",
         "preflight" => "预检",
         "prepare_kernel" => "准备内核环境",
@@ -434,7 +475,7 @@ fn command_log(command: &str, response: &Value) -> (&'static str, String, String
             format!("{action}{gap}失败（{code}）"),
         );
     }
-    if matches!(command, "start" | "switch" | "stop") && response["passed"] == false {
+    if matches!(command, "start" | "stop") && response["passed"] == false {
         let blockers = response["blockers"].as_array().map_or(0, Vec::len);
         return (
             "warning",
@@ -444,6 +485,21 @@ fn command_log(command: &str, response: &Value) -> (&'static str, String, String
     }
     match command {
         "profile_save" => ("info", "desktop_store".into(), "配置已保存到 SQLite".into()),
+        "environment_residential_save" => (
+            "info",
+            "desktop_store".into(),
+            "环境的住宅代理已保存到 SQLite".into(),
+        ),
+        "environment_residential_assign" => (
+            "info",
+            "desktop_store".into(),
+            "未分配的住宅代理已分配给环境".into(),
+        ),
+        "environment_residential_discard" => (
+            "info",
+            "desktop_store".into(),
+            "未分配的住宅代理已丢弃".into(),
+        ),
         "preflight" if response["passed"] == true => {
             ("info", "preflight".into(), "预检通过".into())
         }
@@ -474,20 +530,14 @@ fn command_log(command: &str, response: &Value) -> (&'static str, String, String
             )
         }
         "start" => ("info", "lifecycle".into(), "已开始接管".into()),
-        "switch" | "stop" if response["unproven_mappings_left"].as_u64().unwrap_or(0) > 0 => (
+        "stop" if response["unproven_mappings_left"].as_u64().unwrap_or(0) > 0 => (
             "warning",
             "lifecycle".into(),
             format!(
-                "{}；旧目标里还留着 {} 条带本次接管标记、但无法证明归属的连接跟踪记录，按设计没有删除。它们只会让各自原有的连接失败，不影响新连接，连接跟踪超时后自行消失。",
-                if command == "stop" {
-                    "已停止接管并恢复直连"
-                } else {
-                    "已切换接管目标"
-                },
+                "已停止接管并恢复直连；旧目标里还留着 {} 条带本次接管标记、但无法证明归属的连接跟踪记录，按设计没有删除。它们只会让各自原有的连接失败，不影响新连接，连接跟踪超时后自行消失。",
                 response["unproven_mappings_left"]
             ),
         ),
-        "switch" => ("info", "lifecycle".into(), "已切换接管目标".into()),
         "stop" => ("info", "lifecycle".into(), "已停止接管并恢复直连".into()),
         "probe_exit" => ("info", "diagnostics".into(), "出口检测完成".into()),
         // 只记结论，不记服务器地址和账号。
@@ -678,6 +728,23 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                 let req: SqliteSave = fields(&mut request, "invalid_desktop_profile_fields")?;
                 sqlite_save(&profile_path().map_err(bad)?, req).map_err(bad)?
             }
+            "environment_residential_save" => {
+                let req: EnvironmentResidentialSave =
+                    fields(&mut request, "invalid_environment_residential_fields")?;
+                environment_residential_save(req).map_err(bad)?
+            }
+            "environment_residential_assign" => {
+                let req: EnvironmentResidentialAssign =
+                    fields(&mut request, "invalid_environment_residential_fields")?;
+                let path = profile_path().map_err(bad)?;
+                desktop_store::assign_legacy_residential(&path, &req.distro_id).map_err(bad)?;
+                sqlite_view(&path).map_err(bad)?
+            }
+            "environment_residential_discard" => {
+                let path = profile_path().map_err(bad)?;
+                desktop_store::discard_legacy_residential(&path).map_err(bad)?;
+                sqlite_view(&path).map_err(bad)?
+            }
             "runtime_logs" => {
                 let req: RuntimeLogs = fields(&mut request, "invalid_runtime_log_fields")?;
                 desktop_store::runtime_logs(
@@ -774,8 +841,19 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                 require_idle(controller)?;
                 let req: EnvironmentDelete = fields(&mut request, "invalid_environment_fields")?;
                 let target = req.name.clone();
+                // Read before the job: the registry entry is gone afterwards.
+                let distro_id = host::distributions()
+                    .ok()
+                    .and_then(|all| all.into_iter().find(|d| d.name == req.name))
+                    .map(|d| d.id);
                 start_environment_job("environment_delete", target, move || {
                     let environment = environment::remove(&req.name)?;
+                    // Its residential proxy and port go with it.
+                    if let Some(id) = distro_id
+                        && let Ok(path) = profile_path()
+                    {
+                        let _ = desktop_store::delete_environment(&path, &id);
+                    }
                     let mut response = json!({"environment":environment});
                     if let Ok(distributions) = host::distributions() {
                         response["distributions"] = json!(distributions);
@@ -795,7 +873,10 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
             "export_diagnostics" => export(controller).map_err(bad)?,
             "residential_probe" => {
                 residential_probe_confirmed(&request)?;
-                residential_probe().map_err(bad)?
+                let distro_id = request["distro_id"]
+                    .as_str()
+                    .ok_or_else(|| bad("distro_id_required".into()))?;
+                residential_probe(distro_id).map_err(bad)?
             }
             "probe_exit" => {
                 let generation = request["expected_generation"]
@@ -811,16 +892,20 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                 return Ok((json!({"shutdown":true}), true));
             }
             "list" | "status" | "preflight" | "prepare_kernel" | "import_credential"
-            | "forget_credential" | "start" | "switch" | "stop" | "abandon"
-            | "reset_dns_aliases" | "wsl_platform" => {
-                if matches!(&*cmd, "start" | "switch" | "stop" | "abandon")
+            | "forget_credential" | "start" | "stop" | "abandon" | "reset_dns_aliases"
+            | "wsl_platform" => {
+                if matches!(&*cmd, "start" | "stop" | "abandon")
                     && request["expected_generation"].as_u64().is_none()
                 {
                     return Err(bad("expected_generation_required".into()));
                 }
-                if matches!(&*cmd, "start" | "switch") && request["profile"].is_string() {
+                if cmd == "start" && request["profile"].is_string() {
+                    // The desktop starts exactly what it showed as saved: the
+                    // shared profile and this environment's row.
                     let path = profile_path().map_err(bad)?;
-                    let expect = request.as_object_mut().unwrap().remove("profile_revision");
+                    let object = request.as_object_mut().unwrap();
+                    let expect = object.remove("profile_revision");
+                    let expect_environment = object.remove("residential_revision");
                     let current_revision = desktop_store::revision(&path).map_err(bad)?;
                     let current_revision = current_revision.to_string();
                     if request["profile"].as_str().map(Path::new) != Some(path.as_path())
@@ -829,6 +914,23 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                             != Some(current_revision.as_str())
                     {
                         return Err(bad("saved_profile_revision_required".into()));
+                    }
+                    let saved = request["target"]
+                        .as_str()
+                        .and_then(|target| {
+                            host::distributions()
+                                .ok()?
+                                .into_iter()
+                                .find(|d| d.name == target || d.id.eq_ignore_ascii_case(target))
+                        })
+                        .and_then(|d| desktop_store::environment(&path, &d.id).ok().flatten());
+                    if saved.map(|row| row.revision.to_string())
+                        != expect_environment
+                            .as_ref()
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    {
+                        return Err(bad("saved_environment_revision_required".into()));
                     }
                 }
                 let req = serde_json::from_value::<crate::command::Command>(request)
@@ -876,6 +978,62 @@ mod tests {
         assert!(
             residential_probe_confirmed(&json!({"command":"residential_probe","confirm":true}))
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_desktop_requests_for_one_environment_parse() {
+        // The shapes `drafts::environment_save_request` and the takeover card send.
+        let mut save = json!({
+            "command":"environment_residential_save",
+            "distro_id":"{44444444-4444-4444-4444-444444444444}",
+            "residential":{"protocol":"http","ip":"203.0.113.9","port":8080,"username":"fixture-user","password":"fixture-password"},
+            "ingress_port":null,
+            "expected_revision":null,
+        });
+        let request: EnvironmentResidentialSave =
+            fields(&mut save, "bad").map_err(|e| e.code).unwrap();
+        assert_eq!(request.ingress_port, None);
+        assert_eq!(request.expected_revision, None);
+        let mut later = json!({
+            "command":"environment_residential_save",
+            "distro_id":"{4444}",
+            "residential":{"protocol":"socks5","ip":"","port":0,"username":"","password":""},
+            "ingress_port":44000,
+            "expected_revision":"3",
+        });
+        let request: EnvironmentResidentialSave =
+            fields(&mut later, "bad").map_err(|e| e.code).unwrap();
+        assert_eq!(request.ingress_port, Some(44000));
+        let mut assign = json!({"command":"environment_residential_assign","distro_id":"{4444}"});
+        assert!(fields::<EnvironmentResidentialAssign>(&mut assign, "bad").is_ok());
+        // A desktop from before decision 40 still sends the target and port with
+        // the profile: refused, not silently dropped.
+        let mut old = json!({
+            "command":"profile_save",
+            "profile":{},
+            "desktop":{"target":"Target","port":43531},
+            "expected_revision":"1",
+        });
+        assert!(fields::<SqliteSave>(&mut old, "bad").is_err());
+        // A start without a port uses the one saved for the environment.
+        let start: crate::command::Command = serde_json::from_value(json!({
+            "command":"start",
+            "target":"{4444}",
+            "profile":"C:\\WSL Proxy\\desktop.sqlite",
+            "expected_generation":7,
+        }))
+        .unwrap();
+        assert!(matches!(
+            start,
+            crate::command::Command::Start { port: None, .. }
+        ));
+        // `switch` is gone from the desktop channel.
+        assert!(
+            serde_json::from_value::<crate::command::Command>(json!({
+                "command":"switch","target":"{4444}","expected_generation":7
+            }))
+            .is_err()
         );
     }
 
@@ -942,9 +1100,6 @@ mod tests {
         );
         let (level, _, message) = command_log("stop", &json!({"phase":"idle"}));
         assert_eq!((level, message.as_str()), ("info", "已停止接管并恢复直连"));
-        let (level, _, message) = command_log("switch", &json!({"unproven_mappings_left":1}));
-        assert_eq!(level, "warning");
-        assert!(message.starts_with("已切换接管目标；"), "{message}");
     }
 
     #[test]

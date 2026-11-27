@@ -53,15 +53,18 @@ impl Look {
     }
 }
 
-/// 菜单里的主操作，和首页的主按钮跟着同一套状态走。
+/// 菜单里的主操作，和首页的主按钮跟着同一套状态走。启动接管在各环境的页面上
+/// （决策 40），托盘只负责停止全部接管和带用户去对应的页面。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Primary {
     #[default]
     Reconnect,
-    ChooseTarget,
-    GoSave,
-    Start,
+    /// 空闲：去环境页选一个环境启动接管。
+    Environments,
+    /// 需要恢复：去那个环境的页面恢复或放弃。
+    Recover,
     Stop,
+    /// 需要恢复、但那个发行版已经不在 WSL 里：没有页面可去，直接放弃记录。
     Abandon,
 }
 
@@ -69,9 +72,8 @@ impl Primary {
     pub(crate) fn command(self) -> Command {
         match self {
             Self::Reconnect => Command::Reconnect,
-            Self::ChooseTarget => Command::ChooseTarget,
-            Self::GoSave => Command::GoSave,
-            Self::Start => Command::Start,
+            Self::Environments => Command::Environments,
+            Self::Recover => Command::Recover,
             Self::Stop => Command::Stop,
             Self::Abandon => Command::Abandon,
         }
@@ -79,7 +81,7 @@ impl Primary {
 
     /// 只是带用户去某一页，不发请求，界面忙的时候也能点。
     pub(crate) fn navigates(self) -> bool {
-        matches!(self, Self::ChooseTarget | Self::GoSave)
+        matches!(self, Self::Environments | Self::Recover)
     }
 }
 
@@ -133,9 +135,8 @@ impl Snapshot {
 pub(crate) enum Command {
     Open,
     Reconnect,
-    ChooseTarget,
-    GoSave,
-    Start,
+    Environments,
+    Recover,
     Stop,
     Abandon,
     Probe,
@@ -147,12 +148,11 @@ pub(crate) enum Command {
 }
 
 impl Command {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 12] = [
         Self::Open,
         Self::Reconnect,
-        Self::ChooseTarget,
-        Self::GoSave,
-        Self::Start,
+        Self::Environments,
+        Self::Recover,
         Self::Stop,
         Self::Abandon,
         Self::Probe,
@@ -180,10 +180,9 @@ impl Command {
         match self {
             Self::Open => "打开 WSL Proxy",
             Self::Reconnect => "重新连接后台",
-            Self::ChooseTarget => "选择接管目标",
-            Self::GoSave => "去保存修改",
-            Self::Start => "启动接管",
-            Self::Stop => "停止并恢复直连",
+            Self::Environments => "打开环境页",
+            Self::Recover => "去恢复接管",
+            Self::Stop => "停止全部接管",
             Self::Abandon => "放弃本次记录",
             Self::Probe => "检测公网出口",
             Self::Connections => "查看连接记录",
@@ -339,17 +338,15 @@ mod tests {
     fn the_menu_offers_exactly_one_primary_action() {
         let primaries = [
             Command::Reconnect,
-            Command::ChooseTarget,
-            Command::GoSave,
-            Command::Start,
+            Command::Environments,
+            Command::Recover,
             Command::Stop,
             Command::Abandon,
         ];
         for (primary, expected) in [
             (Primary::Reconnect, Command::Reconnect),
-            (Primary::ChooseTarget, Command::ChooseTarget),
-            (Primary::GoSave, Command::GoSave),
-            (Primary::Start, Command::Start),
+            (Primary::Environments, Command::Environments),
+            (Primary::Recover, Command::Recover),
             (Primary::Stop, Command::Stop),
             (Primary::Abandon, Command::Abandon),
         ] {
@@ -387,8 +384,10 @@ mod tests {
         assert_eq!(enabled(&entries, Command::Logs), Some(true));
         assert_eq!(enabled(&entries, Command::Exit), Some(true));
         assert_eq!(entries[1], Entry::Text("正在启动接管…".into()));
-        let entries = menu(&busy(Primary::GoSave));
-        assert_eq!(enabled(&entries, Command::GoSave), Some(true));
+        for primary in [Primary::Environments, Primary::Recover] {
+            let entries = menu(&busy(primary));
+            assert_eq!(enabled(&entries, primary.command()), Some(true));
+        }
     }
 
     #[test]

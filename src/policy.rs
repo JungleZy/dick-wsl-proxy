@@ -508,7 +508,7 @@ fn same_endpoint(left: SocketAddr, right: SocketAddr) -> bool {
 }
 
 impl Policy {
-    pub fn from_file(path: &Path) -> Result<Self, String> {
+    pub fn from_file(path: &Path, distro_id: &str) -> Result<Self, String> {
         let file = File::open(path).map_err(|_| "cannot open policy file")?;
         let mut bytes = Vec::new();
         file.take(MAX_CONFIG + 1)
@@ -520,7 +520,7 @@ impl Policy {
         let config = profile::decode_policy(&bytes)?;
         let validated = Validated::new(config)?;
         // Residential settings live in the local SQLite store, not the policy file.
-        let residential = crate::desktop_store::load_credential()?;
+        let residential = crate::desktop_store::load_credential(distro_id)?;
         Self::assemble(validated, residential)
     }
 

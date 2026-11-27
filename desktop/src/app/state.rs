@@ -66,10 +66,16 @@ pub(crate) struct Desktop {
     pub(crate) dns_history: Vec<f32>,
     pub(crate) dns_checked_at: Option<u64>,
     pub(crate) distributions: Vec<Value>,
+    /// 环境页正在看的环境的 ID。住宅代理和入口端口输入框装的是它的配置，
+    /// 详情页上的「启动接管」也是启动它。
     pub(crate) selected: Option<String>,
-    pub(crate) saved_selected: Option<String>,
     pub(crate) profile: Value,
-    pub(crate) residential: Value,
+    /// 配置库里各环境的住宅代理和入口端口（决策 40），每项带 `distro_id`、`revision`、
+    /// `residential`、`ingress_port`。
+    pub(crate) environments: Vec<Value>,
+    /// 旧版本留下、还没分给任何环境的那一份住宅代理（`residential` 和当时的 `target`）；
+    /// 没有时为 `null`。
+    pub(crate) unassigned_residential: Value,
     pub(crate) profile_path: Option<String>,
     pub(crate) revision: Value,
     pub(crate) profile_exists: bool,
@@ -77,10 +83,7 @@ pub(crate) struct Desktop {
     pub(crate) unsaved: Unsaved,
     /// 正在保存的是哪一页；回复到了只重置这一页的输入框。
     pub(crate) saving: Option<SaveScope>,
-    /// 在途的保存是自动清除失效的接管目标，不是用户点的保存。
-    pub(crate) clearing_target: bool,
     pub(crate) loading_fields: bool,
-    pub(crate) saved_port: String,
     pub(crate) preflight: Option<Value>,
     pub(crate) pending_prepare: Option<PendingPrepare>,
     pub(crate) notice: String,
@@ -92,7 +95,7 @@ pub(crate) struct Desktop {
     pub(crate) autostart_enabled: bool,
     /// 设置页「远端解析」勾选框的当前值；保存设置时写进策略的 `fake_ip`。
     pub(crate) fake_ip_draft: bool,
-    /// 设置页住宅代理「协议」的当前选择（`socks5` 或 `http`）；保存设置时随住宅代理写入。
+    /// 环境页住宅代理「协议」的当前选择（`socks5` 或 `http`）；保存时随住宅代理写入。
     pub(crate) residential_protocol_draft: &'static str,
     pub(crate) confirmation: Option<Confirmation>,
     pub(crate) confirmation_pending: bool,
@@ -159,12 +162,13 @@ pub(crate) struct Desktop {
     pub(crate) wsl_platform_checking: bool,
     /// 最近一次 WSL 升级的结果，含升级前后的版本。
     pub(crate) wsl_update_result: Option<Value>,
-    /// 最近一次住宅代理检测的结果（带检测时的配置版本）、失败原因、完成时刻和是否在检测中。
+    /// 最近一次住宅代理检测的结果（带检测的环境 `distro_id` 和那时的配置版本）、失败原因、
+    /// 完成时刻和是否在检测中。只在环境页看的是同一个环境时显示。
     pub(crate) residential_probe: Option<Value>,
     pub(crate) residential_probe_error: Option<String>,
     pub(crate) residential_probe_at: Option<Instant>,
     pub(crate) residential_probe_checking: bool,
-    /// 还没弹出的保存结果（规则页、设置页的保存，环境页的「设为目标」）：`Ok` 是成功提示，
+    /// 还没弹出的保存结果（规则页、设置页、环境页住宅代理的保存）：`Ok` 是成功提示，
     /// `Err` 是可读的失败原因。推通知要用 `Window`，所以先记在这里，下一次界面刷新时用
     /// gpui-kit 的 Notification 弹出，弹出后清空。
     pub(crate) save_notice: Option<Result<String, String>>,
