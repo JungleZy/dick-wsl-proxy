@@ -15,6 +15,7 @@ mod environment_facts;
 mod instance;
 mod integrity;
 mod island;
+mod launcher;
 mod model;
 mod overview;
 mod policy;
@@ -65,9 +66,10 @@ pub fn run() {
                         // 后台留着，再次打开 EXE 会重新连上。
                         true
                     };
-                    // 岛也是 gpui 窗口：它还开着，主窗口关了进程也不会退出。
+                    // 岛和应用窗口也是 gpui 窗口：它们还开着，主窗口关了进程也不会退出。
                     if closing {
                         island::close(cx);
+                        launcher::close(cx);
                     }
                     closing
                 });

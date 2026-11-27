@@ -107,7 +107,8 @@ pub(crate) struct Desktop {
     pub(crate) environment_edit_target: Option<String>,
     pub(crate) environment_selected: Option<String>,
     pub(crate) environment_detail: Option<Value>,
-    /// 环境详情里「已安装应用」卡片：最近一次读到的列表（带环境名）、失败原因、是否在读。
+    /// 「已安装应用」窗口（[`super::launcher`]）显示的内容：最近一次读到的列表（带环境名）、
+    /// 失败原因、是否在读。
     pub(crate) environment_apps: Option<Value>,
     pub(crate) environment_apps_error: Option<String>,
     pub(crate) environment_apps_loading: bool,
@@ -115,6 +116,8 @@ pub(crate) struct Desktop {
     pub(crate) environment_apps_requested: Option<String>,
     /// 正在启动的应用（桌面文件 ID）；同一时间只启动一个。
     pub(crate) environment_launching: Option<String>,
+    /// 最近一次启动的结果，显示在应用窗口里：`Ok` 是成功说明，`Err` 是失败原因。
+    pub(crate) environment_launch_result: Option<Result<String, String>>,
     pub(crate) environment_started: Option<Instant>,
     /// 最近一次在后台读到的环境操作进度，见 [`EnvironmentProgress`]。
     pub(crate) environment_progress_snapshot: Option<EnvironmentProgress>,

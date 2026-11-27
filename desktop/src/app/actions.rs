@@ -1093,6 +1093,55 @@ impl Desktop {
             .to_owned()
     }
 
+    /// 详情页的「已安装应用」按钮：打开（或叫到前面）应用窗口，并重读当前环境的列表。
+    pub(crate) fn open_app_launcher(&mut self, cx: &mut Context<Self>) {
+        if self.environment_detail.is_none() {
+            return;
+        }
+        self.environment_launch_result = None;
+        self.refresh_environment_apps(cx);
+        super::launcher::open(cx.entity(), cx);
+        cx.notify();
+    }
+
+    /// 应用窗口里的流量提示：这个环境不是接管目标、或者接管没启动时，应用直连上网。
+    pub(crate) fn environment_traffic_hint(&self, name: &str) -> Option<&'static str> {
+        let id = self
+            .distributions
+            .iter()
+            .find(|distro| {
+                distro["name"]
+                    .as_str()
+                    .is_some_and(|listed| listed.eq_ignore_ascii_case(name))
+            })
+            .and_then(|distro| distro["id"].as_str());
+        let target = id.is_some() && self.selected.as_deref() == id;
+        if !target {
+            Some("这个环境不是接管目标：从这里启动的应用直连上网，不经代理。")
+        } else if self.phase() == "idle" {
+            Some("接管没有启动：从这里启动的应用现在直连上网。")
+        } else {
+            None
+        }
+    }
+
+    /// 应用列表所属环境有没有 WSLg。只在确定不可用时返回 `false`；没读到（旧后台、
+    /// 详情已换成别的环境）时照样让用户试。
+    pub(crate) fn environment_apps_graphics(&self) -> bool {
+        let listed = self
+            .environment_apps
+            .as_ref()
+            .and_then(|apps| apps["name"].as_str());
+        let detail = self.environment_detail.as_ref();
+        let same = listed
+            .zip(detail.and_then(|detail| detail["name"].as_str()))
+            .is_some_and(|(listed, name)| listed.eq_ignore_ascii_case(name));
+        !(same
+            && detail.is_some_and(|detail| {
+                super::environment_facts::graphics(&detail["features"]) == "WSLg 不可用"
+            }))
+    }
+
     /// 在环境里以默认用户启动一个应用。不要求空闲：在接管中的环境里开应用正是用途。
     pub(crate) fn environment_launch(&mut self, app: String, cx: &mut Context<Self>) {
         if self.environment_launching.is_some() || self.busy.is_some() {
@@ -1107,6 +1156,7 @@ impl Desktop {
             return;
         };
         self.environment_launching = Some(app.clone());
+        self.environment_launch_result = None;
         self.send(
             Kind::EnvironmentLaunch,
             json!({"command":"environment_launch","name":name,"app":app}),

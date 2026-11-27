@@ -313,6 +313,7 @@ impl Desktop {
             environment_apps_loading: false,
             environment_apps_requested: None,
             environment_launching: None,
+            environment_launch_result: None,
             environment_started: None,
             environment_progress_snapshot: None,
             environment_progress_reading: false,
@@ -1350,7 +1351,9 @@ impl Desktop {
                 self.environment_editor = None;
                 self.environment_edit_target = None;
                 self.environment_apps = None;
-                self.refresh_environment_apps(cx);
+                if super::launcher::is_open() {
+                    self.refresh_environment_apps(cx);
+                }
                 self.error = false;
                 self.notice = "环境创建成功，组件安装已完成。".into();
             }
@@ -1650,14 +1653,14 @@ impl Desktop {
         }
     }
 
-    /// 启动结果弹成通知：应用窗口由 WSLg 打开，界面上没有别的地方能看到结果。
+    /// 启动结果写进应用窗口：用户是在那个窗口里点的，主窗口可能在托盘里。
     fn accept_environment_launch(&mut self, result: Result<Value, String>) {
         let app = self.environment_launching.take();
         let label = app
             .as_deref()
             .map(|id| self.environment_app_name(id))
             .unwrap_or_else(|| "应用".into());
-        self.save_notice = Some(match result {
+        self.environment_launch_result = Some(match result {
             Ok(_) => Ok(format!("已启动 {label}，窗口出现可能要几秒。")),
             Err(error) => Err(format!(
                 "启动 {label} 失败：{}",
@@ -1680,11 +1683,14 @@ impl Desktop {
             .is_some_and(|(listed, name)| listed.eq_ignore_ascii_case(name));
         if !same_environment {
             self.environment_apps = None;
+            self.environment_launch_result = None;
         }
         self.environment_apps_error = None;
         self.environment_detail = Some(value.clone());
-        // 每次读详情都重读应用：刷新详情也是用户想看最新状态的时候。
-        self.refresh_environment_apps(cx);
+        // 应用窗口开着时跟着详情换环境、刷新；没开着就不在发行版里多跑一次列表脚本。
+        if super::launcher::is_open() {
+            self.refresh_environment_apps(cx);
+        }
         if let Some(features) = value.get("features") {
             self.environment_zsh = features["zsh"].as_bool().unwrap_or(false);
             self.environment_chrome = features["chrome"].as_bool().unwrap_or(false);

@@ -223,7 +223,11 @@ fn theme_toggle_button(cx: &Context<Desktop>) -> Button {
         }))
 }
 
-fn window_control_button(area: WindowControlArea, icon: IconName, close: bool) -> impl IntoElement {
+pub(crate) fn window_control_button(
+    area: WindowControlArea,
+    icon: IconName,
+    close: bool,
+) -> impl IntoElement {
     div()
         .id(if close {
             "window-close"
@@ -1242,119 +1246,6 @@ impl Desktop {
         .min_h_0()
     }
 
-    /// 「已安装应用」：环境里 .desktop 入口列出的图形应用，点一下以默认用户启动。
-    fn environment_apps_section(&self, features: &Value, id: &str, cx: &Context<Self>) -> Div {
-        let apps = self
-            .environment_apps
-            .as_ref()
-            .and_then(|apps| apps["apps"].as_array());
-        let count = apps.map(Vec::len);
-        let graphics = environment_facts::graphics(features);
-        // 只有确定没有 WSLg 时才禁用；旧后台没读这一项（未读取）时照样让用户试。
-        let no_graphics = graphics == "WSLg 不可用";
-        let busy = self.busy.is_some();
-        let launching = self.environment_launching.as_deref();
-        let target = self.selected.as_deref() == Some(id);
-        let traffic_hint = if !target {
-            Some((
-                "这个环境不是接管目标：从这里启动的应用直连上网，不经代理。",
-                AMBER,
-            ))
-        } else if self.phase() == "idle" {
-            Some(("接管没有启动：从这里启动的应用现在直连上网。", AMBER))
-        } else {
-            None
-        };
-        let header = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().text_sm().child("已安装应用"))
-                    .children(count.map(|count| {
-                        div()
-                            .text_sm()
-                            .text_color(rgb(MUTED))
-                            .child(format!("{count} 个"))
-                    })),
-            )
-            .child(
-                Button::new("environment-apps-refresh")
-                    .icon(design_icon("refresh", 15., MUTED))
-                    .accessibility_label("重新读取应用列表")
-                    .tooltip("重新读取应用列表")
-                    .ghost()
-                    .compact()
-                    .disabled(self.environment_apps_loading || busy)
-                    .on_click(cx.listener(|this, _, _, cx| this.refresh_environment_apps(cx))),
-            );
-        let muted = |message: String| div().text_sm().text_color(rgb(MUTED)).child(message);
-        let body = if let Some(error) = self.environment_apps_error.as_ref() {
-            div()
-                .text_sm()
-                .text_color(rgb(AMBER))
-                .child(format!("读取应用列表失败：{error}"))
-        } else if let Some(apps) = apps {
-            if apps.is_empty() {
-                muted(
-                    "没有找到图形应用。这里只列 .desktop 入口里登记、不在终端里运行的程序。".into(),
-                )
-            } else {
-                let mut grid = div().flex().flex_wrap().gap_2();
-                for (index, app) in apps.iter().enumerate() {
-                    let app_id = app["id"].as_str().unwrap_or_default().to_owned();
-                    let name = app["name"].as_str().unwrap_or(app_id.as_str()).to_owned();
-                    let starting = launching == Some(app_id.as_str());
-                    let label = if starting {
-                        format!("{name}（启动中）")
-                    } else {
-                        name.clone()
-                    };
-                    grid = grid.child(
-                        Button::new(("environment-app", index))
-                            .icon(design_icon("play", 14., TEAL))
-                            .label(label)
-                            .tooltip(format!("启动 {name}（{app_id}）"))
-                            .small()
-                            .disabled(no_graphics || busy || launching.is_some())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.environment_launch(app_id.clone(), cx)
-                            })),
-                    );
-                }
-                grid
-            }
-        } else if self.environment_apps_loading {
-            muted("正在读取环境里的应用…".into())
-        } else {
-            muted("还没有读取应用列表。".into())
-        };
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(header)
-            .children(no_graphics.then(|| {
-                div()
-                    .text_sm()
-                    .text_color(rgb(AMBER))
-                    .child("WSLg 不可用，无法启动图形应用。")
-            }))
-            .children(
-                traffic_hint
-                    .map(|(message, color)| div().text_sm().text_color(rgb(color)).child(message)),
-            )
-            .child(body)
-            .child(muted(
-                "以环境的默认用户启动；环境没运行时会先启动它。".into(),
-            ))
-    }
-
     fn environment_detail_card(&self, detail: &Value, locked: bool, cx: &Context<Self>) -> Div {
         let features = &detail["features"];
         let name = text(detail, "name", "未命名");
@@ -1531,6 +1422,18 @@ impl Desktop {
                                     })),
                             )
                             .child(
+                                Button::new("environment-detail-apps")
+                                    .icon(design_icon("apps", 15., MUTED))
+                                    .accessibility_label("已安装应用")
+                                    .tooltip("已安装应用：在新窗口里列出并启动")
+                                    .ghost()
+                                    .compact()
+                                    .disabled(locked)
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.open_app_launcher(cx)),
+                                    ),
+                            )
+                            .child(
                                 Button::new("environment-detail-edit")
                                     .icon(design_icon("edit", 15., MUTED))
                                     .accessibility_label("编辑环境")
@@ -1629,7 +1532,6 @@ impl Desktop {
                     )
                     .child(system_info),
             )
-            .child(self.environment_apps_section(features, &id, cx))
             .child(div().text_sm().child("环境能力"))
             .child(feature_grid)
             .children(repair_hint)
