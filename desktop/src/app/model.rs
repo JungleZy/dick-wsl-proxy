@@ -397,8 +397,8 @@ pub(crate) struct Fields {
     pub(crate) max_tcp_connections: Field,
     pub(crate) tcp_idle_timeout: Field,
     pub(crate) tcp_half_close_timeout: Field,
-    pub(crate) port: Field,
     pub(crate) environment_name: Field,
+    pub(crate) environment_hostname: Field,
     pub(crate) environment_distribution: Field,
     pub(crate) environment_install: Field,
     pub(crate) environment_backup: Field,
@@ -434,11 +434,8 @@ pub(crate) enum UiAction {
     /// 只保存这一页的输入。
     Save(super::drafts::SaveScope),
     Probe,
-    Prepare(Kind),
     /// 停止或放弃某一个环境的接管（scope 或注册表 GUID）。
     PrepareFor(Kind, String),
-    /// 停止全部接管。
-    StopAll,
     /// 启动某一个环境的接管（注册表 GUID）。
     StartFor(String),
     Reveal,

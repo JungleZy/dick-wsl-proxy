@@ -138,82 +138,45 @@ pub(crate) fn chart_card(
 const READY: (&str, u32, u32) = ("已就绪", TEAL, SUCCESS_BG);
 const NOT_READ: (&str, u32, u32) = ("未读取", MUTED, SURFACE_SOFT);
 
-/// 环境详情里的一项：名称和状态标签同一行，下一行写用途或缺了什么（可换行）。
-fn environment_feature(
+/// 详情页里的一行：名称、说明、右侧状态标签。用行代替每项一个方块，页面安静得多。
+fn status_line(
     label: &'static str,
-    (status, color, background): (&'static str, u32, u32),
     detail: impl Into<SharedString>,
+    (status, color, background): (&'static str, u32, u32),
 ) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_3()
+        .py_1()
+        .child(div().w(px(112.)).flex_shrink_0().text_sm().child(label))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_sm()
+                .text_color(rgb(MUTED))
+                .child(detail.into()),
+        )
+        .child(badge(status, color, background))
+}
+
+/// 详情页系统信息里的一格：上面是 muted 名称，下面是等宽的值。
+fn info_cell(label: &'static str, value: impl Into<SharedString>) -> Div {
     div()
         .flex()
         .flex_col()
         .gap_1()
         .flex_1()
         .min_w(px(150.))
-        .p_2()
-        .bg(rgb(SURFACE_SOFT))
-        .rounded_md()
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(div().text_sm().child(label))
-                .child(badge(status, color, background)),
-        )
-        .child(div().text_sm().text_color(rgb(MUTED)).child(detail.into()))
-}
-
-/// 可选组件：齐了写用途，缺东西时写缺了什么。
-fn component_feature(label: &'static str, component: Component, purpose: &'static str) -> Div {
-    match component.state {
-        ComponentState::Ready => environment_feature(label, READY, purpose),
-        ComponentState::Incomplete => environment_feature(
-            label,
-            ("需要补齐", AMBER, WARNING_BG),
-            component.gaps.join("；"),
-        ),
-        // 自己装的不推「编辑 → 保存设置」，只写出跟本工具装的相比缺什么。
-        ComponentState::Foreign => environment_feature(
-            label,
-            ("手动安装", MUTED, SURFACE_SOFT),
-            format!("非本工具安装：{}", component.gaps.join("；")),
-        ),
-        ComponentState::Missing => {
-            environment_feature(label, ("未安装", MUTED, SURFACE_SOFT), purpose)
-        }
-        ComponentState::Unknown => environment_feature(label, NOT_READ, purpose),
-    }
-}
-
-/// 接管要用的命令：只报在不在；能不能用（比如是不是 legacy 版本）由预检判断。
-fn takeover_tool(label: &'static str, present: Option<bool>, purpose: &'static str) -> Div {
-    match present {
-        Some(true) => environment_feature(label, ("已安装", TEAL, SUCCESS_BG), purpose),
-        Some(false) => environment_feature(label, ("未安装", AMBER, WARNING_BG), purpose),
-        None => environment_feature(label, NOT_READ, purpose),
-    }
-}
-
-fn environment_info(label: &'static str, value: impl Into<SharedString>) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .flex_1()
-        .min_w(px(128.))
-        .p_2()
-        .bg(rgb(SURFACE_SOFT))
-        .rounded_md()
         .child(div().text_sm().text_color(rgb(MUTED)).child(label))
-        .child(
-            div()
-                .font_family(MONO_FONT)
-                .text_sm()
-                .truncate()
-                .child(value.into()),
-        )
+        // 不截断：内核这类长值换行显示全，其余值本来就只有一行。
+        .child(div().font_family(MONO_FONT).text_sm().child(value.into()))
+}
+
+/// 两段之间的分隔线；内容放在它下面。
+fn section_rule() -> Div {
+    div().pt_3().border_t_1().border_color(rgb(RULE))
 }
 
 fn theme_toggle_button(cx: &Context<Desktop>) -> Button {
@@ -1028,14 +991,38 @@ impl Desktop {
     }
 
     fn environment_editor_card(&self, creating: bool, locked: bool, cx: &Context<Self>) -> Div {
-        let mut body = div().flex().flex_col().gap_3().flex_1().min_h_0();
+        // 字段区可滚动，底部的「创建并设置 / 取消」固定在卡片底部：窗口高 708 时
+        // 这张表单放不下全部字段，之前用 h_full 把内容裁掉、又没有滚动区，按钮看不到。
+        // 字段列不能被滚动区压缩：压缩后内容会被裁掉而滚动区认为没有溢出，
+        // 滚轮就滚不动（实测）。让它保持自然高度，溢出多少由滚动区处理。
+        let mut body = div().flex().flex_col().gap_3().min_w_0().flex_shrink_0();
         if creating {
-            body = body.child(self.compact_field(
-                "环境名称",
-                "environment-name-help",
-                "只能使用字母、数字、点、下划线和短横线，且必须以字母或数字开头。",
-                &self.fields.environment_name,
-            ));
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_3()
+                    .child(
+                        self.compact_field(
+                            "环境名称",
+                            "environment-name-help",
+                            "只能使用字母、数字、点、下划线和短横线，且必须以字母或数字开头。",
+                            &self.fields.environment_name,
+                        )
+                        .flex_1()
+                        .min_w_0(),
+                    )
+                    .child(
+                        self.compact_field(
+                            "主机名",
+                            "environment-hostname-help",
+                            "Claude 等桌面程序显示为本机设备名；留空则与环境名相同。",
+                            &self.fields.environment_hostname,
+                        )
+                        .flex_1()
+                        .min_w_0(),
+                    ),
+            );
         } else {
             body = body.child(
                 div()
@@ -1062,47 +1049,64 @@ impl Desktop {
             );
         }
         if creating {
+            // 安装目录和发行版并排，说明文字都收进 ⓘ 悬停提示：以前这两段是输入框
+            // 下面各占一行的小字，占高度、也对不齐。
+            let install_tooltip = {
+                let base = Self::field_value(&self.fields.environment_install, cx);
+                let name = Self::field_value(&self.fields.environment_name, cx);
+                let preview = if base.is_empty() || name.is_empty() {
+                    "实际路径将在填写父目录和环境名称后生成。".to_owned()
+                } else {
+                    format!("实际路径 {}", Self::environment_install_path(&base, &name))
+                };
+                format!("选择父目录，系统会自动创建环境名称子目录。{preview}")
+            };
             body = body
                 .child(
                     div()
                         .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(self.field_label(
-                            "发行版",
-                            "environment-distribution-help",
-                            "从微软 WSL 官方发行版列表中选择。",
-                        ))
+                        .flex_wrap()
+                        .gap_3()
                         .child(
-                            Select::new(&self.environment_distribution_select)
-                                .placeholder("选择官方发行版")
-                                .accessibility_label("发行版")
-                                .menu_width(px(360.))
-                                .menu_max_h(px(280.))
-                                .disabled(locked),
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .flex_1()
+                                .min_w(px(180.))
+                                .child(self.field_label(
+                                    "发行版",
+                                    "environment-distribution-help",
+                                    "从微软 WSL 官方发行版列表中选择。",
+                                ))
+                                .child(
+                                    Select::new(&self.environment_distribution_select)
+                                        .placeholder("选择官方发行版")
+                                        .accessibility_label("发行版")
+                                        .menu_width(px(360.))
+                                        .menu_max_h(px(280.))
+                                        .disabled(locked),
+                                ),
+                        )
+                        .child(
+                            self.field_with_action(
+                                "安装目录",
+                                "environment-install-help",
+                                install_tooltip,
+                                &self.fields.environment_install,
+                                self.button(
+                                    "env-pick-install",
+                                    "选择目录",
+                                    UiAction::EnvironmentPickInstall,
+                                    locked,
+                                    cx,
+                                ),
+                            )
+                            .flex_1()
+                            .flex_grow(2.)
+                            .min_w(px(300.)),
                         ),
                 )
-                .child(self.field_with_action(
-                    "安装目录",
-                    "选择父目录，系统会自动创建环境名称子目录。",
-                    &self.fields.environment_install,
-                    self.button(
-                        "env-pick-install",
-                        "选择目录",
-                        UiAction::EnvironmentPickInstall,
-                        locked,
-                        cx,
-                    ),
-                ))
-                .child(div().text_sm().text_color(rgb(MUTED)).child({
-                    let base = Self::field_value(&self.fields.environment_install, cx);
-                    let name = Self::field_value(&self.fields.environment_name, cx);
-                    if base.is_empty() || name.is_empty() {
-                        "实际路径将在填写父目录和环境名称后生成。".to_owned()
-                    } else {
-                        format!("实际路径 {}", Self::environment_install_path(&base, &name))
-                    }
-                }))
                 .child(
                     div()
                         .flex()
@@ -1129,7 +1133,12 @@ impl Desktop {
                             .min_w_0(),
                         ),
                 )
-                .child(self.create_residential_section(locked, cx));
+                .child(self.residential_editor(true, locked, cx));
+        } else {
+            // 详情页只读，住宅代理的修改入口在这里：旧版本留下的未分配提示和编辑框。
+            body = body
+                .children(self.unassigned_residential_notice(cx))
+                .child(self.residential_editor(false, locked, cx));
         }
         body = body.child(
             div()
@@ -1213,7 +1222,6 @@ impl Desktop {
                         .child(EDIT_LANGUAGE_NOTE),
                 );
         }
-        body = body.child(div().flex_1());
         let action_bar = ButtonGroup::new("environment-editor-actions")
             .child(
                 self.button(
@@ -1245,7 +1253,24 @@ impl Desktop {
                 )
                 .icon(design_icon("close", 15., MUTED)),
             );
-        body = body.child(div().flex().justify_end().child(action_bar));
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .flex_1()
+            .min_h_0()
+            .child(
+                div()
+                    .id("environment-editor-scroll")
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(body),
+            )
+            .child(div().flex().justify_end().child(action_bar));
         card(
             if creating {
                 "新增 WSL 环境"
@@ -1259,6 +1284,158 @@ impl Desktop {
         .min_h_0()
     }
 
+    /// 首页中间的环境总览：每个发行版一行，代理/接管两个标记、入口端口和这个环境自己的
+    /// 启停按钮；点一行打开它的详情。首页不滚动，行多时这里自己滚。
+    /// 首页中间的环境卡片：每个发行版一张卡，两个状态标记和这个环境自己的
+    /// 启停按钮；点卡片打开它的详情。卡片两列铺开，行多时这里自己滚。
+    /// 首页的环境卡片：固定宽高、横向排列，超出时这一行自己横向滚动；点卡片打开详情。
+    pub(crate) fn home_environment_cards(&self, cx: &Context<Self>) -> Stateful<Div> {
+        let locked = self.locked();
+        let mut row = div()
+            .id("home-environments")
+            .flex()
+            .flex_row()
+            .gap_2()
+            .h(px(100.))
+            .flex_shrink_0()
+            // 卡片少时右边也是这条底色，不露出页面底色。
+            .px_2()
+            .bg(rgb(SURFACE))
+            .rounded_md()
+            .overflow_x_scroll();
+        for (index, distro) in self.distributions.iter().enumerate() {
+            row = row.child(self.home_environment_tile(index, distro, locked, cx));
+        }
+        if self.distributions.is_empty() {
+            row = row.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .child(design_icon("environment", 20., MUTED))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(MUTED))
+                            .child("没有发现 WSL2 发行版"),
+                    ),
+            );
+        }
+        row
+    }
+
+    /// 首页的一张环境卡：200 × 140，名称、住宅地址、两个标记和启停按钮。
+    fn home_environment_tile(
+        &self,
+        index: usize,
+        distro: &Value,
+        locked: bool,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let id = text(distro, "id", "");
+        let name = text(distro, "name", "未命名发行版");
+        let version = distro["version"].as_u64().unwrap_or_default();
+        let click_name = name.clone();
+        let key_name = name.clone();
+        let server = {
+            let residential = super::drafts::environment_row(&self.environments, &id)
+                .map(|row| row["residential"].clone())
+                .unwrap_or(Value::Null);
+            let ip = super::drafts::saved_residential_text(&residential, "ip")
+                .trim()
+                .to_owned();
+            if ip.is_empty() {
+                "未配置".to_owned()
+            } else {
+                format!(
+                    "{ip}:{}",
+                    super::drafts::saved_residential_text(&residential, "port")
+                )
+            }
+        };
+        let action = (version == 2)
+            .then(|| self.environment_row_action(index, &id, locked, cx))
+            .map(|button| div().flex_shrink_0().child(button));
+        div()
+            .id(("home-environment", index))
+            .role(Role::Button)
+            .aria_label("查看环境详情")
+            .focusable()
+            .tab_stop(true)
+            .focus_visible(|style| style.border_1().border_color(rgb(ACCENT)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.environment_view(click_name.clone(), window, cx);
+                this.open_page(Page::Environment, cx);
+            }))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    this.environment_view(key_name.clone(), window, cx);
+                    this.open_page(Page::Environment, cx);
+                }
+            }))
+            .flex()
+            .flex_col()
+            .justify_between()
+            .gap_1()
+            .w(px(200.))
+            .h_full()
+            .flex_shrink_0()
+            .p_3()
+            .bg(rgb(SURFACE_SOFT))
+            .border_1()
+            .border_color(rgb(RULE))
+            .rounded_md()
+            .hover(|style| style.bg(rgb(HOVER)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .child(icon("icons/square-terminal.svg")),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(name)),
+            )
+            .when(version == 2, |card| {
+                card.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .min_w_0()
+                        .child(div().flex_shrink_0().text_color(rgb(MUTED)).child("住宅"))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .font_family(MONO_FONT)
+                                .text_color(rgb(MUTED))
+                                .child(server),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(self.environment_status_badges(&id))
+                        .children(action),
+                )
+            })
+            .when(version != 2, |card| {
+                card.child(div().flex().items_center().child(badge(
+                    "WSL 1 不支持",
+                    RUST,
+                    super::theme::DANGER_BG,
+                )))
+            })
+    }
     fn environment_detail_card(&self, detail: &Value, locked: bool, cx: &Context<Self>) -> Div {
         let features = &detail["features"];
         let name = text(detail, "name", "未命名");
@@ -1266,7 +1443,7 @@ impl Desktop {
         let backup_name = name.clone();
         let delete_name = name.clone();
         let id = text(detail, "id", "");
-        let role = self.environment_role_badge(&id);
+        let status = self.environment_status_badges(&id);
         let base_path = text(detail, "base_path", "未读取");
         let location_path = base_path.clone();
         let location_available = base_path != "未读取" && !base_path.is_empty();
@@ -1281,17 +1458,33 @@ impl Desktop {
             .iter()
             .any(|component| component.state == ComponentState::Incomplete);
         let [zsh, chrome, chinese] = components;
-        let feature_grid = div()
+        // 能力和接管基础都用行式状态，一项一行，不再一项套一个方块。
+        let component_line = |label: &'static str, component: Component, purpose: &'static str| {
+            let (status, detail) = match component.state {
+                ComponentState::Ready => (READY, purpose.to_owned()),
+                ComponentState::Incomplete => {
+                    (("需要补齐", AMBER, WARNING_BG), component.gaps.join("；"))
+                }
+                // 自己装的不推「编辑 → 保存设置」，只写出跟本工具装的相比缺什么。
+                ComponentState::Foreign => (
+                    ("手动安装", MUTED, SURFACE_SOFT),
+                    format!("非本工具安装：{}", component.gaps.join("；")),
+                ),
+                ComponentState::Missing => (("未安装", MUTED, SURFACE_SOFT), purpose.to_owned()),
+                ComponentState::Unknown => (NOT_READ, purpose.to_owned()),
+            };
+            status_line(label, detail, status)
+        };
+        let capabilities = div()
             .flex()
-            .flex_wrap()
-            .gap_2()
-            .child(component_feature("zsh", zsh, "终端工具"))
-            .child(component_feature(
+            .flex_col()
+            .child(component_line("zsh", zsh, "终端工具"))
+            .child(component_line(
                 "Chrome",
                 chrome,
                 "图形浏览器和 chrome 启动器",
             ))
-            .child(component_feature(
+            .child(component_line(
                 "中文输入法",
                 chinese,
                 "fcitx5 拼音和 zh_CN 语言包",
@@ -1302,101 +1495,93 @@ impl Desktop {
                 "有组件需要补齐：点右上角「编辑」后直接「保存设置」，会按当前版本重装勾选的组件（保存会重启该发行版；装了 Chrome 或中文输入法时，系统语言会改成 en_US）。",
             )
         });
-        let systemd = match environment_facts::systemd(features) {
-            Systemd::Running => {
-                environment_feature("systemd", ("运行中", TEAL, SUCCESS_BG), "PID 1 是 systemd")
-            }
-            Systemd::ConfiguredNotRunning => environment_feature(
-                "systemd",
-                ("未运行", AMBER, WARNING_BG),
-                "wsl.conf 已开启，重启发行版后生效；仍不运行时检查是否装了 systemd",
-            ),
-            Systemd::Off => environment_feature(
-                "systemd",
-                ("未开启", AMBER, WARNING_BG),
-                "wsl.conf 没开启；「编辑 → 保存设置」会开启",
-            ),
-            Systemd::Unknown => environment_feature("systemd", NOT_READ, "接管需要"),
+        let tool_status = |present: Option<bool>| match present {
+            Some(true) => ("已安装", TEAL, SUCCESS_BG),
+            Some(false) => ("未安装", AMBER, WARNING_BG),
+            None => NOT_READ,
         };
-        let takeover_grid = div()
+        let systemd_line = match environment_facts::systemd(features) {
+            Systemd::Running => {
+                status_line("systemd", "PID 1 是 systemd", ("运行中", TEAL, SUCCESS_BG))
+            }
+            Systemd::ConfiguredNotRunning => status_line(
+                "systemd",
+                "wsl.conf 已开启，重启发行版后生效；仍不运行时检查是否装了 systemd",
+                ("未运行", AMBER, WARNING_BG),
+            ),
+            Systemd::Off => status_line(
+                "systemd",
+                "wsl.conf 没开启；「编辑 → 保存设置」会开启",
+                ("未开启", AMBER, WARNING_BG),
+            ),
+            Systemd::Unknown => status_line("systemd", "接管需要", NOT_READ),
+        };
+        let basics = div()
             .flex()
-            .flex_wrap()
-            .gap_2()
-            .child(systemd)
-            .child(takeover_tool(
+            .flex_col()
+            .child(systemd_line)
+            .child(status_line(
                 "iptables-legacy",
-                features["iptables_legacy"].as_bool(),
                 "IPv4 接管规则",
+                tool_status(features["iptables_legacy"].as_bool()),
             ))
-            .child(takeover_tool(
+            .child(status_line(
                 "ip6tables-legacy",
-                features["ip6tables_legacy"].as_bool(),
                 "IPv6 接管规则",
+                tool_status(features["ip6tables_legacy"].as_bool()),
             ));
-        let system_info = div()
+        // 系统信息：三列的名称—值，不加底和边框。
+        let timezone_info = div()
             .flex()
-            .flex_wrap()
-            .gap_2()
-            .child(environment_info("WSL 版本", format!("WSL {version}")))
-            .child(environment_info(
-                "发行版",
-                text(features, "distribution", "未读取"),
-            ))
+            .flex_col()
+            .gap_1()
+            .flex_1()
+            .min_w(px(150.))
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .gap_1()
-                    .flex_1()
-                    .min_w(px(128.))
-                    .p_2()
-                    .bg(rgb(SURFACE_SOFT))
-                    .rounded_md()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_sm().text_color(rgb(MUTED)).child("时区"))
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(div().text_sm().text_color(rgb(MUTED)).child("时区"))
-                            .child(
-                                Button::new("environment-timezone-edit")
-                                    .icon(design_icon("edit", 15., MUTED))
-                                    .accessibility_label("修改时区")
-                                    .tooltip("修改时区")
-                                    .ghost()
-                                    .compact()
-                                    .disabled(locked)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_timezone_dialog(window, cx);
-                                    })),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .font_family(MONO_FONT)
-                            .text_sm()
-                            .truncate()
-                            .child(text(features, "timezone", "未读取")),
+                        Button::new("environment-timezone-edit")
+                            .icon(design_icon("edit", 15., MUTED))
+                            .accessibility_label("修改时区")
+                            .tooltip("修改时区")
+                            .ghost()
+                            .compact()
+                            .disabled(locked)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_timezone_dialog(window, cx);
+                            })),
                     ),
             )
-            .child(environment_info(
-                "Locale",
-                text(features, "locale", "未读取"),
+            .child(
+                div()
+                    .font_family(MONO_FONT)
+                    .text_sm()
+                    .truncate()
+                    .child(text(features, "timezone", "未读取")),
+            );
+        let system_info = div()
+            .flex()
+            .flex_wrap()
+            .gap_3()
+            .child(info_cell("WSL 版本", format!("WSL {version}")))
+            .child(info_cell(
+                "发行版",
+                text(features, "distribution", "未读取"),
             ))
-            .child(environment_info("内核", text(features, "kernel", "未读取")))
-            .child(environment_info(
-                "架构",
-                text(features, "architecture", "未读取"),
-            ))
-            .child(environment_info(
+            .child(timezone_info)
+            .child(info_cell("Locale", text(features, "locale", "未读取")))
+            .child(info_cell("内核", text(features, "kernel", "未读取")))
+            .child(info_cell("架构", text(features, "architecture", "未读取")))
+            .child(info_cell(
                 "默认用户",
                 environment_facts::default_user(features),
             ))
-            .child(environment_info(
-                "图形界面",
-                environment_facts::graphics(features),
-            ))
-            .child(environment_info(
+            .child(info_cell("图形界面", environment_facts::graphics(features)))
+            .child(info_cell(
                 "磁盘 已用/上限",
                 environment_facts::disk(features),
             ));
@@ -1409,22 +1594,41 @@ impl Desktop {
             .border_1()
             .border_color(rgb(RULE))
             .rounded_md()
+            .h_full()
+            .min_h_0()
             .child(
                 div()
                     .flex()
                     .items_start()
                     .justify_between()
                     .gap_3()
-                    .child(card_header("环境详情", ""))
                     .child(
-                        ButtonGroup::new("environment-detail-actions")
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .flex_1()
+                            .min_w_0()
+                            .child(icon("icons/square-terminal.svg"))
+                            .child(div().text_sm().truncate().child(name))
+                            .child(status),
+                    )
+                    .child(
+                        // 文字按钮组：外面自己画一圈边框，按钮用透明底，启动保留主色填充。
+                        div()
+                            .flex()
+                            .items_center()
+                            .border_1()
+                            .border_color(rgb(RULE))
+                            .rounded_md()
+                            .overflow_hidden()
                             .child(
                                 Button::new("environment-detail-refresh")
-                                    .icon(design_icon("refresh", 15., MUTED))
+                                    .label("刷新")
                                     .accessibility_label("重新读取详情")
                                     .tooltip("重新读取详情")
+                                    .small()
                                     .ghost()
-                                    .compact()
                                     .disabled(locked)
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.environment_view(refresh_name.clone(), window, cx)
@@ -1432,11 +1636,11 @@ impl Desktop {
                             )
                             .child(
                                 Button::new("environment-detail-apps")
-                                    .icon(design_icon("apps", 15., MUTED))
+                                    .label("程序")
                                     .accessibility_label("已安装应用")
                                     .tooltip("已安装应用：在新窗口里列出并启动")
+                                    .small()
                                     .ghost()
-                                    .compact()
                                     .disabled(locked)
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.open_app_launcher(cx)),
@@ -1444,12 +1648,11 @@ impl Desktop {
                             )
                             .child(
                                 Button::new("environment-detail-edit")
-                                    .icon(design_icon("edit", 15., MUTED))
+                                    .label("编辑")
                                     .accessibility_label("编辑环境")
                                     .tooltip("编辑环境")
-                                    .ghost()
-                                    .compact()
                                     .small()
+                                    .ghost()
                                     .disabled(locked)
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.environment_edit(edit_name.clone(), window, cx)
@@ -1457,11 +1660,11 @@ impl Desktop {
                             )
                             .child(
                                 Button::new("environment-detail-backup")
-                                    .icon(design_icon("archive", 15., MUTED))
+                                    .label("备份")
                                     .accessibility_label("备份环境")
                                     .tooltip("备份环境")
+                                    .small()
                                     .ghost()
-                                    .compact()
                                     .disabled(locked)
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.environment_backup(backup_name.clone(), window, cx)
@@ -1469,42 +1672,29 @@ impl Desktop {
                             )
                             .child(
                                 Button::new("environment-detail-delete")
-                                    .icon(design_icon("trash", 15., RUST))
+                                    .label("删除")
                                     .accessibility_label("删除环境")
                                     .tooltip("删除环境")
+                                    .small()
                                     .ghost()
-                                    .compact()
                                     .disabled(locked)
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.environment_delete(delete_name.clone(), window, cx)
                                     })),
-                            ),
+                            )
+                            .child(self.environment_takeover_button(&id, cx).small()),
                     ),
             )
             .child(
                 div()
+                    .id("environment-detail-body")
                     .flex()
                     .flex_col()
-                    .gap_2()
-                    .p_3()
-                    .bg(rgb(SURFACE_SOFT))
-                    .rounded_md()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(icon("icons/folder.svg"))
-                                    .child(div().text_sm().child(name)),
-                            )
-                            .child(role),
-                    )
+                    .gap_3()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .overflow_y_scroll()
                     .child(
                         div()
                             .flex()
@@ -1539,19 +1729,29 @@ impl Desktop {
                                     })),
                             ),
                     )
-                    .child(system_info),
-            )
-            .child(self.environment_takeover_card(&id, cx))
-            .child(div().text_sm().child("环境能力"))
-            .child(feature_grid)
-            .children(repair_hint)
-            .child(div().text_sm().child("接管基础"))
-            .child(takeover_grid)
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(MUTED))
-                    .child("这里只列组件在不在；能不能接管以预检结果为准。"),
+                    .child(section_rule().child(system_info))
+                    .child(section_rule().child(self.environment_takeover_section(&id, cx)))
+                    .child(
+                        section_rule().child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(div().text_sm().child("环境能力"))
+                                .child(capabilities)
+                                .children(repair_hint),
+                        ),
+                    )
+                    .child(
+                        section_rule().child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(div().text_sm().child("接管基础"))
+                                .child(basics),
+                        ),
+                    ),
             )
     }
 
@@ -1598,60 +1798,82 @@ impl Desktop {
         }
     }
 
-    /// 环境列表名字下面的一行小字：这个环境的接管状态。
+    /// 环境列表名字下面：和详情标题旁一样的代理、接管两个标记。
     fn environment_state_line(&self, id: &str) -> Div {
-        let phase = self.phase_for(id);
-        let (text, color) = if phase == "recovery_required" {
-            ("需要恢复", RUST)
-        } else if phase.starts_with("forwarding") {
-            ("接管中", ACCENT)
-        } else if super::drafts::residential_configured(super::drafts::environment_row(
-            &self.environments,
-            id,
-        )) {
-            ("未接管", MUTED)
-        } else {
-            ("未配置住宅代理", MUTED)
-        };
-        div().text_xs().text_color(rgb(color)).child(text)
+        self.environment_status_badges(id)
     }
 
-    /// 新建环境表单里的住宅代理：和环境详情里的是同一组输入框，创建成功后保存给新环境。
-    fn create_residential_section(&self, locked: bool, cx: &Context<Self>) -> Div {
+    /// 代理和接管两个两态标记：配置了代理 / 正在接管时着色，否则灰色；
+    /// 需要恢复时「接管」用红色。详情标题旁和左侧列表都用它。
+    fn environment_status_badges(&self, id: &str) -> Div {
+        let configured = super::drafts::residential_configured(super::drafts::environment_row(
+            &self.environments,
+            id,
+        ));
+        let phase = self.phase_for(id);
+        let (takeover_color, takeover_background) = if phase == "recovery_required" {
+            (RUST, super::theme::DANGER_BG)
+        } else if phase.starts_with("forwarding") {
+            (ACCENT, super::theme::TARGET_BG)
+        } else {
+            (MUTED, SURFACE_SOFT)
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(if configured {
+                badge("代理", TEAL, SUCCESS_BG)
+            } else {
+                badge("代理", MUTED, SURFACE_SOFT)
+            })
+            .child(badge("接管", takeover_color, takeover_background))
+    }
+
+    /// 住宅代理的输入框，新建和编辑共用。新建时没有保存按钮；编辑时保存只写这个环境的
+    /// 住宅代理。入口端口由后台分配，不在界面上设置。
+    fn residential_editor(&self, creating: bool, locked: bool, cx: &Context<Self>) -> Div {
         let view = cx.entity().clone();
         let selected = RESIDENTIAL_PROTOCOLS
             .iter()
             .position(|(value, _)| *value == self.residential_protocol_draft);
-        div()
+        let mut section = div()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_3()
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_1()
-                    .child(div().text_sm().child("住宅代理"))
-                    .child(info_tip(
-                        "environment-create-residential-tip",
-                        "这个环境接管时用的住宅代理，创建成功后保存给它。协议按服务商给这个端口的类型选；HTTP 代理只能转发 TCP。Windows 入口端口由程序分配，之后可在环境详情里改。",
-                    )),
-            )
-            .child(
-                RadioGroup::horizontal("environment-create-protocol")
-                    .children(
-                        RESIDENTIAL_PROTOCOLS
-                            .iter()
-                            .map(|(value, label)| Radio::new(*value).label(*label)),
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(div().text_sm().child("住宅代理"))
+                            .child(info_tip(
+                                "environment-residential-tip",
+                                "这个环境接管时用的住宅代理。协议按服务商给的地址选；HTTP 代理只能转发 TCP。",
+                            )),
                     )
-                    .selected_index(selected)
-                    .disabled(locked)
-                    .on_click(move |index: &usize, _, cx: &mut App| {
-                        let protocol = RESIDENTIAL_PROTOCOLS[*index].0;
-                        view.update(cx, |this, cx| {
-                            this.set_residential_protocol_draft(protocol, cx)
-                        });
-                    }),
+                    .child(
+                        RadioGroup::horizontal("environment-residential-protocol")
+                            .children(
+                                RESIDENTIAL_PROTOCOLS
+                                    .iter()
+                                    .map(|(value, label)| Radio::new(*value).label(*label)),
+                            )
+                            .selected_index(selected)
+                            .disabled(locked)
+                            .on_click(move |index: &usize, _, cx: &mut App| {
+                                let protocol = RESIDENTIAL_PROTOCOLS[*index].0;
+                                view.update(cx, |this, cx| {
+                                    this.set_residential_protocol_draft(protocol, cx)
+                                });
+                            }),
+                    ),
             )
             .child(
                 div()
@@ -1675,186 +1897,9 @@ impl Desktop {
                         self.field("密码", "", &self.fields.residential_password, false)
                             .flex_1(),
                     ),
-            )
-    }
-
-    /// 这个环境此刻的接管状态：接管中、需要恢复、配好了住宅代理或还没配。
-    fn environment_role_badge(&self, id: &str) -> Div {
-        let phase = self.phase_for(id);
-        if phase == "recovery_required" {
-            badge("需要恢复", RUST, super::theme::DANGER_BG)
-        } else if phase.starts_with("forwarding") {
-            badge("接管中", ACCENT, super::theme::TARGET_BG)
-        } else if super::drafts::residential_configured(super::drafts::environment_row(
-            &self.environments,
-            id,
-        )) {
-            badge("住宅代理已配置", MUTED, SURFACE_SOFT)
-        } else {
-            badge("未配置住宅代理", MUTED, SURFACE_SOFT)
-        }
-    }
-
-    /// 环境详情里的「接管」卡片：这个环境的启动、停止按钮，它自己的住宅代理和 Windows
-    /// 入口端口（决策 40），以及住宅代理检测。各环境的接管互不影响。
-    fn environment_takeover_card(&self, id: &str, cx: &Context<Self>) -> Div {
-        // 输入框和按钮作用于 `selected`；和详情里的环境对不上时宁可不画，也不能让
-        // 保存或启动落到另一个环境上。
-        if !self
-            .selected
-            .as_deref()
-            .is_some_and(|selected| selected.eq_ignore_ascii_case(id))
-        {
-            return div()
-                .text_sm()
-                .text_color(rgb(MUTED))
-                .child("正在读取这个环境的接管设置…");
-        }
-        let locked = self.locked();
-        let phase = self.phase_for(id);
-        let active = phase != "idle" && phase != "unknown";
-        let gone = self
-            .session_for(id)
-            .is_some_and(|session| session["target_registered"] == false);
-        let action = if active && gone {
-            self.button(
-                "environment-takeover-abandon",
-                "放弃本次记录",
-                UiAction::PrepareFor(Kind::Abandon, id.to_owned()),
-                locked,
-                cx,
-            )
-        } else if phase == "recovery_required" {
-            self.button(
-                "environment-takeover-recover",
-                "恢复直连",
-                UiAction::PrepareFor(Kind::Stop, id.to_owned()),
-                locked,
-                cx,
-            )
-        } else if active {
-            self.button(
-                "environment-takeover-stop",
-                "停止接管",
-                UiAction::PrepareFor(Kind::Stop, id.to_owned()),
-                locked,
-                cx,
-            )
-            .icon(design_icon("close", 15., SURFACE))
-        } else {
-            self.button(
-                "environment-takeover-start",
-                "启动接管",
-                UiAction::StartFor(id.to_owned()),
-                locked,
-                cx,
-            )
-            .icon(design_icon("play", 15., SURFACE))
-        }
-        .primary();
-        let view = cx.entity().clone();
-        let protocol_selected = RESIDENTIAL_PROTOCOLS
-            .iter()
-            .position(|(value, _)| *value == self.residential_protocol_draft);
-        let protocol = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(
-                div()
-                    .w(px(112.))
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(div().text_sm().text_color(rgb(MUTED)).child("协议"))
-                    .child(info_tip(
-                        "environment-protocol-tip",
-                        "按服务商给这个端口的类型选。HTTP 代理只能转发 TCP：选它时接管期间的 UDP（含 QUIC、WebRTC、游戏和语音）一律拒绝，不会直连。两种协议的用户名和密码都是明文发送，接管时经宿主 SOCKS5 发出。",
-                    )),
-            )
-            .child(
-                RadioGroup::horizontal("environment-residential-protocol")
-                    .children(
-                        RESIDENTIAL_PROTOCOLS
-                            .iter()
-                            .map(|(value, label)| Radio::new(*value).label(*label)),
-                    )
-                    .selected_index(protocol_selected)
-                    .disabled(locked)
-                    .on_click(move |index: &usize, _, cx: &mut App| {
-                        let protocol = RESIDENTIAL_PROTOCOLS[*index].0;
-                        view.update(cx, |this, cx| {
-                            this.set_residential_protocol_draft(protocol, cx)
-                        });
-                    }),
             );
-        let unassigned = self.unassigned_residential_notice(cx);
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p_3()
-            .bg(rgb(SURFACE_SOFT))
-            .rounded_md()
-            .child(
-                div()
-                    .flex()
-                    .items_start()
-                    .justify_between()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(div().text_sm().child("接管"))
-                            .child(info_tip(
-                                "environment-takeover-tip",
-                                "这个环境用自己的住宅代理和入口端口出网，可以和别的环境同时接管。启动前会把它的时区改成住宅出口所在时区并重启它。",
-                            )),
-                    )
-                    .child(action),
-            )
-            .children(unassigned)
-            .child(protocol)
-            .child(
-                div()
-                    .flex()
-                    .gap_3()
-                    .child(
-                        self.field("服务器 IPv4", "", &self.fields.residential_ip, false)
-                            .flex_1(),
-                    )
-                    .child(
-                        self.field("服务器端口", "", &self.fields.residential_port, false)
-                            .w(px(128.)),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_3()
-                    .child(
-                        self.field("用户名", "", &self.fields.residential_username, false)
-                            .flex_1(),
-                    )
-                    .child(
-                        self.field("密码", "", &self.fields.residential_password, false)
-                            .flex_1(),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_end()
-                    .gap_1()
-                    .child(self.field("Windows 入口端口", "", &self.fields.port, false))
-                    .child(div().pb_1().child(info_tip(
-                        "environment-port-tip",
-                        "这个环境的流量从这个端口进入代理，每个环境一个；留空保存时由程序从 43531 起分配一个别的环境没用的端口。",
-                    ))),
-            )
-            .child(
+        if !creating {
+            section = section.child(
                 div()
                     .flex()
                     .items_center()
@@ -1871,8 +1916,164 @@ impl Desktop {
                         )
                         .primary(),
                     ),
+            );
+        }
+        section
+    }
+
+    /// 详情页右上角的接管主按钮（文字）：按这个环境的状态显示启动 / 停止 / 恢复 / 放弃，
+    /// 和刷新、编辑等文字按钮排在一起，用主色突出。
+    fn environment_takeover_button(&self, id: &str, cx: &Context<Self>) -> Button {
+        let locked = self.locked();
+        let phase = self.phase_for(id);
+        let active = phase != "idle" && phase != "unknown";
+        let gone = self
+            .session_for(id)
+            .is_some_and(|session| session["target_registered"] == false);
+        if active && gone {
+            self.button(
+                "environment-takeover-abandon",
+                "放弃",
+                UiAction::PrepareFor(Kind::Abandon, id.to_owned()),
+                locked,
+                cx,
             )
-            .child(self.residential_probe_panel(cx))
+        } else if phase == "recovery_required" {
+            self.button(
+                "environment-takeover-recover",
+                "恢复",
+                UiAction::PrepareFor(Kind::Stop, id.to_owned()),
+                locked,
+                cx,
+            )
+        } else if active {
+            self.button(
+                "environment-takeover-stop",
+                "停止",
+                UiAction::PrepareFor(Kind::Stop, id.to_owned()),
+                locked,
+                cx,
+            )
+        } else {
+            self.button(
+                "environment-takeover-start",
+                "接管",
+                UiAction::StartFor(id.to_owned()),
+                locked,
+                cx,
+            )
+        }
+        .primary()
+    }
+
+    /// 环境详情里的「接管」一段：这个环境的启动、停止按钮，它自己的住宅代理和 Windows
+    /// 入口端口（决策 40），以及住宅代理检测。各环境的接管互不影响。
+    fn environment_takeover_section(&self, id: &str, cx: &Context<Self>) -> Div {
+        // 输入框和按钮作用于 `selected`；和详情里的环境对不上时宁可不画，也不能让
+        // 保存或启动落到另一个环境上。
+        if !self
+            .selected
+            .as_deref()
+            .is_some_and(|selected| selected.eq_ignore_ascii_case(id))
+        {
+            return div()
+                .text_sm()
+                .text_color(rgb(MUTED))
+                .child("正在读取这个环境的接管设置…");
+        }
+        // 详情页只读：住宅代理在这里只看已保存的值，修改在「编辑 WSL 环境」里。
+        let residential = self.selected_residential();
+        let configured = super::drafts::residential_configured(self.selected_row());
+        let protocol = super::drafts::saved_residential_protocol(&residential);
+        let protocol_label = RESIDENTIAL_PROTOCOLS
+            .iter()
+            .find(|(value, _)| *value == protocol)
+            .map(|(_, label)| *label)
+            .unwrap_or("SOCKS5");
+        let server = {
+            let ip = super::drafts::saved_residential_text(&residential, "ip");
+            let port = super::drafts::saved_residential_text(&residential, "port");
+            if ip.is_empty() {
+                "未配置".to_owned()
+            } else {
+                format!("{ip}:{port}")
+            }
+        };
+        let text_or_dash = |key: &str| {
+            let value = super::drafts::saved_residential_text(&residential, key);
+            if value.is_empty() {
+                "—".to_owned()
+            } else {
+                value
+            }
+        };
+        // 只读信息用紧凑的「标签 值」对，两列排开；不再画成带分隔线的表。
+        let pair = |label: &'static str, value: String| {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .flex_1()
+                .min_w(px(200.))
+                .child(
+                    div()
+                        .w(px(56.))
+                        .flex_shrink_0()
+                        .text_sm()
+                        .text_color(rgb(MUTED))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .font_family(MONO_FONT)
+                        .text_sm()
+                        .truncate()
+                        .child(value),
+                )
+        };
+        let summary = if configured {
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .child(pair("协议", protocol_label.to_owned()))
+                .child(pair("服务器", server))
+                .child(pair("用户名", text_or_dash("username")))
+                .child(pair("密码", text_or_dash("password")))
+        } else {
+            div()
+                .text_sm()
+                .text_color(rgb(MUTED))
+                .child("还没有配置住宅代理；在「编辑」里填写后才能启动接管。")
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(div().text_sm().child("住宅代理"))
+                    .child(info_tip(
+                        "environment-takeover-tip",
+                        "这个环境用自己的住宅代理出网，可以和别的环境同时接管。启动前会把它的时区改成住宅出口所在时区并重启它。",
+                    )),
+            )
+            .child(summary)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .pt_3()
+                    .border_t_1()
+                    .border_color(rgb(RULE))
+                    .child(self.residential_probe_panel(cx)),
+            )
     }
 
     /// 旧版本留下的那一份住宅代理还没分给任何环境时，在环境详情里提示，并让用户分给
@@ -2002,7 +2203,11 @@ impl Desktop {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(div().flex_shrink_0().child(icon("icons/folder.svg")))
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .child(icon("icons/square-terminal.svg")),
+                            )
                             .child(
                                 div()
                                     .flex()
@@ -2039,7 +2244,7 @@ impl Desktop {
                         div()
                             .text_sm()
                             .text_color(rgb(MUTED))
-                            .child("刷新列表后重新读取系统注册信息。"),
+                            .child("刷新后重新读取系统注册信息。"),
                     ),
             );
         }
@@ -2047,7 +2252,7 @@ impl Desktop {
             .child(
                 self.button(
                     "environment-create-top",
-                    "新增环境",
+                    "新增",
                     UiAction::EnvironmentCreate,
                     controls_locked,
                     cx,
@@ -2059,11 +2264,7 @@ impl Desktop {
             .child(
                 self.button(
                     "environment-list",
-                    if self.reading {
-                        "读取中…"
-                    } else {
-                        "刷新列表"
-                    },
+                    if self.reading { "读取中" } else { "刷新" },
                     UiAction::List,
                     controls_locked,
                     cx,
@@ -2596,7 +2797,7 @@ impl Desktop {
             .child(
                 self.button(
                     "environment-residential-probe",
-                    "检测住宅代理",
+                    "检测",
                     UiAction::ResidentialProbe,
                     self.locked() || self.residential_probe_checking,
                     cx,
@@ -2605,39 +2806,56 @@ impl Desktop {
             )
     }
 
-    /// 住宅代理卡片底部：两条路各自的结果、失败原因和检测说明。
-    fn residential_probe_result(&self) -> Vec<Div> {
-        let mut rows = Vec::new();
-        if let Some(error) = self.residential_probe_error.clone() {
-            rows.push(div().text_sm().text_color(rgb(RUST)).child(error));
-        } else if let Some(report) = self
+    /// 检测结束（或失败）后弹出结果对话框；卡片里只保留状态和检测时间。
+    pub(crate) fn show_residential_probe_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let error = self.residential_probe_error.clone();
+        let report = self
             .residential_probe
             .as_ref()
             .filter(|_| !self.residential_probe_stale())
-        {
-            let verdict = report["verdict"].as_str().unwrap_or("unreachable");
-            rows.push(
+            .map(|report| {
+                let verdict = report["verdict"].as_str().unwrap_or("unreachable");
+                (
+                    super::backend::residential_probe_summary(verdict).to_owned(),
+                    super::backend::residential_stage_text(&report["direct"]),
+                    super::backend::residential_stage_text(&report["chained"]),
+                )
+            });
+        if error.is_none() && report.is_none() {
+            return;
+        }
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let body = if let Some(error) = &error {
+                div().text_sm().text_color(rgb(RUST)).child(error.clone())
+            } else if let Some((summary, direct, chained)) = &report {
                 div()
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(INK))
-                            .child(super::backend::residential_probe_summary(verdict)),
-                    )
-                    .child(key_value(
-                        "直接连接",
-                        super::backend::residential_stage_text(&report["direct"]),
-                    ))
-                    .child(key_value(
-                        "经宿主 SOCKS5",
-                        super::backend::residential_stage_text(&report["chained"]),
-                    )),
-            );
-        }
-        rows
+                    .child(div().text_sm().text_color(rgb(INK)).child(summary.clone()))
+                    .child(key_value("直接连接", direct.clone()))
+                    .child(key_value("经宿主 SOCKS5", chained.clone()))
+            } else {
+                div()
+            };
+            dialog
+                .w(px(520.))
+                .title(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::NORMAL)
+                        .child("检测结果"),
+                )
+                .description(body)
+                .confirm()
+                .ok_text("关闭")
+                .show_cancel(false)
+                .on_ok(|_, _, _| true)
+        });
     }
 
     /// 有保存按钮的页面：规则页和设置页。
@@ -2745,14 +2963,10 @@ impl Desktop {
         )
     }
 
-    /// 环境详情「接管」卡片里的住宅代理检测：状态和「检测」按钮，下面是两条路的结果和说明。
+    /// 环境详情「住宅代理」一段里的检测：只显示状态、检测时间和「检测」按钮；
+    /// 检测结果用对话框弹出，状态照常更新。
     fn residential_probe_panel(&self, cx: &Context<Self>) -> Div {
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(self.residential_probe_row(cx))
-            .children(self.residential_probe_result())
+        self.residential_probe_row(cx)
     }
 
     /// 设置页用 gpui-kit 的 Settings：左边按分区切换，右边是当前分区的设置项。输入框沿用

@@ -125,8 +125,8 @@ impl Desktop {
             max_tcp_connections: input(window, cx, "留空为默认 256", false),
             tcp_idle_timeout: input(window, cx, "留空为默认 1800", false),
             tcp_half_close_timeout: input(window, cx, "留空为默认 60", false),
-            port: Field::Single(cx.new(|cx| InputState::new(window, cx).default_value("43531"))),
             environment_name: input(window, cx, "例如 Ubuntu-Dev", false),
+            environment_hostname: input(window, cx, "例如 Jungle，留空与环境名相同", false),
             environment_distribution: input(window, cx, "发行版，例如 Ubuntu-24.04", false),
             environment_install: input(
                 window,
@@ -162,8 +162,8 @@ impl Desktop {
             (&fields.max_tcp_connections, settings),
             (&fields.tcp_idle_timeout, settings),
             (&fields.tcp_half_close_timeout, settings),
-            (&fields.port, environment),
             (&fields.environment_name, None),
+            (&fields.environment_hostname, None),
             (&fields.environment_distribution, None),
             (&fields.environment_install, None),
             (&fields.environment_backup, None),
@@ -741,7 +741,8 @@ impl Desktop {
     }
 
     /// 住宅代理检测同样是静默的：结果只写进环境页住宅代理卡片，不动页面提示和全局错误条。
-    fn accept_residential_probe(&mut self, result: Result<Value, String>) {
+    /// 返回是否是一份新结果（换过环境被丢掉的不算），调用方据此弹出结果对话框。
+    fn accept_residential_probe(&mut self, result: Result<Value, String>) -> bool {
         self.residential_probe_checking = false;
         match result {
             // 检测期间环境页换了环境：结果不是现在这个环境的，丢掉。
@@ -749,14 +750,19 @@ impl Desktop {
                 if !value["residential_probe"]["distro_id"]
                     .as_str()
                     .zip(self.selected.as_deref())
-                    .is_some_and(|(probed, selected)| probed.eq_ignore_ascii_case(selected)) => {}
+                    .is_some_and(|(probed, selected)| probed.eq_ignore_ascii_case(selected)) =>
+            {
+                false
+            }
             Ok(value) => {
                 self.residential_probe = Some(value["residential_probe"].clone());
                 self.residential_probe_at = Some(Instant::now());
                 self.residential_probe_error = None;
+                true
             }
             Err(error) => {
                 self.residential_probe_error = Some(super::backend::humanize_error(&error));
+                true
             }
         }
     }
@@ -918,8 +924,11 @@ impl Desktop {
             return;
         }
         if reply.kind == Kind::ResidentialProbe {
-            self.accept_residential_probe(reply.result);
+            let fresh = self.accept_residential_probe(reply.result);
             cx.notify();
+            if fresh {
+                self.show_residential_probe_dialog(window, cx);
+            }
             return;
         }
         if reply.kind == Kind::EnvironmentApps {
@@ -1962,9 +1971,6 @@ impl Desktop {
         match scope {
             SaveScope::Environment => {
                 let residential = self.selected_residential();
-                self.fields
-                    .port
-                    .set_value(self.selected_port_text(), window, cx);
                 self.residential_protocol_draft = saved_residential_protocol(&residential);
                 for (field, key) in self.residential_inputs() {
                     let value = saved_residential_text(&residential, key);

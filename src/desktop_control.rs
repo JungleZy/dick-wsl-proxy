@@ -192,6 +192,10 @@ struct EnvironmentCreate {
     install_path: String,
     username: String,
     password: String,
+    /// An older desktop client does not send it; the environment name is then
+    /// used as the hostname.
+    #[serde(default)]
+    hostname: Option<String>,
     #[serde(default)]
     install_zsh: bool,
     #[serde(default)]
@@ -281,6 +285,7 @@ fn environment_options(
     username: Option<String>,
     password: Option<String>,
     timezone: Option<String>,
+    hostname: Option<String>,
 ) -> InstallOptions {
     InstallOptions {
         zsh,
@@ -289,6 +294,7 @@ fn environment_options(
         username,
         password,
         timezone,
+        hostname,
     }
 }
 
@@ -838,6 +844,7 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                             Some(req.username.clone()),
                             Some(req.password.clone()),
                             None,
+                            req.hostname.clone(),
                         ),
                     )?;
                     let mut response = json!({"environment":environment});
@@ -861,6 +868,7 @@ pub fn handle(mut request: Value, controller: &mut controller::Controller) -> (V
                             None,
                             None,
                             req.timezone,
+                            None,
                         ),
                     )?;
                     Ok(json!({"environment":environment}))

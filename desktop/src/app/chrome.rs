@@ -32,8 +32,9 @@ impl Desktop {
         &self,
         label: &'static str,
         tooltip_id: &'static str,
-        tooltip_text: &'static str,
+        tooltip_text: impl Into<SharedString>,
     ) -> Div {
+        let tooltip_text = tooltip_text.into();
         div()
             .flex()
             .items_center()
@@ -49,7 +50,7 @@ impl Desktop {
                 div()
                     .id(tooltip_id)
                     .child(design_icon("info", 14., MUTED))
-                    .tooltip(move |window, cx| text_tip(tooltip_text, window, cx)),
+                    .tooltip(move |window, cx| text_tip(tooltip_text.clone(), window, cx)),
             )
     }
 
@@ -90,11 +91,9 @@ impl Desktop {
                     UiAction::List => this.send(Kind::List, json!({"command":"list"}), cx),
                     UiAction::Save(scope) => this.save(scope, cx),
                     UiAction::Probe => this.probe(cx),
-                    UiAction::Prepare(kind) => this.prepare(kind, window, cx),
                     UiAction::PrepareFor(kind, target) => {
                         this.prepare_for(kind, target, window, cx)
                     }
-                    UiAction::StopAll => this.prompt_stop_all(window, cx),
                     UiAction::StartFor(target) => this.start_environment(target, cx),
                     UiAction::Reveal => {
                         if let Some(path) = &this.export_path {
@@ -156,7 +155,7 @@ impl Desktop {
                 .disabled(self.locked())
                 .into_any_element(),
         };
-        div()
+        let mut field = div()
             .flex()
             .flex_col()
             .gap_2()
@@ -169,8 +168,13 @@ impl Desktop {
                     .text_color(rgb(INK))
                     .child(label),
             )
-            .child(input)
-            .child(div().text_sm().text_color(rgb(MUTED)).child(hint))
+            .child(input);
+        // 空提示不占位：住宅代理的几行都传空字符串，之前每行下面都留一条
+        // 空文本的高度，两行之间的间距看起来比别处大。
+        if !hint.is_empty() {
+            field = field.child(div().text_sm().text_color(rgb(MUTED)).child(hint));
+        }
+        field
     }
 
     pub(crate) fn compact_secret_field(
@@ -202,7 +206,8 @@ impl Desktop {
     pub(crate) fn field_with_action(
         &self,
         label: &'static str,
-        hint: &'static str,
+        tooltip_id: &'static str,
+        tooltip_text: impl Into<SharedString>,
         state: &Field,
         button: Button,
     ) -> Div {
@@ -217,13 +222,7 @@ impl Desktop {
             .flex()
             .flex_col()
             .gap_2()
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::NORMAL)
-                    .text_color(rgb(INK))
-                    .child(label),
-            )
+            .child(self.field_label(label, tooltip_id, tooltip_text))
             .child(
                 div()
                     .flex()
@@ -237,6 +236,5 @@ impl Desktop {
                             .flex_shrink_0(),
                     ),
             )
-            .child(div().text_sm().text_color(rgb(MUTED)).child(hint))
     }
 }

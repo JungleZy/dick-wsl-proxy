@@ -280,6 +280,7 @@ The package is unsigned: the SHA-256 check catches a broken download but does no
 
 The Environments page can create a distribution (Ubuntu-24.04 by default, optionally with zsh, Chrome, and a Chinese input method), edit its components, change its timezone, back it up to a file, or delete it.
 
+- The create form has a **hostname** field; it is written to `[network] hostname` in `/etc/wsl.conf`, and that is the device name desktop apps such as Claude show. Left empty, the environment name is used (an underscore in it becomes a hyphen and the name is capped at 63 bytes). Only letters, digits, dots and hyphens are allowed, and case is kept as typed. Only new environments get it, and editing never renames an existing distribution;
 - A new distribution with `apt-get` (such as Ubuntu or Debian) gets the system language `LANG=en_US.UTF-8` and `LANGUAGE=en_US:en` with no `LC_ALL`; Chrome in it reports en-US for both its language (`navigator.language`) and the Intl locale (not yet tested by creating a distribution from the desktop app). The Chinese input method only adds fcitx5 Pinyin and the zh_CN locale without making it the default language, and Pinyin stays the default input method;
 - saving an edit with Chrome or the Chinese input method selected switches the system language to that en_US setting;
 - editing components or changing the timezone restarts the distribution;

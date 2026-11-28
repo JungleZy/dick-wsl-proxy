@@ -373,18 +373,6 @@ pub(crate) fn environment_save_request(
     })
 }
 
-/// Windows 入口端口输入框的值：留空表示让后台分配，否则要是 1024–65535 的整数。
-pub(crate) fn ingress_port_value(text: &str) -> Result<Option<u16>, &'static str> {
-    if text.is_empty() {
-        return Ok(None);
-    }
-    text.parse::<u16>()
-        .ok()
-        .filter(|port| *port >= 1024)
-        .map(Some)
-        .ok_or("Windows 入口端口需为 1024–65535 的整数，留空由程序分配。")
-}
-
 /// 配置库里这个环境的那一行；没保存过时为 `None`。和后台一样，ID 不区分大小写。
 pub(crate) fn environment_row<'a>(rows: &'a [Value], distro_id: &str) -> Option<&'a Value> {
     rows.iter().find(|row| {
@@ -495,9 +483,9 @@ mod tests {
 
     use super::{
         FailedSaves, PageDraft, ProfileField, SaveScope, Saved, Unsaved, environment_row,
-        environment_save_request, ingress_port_value, merge_profile, profile_changed,
-        residential_configured, residential_value, save_request, saved_fake_ip,
-        saved_residential_protocol, saved_residential_text, saved_text,
+        environment_save_request, merge_profile, profile_changed, residential_configured,
+        residential_value, save_request, saved_fake_ip, saved_residential_protocol,
+        saved_residential_text, saved_text,
     };
 
     fn saved() -> Value {
@@ -684,16 +672,12 @@ mod tests {
         assert_eq!(first["command"], "environment_residential_save");
         assert_eq!(first["distro_id"], "{4444}");
         assert_eq!(first["residential"], residential);
-        // 没填端口：后台沿用或分配。
+        // 不传端口：后台沿用或分配。
         assert_eq!(first["ingress_port"], Value::Null);
         assert_eq!(first["expected_revision"], Value::Null);
         let later = environment_save_request("{4444}", residential, Some(44000), &json!("3"));
         assert_eq!(later["ingress_port"], 44000);
         assert_eq!(later["expected_revision"], "3");
-        assert_eq!(ingress_port_value(""), Ok(None));
-        assert_eq!(ingress_port_value("44000"), Ok(Some(44000)));
-        assert!(ingress_port_value("80").is_err());
-        assert!(ingress_port_value("port").is_err());
     }
 
     #[test]

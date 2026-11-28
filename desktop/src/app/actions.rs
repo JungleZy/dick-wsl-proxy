@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 use super::backend::Kind;
 use super::drafts::{
     PageDraft, ProfileField, SaveScope, Saved, Unsaved, environment_row, environment_save_request,
-    ingress_port_value, names_target, profile_changed, residential_configured, residential_value,
-    save_request, saved_fake_ip, saved_residential_protocol, saved_residential_text,
+    names_target, profile_changed, residential_configured, residential_value, save_request,
+    saved_fake_ip, saved_residential_protocol, saved_residential_text,
 };
 use super::model::{Confirmation, EnvironmentEditor, Field, PendingPrepare};
 use super::state::Desktop;
@@ -32,6 +32,22 @@ fn valid_environment_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// An empty hostname is allowed: the controller then uses the environment name.
+fn valid_environment_hostname(hostname: &str) -> bool {
+    hostname.is_empty()
+        || (hostname.len() <= 63
+            && !hostname.starts_with('.')
+            && !hostname.ends_with('.')
+            && hostname.split('.').all(|label| {
+                !label.is_empty()
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            }))
 }
 
 impl Desktop {
@@ -161,28 +177,6 @@ impl Desktop {
     pub(crate) fn field_value(field: &Field, cx: &App) -> String {
         field.value(cx)
     }
-    pub(crate) fn profile_field_value(profile: &Value, key: &str, array: bool) -> String {
-        if array {
-            profile[key]
-                .as_array()
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::trim)
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .unwrap_or_default()
-        } else {
-            profile[key]
-                .as_str()
-                .map(str::trim)
-                .map(str::to_owned)
-                .or_else(|| profile[key].as_u64().map(|value| value.to_string()))
-                .unwrap_or_default()
-        }
-    }
     /// 策略字段对应的输入框。
     pub(crate) fn profile_input(&self, field: ProfileField) -> &Field {
         match field {
@@ -233,14 +227,6 @@ impl Desktop {
             .unwrap_or(Value::Null)
     }
 
-    /// 正在看的环境已保存的 Windows 入口端口；没保存过时为空，保存时由后台分配。
-    pub(crate) fn selected_port_text(&self) -> String {
-        self.selected_row()
-            .and_then(|row| row["ingress_port"].as_u64())
-            .map(|port| port.to_string())
-            .unwrap_or_default()
-    }
-
     /// 发行版名称对应的 ID；列表里没有时为 `None`。
     pub(crate) fn distro_id(&self, name: &str) -> Option<String> {
         self.distributions
@@ -248,17 +234,6 @@ impl Desktop {
             .find(|distro| names_target(distro, name))
             .and_then(|distro| distro["id"].as_str())
             .map(str::to_owned)
-    }
-
-    /// 后台记着的接管目标（接管中或需要恢复）的 ID；空闲或状态未确认时为 `None`。
-    pub(crate) fn active_distro_id(&self) -> Option<String> {
-        if !self.status_valid || self.phase() == "idle" {
-            return None;
-        }
-        let name = self.status["active_target"]
-            .as_str()
-            .or_else(|| self.status["recorded_target"].as_str())?;
-        self.distro_id(name)
     }
 
     /// The backend's session of one environment, if it has records for it
@@ -326,8 +301,7 @@ impl Desktop {
             || profile_changed(&self.profile, SaveScope::Settings, draft);
         let residential = self.selected_residential();
         let environment = self.selected.is_some()
-            && (Self::field_value(&self.fields.port, cx) != self.selected_port_text()
-                || self.residential_protocol_draft != saved_residential_protocol(&residential)
+            && (self.residential_protocol_draft != saved_residential_protocol(&residential)
                 || self.residential_inputs().into_iter().any(|(field, key)| {
                     Self::field_value(field, cx) != saved_residential_text(&residential, key)
                 }));
@@ -701,52 +675,6 @@ impl Desktop {
             return self.busy == Some(Kind::Stop);
         }
         false
-    }
-
-    pub(crate) fn prepare(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
-        if self.locked() {
-            return;
-        }
-        let Some(generation) = self.generation() else {
-            self.fail("后台状态未确认，请先刷新。", cx);
-            return;
-        };
-        // Stop and abandon act on the takeover the status shows; each
-        // environment has its own records (decision 40).
-        let scope = self.status["scope"].clone();
-        if kind == Kind::Abandon {
-            self.confirmation = Some(Confirmation {
-                kind,
-                generation,
-                request: json!({"command":"abandon","confirm":true,"expected_generation":generation,"target":scope}),
-                message: "目标发行版已不在 WSL 注册表里，无法清理它的规则。将释放本次接管占用的端口并清掉恢复记录。WSL 里可能还残留本次接管的规则：下次启动接管前，请先在终端执行一次 wsl --shutdown（会关闭所有发行版）。".into(),
-                exit: false,
-                queue: Vec::new(),
-            });
-            self.open_confirmation_dialog(window, cx);
-            cx.notify();
-            return;
-        }
-        if kind == Kind::Stop {
-            self.confirmation = Some(Confirmation {
-                kind,
-                generation,
-                request: json!({"command":"stop","expected_generation":generation,"target":scope}),
-                message:
-                    "将停止接管并恢复直连。现有 TCP 连接会中断，需要重连；只清理本控制器的规则。"
-                        .into(),
-                exit: false,
-                queue: Vec::new(),
-            });
-            self.open_confirmation_dialog(window, cx);
-            cx.notify();
-            return;
-        }
-        let Some(target) = self.selected.clone() else {
-            self.fail("请先在环境页选一个环境。", cx);
-            return;
-        };
-        self.start_environment(target, cx);
     }
 
     /// 启动某个环境的接管（环境列表的按钮、详情的按钮都走这里）：按钮不置灰，
@@ -1323,15 +1251,15 @@ impl Desktop {
     fn environment_request(&self, cx: &App) -> Result<Value, String> {
         let distro_id = self.selected.clone().ok_or("请先选一个环境。")?;
         let residential = self.residential_draft(cx)?;
-        let port = ingress_port_value(&Self::field_value(&self.fields.port, cx))?;
         let revision = self
             .selected_row()
             .map(|row| row["revision"].clone())
             .unwrap_or(Value::Null);
+        // 入口端口由后台沿用或分配，界面上不设置。
         Ok(environment_save_request(
             &distro_id,
             residential,
-            port,
+            None,
             &revision,
         ))
     }
@@ -1409,6 +1337,7 @@ impl Desktop {
         self.environment_chrome = true;
         self.environment_chinese = true;
         self.fields.environment_name.set_value("", window, cx);
+        self.fields.environment_hostname.set_value("", window, cx);
         self.fields
             .environment_distribution
             .set_value("Ubuntu-24.04", window, cx);
@@ -1424,7 +1353,7 @@ impl Desktop {
         self.fields.environment_password.set_value("", window, cx);
         self.fields.environment_timezone.set_value("", window, cx);
         self.environment_backup_target = None;
-        self.notice = "选择发行版、安装目录和默认用户，然后创建环境。".into();
+        self.notice = "选择发行版、安装目录、默认用户和主机名，然后创建环境。".into();
         self.error = false;
         cx.notify();
     }
@@ -1445,6 +1374,7 @@ impl Desktop {
         self.fields
             .environment_name
             .set_value(name.clone(), window, cx);
+        self.fields.environment_hostname.set_value("", window, cx);
         self.fields
             .environment_distribution
             .set_value("Ubuntu-24.04", window, cx);
@@ -1736,6 +1666,14 @@ impl Desktop {
                 let install = Self::environment_install_path(&install_base, &name);
                 let username = Self::field_value(&self.fields.environment_username, cx);
                 let password = Self::field_value(&self.fields.environment_password, cx);
+                let hostname = Self::field_value(&self.fields.environment_hostname, cx);
+                if !valid_environment_hostname(&hostname) {
+                    self.fail(
+                        "主机名只能用字母、数字、点和短横线，每段以字母或数字开头结尾，最长 63 个字符。",
+                        cx,
+                    );
+                    return;
+                }
                 if distribution.is_empty() || install_base.is_empty() {
                     self.fail("新增环境需要发行版和安装目录。", cx);
                     return;
@@ -1761,6 +1699,7 @@ impl Desktop {
                         "install_path":install,
                         "username":username,
                         "password":password,
+                        "hostname":hostname,
                         "install_zsh":self.environment_zsh,
                         "install_chrome":self.environment_chrome,
                         "install_chinese":self.environment_chinese

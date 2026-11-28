@@ -182,14 +182,6 @@ impl Tip {
         self
     }
 
-    /// 有值时才加这一行，例如接管中和已保存的配置不同时补一行「已保存」。
-    pub(crate) fn row_some(self, label: impl Into<SharedString>, value: Option<String>) -> Self {
-        match value {
-            Some(value) => self.row(label, value),
-            None => self,
-        }
-    }
-
     pub(crate) fn note(mut self, note: impl Into<SharedString>) -> Self {
         self.notes.push(note.into());
         self

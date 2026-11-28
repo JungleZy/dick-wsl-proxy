@@ -309,6 +309,9 @@ fn humanize_code(code: &str, message: &str) -> String {
         }
         "unassigned_residential_missing" => "没有未分配的住宅代理了，请刷新。".into(),
         "environment_name_invalid" => "环境名称只能使用字母、数字、点、下划线和短横线。".into(),
+        "environment_hostname_invalid" => {
+            "主机名只能用字母、数字、点和短横线，每段以字母或数字开头结尾，最长 63 个字符。".into()
+        }
         "environment_name_exists" => "环境名称已经存在，请换一个名称。".into(),
         "environment_distribution_invalid" => "发行版选择无效，请从列表中重新选择。".into(),
         "environment_distribution_download_failed" => {

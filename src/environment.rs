@@ -29,6 +29,8 @@ pub(crate) struct InstallOptions {
     pub(crate) username: Option<String>,
     pub(crate) password: Option<String>,
     pub(crate) timezone: Option<String>,
+    /// The create form's hostname; empty falls back to the environment name.
+    pub(crate) hostname: Option<String>,
 }
 
 fn valid_name(name: &str) -> bool {
@@ -79,6 +81,60 @@ fn valid_password(password: &str) -> bool {
         && !password
             .bytes()
             .any(|byte| matches!(byte, 0 | b'\r' | b'\n'))
+}
+
+/// A hostname the create form may send: at most 63 bytes, dot-separated labels
+/// of ASCII letters and digits with `-` allowed inside a label. Case is kept —
+/// the account page shows the name exactly as written.
+fn valid_hostname(hostname: &str) -> bool {
+    !hostname.is_empty()
+        && hostname.len() <= 63
+        && !hostname.starts_with('.')
+        && !hostname.ends_with('.')
+        && hostname.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
+/// The hostname used when the create form leaves it empty: the environment name,
+/// with the `_` an environment name may carry turned into `-`, capped at 63.
+fn default_hostname(name: &str) -> String {
+    let mut hostname: String = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    hostname.truncate(63);
+    while hostname.ends_with('-') || hostname.ends_with('.') {
+        hostname.pop();
+    }
+    if hostname.is_empty() {
+        "wsl".to_string()
+    } else {
+        hostname
+    }
+}
+
+/// The hostname a new environment gets: the form's value when it sent one,
+/// otherwise the environment name. `edit` never calls this, so an existing
+/// distribution keeps whatever its owner set.
+fn environment_hostname(requested: Option<&str>, name: &str) -> Result<String, String> {
+    match requested.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) if valid_hostname(value) => Ok(value.to_string()),
+        Some(_) => Err("environment_hostname_invalid".into()),
+        None => Ok(default_hostname(name)),
+    }
 }
 
 fn shell_quote(value: &str) -> String {
@@ -219,11 +275,11 @@ wsl_conf_set() {
 }
 "#;
 
-fn setup_script(options: InstallOptions) -> String {
+fn setup_script(options: InstallOptions, hostname: Option<&str>) -> String {
     // Only `create` supplies a username. Every run enables systemd so an edited
     // distribution can become a takeover target; a newly created environment
     // also always gets the base packages and a default user. Editing never
-    // changes an existing [user] default.
+    // changes an existing [user] default or its hostname.
     let new_environment = if options.username.is_some() { "1" } else { "0" };
     let wsl_conf_set = WSL_CONF_SET;
     let install_zsh = if options.zsh { "1" } else { "0" };
@@ -240,6 +296,8 @@ fn setup_script(options: InstallOptions) -> String {
         .map(shell_quote)
         .unwrap_or_else(|| "''".into());
     let timezone = options.timezone.as_deref().unwrap_or("");
+    // Only `create` passes one: an edited distribution keeps its hostname.
+    let hostname = hostname.map(shell_quote).unwrap_or_else(|| "''".into());
     format!(
         r#"#!/bin/sh
 set -eu
@@ -250,6 +308,7 @@ install_chrome={install_chrome}
 install_chinese={install_chinese}
 environment_user={username}
 environment_password={password}
+environment_hostname={hostname}
 timezone={timezone}
 
 {wsl_conf_set}
@@ -475,6 +534,9 @@ fi
 wsl_conf_set boot systemd true
 if [ -n "$environment_user" ]; then
     wsl_conf_set user default "$environment_user"
+fi
+if [ -n "$environment_hostname" ]; then
+    wsl_conf_set network hostname "$environment_hostname"
 fi
 if [ -n "$timezone" ]; then
     wsl_conf_set time useWindowsTimezone false
@@ -789,6 +851,7 @@ pub(crate) fn create(
     if !valid_password(password) {
         return Err("environment_password_invalid".into());
     }
+    let hostname = environment_hostname(options.hostname.as_deref(), name)?;
     let registered = host::distributions()?;
     if registered
         .iter()
@@ -834,9 +897,11 @@ pub(crate) fn create(
                 return Err(rollback_create(name, &destination, &before, failure));
             }
         };
-        if let Err(error) =
-            host::guest_script_with_timeout(&distro, &setup_script(options), CONFIGURE_DEADLINE)
-        {
+        if let Err(error) = host::guest_script_with_timeout(
+            &distro,
+            &setup_script(options, Some(&hostname)),
+            CONFIGURE_DEADLINE,
+        ) {
             let failure = format!("environment_setup_failed:{error}");
             return Err(rollback_create(name, &destination, &before, failure));
         }
@@ -875,7 +940,7 @@ pub(crate) fn edit(key: &str, options: InstallOptions) -> Result<Value, String> 
         "正在执行环境初始化脚本",
     );
     let result = (|| {
-        host::guest_script_with_timeout(&distro, &setup_script(options), CONFIGURE_DEADLINE)
+        host::guest_script_with_timeout(&distro, &setup_script(options, None), CONFIGURE_DEADLINE)
             .map_err(|error| format!("environment_setup_failed:{error}"))?;
         // Restart so [boot] systemd and [time] take effect. This stops every
         // process in the distribution; the desktop warns before submitting.
@@ -929,9 +994,9 @@ pub(crate) fn remove(key: &str) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        InstallOptions, absolute_path, created_by_request, inspect_script, setup_script,
-        valid_distribution, valid_name, valid_password, valid_timezone, valid_username,
-        within_windows_path,
+        InstallOptions, absolute_path, created_by_request, default_hostname, environment_hostname,
+        inspect_script, setup_script, valid_distribution, valid_hostname, valid_name,
+        valid_password, valid_timezone, valid_username, within_windows_path,
     };
     use crate::host::Distro;
     use std::path::Path;
@@ -1023,14 +1088,18 @@ mod tests {
 
     #[test]
     fn chinese_setup_script_configures_locale_and_fcitx() {
-        let script = setup_script(InstallOptions {
-            zsh: true,
-            chrome: true,
-            chinese: true,
-            username: Some("dev".into()),
-            password: Some("p@ss'word".into()),
-            timezone: Some("Asia/Shanghai".into()),
-        });
+        let script = setup_script(
+            InstallOptions {
+                zsh: true,
+                chrome: true,
+                chinese: true,
+                username: Some("dev".into()),
+                password: Some("p@ss'word".into()),
+                timezone: Some("Asia/Shanghai".into()),
+                ..InstallOptions::default()
+            },
+            None,
+        );
         assert!(script.contains("fcitx5-chinese-addons"));
         assert!(script.contains("fcitx5-frontend-gtk3"));
         assert!(script.contains("fcitx5-frontend-gtk4"));
@@ -1069,11 +1138,14 @@ mod tests {
     /// default.
     #[test]
     fn new_environments_default_to_the_en_us_system_language() {
-        let script = setup_script(InstallOptions {
-            username: Some("dev".into()),
-            password: Some("secret".into()),
-            ..InstallOptions::default()
-        });
+        let script = setup_script(
+            InstallOptions {
+                username: Some("dev".into()),
+                password: Some("secret".into()),
+                ..InstallOptions::default()
+            },
+            None,
+        );
         let locale_block = script
             .split("system_locales=\"en_US.UTF-8\"\n")
             .nth(1)
@@ -1094,10 +1166,13 @@ mod tests {
     /// so the input method ships a system-wide default with Pinyin.
     #[test]
     fn input_method_ships_a_pinyin_default_for_the_en_us_system() {
-        let script = setup_script(InstallOptions {
-            chinese: true,
-            ..InstallOptions::default()
-        });
+        let script = setup_script(
+            InstallOptions {
+                chinese: true,
+                ..InstallOptions::default()
+            },
+            None,
+        );
         let profile = script
             .split("cat > /etc/xdg/fcitx5/profile <<'FCITX'\n")
             .nth(1)
@@ -1116,11 +1191,14 @@ mod tests {
     #[test]
     fn chrome_launcher_runs_chrome_in_en_us() {
         for chinese in [false, true] {
-            let script = setup_script(InstallOptions {
-                chrome: true,
-                chinese,
-                ..InstallOptions::default()
-            });
+            let script = setup_script(
+                InstallOptions {
+                    chrome: true,
+                    chinese,
+                    ..InstallOptions::default()
+                },
+                None,
+            );
             let launcher = script
                 .split("cat > /usr/local/bin/chrome <<'CHROME'")
                 .nth(1)
@@ -1152,11 +1230,14 @@ mod tests {
     /// current setup writes, so the two scripts must agree on paths and markers.
     #[test]
     fn inspect_looks_for_what_the_current_setup_writes() {
-        let setup = setup_script(InstallOptions {
-            chrome: true,
-            chinese: true,
-            ..InstallOptions::default()
-        });
+        let setup = setup_script(
+            InstallOptions {
+                chrome: true,
+                chinese: true,
+                ..InstallOptions::default()
+            },
+            None,
+        );
         let inspect = inspect_script();
         let body = |start: &str, end: &str| {
             setup
@@ -1198,11 +1279,14 @@ mod tests {
 
     #[test]
     fn chrome_launcher_supplies_the_ime_environment_outside_a_login_shell() {
-        let script = setup_script(InstallOptions {
-            chrome: true,
-            chinese: true,
-            ..InstallOptions::default()
-        });
+        let script = setup_script(
+            InstallOptions {
+                chrome: true,
+                chinese: true,
+                ..InstallOptions::default()
+            },
+            None,
+        );
         let launcher = script
             .split("cat > /usr/local/bin/chrome <<'CHROME'")
             .nth(1)
@@ -1232,14 +1316,72 @@ mod tests {
 
     #[test]
     fn editing_never_marks_an_existing_distribution_as_new() {
-        let script = setup_script(InstallOptions {
-            timezone: Some("Asia/Shanghai".into()),
-            ..InstallOptions::default()
-        });
+        let script = setup_script(
+            InstallOptions {
+                timezone: Some("Asia/Shanghai".into()),
+                ..InstallOptions::default()
+            },
+            None,
+        );
         assert!(script.contains("new_environment=0"));
         assert!(script.contains("environment_user=''"));
         // systemd is enabled on every edit, outside any create-only branch.
         assert!(script.contains("\nwsl_conf_set boot systemd true\n"));
+    }
+
+    /// The create form sends the hostname it shows; it wins and is written as
+    /// typed, because the account page displays it verbatim. An empty field falls
+    /// back to the environment name, and `edit` passes none at all so an existing
+    /// distribution keeps its hostname.
+    #[test]
+    fn a_new_environment_gets_the_requested_hostname() {
+        assert_eq!(
+            environment_hostname(Some("Jungle"), "Ubuntu-24.04-Jungle").unwrap(),
+            "Jungle"
+        );
+        assert_eq!(
+            environment_hostname(Some("  "), "Ubuntu-24.04-Jungle").unwrap(),
+            "Ubuntu-24.04-Jungle"
+        );
+        assert_eq!(environment_hostname(None, "Dev_Box").unwrap(), "Dev-Box");
+        assert_eq!(
+            environment_hostname(Some("bad_name"), "x"),
+            Err("environment_hostname_invalid".into())
+        );
+
+        let script = setup_script(
+            InstallOptions {
+                username: Some("dev".into()),
+                password: Some("secret".into()),
+                ..InstallOptions::default()
+            },
+            Some("Jungle"),
+        );
+        assert!(script.contains("environment_hostname='Jungle'"));
+        assert!(script.contains("wsl_conf_set network hostname \"$environment_hostname\""));
+        let edit = setup_script(
+            InstallOptions {
+                timezone: Some("Asia/Shanghai".into()),
+                ..InstallOptions::default()
+            },
+            None,
+        );
+        assert!(edit.contains("environment_hostname=''"));
+        // The write is guarded, so an empty name never reaches wsl.conf.
+        assert!(edit.contains("if [ -n \"$environment_hostname\" ]; then"));
+    }
+
+    #[test]
+    fn hostnames_are_validated_as_dns_labels() {
+        for good in ["Jungle", "ubuntu-24.04-jungle", "a.b", "x-1"] {
+            assert!(valid_hostname(good), "{good}");
+        }
+        for bad in ["", "_x", "x_", "a..b", ".a", "a.", "-a", "a-", "a b"] {
+            assert!(!valid_hostname(bad), "{bad}");
+        }
+        assert!(!valid_hostname(&"a".repeat(64)));
+        assert_eq!(default_hostname(&"A".repeat(100)).len(), 63);
+        assert_eq!(default_hostname("Dev_Box"), "Dev-Box");
     }
 
     #[cfg(unix)]
@@ -1270,7 +1412,7 @@ mod tests {
                 .stdin
                 .take()
                 .unwrap()
-                .write_all(setup_script(options).as_bytes())
+                .write_all(setup_script(options, None).as_bytes())
                 .unwrap();
             assert!(child.wait().unwrap().success());
         }
